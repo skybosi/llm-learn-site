@@ -443,6 +443,51 @@
           onScroll();
           state.cleanupFns.push(function () { window.removeEventListener('scroll', onScroll); toTop.remove(); });
 
+          // 选中正文 → 浮出「摘录到笔记」：读长文时最常用的动作，直接落到本课笔记里
+          var pop = null;
+          function hidePop() { if (pop) { pop.remove(); pop = null; } }
+          function showPop(excerpt, rect) {
+            hidePop();
+            pop = ui.el('button', 'excerpt-btn', '✎ 摘录到笔记');
+            pop.style.top = Math.max(8, rect.top - 42 + window.scrollY) + 'px';
+            pop.style.left = Math.min(window.innerWidth - 150, Math.max(12, rect.left + rect.width / 2 - 70)) + 'px';
+            pop.addEventListener('mousedown', function (e) { e.preventDefault(); });   // 别把选区弄丢
+            pop.addEventListener('click', function () {
+              hidePop();
+              openDrawer();
+              var cur = noteArea.value ? noteArea.value.replace(/\s*$/, '') + '\n\n' : '';
+              noteArea.value = cur + '> 摘录：' + excerpt.replace(/\n+/g, ' ') + '\n';
+              LLM.store.setNote(lesson.id, noteArea.value);
+              if (noteStatus) noteStatus.textContent = '已摘录 · ' + fmt.rel(Date.now());
+              ui.toast('已摘录到本课笔记', 'ok', 1500);
+              refreshNoteFlags();
+              noteArea.focus();
+            });
+            document.body.appendChild(pop);
+          }
+          function onSelect() {
+            var sel = root.getSelection ? root.getSelection() : null;
+            if (!sel || sel.isCollapsed || !sel.rangeCount) { hidePop(); return; }
+            var text = String(sel).trim();
+            if (text.length < 6) { hidePop(); return; }
+            var node = sel.anchorNode;
+            if (!node || !article.contains(node.nodeType === 1 ? node : node.parentNode)) { hidePop(); return; }
+            var rect = sel.getRangeAt(0).getBoundingClientRect();
+            if (!rect || (!rect.width && !rect.height)) { hidePop(); return; }
+            showPop(text.length > 400 ? text.slice(0, 400) + '…' : text, rect);
+          }
+          var selectTimer = null;
+          var onUp = function () { clearTimeout(selectTimer); selectTimer = setTimeout(onSelect, 60); };
+          document.addEventListener('mouseup', onUp);
+          document.addEventListener('touchend', onUp);
+          document.addEventListener('scroll', hidePop, { passive: true });
+          state.cleanupFns.push(function () {
+            document.removeEventListener('mouseup', onUp);
+            document.removeEventListener('touchend', onUp);
+            document.removeEventListener('scroll', hidePop);
+            hidePop();
+          });
+
           // 键盘：← → 上一课/下一课；n 记笔记
           function onKey(e) {
             var tag = (e.target.tagName || '').toLowerCase();

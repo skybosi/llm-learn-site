@@ -246,13 +246,42 @@
     return main;
   }
 
-  function layerLink(id, glyph, label, count, isAll) {
+  /**
+   * 层图标：方块里放**线性 SVG**，而不是一个汉字。
+   * 汉字当图标看着像占位符（用户反馈：「图标是文字感觉很奇怪」），所以按层 id 映射到图形语义。
+   */
+  var LAYER_ICONS = {
+    math: 'sigma', code: 'code', ml: 'graph', dl: 'brain', transformer: 'share', llm: 'book',
+    tune: 'tune', kernel: 'cpu', 'train-sys': 'network', hw: 'chip', infer: 'zap', net: 'globe',
+    os: 'terminal', serve: 'server', data: 'database', rag: 'search', agent: 'bot', eval: 'gauge',
+    safety: 'shield', mm: 'image', domain: 'globe', project: 'briefcase', tags: 'tag',
+  };
+  function layerIcon(L) {
+    L = L || {};
+    if (LAYER_ICONS[L.id]) return LAYER_ICONS[L.id];
+    var hay = String((L.name || '') + ' ' + (L.id || '')).toLowerCase();
+    var rules = [
+      [/数学|math|概率|线代|微积分/, 'sigma'], [/代码|编程|code|python/, 'code'],
+      [/内核|kernel|cuda|gpu/, 'cpu'], [/训练|并行|分布/, 'network'],
+      [/推理|部署|服务/, 'server'], [/数据|存储/, 'database'], [/检索|rag/, 'search'],
+      [/安全|对齐|风险/, 'shield'], [/多模态|生成|图像|语音|视频/, 'image'],
+      [/评测|指标|基准/, 'gauge'], [/工具|agent|智能体/, 'bot'], [/网络|协议/, 'globe'],
+    ];
+    for (var i = 0; i < rules.length; i++) if (rules[i][0].test(hay)) return rules[i][1];
+    return 'boxes';
+  }
+
+  function layerLink(id, label, count, isAll, note) {
     var a = ui.el('a', 'gloss-layer');
     a.href = '#/glossary' + (id ? '/' + id : '');
     a.dataset.layer = id || '';
     if (isAll) a.dataset.all = '1';
-    if (glyph) a.appendChild(ui.el('span', 'gl-glyph', glyph));
+    // 图标由层 id 决定（线性 SVG）；不再把一个汉字塞进方块当图标
+    var g = ui.el('span', 'gl-glyph');
+    g.innerHTML = ui.iconSvg(isAll ? 'boxes' : layerIcon({ id: id, name: label }), 15);
+    a.appendChild(g);
     a.appendChild(ui.el('span', 'gl-name', label));
+    if (note) a.title = note;
     if (count != null) a.appendChild(ui.el('span', 'gl-count', String(count)));
     a.addEventListener('click', function (e) {
       e.preventDefault();
@@ -270,11 +299,9 @@
       side.appendChild(ui.el('div', 'small muted', '层目录加载中…'));
       return;
     }
-    side.appendChild(layerLink(null, '全', '全部', fmt.num((IDX && IDX.terms) || 0), true));
+    side.appendChild(layerLink(null, '全部', fmt.num((IDX && IDX.terms) || 0), true, '所有层的词条'));
     ls.forEach(function (L) {
-      var a = layerLink(L.id, L.glyph || '·', L.name, L.count);
-      if (L.note) a.title = L.note;
-      side.appendChild(a);
+      side.appendChild(layerLink(L.id, L.name, L.count, false, L.note));
     });
   }
 
@@ -288,7 +315,9 @@
   function layerHead(meta) {
     var box = ui.el('div', 'gloss-layer-head');
     if (meta) {
-      box.appendChild(ui.el('h2', 'gloss-layer-title', (meta.glyph ? meta.glyph + ' ' : '') + meta.name));
+      var h2 = ui.el('h2', 'gloss-layer-title');
+      h2.innerHTML = ui.iconSvg(layerIcon(meta), 20) + ' ' + fmt.esc(meta.name);
+      box.appendChild(h2);
       if (meta.note) box.appendChild(ui.el('p', 'small muted', meta.note));
       var bits = [];
       if (meta.line) bits.push(meta.line);
@@ -461,7 +490,8 @@
     if (t.en) head.appendChild(ui.el('div', 'term-en', t.en));
     if (t.aliases && t.aliases.length) head.appendChild(aliasChips(t.aliases));
     if (meta) {
-      var a = ui.el('a', 'badge badge--level', (meta.glyph ? meta.glyph + ' ' : '') + meta.name);
+      var a = ui.el('a', 'badge badge--level');
+      a.innerHTML = ui.iconSvg(layerIcon(meta), 13) + ' ' + fmt.esc(meta.name);
       a.href = '#/glossary/' + meta.id;
       a.title = '回到本层';
       head.appendChild(a);

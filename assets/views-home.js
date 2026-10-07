@@ -64,7 +64,9 @@
   function pathCard(p, bySlug, progressMap) {
     var card = ui.el('div', 'card path-card');
     var head = ui.el('div', 'path-head');
-    head.appendChild(ui.el('div', 'path-glyph', p.glyph || '学'));
+    var glyph = ui.el('div', 'path-glyph');
+    glyph.innerHTML = (views.pathIcon ? ui.iconSvg(views.pathIcon(p), 22) : ui.iconSvg('route', 22));
+    head.appendChild(glyph);
     var tw = ui.el('div');
     tw.appendChild(ui.el('h3', null, p.name));
     if (p.group) tw.appendChild(ui.el('div', 'small muted', p.group));
