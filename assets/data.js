@@ -9,13 +9,31 @@
   var cache = Object.create(null);
   var pending = Object.create(null);
 
+  /** 带缓存戳的 URL（同一路径，绕过浏览器里可能被缓存住的 404 / 旧内容） */
+  function bust(rel) {
+    return rel + (rel.indexOf('?') < 0 ? '?' : '&') + 't=' + Date.now();
+  }
+
+  function once(rel, url) {
+    return fetch(url, { cache: 'no-store' }).then(function (r) {
+      if (!r.ok) throw new Error('加载失败 ' + rel + '（HTTP ' + r.status + '）');
+      return r.json();
+    });
+  }
+
   function fetchJSON(rel) {
     if (cache[rel]) return Promise.resolve(cache[rel]);
     if (pending[rel]) return pending[rel];
-    pending[rel] = fetch(rel, { cache: 'force-cache' })
-      .then(function (r) {
-        if (!r.ok) throw new Error('加载失败 ' + rel + '（HTTP ' + r.status + '）');
-        return r.json();
+    pending[rel] = once(rel, rel)
+      // 自愈：之前那次加载（比如构建中途 / 打开错目录）可能在浏览器里留下了 404 缓存，
+      // 带时间戳重试一次 —— 文件在就正常了，用户不用去手动清缓存。
+      .catch(function (firstErr) {
+        if (!/HTTP 404/.test(String(firstErr.message))) throw firstErr;
+        console.warn('[llm-learn] ' + rel + ' 首次加载 404，带缓存戳重试一次…');
+        return once(rel, bust(rel)).then(function (data) {
+          console.warn('[llm-learn] ' + rel + ' 重试成功（之前那次多半是缓存住的 404）');
+          return data;
+        }).catch(function () { throw firstErr; });
       })
       .then(function (data) {
         cache[rel] = data;
@@ -39,6 +57,8 @@
     search: function () { return fetchJSON('data/search.json').then(function (d) { return d.items; }); },
     text: function (slug) { return fetchJSON('data/text/' + slug + '.json').then(function (d) { return d.lessons; }); },
     figures: function () { return fetchJSON('data/figures.json'); },
+    /** 课时 → 本课涉及的关键词（构建期从百科指针反转而来） */
+    lessonTerms: function () { return fetchJSON('data/lesson-terms.json').then(function (d) { return d.lessons || {}; }); },
     glossaryIndex: function () { return fetchJSON('data/glossary/index.json'); },
     glossaryLayer: function (id) { return fetchJSON('data/glossary/' + id + '.json'); },
 

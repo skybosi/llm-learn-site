@@ -153,14 +153,14 @@
           var hero = ui.el('section', 'hero');
           var inner = ui.el('div', 'hero-inner');
           var left = ui.el('div');
-          left.appendChild(ui.el('span', 'hero-eyebrow', '纯静态学习站 · 无需登录 · 进度与笔记存在你自己的浏览器'));
+          left.appendChild(ui.el('span', 'hero-eyebrow', '9 条方向线 · 从零基础到能部署大模型'));
           var h1 = ui.el('h1');
           h1.innerHTML = '把大模型从<em>数学地基</em>学到<em>推理部署</em>';
           left.appendChild(h1);
           left.appendChild(ui.el('p', 'hero-lead',
             site.counts.courses + ' 门课 · ' + site.counts.chapters + ' 章 · ' + site.counts.lessons +
-            ' 个课时，按 9 条方向线组织：每个概念都从「为什么需要」讲到「怎么算、怎么调、代价是什么」。' +
-            '公式本地渲染、' + fmt.num(site.counts.figures) + ' 张图表、' + fmt.num(site.counts.glossaryTerms) + ' 条关键词百科。'));
+            ' 个课时：每个概念都从「为什么需要」讲到「怎么算、怎么调、代价是什么」，' +
+            '配 ' + fmt.num(site.counts.figures) + ' 张图表与 ' + fmt.num(site.counts.glossaryTerms) + ' 条关键词百科。'));
           var actions = ui.el('div', 'hero-actions');
           var a1 = ui.el('a', 'btn btn--primary btn--lg', '开始学习');
           a1.href = '#/paths';
@@ -317,10 +317,32 @@
         }
       }).catch(function (e) {
         ui.clear(rootEl);
-        var c = ui.el('div', 'container');
-        c.innerHTML = '<div class="empty"><strong>站点数据加载失败</strong><p class="small">' +
-          fmt.esc(e.message) + '</p><p class="small">如果你是从本地文件直接打开（file://），浏览器会拦截数据请求：请用本地静态服务预览（例如 <code>python3 -m http.server</code>）。</p></div>';
+        var msg = String(e && e.message || e);
+        var isFile = /^file:/i.test(location.protocol);
+        var is404 = /404/.test(msg);
+        var why = isFile
+          ? '你是用 <code>file://</code> 直接打开的：浏览器会拦截 <code>data/*.json</code> 的请求（CORS），必须走本地静态服务。'
+          : (is404
+            ? '请求 <code>data/site.json</code> 返回 404 —— 你打开的**多半是站点源码目录 <code>site/</code>**（它只有 <code>assets/</code>，<code>data/</code> 是构建产物）。请打开构建出来的 <code>site-dist/</code>。'
+            : '数据请求失败：' + fmt.esc(msg));
+        // 强制重载（带时间戳）：把浏览器缓存整个绕过去
+        var retryUrl = location.origin + location.pathname + '?r=' + Date.now() + (location.hash || '#/');
+        var c = ui.el('div', 'container container--narrow');
+        c.innerHTML = '<div class="empty"><strong>站点数据加载失败</strong>' +
+          '<p class="small mono" style="word-break:break-all">当前地址：' + fmt.esc(location.href) + '</p>' +
+          '<p class="small mono" style="word-break:break-all">失败请求：' + fmt.esc(msg) + '</p>' +
+          '<p class="small">' + why + '</p>' +
+          '<p class="small muted" style="margin-top:14px">正确的本地预览方式（二选一）：</p>' +
+          '<pre style="text-align:left;max-width:560px;margin:0 auto"><code>cd llm-learn\n' +
+          '# ① 根路径（＝直接打开站点根）\npython3 -m http.server 4010 --directory site-dist\n' +
+          '# ② 子路径（＝GitHub Pages 的真实形态）\nmkdir -p /tmp/pages && ln -sfn "$PWD/site-dist" /tmp/pages/llm-learn-site\npython3 -m http.server 4011 --directory /tmp/pages</code></pre>' +
+          '<p class="small muted" style="margin-top:10px">打开：<code>http://127.0.0.1:4010/</code> 或 <code>http://127.0.0.1:4011/llm-learn-site/</code></p>' +
+          '<p style="margin-top:14px">' +
+          '<button class="btn btn--primary" id="hard-reload">强制重载（绕过缓存）</button> ' +
+          '<a class="btn" href="#/">重试</a></p></div>';
         rootEl.appendChild(c);
+        var hr = c.querySelector('#hard-reload');
+        if (hr) hr.addEventListener('click', function () { location.replace(retryUrl); });
       });
     },
   };

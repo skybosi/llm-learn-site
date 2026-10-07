@@ -765,7 +765,7 @@
     var L = [];
     L.push('# llm-learn 学习笔记');
     L.push('');
-    L.push('> 导出时间：' + stamp() + ' · 站点：llm-learn 大模型系统学习站（纯静态，无账号）');
+    L.push('> 导出时间：' + stamp() + ' · 来源：llm-learn 大模型系统学习站');
     L.push('> 笔记 ' + st.notes + ' 条 · 进度 ' + st.doneLessons + ' / ' + (st.totalLessons || '—') + ' 课时');
     L.push('> 本文件只含**笔记原文**（按 课程 → 章节 → 课时 组织）。进度与收藏请用页面的「导出 JSON」备份。');
     L.push('');

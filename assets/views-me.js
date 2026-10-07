@@ -125,7 +125,7 @@
     /* ---------- 标题 ---------- */
     var head = ui.el('div', 'page-head');
     head.appendChild(ui.el('h1', null, '我的学习'));
-    head.appendChild(ui.el('p', null, '进度与笔记只保存在本机浏览器（localStorage），换设备请用导出/导入。'));
+    head.appendChild(ui.el('p', null, '学习记录保存在这台设备的浏览器里：换设备或换浏览器时，用下面的「导出 / 导入」把进度与笔记带走。'));
     wrap.appendChild(head);
 
     /* ---------- 子页锚点（点 tab 由 app.js 的 hash 路由重渲染，所以是 link 不是 button） ---------- */

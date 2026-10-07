@@ -185,6 +185,21 @@
         if (lesson.difficulty) meta.appendChild(ui.el('span', 'badge badge--level', lesson.difficulty));
         (lesson.tags || []).slice(0, 3).forEach(function (t) { meta.appendChild(ui.el('span', 'tag', t)); });
         head.appendChild(meta);
+
+        // 前置课时：这门课/这条学习路径的「该先学什么」，系统学习的入口
+        if ((lesson.prerequisites || []).length) {
+          var pre = ui.el('div', 'prereq');
+          pre.appendChild(ui.el('span', 'prereq-label', '前置课时'));
+          (lesson.prerequisites || []).forEach(function (pid) {
+            var m = lessonIndex[pid];
+            var a = ui.el('a', 'chip', m ? m.t : pid);
+            a.href = '#/l/' + pid;
+            a.title = m ? (m.ct + ' · ' + m.t) : pid;
+            if (m) a.textContent = fmt.clamp(m.t, 26);
+            pre.appendChild(a);
+          });
+          head.appendChild(pre);
+        }
         main.appendChild(head);
 
         var article = ui.el('article', 'article');
@@ -216,6 +231,26 @@
           nav.appendChild(fin);
         }
         foot.appendChild(nav);
+
+        // 本课关键词（构建期从「词条 → 课时」指针反转而来）：读完这一课顺手回查概念
+        data.lessonTerms().then(function (map) {
+          var terms = map[lesson.id] || [];
+          if (!terms.length) return;
+          var box = ui.el('div', 'keyterms');
+          var kh = ui.el('div', 'section-sub');
+          kh.textContent = '本课关键词（' + terms.length + ' 个，点击查百科）';
+          box.appendChild(kh);
+          var row = ui.el('div', 'chip-row');
+          terms.forEach(function (t) {
+            var a = ui.el('a', 'chip', t.zh);
+            a.href = '#/glossary/t/' + t.k;
+            a.title = t.layerName + ' · ' + t.zh;
+            row.appendChild(a);
+          });
+          box.appendChild(row);
+          foot.insertBefore(box, nav.nextSibling);
+        }).catch(function () { /* 关键词索引没有也能读 */ });
+
         main.appendChild(foot);
         layout.appendChild(main);      // 正文（第 2 列，最宽）
         layout.appendChild(tocBox);    // 本页目录（第 3 列）—— 顺序不能颠倒，grid 按 DOM 顺序落列
@@ -397,6 +432,16 @@
           }, { rootMargin: '-70px 0px -70% 0px', threshold: 0 });
           spy.forEach(function (s) { io.observe(s.node); });
           state.cleanupFns.push(function () { io.disconnect(); });
+
+          // 回到顶部：正文常有一万多字，手机上尤其需要（滚动超过 700px 才出现）
+          var toTop = ui.el('button', 'to-top', '↑');
+          toTop.title = '回到顶部';
+          toTop.addEventListener('click', function () { window.scrollTo({ top: 0, behavior: 'smooth' }); });
+          document.body.appendChild(toTop);
+          var onScroll = function () { toTop.classList.toggle('show', window.scrollY > 700); };
+          window.addEventListener('scroll', onScroll, { passive: true });
+          onScroll();
+          state.cleanupFns.push(function () { window.removeEventListener('scroll', onScroll); toTop.remove(); });
 
           // 键盘：← → 上一课/下一课；n 记笔记
           function onKey(e) {

@@ -70,7 +70,7 @@
    * @param {object} fullCourse  单课视图额外取到的 data/course/<slug>.json（有 chapters，用于章标题）
    * @returns {{items:Array, total:number, lineNames:Array, chaptersOf:function}}
    */
-  function buildModel(figuresMap, courseCards, siteLines, fullCourse) {
+  function buildModel(figuresMap, courseCards, siteLines, fullCourse, figureMeta) {
     var meta = {};
     (courseCards || []).forEach(function (c) { meta[c.slug] = c; });
 
@@ -108,13 +108,20 @@
           chapter: ch,
           chapterTitle: (chapterTitles[slug] || {})[ch] || '',
           figNo: figureNo(url) || (i + 1),
+          title: (figureMeta[url] && figureMeta[url].t) || '',
+          lessons: (figureMeta[url] && figureMeta[url].k) || [],
           w: Number(fig.w) || 0,
           h: Number(fig.h) || 0,
           cap: '',
         });
       });
     });
-    items.forEach(function (f) { f.cap = fullLabel(f); f.hay = (f.slug + ' ' + f.courseTitle + ' ' + baseName(f.url) + ' ' + posLabel(f) + ' ' + f.line).toLowerCase(); });
+    items.forEach(function (f) {
+      f.cap = f.title || fullLabel(f);
+      // 搜索词里带上**图题**（正文里那句描述）与所属课时标题 —— 这才是「找那张讲 XX 的图」的用法
+      f.hay = (f.slug + ' ' + f.courseTitle + ' ' + baseName(f.url) + ' ' + posLabel(f) + ' ' + f.line + ' ' +
+        (f.title || '') + ' ' + f.lessons.map(function (k) { return k.t + ' ' + k.ct; }).join(' ')).toLowerCase();
+    });
 
     return {
       items: items,
@@ -218,9 +225,27 @@
     // 用数据里的真实 w/h 定宽高比，图片没到之前就占好位，避免滚动抖动
     img.style.aspectRatio = (f.w && f.h) ? (f.w + ' / ' + f.h) : FALLBACK_AR;
     var cap = ui.el('div', 'fig-cap');
-    cap.style.cssText = 'display:flex;gap:10px;justify-content:space-between';  // 本文件不许改 css，左文案/右课程名靠内联布局
-    cap.appendChild(ui.el('span', null, posLabel(f)));
-    cap.appendChild(ui.el('span', 'fig-course', f.courseTitle));
+    cap.style.cssText = 'display:flex;flex-direction:column;gap:6px';
+    var top = ui.el('div');
+    top.style.cssText = 'display:flex;gap:10px;justify-content:space-between';
+    top.appendChild(ui.el('span', null, posLabel(f)));
+    top.appendChild(ui.el('span', 'fig-course', f.courseTitle));
+    cap.appendChild(top);
+    if (f.title) {
+      var t = ui.el('div', 'fig-title', f.title);
+      t.style.cssText = 'font-size:12.5px;line-height:1.5;color:var(--text-soft)';
+      t.title = f.title;
+      cap.appendChild(t);
+    }
+    if (f.lessons && f.lessons.length) {
+      // 图 → 讲它的那一课：图表库的意义就落在这里
+      var go = ui.el('a', 'fig-go', '去这一课：' + fmt.clamp(f.lessons[0].t, 22) + ' →');
+      go.href = '#/l/' + f.lessons[0].id;
+      go.style.cssText = 'font-size:12px;color:var(--accent)';
+      go.title = f.lessons[0].ct + ' · ' + f.lessons[0].t;
+      go.addEventListener('click', function (e) { e.stopPropagation(); });   // 别触发外层的灯箱
+      cap.appendChild(go);
+    }
     it.appendChild(img);
     it.appendChild(cap);
     return it;
@@ -348,7 +373,7 @@
     f3.appendChild(ui.el('label', 'small muted', '搜索'));
     var q = ui.el('input');
     q.type = 'search';
-    q.placeholder = '课程名或文件名序号，如 chapter-3';
+    q.placeholder = '搜图题（如「KV 头」「缩放律」）或课程 / 章节';
     q.value = st.q || '';
     q.setAttribute('autocomplete', 'off');
     var fire = ui.debounce(function () { onChange({ q: q.value }); }, 160);   // 防抖：别每敲一个字就重排 1000 条
@@ -516,9 +541,11 @@
       // 单课视图：data/courses.json 的课程卡**不含 chapters**（构建期只留在单课 JSON 里），
       // 所以想看章标题与「按 N 章分组」，得再取一次 data/course/<slug>.json；取不到就退化为无标题分组
       (slug && data.course) ? data.course(slug).catch(function () { return null; }) : Promise.resolve(null),
+      data.get('data/figure-meta.json').catch(function () { return { meta: {} }; }),   // 图题 + 图→课时
     ]).then(function (res) {
       var full = res[3] || {};
-      var m = buildModel(res[0] || {}, res[1] || [], (res[2] && res[2].lines) || [], full);
+      var meta = (res[4] && res[4].meta) || {};
+      var m = buildModel(res[0] || {}, res[1] || [], (res[2] && res[2].lines) || [], full, meta);
       var courseList = (res[1] || []).map(function (c) {
         return {
           slug: c.slug, title: c.title, line: c.line, counts: c.counts, chapters: c.chapters || [],

@@ -229,7 +229,7 @@
     activeIdx = lastResults.length ? 0 : -1;
     if (!q.trim()) {
       results.innerHTML = '<div class="sr-empty">输入关键词：课程名、课时标题、正文小标题、百科词条都能搜到。<br>' +
-        '按 <kbd>Shift</kbd>+<kbd>Enter</kbd> 可在全部课程正文里深搜（会逐课加载，稍慢）。</div>';
+        '按 <kbd>Shift</kbd>+<kbd>Enter</kbd> 可以连正文一起搜（稍慢一些）。</div>';
       return;
     }
     if (!lastResults.length) {
@@ -354,8 +354,8 @@
       }
       var b = ui.$('#footer-bottom');
       if (b) {
-        b.textContent = '构建于 ' + String(s.generated).slice(0, 10) + ' · 数据版本 ' + (s.version || '—') +
-          ' · 纯静态站点（无服务端、无账号）· 进度与笔记只保存在本机浏览器';
+        b.textContent = '内容更新于 ' + String(s.generated).slice(0, 10) +
+          ' · 共 ' + s.counts.courses + ' 门课 / ' + s.counts.chapters + ' 章 / ' + s.counts.lessons + ' 课时';
       }
       LLM.emit('site', s);
     }).catch(function (e) {

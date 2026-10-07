@@ -85,6 +85,19 @@
           left.appendChild(crumb);
           left.appendChild(ui.el('h1', 'course-h1', course.title));
           left.appendChild(ui.el('p', 'course-lead', course.description || ''));
+          // 前置课程（由课时级前置推导）：系统学习的关键提示
+          if ((course.prereqCourses || []).length) {
+            var preBox = ui.el('div', 'course-prereq');
+            preBox.appendChild(ui.el('span', 'prereq-label', '建议先学'));
+            course.prereqCourses.forEach(function (p) {
+              var a = ui.el('a', 'chip', p.title);
+              a.href = '#/course/' + p.slug;
+              a.title = '有 ' + p.hits + ' 处前置依赖指向这门课';
+              preBox.appendChild(a);
+            });
+            left.appendChild(preBox);
+          }
+
           var badges = ui.el('div', 'row row--wrap');
           if (course.difficulty) badges.appendChild(ui.el('span', 'badge badge--level', course.difficulty));
           if (course.line) badges.appendChild(ui.el('span', 'badge badge--line', course.line));

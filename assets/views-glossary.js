@@ -216,9 +216,8 @@
     var p = ui.el('p');
     if (IDX) {
       var n = (IDX.layers || []).length;
-      p.textContent = '把 41 门课正文里出现的关键词自动编目成 ' + n + ' 层链路（共 ' + fmt.num(IDX.terms || 0) +
-        ' 条词条）：从数学基础 → 机器学习 → Transformer → 训练系统 → 推理部署 → 应用工程。' +
-        '每条词条都带「相关课时」指针，点一下就能跳到讲过它的那一课。';
+      p.textContent = '按大模型完整链路的 ' + n + ' 层整理，共 ' + fmt.num(IDX.terms || 0) +
+        ' 条词条：每条给出定义、详解与工程提醒，并挂到讲它的那几节课上 —— 卡住时先来这里查概念。';
     } else {
       p.className = 'muted';
       p.textContent = '正在读取百科目录…';

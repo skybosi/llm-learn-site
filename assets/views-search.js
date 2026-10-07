@@ -27,7 +27,7 @@
 
       var head = ui.el('div', 'page-head');
       head.appendChild(ui.el('h1', null, q ? '搜索「' + q + '」' : '搜索'));
-      head.appendChild(ui.el('p', null, '先在标题、小标题与百科词条里找；需要翻正文时点「全文深搜」。'));
+      head.appendChild(ui.el('p', null, '先匹配课程名、课时标题与小标题；要翻正文内容，点「搜正文」。'));
       wrap.appendChild(head);
 
       var form = ui.el('div', 'filters');
@@ -38,7 +38,7 @@
       form.appendChild(input);
       var goBtn = ui.el('button', 'btn btn--primary btn--sm', '搜索');
       form.appendChild(goBtn);
-      var deepBtn = ui.el('button', 'btn btn--sm', '全文深搜（逐课加载）');
+      var deepBtn = ui.el('button', 'btn btn--sm', '搜正文（慢一点）');
       form.appendChild(deepBtn);
       var deepInfo = ui.el('span', 'deep-progress');
       form.appendChild(deepInfo);
