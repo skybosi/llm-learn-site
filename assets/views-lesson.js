@@ -521,6 +521,10 @@
     },
   };
 
+  /* 路由别名：`#/l/<课时id>` 与 `#/learn/<课>/<章>/<课时>` 是同一个视图（内部按 route.name 分支）。
+   * ⚠️ 之前只注册了 lesson，`#/l/…` 就落到 404 —— 正文里的「下一课」与百科的课时指针全都点不通。 */
+  views.lessonById = views.lesson;
+
   /* 供课程页/搜索复用 */
   views.lessonRoute = function (slug, chapter, lessonFile) {
     return '#/learn/' + slug + '/' + chapter + '/' + lessonSlugOf(lessonFile);

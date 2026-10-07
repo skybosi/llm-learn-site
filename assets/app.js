@@ -86,7 +86,10 @@
     if (typeof cleanup === 'function') { try { cleanup(); } catch (e) {} cleanup = null; }
     setNav(route.name);
 
-    var view = LLM.views[route.name] || LLM.views.notfound;
+    // 兜底：视图名与路由名不完全一致时（如 lessonById → lesson）也找得到，别静默变 404
+    var view = LLM.views[route.name] ||
+      (route.name === 'lessonById' ? LLM.views.lesson : null) ||
+      LLM.views.notfound;
     ui.clear(viewRoot);
     var done = function () {
       LLM.emit('route', route);
