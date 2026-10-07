@@ -393,22 +393,32 @@
       }
       var b = ui.$('#footer-bottom');
       if (b) {
-        ui.clear(b);
-        b.appendChild(document.createTextNode('共 ' + s.counts.courses + ' 门课 / ' + s.counts.chapters + ' 章 / ' + s.counts.lessons + ' 课时'));
+        b.textContent = '共 ' + s.counts.courses + ' 门课 / ' + s.counts.chapters + ' 章 / ' + s.counts.lessons +
+          ' 课时 · ' + fmt.num(s.counts.figures) + ' 张图表 · ' + fmt.num(s.counts.glossaryTerms) + ' 条关键词';
+      }
+      // 版本信息单独一栏（放 footer 里，位置固定；点 commit 可看完整 build-info.json）
+      var v = ui.$('#footer-version');
+      if (v) {
+        ui.clear(v);
+        var head = ui.el('span', 'fv-label', '站点版本');
+        v.appendChild(head);
         if (s.build && s.build.sourceCommit) {
-          b.appendChild(document.createTextNode(' · 站点构建 '));
-          var code = ui.el('a', 'mono', '#' + s.build.sourceCommit);
+          var code = ui.el('a', 'fv-code mono', '#' + s.build.sourceCommit);
           code.href = 'data/build-info.json';
           code.target = '_blank';
           code.rel = 'noreferrer';
           code.title = '源仓 commit ' + (s.build.sourceCommitFull || '') +
             (s.build.sourceDirty ? '（构建时源仓有未提交改动）' : '') +
-            ' · 内容版本 ' + (s.build.contentVersion || '') +
-            ' · 构建于 ' + localTime(s.build.builtAt);
-          b.appendChild(code);
-          b.appendChild(document.createTextNode(' · ' + localTime(s.build.builtAt)));
+            '\n内容版本 ' + (s.build.contentVersion || '') +
+            '\n构建于 ' + localTime(s.build.builtAt);
+          v.appendChild(code);
+          var dot = function () { v.appendChild(ui.el('span', 'fv-dot', '·')); };
+          dot();
+          v.appendChild(ui.el('span', 'fv-item', '构建于 ' + localTime(s.build.builtAt)));
+          dot();
+          v.appendChild(ui.el('span', 'fv-item', '内容版本 ' + (s.build.contentVersion || '—')));
         } else {
-          b.appendChild(document.createTextNode(' · 内容更新于 ' + String(s.generated).slice(0, 10)));
+          v.appendChild(ui.el('span', 'fv-item', '内容更新于 ' + String(s.generated).slice(0, 10)));
         }
       }
       // 页面一直开着时，若线上已经换了一版，提示刷新（静态站最常见的困惑：我看到的到底是不是最新）
