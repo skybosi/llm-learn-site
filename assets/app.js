@@ -300,6 +300,45 @@
     document.body.classList.remove('no-scroll');
   }
 
+  /**
+   * 版本守望：记住这次打开时的构建时间，之后每次页面重新可见时（复用标签页/切回来）
+   * 拉一次 data/build-info.json（no-store），变了就提示刷新。
+   */
+  /** ISO 时间 → 本地时区可读串（页脚不要显示 UTC，会让人以为构建时间不对） */
+  function localTime(iso) {
+    if (!iso) return '';
+    var d = new Date(iso);
+    if (isNaN(d.getTime())) return String(iso).slice(0, 16);
+    var p = function (n) { return String(n).padStart(2, '0'); };
+    return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+  }
+
+  var lastBuildAt = null;
+  var lastCheck = 0;
+  function watchForNewBuild(builtAt) {
+    if (!builtAt) return;
+    lastBuildAt = builtAt;
+    document.addEventListener('visibilitychange', function () {
+      if (document.visibilityState !== 'visible') return;
+      if (Date.now() - lastCheck < 120000) return;      // 两分钟内不重复查
+      lastCheck = Date.now();
+      fetch('data/build-info.json', { cache: 'no-store' })
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (info) {
+          if (!info || !info.builtAt || info.builtAt === lastBuildAt) return;
+          lastBuildAt = info.builtAt;
+          var box = ui.$('#toasts');
+          if (!box) return;
+          var n = ui.el('div', 'toast toast--ok');
+          n.innerHTML = '站点有更新（#' + fmt.esc(info.sourceCommit || '') + '）<br><a href="#" id="reload-new">点这里刷新</a>';
+          box.appendChild(n);
+          var a = n.querySelector('#reload-new');
+          if (a) a.addEventListener('click', function (e) { e.preventDefault(); location.reload(); });
+        })
+        .catch(function () { /* 离线/失败就算了 */ });
+    });
+  }
+
   /* ---------------- 启动 ---------------- */
   // 供其它视图复用（搜索页要同一份索引，避免重复加载）
   LLM.search = { build: buildIndex, run: runSearch, open: openSearch, close: closeSearch, index: function () { return searchIndex; } };
@@ -354,9 +393,26 @@
       }
       var b = ui.$('#footer-bottom');
       if (b) {
-        b.textContent = '内容更新于 ' + String(s.generated).slice(0, 10) +
-          ' · 共 ' + s.counts.courses + ' 门课 / ' + s.counts.chapters + ' 章 / ' + s.counts.lessons + ' 课时';
+        ui.clear(b);
+        b.appendChild(document.createTextNode('共 ' + s.counts.courses + ' 门课 / ' + s.counts.chapters + ' 章 / ' + s.counts.lessons + ' 课时'));
+        if (s.build && s.build.sourceCommit) {
+          b.appendChild(document.createTextNode(' · 站点构建 '));
+          var code = ui.el('a', 'mono', '#' + s.build.sourceCommit);
+          code.href = 'data/build-info.json';
+          code.target = '_blank';
+          code.rel = 'noreferrer';
+          code.title = '源仓 commit ' + (s.build.sourceCommitFull || '') +
+            (s.build.sourceDirty ? '（构建时源仓有未提交改动）' : '') +
+            ' · 内容版本 ' + (s.build.contentVersion || '') +
+            ' · 构建于 ' + localTime(s.build.builtAt);
+          b.appendChild(code);
+          b.appendChild(document.createTextNode(' · ' + localTime(s.build.builtAt)));
+        } else {
+          b.appendChild(document.createTextNode(' · 内容更新于 ' + String(s.generated).slice(0, 10)));
+        }
       }
+      // 页面一直开着时，若线上已经换了一版，提示刷新（静态站最常见的困惑：我看到的到底是不是最新）
+      watchForNewBuild(s.build && s.build.builtAt);
       LLM.emit('site', s);
     }).catch(function (e) {
       console.warn('site.json 加载失败', e);
