@@ -1,0 +1,132 @@
+<h2 id="h-yolo-系列">YOLO 系列<a class="anchor" href="#h-yolo-系列" aria-label="本节链接">#</a></h2>
+<p>Faster R-CNN 精，但慢。YOLO（You Only Look Once）走的是完全相反的另一条路：<strong>不先生成候选框，把检测当作一次回归，端到端一步完成</strong>。</p>
+<p>它的名字就是它的哲学：<strong>只看一眼</strong>。这一课我们搞懂 YOLO 的核心思想——网格划分、框编码、置信度、NMS——以及它从 v1 到 v8 一路演进的逻辑。理解 YOLOv1 的原始设计，比会调 YOLOv8 的命令行参数重要得多：后者只是前者的工程化放大。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-核心思想把找框变成填表格">1. 核心思想：把&quot;找框&quot;变成&quot;填表格&quot;<a class="anchor" href="#h-1-核心思想把找框变成填表格" aria-label="本节链接">#</a></h4>
+<p>YOLO 把输入图像切成 <strong>S × S 的网格</strong>。每个网格单元（grid cell）负责预测：</p>
+<ul>
+<li><strong>B 个边界框</strong>，每个框用 5 个数描述：<code>(x, y, w, h, confidence)</code>；</li>
+<li><strong>C 个类别概率</strong>（该单元中心落在哪个物体上，属于各类的概率）。</li>
+</ul>
+<p>其中 <code>(x, y)</code> 是框中心<strong>相对于所在网格单元左上角</strong>的偏移（归一化到 0~1），<code>(w, h)</code> 是框宽高<strong>相对于整张图</strong>的比例；<code>confidence</code> = &quot;这个框里有物体&quot;的概率 × &quot;框与真值 IoU&quot;的乘积，衡量这个框有多可信。</p>
+<p>于是，网络的输出张量形状是 <code>S × S × (B*5 + C)</code>——一个<strong>定长张量</strong>就承载了&quot;任意数量的物体&quot;（只要它们落在不同网格里）。模型一次前向，同时输出所有框的位置、置信度和类别，这就是&quot;one-stage&quot;的本质：<strong>没有候选框生成阶段，只有一次密集回归</strong>。</p>
+<p><figure><img class="md-img" src="content/courses/cv-advanced/assets/chapter-1-figure-05.svg" alt="YOLO 网格划分与预测编码：每个格子预测 B 个框与类别概率" loading="lazy" decoding="async"><figcaption>YOLO 网格划分与预测编码：每个格子预测 B 个框与类别概率</figcaption></figure>
+</p>
+<h4 id="h-2-训练时的责任分配">2. 训练时的&quot;责任分配&quot;<a class="anchor" href="#h-2-训练时的责任分配" aria-label="本节链接">#</a></h4>
+<p>网格划分带来一个必须解决的问题：<strong>哪个格子、哪个框对哪个真值负责？</strong> YOLOv1 的规则是：</p>
+<ul>
+<li>真值框的中心落在哪个网格，就由那个网格负责预测它；</li>
+<li>该网格的 B 个预测框中，与真值 <strong>IoU 最大</strong>的那个框才承担&quot;有物体&quot;的置信度损失和坐标损失，其余框只承担&quot;没有物体&quot;的置信度损失。</li>
+</ul>
+<p>这个&quot;一个真值只对应一个负责预测&quot;的机制，是理解 YOLO 的关键，也是它早期<strong>密集小目标易漏检</strong>（一个网格只能报一个物体）的根源。训练损失由三块加权而成：<strong>坐标回归损失</strong>（通常用平方误差或平滑 L1）、<strong>含物体的置信度损失</strong>、<strong>不含物体的置信度损失</strong>，外加类别交叉熵。</p>
+<h4 id="h-3-为什么-yolo-快一次前向--网格并行">3. 为什么 YOLO 快：一次前向 + 网格并行<a class="anchor" href="#h-3-为什么-yolo-快一次前向--网格并行" aria-label="本节链接">#</a></h4>
+<p>YOLO 快的根本原因不是&quot;网络更小&quot;，而是<strong>架构范式</strong>：</p>
+<ul>
+<li>一次前向处理整张图，所有网格并行预测，没有逐框的二次精修；</li>
+<li>推理时只需对最后一步做<strong>阈值过滤 + NMS</strong> 即可得到最终框，流程极简。</li>
+</ul>
+<p>代价则是精度：早期的 YOLO 对<strong>小目标、重叠目标、异常长宽比</strong>不如两阶段方法，定位也更粗糙。速度与精度的取舍，在检测领域被概括为&quot;one-stage vs two-stage&quot;之争。</p>
+<h4 id="h-4-推理的最后一步nms">4. 推理的最后一步：NMS<a class="anchor" href="#h-4-推理的最后一步nms" aria-label="本节链接">#</a></h4>
+<p>同一物体常常被相邻几个网格、或同一个网格的多个框重复预测。<strong>非极大值抑制（NMS）</strong>负责去重：</p>
+<ol>
+<li>把所有预测框按置信度<strong>从高到低排序</strong>；</li>
+<li>取出分数最高的框加入结果集；</li>
+<li>删除所有与它 <strong>IoU 超过阈值</strong>（如 0.5）的同类框（认为它们是同一物体的重复）；</li>
+<li>重复直到没有剩余框。</li>
+</ol>
+<p>NMS 是几乎所有检测器（无论 one-stage 还是 two-stage）都绕不开的后处理。</p>
+<p><figure><img class="md-img" src="content/courses/cv-advanced/assets/chapter-1-figure-06.svg" alt="NMS 流程：按分数排序后，逐次保留最高分框并抑制重叠框" loading="lazy" decoding="async"><figcaption>NMS 流程：按分数排序后，逐次保留最高分框并抑制重叠框</figcaption></figure>
+</p>
+<h4 id="h-5-从-v1-到-v8一条补短板的进化线">5. 从 v1 到 v8：一条&quot;补短板&quot;的进化线<a class="anchor" href="#h-5-从-v1-到-v8一条补短板的进化线" aria-label="本节链接">#</a></h4>
+<p>YOLO 系列每次迭代都在修补上一代的短板，看懂这条线就懂了现代检测器的关键组件：</p>
+<ul>
+<li><strong>v2（YOLO9000）</strong>：引入 <strong>anchor</strong>（借鉴 Faster R-CNN）、批归一化、更高分辨率输入，缓解了 v1 定位粗糙的问题；</li>
+<li><strong>v3</strong>：引入<strong>多尺度检测</strong>（类似 FPN 的金字塔结构，在三个不同分辨率的特征层分别预测），大幅改善小目标；用更强的骨干网络 Darknet-53；</li>
+<li><strong>v4/v5</strong>：进入工程优化阶段，Mosaic 数据增强、CSP 结构、多种训练技巧，把精度与速度的性价比推到极致；</li>
+<li><strong>v8（以及 Ultralytics 系列）</strong>：进一步采用<strong>anchor-free 的解码方式</strong>（直接回归框中心到四条边的距离），结构更简洁，训练与部署更友好，成为当下的工业界事实标准。</li>
+</ul>
+<p>这条进化线的共同主题：<strong>在&quot;一次回归&quot;的大框架下，不断吸收两阶段方法的好组件（anchor、多尺度、更强骨干）来补精度短板，同时靠工程技巧守住速度优势</strong>。</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>torchvision 没有内置 YOLO，这反而是好事：我们<strong>从零写一个 YOLOv1 风格的网格解码 + NMS</strong>，把核心机制亲手实现一遍（只依赖 PyTorch）。先看透这个玩具，再去用 Ultralytics 的 YOLOv8 就毫无障碍。</p>
+<pre data-lang="python"><code class="language-python">import torch
+
+# ---------- 1) 网格解码：把网络输出变成真实框 ----------
+def decode_yolo(raw, S=7, B=2, C=3):
+    &quot;&quot;&quot;
+    raw: (S, S, B*5 + C) 的预测张量，坐标都是 0~1 的归一化值
+    返回: (num_boxes, 6) 的框列表，每行 [x1, y1, x2, y2, 置信度, 类别]
+    &quot;&quot;&quot;
+    boxes = []
+    for gy in range(S):                 # 遍历每个网格的行
+        for gx in range(S):             # 遍历每个网格的列
+            cell = raw[gy, gx]
+            class_prob, class_id = cell[-C:].max(0)   # 取该类最大概率及其下标
+            for b in range(B):
+                # 每个框占 5 个值：cx, cy, w, h, confidence
+                cx, cy, w, h, conf = cell[b*5:(b+1)*5]
+                # 框中心 = 网格左上角偏移 + 归一化偏移（除以 S 归一到整图）
+                abs_cx = (gx + cx) / S
+                abs_cy = (gy + cy) / S
+                # 置信度 = 框置信度 * 类别概率
+                score = conf * class_prob
+                # 转成 [x1, y1, x2, y2]
+                x1, y1 = abs_cx - w/2, abs_cy - h/2
+                x2, y2 = abs_cx + w/2, abs_cy + h/2
+                boxes.append([x1, y1, x2, y2, score.item(), class_id.item()])
+    return torch.tensor(boxes)
+
+# ---------- 2) NMS：按分数排序，抑制重叠框 ----------
+def nms(boxes, iou_thresh=0.5):
+    &quot;&quot;&quot;boxes: (N, 6)，列为 [x1, y1, x2, y2, score, class_id]&quot;&quot;&quot;
+    keep = []
+    order = boxes[:, 4].argsort(descending=True)   # 按置信度降序
+    while order.numel() &gt; 0:
+        i = order[0].item()
+        keep.append(i)
+        if order.numel() == 1:
+            break
+        # 计算当前最高分框与其余所有框的 IoU
+        ious = box_iou_matrix(boxes[i:i+1], boxes[order[1:]])   # (1, rest)
+        # 保留 IoU 小于阈值的框（不同物体）
+        order = order[1:][ious[0] &lt;= iou_thresh]
+    return boxes[keep]
+
+def box_iou_matrix(a, b):
+    &quot;&quot;&quot;a: (1,4), b: (N,4)，返回 (1, N) 的 IoU 矩阵（广播实现）&quot;&quot;&quot;
+    ix1 = torch.max(a[:, 0:1], b[:, 0][None])   # 交集左上角
+    iy1 = torch.max(a[:, 1:2], b[:, 1][None])
+    ix2 = torch.min(a[:, 2:3], b[:, 2][None])   # 交集右下角
+    iy2 = torch.min(a[:, 3:4], b[:, 3][None])
+    inter = (ix2 - ix1).clamp(min=0) * (iy2 - iy1).clamp(min=0)
+    area_a = (a[:, 2] - a[:, 0]) * (a[:, 3] - a[:, 1])
+    area_b = (b[:, 2] - b[:, 0]) * (b[:, 3] - b[:, 1])
+    return inter / (area_a[:, None] + area_b[None] - inter + 1e-6)
+
+# ---------- 3) 造一个假输出并跑通全流程 ----------
+torch.manual_seed(0)
+S, B, C = 7, 2, 3
+raw = torch.rand(S, S, B*5 + C)              # 模拟网络输出
+all_boxes = decode_yolo(raw, S, B, C)
+# 只保留高置信度的框，模拟&quot;阈值过滤&quot;
+candidates = all_boxes[all_boxes[:, 4] &gt; 0.4]
+final = nms(candidates, iou_thresh=0.5)
+print(f&quot;解码得到 {len(all_boxes)} 个框，阈值过滤后 {len(candidates)} 个，NMS 后 {len(final)} 个&quot;)
+print(&quot;最终框（x1, y1, x2, y2, 分数, 类别）：&quot;)
+print(final)</code></pre>
+<p>这段代码把 YOLO 的&quot;表格&quot;真实地填了一遍：网络输出一个定长张量，解码器把它翻译成框，NMS 去掉重复。实际 YOLO 的实现远比这复杂（多尺度、anchor、更精细的坐标编码与损失），但<strong>骨架逻辑完全相同</strong>。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>把 <code>decode_yolo</code> 里的坐标编码改成 <strong>anchor-based</strong> 方式（网络输出的是相对 anchor 的偏移 <code>tx, ty, tw, th</code>，再用 <code>exp</code> 还原宽高），体会 v1 与 v2 之后的差别。</li>
+<li>在 <code>nms</code> 里加上<strong>类别判断</strong>：只有同类框之间才做抑制，不同类框即使 IoU 高也各自保留；说说为什么真实实现必须这么做。</li>
+<li>把 <code>S</code> 从 7 改成 13，观察单个网格&quot;负责区域&quot;变小后，密集小目标被漏检的概率如何变化；再用一句话解释 v3 为什么靠多尺度特征缓解这个问题。</li>
+<li>对比式回答：YOLO 和 Faster R-CNN 各自把&quot;检测&quot;这个问题的<strong>主要计算</strong>放在哪里？为什么 YOLO 更快、Faster R-CNN 更准？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>YOLOv1 原论文：<a href="https://arxiv.org/abs/1506.02640" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1506.02640</a></li>
+<li>YOLO9000（v2）原论文：<a href="https://arxiv.org/abs/1612.08242" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1612.08242</a></li>
+<li>YOLOv3 原论文：<a href="https://arxiv.org/abs/1804.02767" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1804.02767</a></li>
+<li>Ultralytics YOLOv8 官方文档：<a href="https://docs.ultralytics.com/" target="_blank" rel="noopener noreferrer">https://docs.ultralytics.com/</a></li>
+<li>RetinaNet（one-stage 精度问题的 Focal Loss 分析）：<a href="https://arxiv.org/abs/1708.02002" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1708.02002</a></li>
+</ul>
+<p><a href="#/l/cv-ch2-l1">下一课：语义分割任务</a></p>

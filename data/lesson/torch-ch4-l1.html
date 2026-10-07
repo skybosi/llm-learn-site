@@ -1,0 +1,107 @@
+<h2 id="h-dataset">Dataset<a class="anchor" href="#h-dataset" aria-label="本节链接">#</a></h2>
+<p>前面三章我们学会了张量、自动微分和用 <code>nn.Module</code> 搭模型。但要真正训练一个模型，光有模型还不够——你得先把&quot;一堆原始数据（图片、文本、数值）&quot;变成模型能一口口吃进去的<strong>标准样本</strong>。这一课的主角是 PyTorch 的 <code>Dataset</code>：它是连接&quot;杂乱原始数据&quot;和&quot;训练循环&quot;的第一道关卡。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-dataset-是什么数据与模型之间的统一接口">1. Dataset 是什么：数据与模型之间的&quot;统一接口&quot;<a class="anchor" href="#h-1-dataset-是什么数据与模型之间的统一接口" aria-label="本节链接">#</a></h4>
+<p>训练神经网络需要成百上千、甚至上百万个样本。如果每个样本的加载方式都不一样（有的是图片文件、有的是数据库记录、有的是内存里的数组），训练循环就没法写。PyTorch 用 <code>torch.utils.data.Dataset</code> 提供了一个<strong>统一约定</strong>：</p>
+<blockquote>
+<p>只要你能回答两个问题——&quot;总共有多少个样本&quot;和&quot;给我第 i 个样本&quot;，你的数据就符合 Dataset 规范。</p>
+</blockquote>
+<p><code>Dataset</code> 是一个抽象基类，你继承它并实现两个方法：</p>
+<ul>
+<li><code>__len__(self)</code>：返回样本总数，<code>len(dataset)</code> 时被调用；</li>
+<li><code>__getitem__(self, index)</code>：给定下标 <code>index</code>，返回<strong>第 index 个样本</strong>（通常是一个 <code>(输入, 标签)</code> 元组，或一个字典）。</li>
+</ul>
+<p>模型训练时不关心你的数据来自硬盘还是内存，只关心&quot;按索引取样本&quot;这个约定。这就是为什么把 MNIST 换成你自己的数据集时，训练循环几乎不用改。</p>
+<h4 id="h-2-两种常见获取方式">2. 两种常见获取方式<a class="anchor" href="#h-2-两种常见获取方式" aria-label="本节链接">#</a></h4>
+<p><strong>（1）现成数据集</strong>：<code>torchvision.datasets</code> 内置了 MNIST、CIFAR-10、FashionMNIST 等经典数据集。它们会自动下载、解压，并已经实现了 <code>__len__</code> 和 <code>__getitem__</code>：</p>
+<pre data-lang="python"><code class="language-python">from torchvision import datasets
+
+# root 指定存放目录，train=True 表示训练集，download=True 表示没有就自动下载
+train_set = datasets.MNIST(root=&quot;./data&quot;, train=True, download=True)
+print(len(train_set))       # 60000 张手写数字图
+img, label = train_set[0]   # 第 0 张图（PIL 图像）和它的标签
+print(label)                # 例如 5</code></pre>
+<p><strong>（2）自定义 Dataset</strong>：真实项目里数据几乎都是你自己的。你只需继承 <code>Dataset</code>，在 <code>__getitem__</code> 里完成&quot;读取 + 预处理&quot;，就能复用 PyTorch 整套数据流水线。</p>
+<h4 id="h-3-一个最常用的快捷方式tensordataset">3. 一个最常用的&quot;快捷方式&quot;：TensorDataset<a class="anchor" href="#h-3-一个最常用的快捷方式tensordataset" aria-label="本节链接">#</a></h4>
+<p>如果你的数据本来就是内存里的张量（例如从 NumPy 转换而来），不需要写类。<code>torch.utils.data.TensorDataset</code> 能把多个张量&quot;按第一维对齐&quot;打包成一个 Dataset：</p>
+<pre data-lang="python"><code class="language-python">from torch.utils.data import TensorDataset
+import torch
+
+features = torch.randn(100, 4)   # 100 条样本，每条 4 个特征
+labels = torch.randint(0, 2, (100,))  # 100 个二分类标签
+dataset = TensorDataset(features, labels)
+print(len(dataset))       # 100
+print(dataset[7])         # (第7条特征张量, 第7个标签)</code></pre>
+<p><figure><img class="md-img" src="content/courses/pytorch-fundamentals/assets/chapter-4-figure-01.svg" alt="自定义 Dataset 需要实现的两个方法示意" loading="lazy" decoding="async"><figcaption>自定义 Dataset 需要实现的两个方法示意</figcaption></figure>
+</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面完整实现一个自定义 <code>Dataset</code>：数据是&quot;二次函数带噪声&quot;的数值对 <code>(x, y)</code>，其中 <code>y = 2x² - 3x + 1 + 噪声</code>。这个例子不依赖任何外部文件，直接就能跑，重点体会 <code>__len__</code> 与 <code>__getitem__</code> 的写法。</p>
+<pre data-lang="python"><code class="language-python">import torch
+from torch.utils.data import Dataset, TensorDataset, DataLoader
+
+
+# 1) 自定义 Dataset：生成 y = 2x^2 - 3x + 1 的带噪声样本
+class ParabolaDataset(Dataset):
+    &quot;&quot;&quot;把 (x, y) 数值对封装成标准 Dataset。
+
+    每个样本：输入 x（1 维张量），标签 y（0 维张量，即标量）。
+    &quot;&quot;&quot;
+
+    def __init__(self, n=200, noise=0.2):
+        super().__init__()
+        # 在 [-3, 3] 区间均匀取 n 个点作为输入
+        self.x = torch.linspace(-3, 3, steps=n).unsqueeze(1)
+        # 真实值 y = 2x^2 - 3x + 1，再加一点随机噪声
+        self.y = 2 * self.x ** 2 - 3 * self.x + 1
+        self.y = self.y + noise * torch.randn_like(self.y)
+
+    def __len__(self):
+        &quot;&quot;&quot;样本总数。&quot;&quot;&quot;
+        return len(self.x)
+
+    def __getitem__(self, index):
+        &quot;&quot;&quot;返回第 index 个样本：输入 x 与标签 y。&quot;&quot;&quot;
+        return self.x[index], self.y[index]
+
+
+# 2) 使用自定义 Dataset
+ds = ParabolaDataset(n=200)
+print(&quot;样本总数：&quot;, len(ds))
+
+sample_x, sample_y = ds[0]   # 取第一个样本
+print(&quot;第 0 个样本的输入形状：&quot;, sample_x.shape, &quot;标签值：&quot;, sample_y.item())
+
+# 3) 用 TensorDataset 快速打包现成张量
+features = torch.randn(50, 3)          # 50 条样本，每条 3 个特征
+labels = torch.randint(0, 3, (50,))    # 三分类标签
+tds = TensorDataset(features, labels)
+print(&quot;\nTensorDataset 样本数：&quot;, len(tds))
+print(&quot;第 12 个样本：&quot;, tds[12])
+
+# 4) Dataset 本身只负责&quot;取样本&quot;，要配合 DataLoader 才能成批喂给模型
+loader = DataLoader(ds, batch_size=8, shuffle=True)
+first_batch_x, first_batch_y = next(iter(loader))
+print(&quot;\n一个 batch 的输入形状：&quot;, first_batch_x.shape)  # torch.Size([8, 1])
+print(&quot;一个 batch 的标签形状：&quot;, first_batch_y.shape)    # torch.Size([8, 1])</code></pre>
+<p>运行后你会看到类似：</p>
+<pre data-lang="text"><code class="language-text">样本总数： 200
+第 0 个样本的输入形状： torch.Size([1]) 标签值： 27.5...
+TensorDataset 样本数： 50
+第 12 个样本： (tensor([...]), tensor(2))
+一个 batch 的输入形状： torch.Size([8, 1])
+一个 batch 的标签形状： torch.Size([8, 1])</code></pre>
+<p>注意最后一步：<code>Dataset</code> 只是&quot;定义了样本长什么样、有多少个&quot;，真正&quot;一次取一批、打乱顺序、多线程预取&quot;是下一课 <code>DataLoader</code> 的职责。两者分工明确。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>修改 <code>ParabolaDataset</code>，把标签改成 <code>y = x³ - 4x + 2 + 噪声</code>，打印样本总数和 <code>ds[99]</code>，确认能正常取样本。</li>
+<li>写一个 <code>ImageFileDataset</code>：<code>__init__</code> 接收一个图片文件路径列表和一个标签列表，<code>__getitem__</code> 里用 <code>PIL.Image.open</code> 打开图片并返回 <code>(图像, 标签)</code>，<code>__len__</code> 返回列表长度。</li>
+<li>用 <code>TensorDataset</code> 打包三个张量 <code>a</code>、<code>b</code>、<code>c</code>（形状第一维相同），然后打印 <code>len(...)</code> 和第 0 个样本，观察返回的元组里有几个元素。</li>
+<li>想一想：为什么 <code>__getitem__</code> 里可以做数据增强（随机翻转、裁剪），而 <code>__len__</code> 里不行？这对&quot;每个 epoch 是否看到不同的样本&quot;有什么影响？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>PyTorch 官方文档 · <code>torch.utils.data.Dataset</code>：<a href="https://pytorch.org/docs/stable/data.html#torch.utils.data.Dataset" target="_blank" rel="noopener noreferrer">https://pytorch.org/docs/stable/data.html#torch.utils.data.Dataset</a></li>
+<li>PyTorch 官方文档 · <code>torch.utils.data.TensorDataset</code>：<a href="https://pytorch.org/docs/stable/data.html#torch.utils.data.TensorDataset" target="_blank" rel="noopener noreferrer">https://pytorch.org/docs/stable/data.html#torch.utils.data.TensorDataset</a></li>
+<li>PyTorch 官方教程 · Datasets &amp; DataLoaders：<a href="https://pytorch.org/tutorials/beginner/basics/data_tutorial.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/tutorials/beginner/basics/data_tutorial.html</a></li>
+</ul>
+<p><a href="#/l/torch-ch4-l2">下一课：DataLoader</a></p>

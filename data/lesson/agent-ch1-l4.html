@@ -1,0 +1,623 @@
+<h2 id="h-设计目标可靠性可观测可组合可回滚成本可控">设计目标：可靠性、可观测、可组合、可回滚、成本可控<a class="anchor" href="#h-设计目标可靠性可观测可组合可回滚成本可控" aria-label="本节链接">#</a></h2>
+<h3 id="h-这一节要解决什么">这一节要解决什么<a class="anchor" href="#h-这一节要解决什么" aria-label="本节链接">#</a></h3>
+<p>上一节把 Agent 的结构补全了。但&quot;结构补全&quot;不等于&quot;能用&quot;：同样的四件事，可以做得让系统稳定交付，也可以做得只能跑 demo。差别在于<strong>你有没有先把&quot;好&quot;的定义写下来</strong>。</p>
+<p>这一节是本章第二个难点，也是整门课的度量基准。要做三件事：</p>
+<ol>
+<li><strong>给定五个设计目标各自的可操作度量</strong> —— 不是&quot;要可靠&quot;，而是&quot;用什么数判断它可靠&quot;。</li>
+<li><strong>给出它们之间的冲突结构</strong> —— 不是罗列&quot;可能冲突&quot;，而是<strong>指出哪几对是结构性冲突（不可调和），哪几对可以通过设计解耦</strong>。</li>
+<li><strong>用一个完整的取舍案例，演示&quot;取舍如何写进设计文档&quot;</strong> —— 这是本节真正的产出物形态。</li>
+</ol>
+<p>学完这一节你应该能回答：</p>
+<ul>
+<li>&quot;可靠性&quot;到底该用一个数还是两个数衡量？为什么只看平均成功率会误导决策？</li>
+<li>五个目标里，哪一个是<strong>唯一没有替代品</strong>的（不满足就不能上线）？</li>
+<li>当&quot;可靠性&quot;和&quot;成本可控&quot;冲突时，正确的处理方式是什么？（答案不是&quot;选一个&quot;，而是&quot;把冲突显式参数化&quot;。）</li>
+<li>你能写出一个别人可以照着实现的取舍决策记录吗？</li>
+</ul>
+<h3 id="h-一为什么先定目标没有目标的优化就是随机游走">一、为什么先定目标：没有目标的优化就是随机游走<a class="anchor" href="#h-一为什么先定目标没有目标的优化就是随机游走" aria-label="本节链接">#</a></h3>
+<p>先给一个工程上的理由，而不是&quot;因为规范要求&quot;。上一节已经说明：Agent 的每一处结构都是一个<strong>设计决策</strong>（校验、授权、幂等、裁剪、终止、验证……）。这些决策<strong>互相耦合</strong>，而且大多数是<strong>双向</strong>的：</p>
+<pre><code>更严的参数校验  → 更少&quot;发明参数&quot;的失败，但更多合法的表达被拒（灵活性↓）
+更早的终止      → 成本更低，但更多任务被判定为未完成（成功率↓）
+更全的轨迹记录  → 归因更容易，但存储/隐私面更大，且可能拖慢热路径
+更多重试        → 成功率↑，成本↑、延迟↑，且可能放大非幂等副作用</code></pre>
+<p>没有目标，你只能凭直觉在每一处&quot;就严一点吧&quot;或&quot;就松一点吧&quot;，<strong>结果是这些局部决策互相打架</strong>：一边给工具加了严格校验，另一边在重试逻辑里把校验放在重试之后，于是&quot;非法参数&quot;被重试了三次。目标的作用就是给这些局部决策一个<strong>统一的偏好方向</strong>。</p>
+<p><strong>关键认识</strong>：目标不是&quot;全都要&quot;，而是<strong>一个带优先级的约束系统</strong>。写在设计文档里的应该是&quot;在 X 情况下优先 A 牺牲 B&quot;，而不是&quot;我们力求做到 A、B、C、D、E 都很好&quot;——后者等于没有任何指导。</p>
+<h3 id="h-二五个目标各自的度量">二、五个目标各自的度量<a class="anchor" href="#h-二五个目标各自的度量" aria-label="本节链接">#</a></h3>
+<p>度量的基本要求：<strong>可观测、可归因、可比较</strong>。下面是每个目标的&quot;主指标 + 辅助指标 + 反指标&quot;三件套。反指标（anti-metric）是<strong>你为了优化主指标而恶化的那个数</strong> —— 不写出来，你的优化一定是局部最优。</p>
+<h4 id="h-21-可靠性reliability">2.1 可靠性（Reliability）<a class="anchor" href="#h-21-可靠性reliability" aria-label="本节链接">#</a></h4>
+<p><strong>定义</strong>：同一任务在相同设置下多次运行，能达成可接受结果的概率<strong>及其稳定性</strong>。</p>
+<table>
+<thead>
+<tr>
+<th>项</th>
+<th>度量</th>
+<th>为什么是它</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>主指标</td>
+<td>成功率 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord accent"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.6944em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal">p</span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.1667em;"><span class="mord">^</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.1944em;"><span></span></span></span></span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">succ</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.4133em;vertical-align:-0.4811em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.9322em;"><span style="top:-2.655em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">#</span><span class="mord text mtight"><span class="mord cjk_fallback mtight">运行</span></span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.4461em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">#</span><span class="mord text mtight"><span class="mord cjk_fallback mtight">可接受完成</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.4811em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span>，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8193em;vertical-align:-0.136em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≥</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">30</span></span></span></span> 次同一任务</td>
+<td>单次结果没有统计意义</td>
+</tr>
+<tr>
+<td>稳定性</td>
+<td>成功率的<strong>置信区间半宽</strong>，或&quot;通过率 @ k 次取最好&quot;（pass@k）</td>
+<td>见下方&quot;方差比均值更重要&quot;</td>
+</tr>
+<tr>
+<td>成本维度</td>
+<td>成功所需的<strong>期望步数 / 期望 token</strong></td>
+<td>可靠但每次要 50 步的系统成本失控</td>
+</tr>
+<tr>
+<td>反指标</td>
+<td>延迟、成本、以及&quot;拒答率&quot;（把任务判为&quot;做不到&quot;的比例）</td>
+<td>提高成功率最偷懒的办法是拒答</td>
+</tr>
+</tbody></table>
+<p><strong>为什么可靠性必须是&quot;两个数&quot;（均值 + 方差）</strong>：上一节提过，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span></span></span></span> 本身是随机变量。设两个系统平均成功率都是 80%：</p>
+<pre><code>系统 A：{[0.75, 0.85]}       —— 几乎每次都差不多
+系统 B：{[0.3, 0.98]}        —— 一半时间很好，一半时间很糟</code></pre>
+<p>对<strong>运维</strong>而言差别是决定性的：</p>
+<ul>
+<li><strong>A 可以给 SLA</strong>：重试没有意义（每次都差不多），但可以承诺&quot;20 次里 16 次成功&quot;，容量规划可做。</li>
+<li><strong>B 不能给 SLA</strong>：用户会遇到完全不可预测的体验，而你无法通过&quot;多跑几次&quot;改进它 —— 因为差的那些运行<strong>不是同一类失败</strong>（可能模型在某类输入上系统性崩）。</li>
+</ul>
+<p><strong>工程含义</strong>：<strong>B 类系统的第一优先级不是提高均值，是找出方差来源</strong>（哪一类输入/哪一类状态导致崩）。用一个切分维度（任务类型、输入长度、工具调用数）分组统计成功率，方差往往立刻定位到一个子集上。这与第 7 章&quot;失效归因四象限&quot;是同一件事的离线版。</p>
+<p>一个可用的可靠性判据（写进设计文档的形式）：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7073em;vertical-align:-0.024em;"></span><span class="mord text"><span class="mord cjk_fallback">可靠</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">⟺</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord accent"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.6944em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal">p</span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.1667em;"><span class="mord">^</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.1944em;"><span></span></span></span></span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">succ</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≥</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.75em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3175em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mop mtight"><span class="mtight">m</span><span class="mtight">i</span><span class="mtight">n</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">∧</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.9024em;vertical-align:-0.2191em;"></span><span class="mord"><span class="mord text"><span class="mord">CI</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3448em;"><span style="top:-2.5198em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">95%</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2191em;"><span></span></span></span></span></span></span><span class="mord text"><span class="mord cjk_fallback">半宽</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≤</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.05</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">∧</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8193em;vertical-align:-0.136em;"></span><span class="mord text"><span class="mord cjk_fallback">拒答率</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≤</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0278em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mop mtight"><span class="mtight">m</span><span class="mtight">a</span><span class="mtight">x</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span></span></p>
+<p><strong>注意最后一项</strong>：没有它，&quot;少做少错&quot;会成为最优策略 —— Agent 遇到难任务直接说&quot;我做不到&quot;，成功率反而很好看。</p>
+<h4 id="h-22-可观测observability">2.2 可观测（Observability）<a class="anchor" href="#h-22-可观测observability" aria-label="本节链接">#</a></h4>
+<p><strong>定义</strong>：能否在<strong>事后</strong>（以及必要时的<strong>事中</strong>）重建&quot;发生了什么、为什么&quot;。</p>
+<p>可观测不是&quot;打日志&quot;，它有明确的层级。每一层能回答的问题不同，成本也不同：</p>
+<table>
+<thead>
+<tr>
+<th>层级</th>
+<th>记录什么</th>
+<th>能回答的问题</th>
+<th>成本</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>L1 事件轨迹</strong></td>
+<td>每步：动作、参数、结果、耗时、token、代价</td>
+<td>&quot;第几步开始偏的？&quot;</td>
+<td>低（结构化日志）</td>
+</tr>
+<tr>
+<td><strong>L2 因果链</strong></td>
+<td>每步的<strong>输入上下文摘要</strong> + 该步<strong>引用了哪些上一步的输出</strong></td>
+<td>&quot;它为什么这么决定？它看到了什么？&quot;</td>
+<td>中（要存上下文快照，需脱敏）</td>
+</tr>
+<tr>
+<td><strong>L3 可重放</strong></td>
+<td>固定随机性（seed / 解码参数）+ 工具桩（录制-回放）</td>
+<td>&quot;把提示词改一个字，结果会变吗？&quot;</td>
+<td>高（要版本化一切外部依赖）</td>
+</tr>
+<tr>
+<td><strong>L4 可干预</strong></td>
+<td>断点、单步、人工注入反馈</td>
+<td>&quot;如果我在这里纠正它，会怎样？&quot;</td>
+<td>很高（要暂停/恢复能力）</td>
+</tr>
+</tbody></table>
+<p><strong>设计决策：按失败代价选择层级。</strong> 一个只读的检索 Agent，L1+L2 足够（出错就重跑）；一个会发钱/删数据的 Agent，L3 是底线（必须能复现事故现场）。</p>
+<p><strong>反指标</strong>：记录的完整度与隐私/合规、存储成本、热路径开销直接冲突。这里有一个真实的两难：<strong>L2 要存上下文，而上下文里常常含用户数据。</strong> 三种常见处置，各有代价：</p>
+<table>
+<thead>
+<tr>
+<th>处置</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>全存</td>
+<td>合规风险；需要加密 + 严格访问控制 + 保留期策略</td>
+</tr>
+<tr>
+<td>存哈希 + 长度</td>
+<td>无法回放语义；L2 退化成 L1</td>
+</tr>
+<tr>
+<td>存脱敏摘要</td>
+<td>摘要可能抹掉正是问题所在的细节（这是最隐蔽的失败）</td>
+</tr>
+</tbody></table>
+<p><strong>取舍的写法</strong>：不要写&quot;我们做了脱敏&quot;，要写&quot;<strong>L2 上下文以脱敏摘要形式保留 30 天；已知代价：PII 相关失败无法从轨迹定位，需依赖线上复现。</strong>&quot;——把代价说出来的才是决策，不说的只是愿望。</p>
+<h4 id="h-23-可组合composability">2.3 可组合（Composability）<a class="anchor" href="#h-23-可组合composability" aria-label="本节链接">#</a></h4>
+<p><strong>定义</strong>：系统的部件（工具、子 Agent、验证器）能否<strong>独立地被替换、测试、复用</strong>，而不牵动整体。</p>
+<p>可组合的度量比前两个难，但可以操作化：</p>
+<table>
+<thead>
+<tr>
+<th>项</th>
+<th>度量</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>替换成本</td>
+<td>换掉一个工具/子 Agent 需要改动的<strong>文件数 / 契约数</strong></td>
+<td>越小越好</td>
+</tr>
+<tr>
+<td>独立可测</td>
+<td>部件能在<strong>无模型</strong>条件下被断言（给定输入 → 期望输出）</td>
+<td>这是可组合的硬测试</td>
+</tr>
+<tr>
+<td>接口泄漏</td>
+<td>跨边界传递的<strong>隐含约定</strong>数量（约定必须写下来才算数）</td>
+<td>泄漏越多越难换</td>
+</tr>
+<tr>
+<td>组合覆盖</td>
+<td>端到端测试里被覆盖的<strong>部件组合路径</strong>比例</td>
+<td>组合爆炸下永远不足，看关键路径</td>
+</tr>
+</tbody></table>
+<p><strong>硬测试</strong>：&quot;这个工具能不能在没有 LLM 的情况下被单测？&quot;如果答案是&quot;不能，因为它依赖模型给的参数格式&quot;，那它<strong>不可组合</strong> —— 它的契约寄生在提示词里，而提示词不是接口。</p>
+<p><strong>为什么会冲突</strong>：可组合要求<strong>窄接口 + 显式契约</strong>，而&quot;把全部历史塞进提示词让模型自己看着办&quot;这类技巧，威力恰恰来自<strong>利用隐含约定</strong>（模型能推断出没说出口的东西）。这是本章最尖锐的取舍之一：</p>
+<pre><code>强接口：参数是结构化的、语义显式的   → 可组合、可测试，但模型&quot;聪明的推断&quot;用不上了
+弱接口：提示词里暗示、参数自由文本   → 效果好，但换不了、测不了、行为随提示词漂移</code></pre>
+<p><strong>处置方向</strong>（不是&quot;选一个&quot;）：把<strong>跨边界</strong>的部分做强接口（工具、子 Agent 的输出 schema），把<strong>边界之内</strong>的部分留给提示词技巧。也就是说：<strong>漂移必须止步于接口。</strong></p>
+<h4 id="h-24-可回滚rollback">2.4 可回滚（Rollback）<a class="anchor" href="#h-24-可回滚rollback" aria-label="本节链接">#</a></h4>
+<p><strong>定义</strong>：高副作用动作在出错后，能否被撤销或补偿，使系统回到一个已知良好状态。</p>
+<table>
+<thead>
+<tr>
+<th>项</th>
+<th>度量</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>可回滚覆盖</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.4133em;vertical-align:-0.4811em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.9322em;"><span style="top:-2.655em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">#</span><span class="mord text mtight"><span class="mord cjk_fallback mtight">全部写操作</span></span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.4461em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">#</span><span class="mord text mtight"><span class="mord cjk_fallback mtight">带补偿动作的写操作</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.4811em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></td>
+</tr>
+<tr>
+<td>补偿成功率</td>
+<td>补偿本身失败的概率（补偿也会失败 —— 这是最常见的疏忽）</td>
+</tr>
+<tr>
+<td>回滚粒度</td>
+<td>最近一次可回滚检查点到失败点的<strong>动作数</strong>（越小损失越小）</td>
+</tr>
+<tr>
+<td>回滚时延</td>
+<td>从决定回滚到状态一致的时间</td>
+</tr>
+</tbody></table>
+<p><strong>三种可逆性，必须区分清楚</strong>（这决定了你能承诺什么）：</p>
+<table>
+<thead>
+<tr>
+<th>类型</th>
+<th>例子</th>
+<th>回滚手段</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>可逆</strong></td>
+<td>写自己的数据库</td>
+<td>事务 / 反向写</td>
+<td>低，但要求设计时就成对写</td>
+</tr>
+<tr>
+<td><strong>可补偿</strong></td>
+<td>转账、发邮件、下单</td>
+<td>反向操作（退款、发更正邮件、取消）</td>
+<td>中；<strong>补偿有可见副作用</strong>（客户已经看到那封邮件了）</td>
+</tr>
+<tr>
+<td><strong>不可逆</strong></td>
+<td>删除外部数据、对外发布、消耗性操作</td>
+<td>只能预防（审批 + 沙箱），不能回滚</td>
+<td>高；必须前置拦截</td>
+</tr>
+</tbody></table>
+<p><strong>关键设计结论</strong>：<strong>&quot;可回滚&quot;的设计动作发生在正向动作之前，而不是之后。</strong> 事后想加回滚，通常只能加&quot;补偿&quot;，而补偿在语义上永远不如真正的回滚（用户已经看到了）。所以有一条硬规则：<strong>任何不可逆动作，必须在写代码时就确定它的前置拦截方案（授权/沙箱/双人确认/软删除），不准许&quot;先上线，回头再加回滚&quot;。</strong></p>
+<p><strong>反指标</strong>：可回滚要写两套逻辑（正向 + 反向），并且<strong>反向逻辑也必须被测试</strong>。实践中反向逻辑的测试覆盖率往往远低于正向 —— 于是&quot;我们有回滚&quot;变成一句无法兑现的承诺。度量里的&quot;补偿成功率&quot;就是防这个的。</p>
+<h4 id="h-25-成本可控cost-controllable">2.5 成本可控（Cost Controllable）<a class="anchor" href="#h-25-成本可控cost-controllable" aria-label="本节链接">#</a></h4>
+<p><strong>定义</strong>：每个任务的资源消耗有一个<strong>可预测的上界</strong>，且系统在接近上界时会有明确行为（降级/终止），而不是无限增长。</p>
+<table>
+<thead>
+<tr>
+<th>项</th>
+<th>度量</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>主指标</td>
+<td>每任务的 <strong>token 上界 / 工具调用上界 / 时延上界</strong>（三个独立维度，不能只算钱）</td>
+</tr>
+<tr>
+<td>分布</td>
+<td>每任务成本的 <strong>p50 / p95 / p99</strong> —— 长尾才是事故来源</td>
+</tr>
+<tr>
+<td>上界兑现率</td>
+<td>实际超预算的运行占比（应该接近 0；不为 0 说明上界是假的）</td>
+</tr>
+<tr>
+<td>成本归因</td>
+<td>按步骤类型拆分的成本占比（哪一步最贵）</td>
+</tr>
+<tr>
+<td>反指标</td>
+<td>成功率、延迟（省钱的方式之一是少做，见&quot;拒答率&quot;）</td>
+</tr>
+</tbody></table>
+<p><strong>为什么&quot;上界&quot;比&quot;平均成本&quot;重要</strong>：Agent 的成本分布是<strong>重尾的</strong>。一次跑偏的循环（模型反复重试同一个失败工具）可以把单任务成本拉到 p50 的 20 倍。只看平均值做容量规划，会被 1% 的尾部打爆。所以：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord cjk_fallback">预算规则</span></span><span class="mord cjk_fallback">：</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mord text"><span class="mord">cost</span></span><span class="mopen">(</span><span class="mord mathnormal">t</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0269em;">w</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0269em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">token</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0269em;">w</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0269em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">call</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0269em;">w</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3175em;"><span style="top:-2.55em;margin-left:-0.0269em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">time</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord"><span class="mord mathnormal">L</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≤</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0502em;">B</span><span class="mpunct">,</span><span class="mspace" style="margin-right:1em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">∀</span><span class="mord mathnormal">t</span></span></span></span></span></p>
+<p><strong>上界必须在每一步检查</strong>（而不是跑完再算）。这直接连到第 2 章的终止条件：预算/步数/置信度三把闸。注意这里的一个微妙点：<strong>预算检查必须是&quot;执行前检查&quot;，而不是&quot;执行后统计&quot;</strong> —— 否则你已经付了那笔钱。</p>
+<p><strong>成本与其他目标的冲突</strong>（本节的核心之一）：</p>
+<table>
+<thead>
+<tr>
+<th>想改善</th>
+<th>常见手段</th>
+<th>成本后果</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>可靠性</td>
+<td>多次采样取最好（best-of-n）、加验证步、加重试</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6667em;vertical-align:-0.0833em;"></span><span class="mord">×</span><span class="mord mathnormal">n</span></span></span></span>（线性放大）</td>
+</tr>
+<tr>
+<td>可观测</td>
+<td>L2/L3 记录、上下文快照、重放桩</td>
+<td>存储与热路径开销</td>
+</tr>
+<tr>
+<td>可组合</td>
+<td>独立可测的部件、额外的接口层</td>
+<td>少量固定开销，但常需多一次模型调用做格式转换</td>
+</tr>
+<tr>
+<td>可回滚</td>
+<td>补偿逻辑、软删除、两阶段写</td>
+<td>正向路径多一到两步</td>
+</tr>
+</tbody></table>
+<p><figure><img class="md-img" src="content/courses/agent-systems/assets/chapter-1-figure-04.svg" alt="五个设计目标与它们各自的度量" loading="lazy" decoding="async"><figcaption>五个设计目标与它们各自的度量</figcaption></figure>
+</p>
+<h3 id="h-三冲突结构哪几对是结构性的">三、冲突结构：哪几对是结构性的<a class="anchor" href="#h-三冲突结构哪几对是结构性的" aria-label="本节链接">#</a></h3>
+<p>把上面五节的内容整理成冲突矩阵。注意区分<strong>结构性冲突</strong>（原理上不可同时最优，只能取舍）与<strong>可解耦冲突</strong>（可以通过设计同时改善）：</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>可靠性</th>
+<th>可观测</th>
+<th>可组合</th>
+<th>可回滚</th>
+<th>成本可控</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>可靠性</strong></td>
+<td>—</td>
+<td>弱</td>
+<td>弱</td>
+<td>正相关</td>
+<td><strong>结构性</strong> ▼</td>
+</tr>
+<tr>
+<td><strong>可观测</strong></td>
+<td>弱</td>
+<td>—</td>
+<td>正相关</td>
+<td>正相关</td>
+<td><strong>结构性</strong> ▼</td>
+</tr>
+<tr>
+<td><strong>可组合</strong></td>
+<td>弱</td>
+<td>正相关</td>
+<td>—</td>
+<td>正相关</td>
+<td>弱 ▼</td>
+</tr>
+<tr>
+<td><strong>可回滚</strong></td>
+<td><strong>正相关</strong></td>
+<td>正相关</td>
+<td>正相关</td>
+<td>—</td>
+<td><strong>结构性</strong> ▼</td>
+</tr>
+<tr>
+<td><strong>成本可控</strong></td>
+<td><strong>结构性</strong> ▼</td>
+<td><strong>结构性</strong> ▼</td>
+<td>弱 ▼</td>
+<td><strong>结构性</strong> ▼</td>
+<td>—</td>
+</tr>
+</tbody></table>
+<p>三个结论：</p>
+<ol>
+<li><strong>可靠性、可观测、可组合、可回滚之间基本是正相关的</strong> —— 它们共同的基础是&quot;显式化&quot;：把状态、契约、判据、副作用都写出来。<strong>这解释了为什么&quot;做对设计&quot;往往同时改善四个目标</strong>：它们不是四个方向，而是同一个方向的四个侧面。</li>
+<li><strong>成本可控与其余四个全部结构性冲突</strong> —— 因为其余四个的实现手段普遍是&quot;多做一点&quot;（多验证、多记录、多一层接口、多一步补偿）。<strong>所以成本不是第五个平等目标，它是那个&quot;预算约束&quot;</strong>：它决定其余四个能做到什么程度。</li>
+<li><strong>可回滚与可靠性正相关</strong>（不是冲突）—— 这点常被误判。直觉上&quot;可靠的系统不需要回滚&quot;，实际上<strong>回滚是可靠性的组成部分</strong>：上一节证明过，可回滚是唯一能从根上打断漂移指数放大的手段。</li>
+</ol>
+<blockquote>
+<p><strong>最重要的工程结论</strong>：真正的取舍<strong>只有一个方向</strong> —— <strong>在固定成本预算下，如何分配&quot;多做一点&quot;的额度</strong>。这就是为什么本节最后要给一个完整的取舍案例，而不是五段&quot;要重视 X&quot;。</p>
+</blockquote>
+<h3 id="h-四把冲突参数化预算下的选择问题">四、把冲突参数化：预算下的选择问题<a class="anchor" href="#h-四把冲突参数化预算下的选择问题" aria-label="本节链接">#</a></h3>
+<p>既然冲突的实质是&quot;额外工作量的分配&quot;，就可以把它写成一个显式的分配问题。设总预算为 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0502em;">B</span></span></span></span>，四种&quot;多做一点&quot;的花费分别为 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7167em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">r</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">o</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">p</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">b</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>（可靠/观测/组合/回滚），对应带来的可靠性增益为 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.9694em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord">Δ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">r</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord">Δ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">o</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord">Δ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">p</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord">Δ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">b</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:2.3277em;vertical-align:-1.2777em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.4306em;"><span style="top:-2.4em;margin-left:0em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight"><span class="mord mathnormal mtight">x</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1645em;"><span style="top:-2.357em;margin-left:0em;margin-right:0.0714em;"><span class="pstrut" style="height:2.5em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">r</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.143em;"><span></span></span></span></span></span></span><span class="mpunct mtight">,</span><span class="mord mtight"><span class="mord mathnormal mtight">x</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1645em;"><span style="top:-2.357em;margin-left:0em;margin-right:0.0714em;"><span class="pstrut" style="height:2.5em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mord mathnormal mtight">o</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.143em;"><span></span></span></span></span></span></span><span class="mpunct mtight">,</span><span class="mord mtight"><span class="mord mathnormal mtight">x</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1645em;"><span style="top:-2.357em;margin-left:0em;margin-right:0.0714em;"><span class="pstrut" style="height:2.5em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mord mathnormal mtight">p</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2819em;"><span></span></span></span></span></span></span><span class="mpunct mtight">,</span><span class="mord mtight"><span class="mord mathnormal mtight">x</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3448em;"><span style="top:-2.3488em;margin-left:0em;margin-right:0.0714em;"><span class="pstrut" style="height:2.5em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mord mathnormal mtight">b</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.1512em;"><span></span></span></span></span></span></span></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span><span class="mop">max</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.8973em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord accent"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.6944em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal">p</span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.1667em;"><span class="mord">^</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.1944em;"><span></span></span></span></span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">succ</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord mathnormal">x</span><span class="mclose">)</span><span class="mspace" style="margin-right:1em;"></span><span class="mord text"><span class="mord">s.t.</span></span><span class="mspace" style="margin-right:1em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.05em;"><span style="top:-1.8723em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∑</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.2777em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord"><span class="mord mathnormal">x</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≤</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0502em;">B</span></span></span></span></span></p>
+<p>这个式子本身解不出数（收益函数未知），但它给了两条<strong>可操作的启发式</strong>：</p>
+<p><strong>启发式一：先补齐&quot;使其他手段生效&quot;的那一项。</strong> 由上一节：错误可检测率 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">d</span></span></span></span> 会把重试的收益以 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.0991em;vertical-align:-0.25em;"></span><span class="mord mathnormal">d</span><span class="mclose"><span class="mclose">)</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8491em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0315em;">k</span></span></span></span></span></span></span></span></span></span></span> 放大。所以当 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">d</span></span></span></span> 接近 0 时，<strong>投在&quot;可观测/可检测&quot;上的第一块钱的边际收益远高于投在&quot;重试&quot;上</strong>。判断顺序：</p>
+<pre><code>d ≈ 0（错误静默传播）       → 先投可观测/校验（否则重试无效）
+d 高但无回滚（错误可检测但不可恢复）→ 投可回滚
+d 高、可回滚、但成本失控     → 投预算闸与剪枝（第 2、5 章）
+以上都有，成功率仍低         → 才是投向模型/提示词</code></pre>
+<p><strong>启发式二：把&quot;拒答&quot;当作成本的一部分。</strong> 任何&quot;少做少错&quot;的优化都会推高拒答率。所以成本约束应该写成：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7073em;vertical-align:-0.024em;"></span><span class="mord text"><span class="mord cjk_fallback">可接受</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">⟺</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.9221em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord text"><span class="mord">cost</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">p</span><span class="mord mtight">99</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≤</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0502em;">B</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">∧</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8193em;vertical-align:-0.136em;"></span><span class="mord text"><span class="mord cjk_fallback">拒答率</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≤</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0278em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mop mtight"><span class="mtight">m</span><span class="mtight">a</span><span class="mtight">x</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span></span></p>
+<p>只写前半句，系统会学会&quot;遇事就说做不到&quot;。</p>
+<h3 id="h-五取舍案例一个对外发邮件的调研-agent">五、取舍案例：一个对外发邮件的调研 Agent<a class="anchor" href="#h-五取舍案例一个对外发邮件的调研-agent" aria-label="本节链接">#</a></h3>
+<p>现在把上面全部内容落到一个完整案例上。选择&quot;对外发邮件&quot;是因为它同时含<strong>不可逆动作</strong>、<strong>语义质量要求</strong>和<strong>成本压力</strong> —— 五个目标全部在场。</p>
+<h4 id="h-51-任务与约束">5.1 任务与约束<a class="anchor" href="#h-51-任务与约束" aria-label="本节链接">#</a></h4>
+<pre><code>任务：给定一个话题，检索资料 → 写一份调研摘要 → 通过邮件发给指定收件人。
+约束：
+  · 邮件一旦发出不可撤回（对外不可逆）
+  · 摘要质量无法完全机械判定（需要语义判断）
+  · 收件人可能是客户（错误代价高）
+  · 需要控制成本：预期每天运行 200 次</code></pre>
+<h4 id="h-52-目标优先级与理由写进设计文档">5.2 目标优先级与理由（写进设计文档）<a class="anchor" href="#h-52-目标优先级与理由写进设计文档" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>优先级</th>
+<th>目标</th>
+<th>为什么排这里</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1</td>
+<td><strong>可回滚（=不可逆动作的前置拦截）</strong></td>
+<td>邮件不可撤回 → 这是<strong>唯一没有替代品</strong>的目标，必须最高</td>
+</tr>
+<tr>
+<td>2</td>
+<td><strong>可靠性</strong></td>
+<td>错误代价高（对客户）；宁可慢，不可错</td>
+</tr>
+<tr>
+<td>3</td>
+<td><strong>可观测</strong></td>
+<td>出问题必须能归因到&quot;检索错/写作错/判据错&quot;</td>
+</tr>
+<tr>
+<td>4</td>
+<td><strong>可组合</strong></td>
+<td>未来要换检索源与写作模型，接口要稳</td>
+</tr>
+<tr>
+<td>5</td>
+<td><strong>成本可控</strong></td>
+<td>排在最后，但<strong>必须给出上界</strong>（不是不控，是不为省钱牺牲前四项）</td>
+</tr>
+</tbody></table>
+<p>注意第 1 和第 5 的排序理由不同：<strong>可回滚排第一是因为&quot;不可逆动作没有替代品&quot;</strong>（不是&quot;它更重要&quot;）；<strong>成本排最后是因为它有硬上界兜底</strong>（p99 ≤ B，超了就拒答而不是降质）。</p>
+<h4 id="h-53-具体取舍每条都带代价">5.3 具体取舍（每条都带代价）<a class="anchor" href="#h-53-具体取舍每条都带代价" aria-label="本节链接">#</a></h4>
+<p><strong>取舍 1：发送动作加&quot;草稿 → 人工确认 → 发送&quot;两阶段（牺牲延迟与人力）</strong></p>
+<ul>
+<li>得到：不可逆动作被前置拦截覆盖（可回滚目标的唯一可行实现）。</li>
+<li>代价：端到端时延从秒级变成&quot;直到人工确认&quot;；每天 200 次里若 30% 需确认，是 60 次人工介入。</li>
+<li><strong>为什么接受</strong>：邮件不可撤回。可补偿（发更正邮件）在客户场景下<strong>语义上不是回滚</strong>。</li>
+</ul>
+<p><strong>取舍 2：加一道独立的模型评审（牺牲成本，换可靠性）</strong></p>
+<ul>
+<li>得到：拦住&quot;内容看似完整但偏离话题&quot;的漂移（上一节的机制一：子目标置换）。</li>
+<li>代价：每次多一次模型调用（成本 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">×</span><span class="mord">1.3</span></span></span></span> 量级）+ 增加 p95 延迟。</li>
+<li>边界条件（重要）：<strong>评审器必须用不同的 rubric 和独立上下文</strong>。若让同一个模型在同一上下文里&quot;检查自己&quot;，会退化成自评 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6944em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal">s</span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.1944em;"><span class="mord">^</span></span></span></span></span></span></span></span></span></span>，收益接近 0。</li>
+</ul>
+<p><strong>取舍 3：L2 因果链只保留摘要（牺牲部分可观测性，换合规与成本）</strong></p>
+<ul>
+<li>得到：能回答&quot;第几步偏了、它看到了什么&quot;（摘要级）。</li>
+<li>代价：<strong>已知盲区</strong> —— PII 相关的失败无法从轨迹复现，需要线上复现或让用户提供输入。</li>
+<li><strong>为什么接受</strong>：完整上下文留存带来合规成本；折中方案必须<strong>把盲区写清楚</strong>，而不是假装可观测已经完备。</li>
+</ul>
+<p><strong>取舍 4：不设&quot;best-of-3 重写&quot;（牺牲一点成功率，换成本上界）</strong></p>
+<ul>
+<li>得到：成本 p99 可控。</li>
+<li>代价：写作环节的成功率少几个百分点（多采样取最好通常能提升若干点）。</li>
+<li><strong>为什么接受</strong>：写作质量由取舍 2 的评审器兜底；重复采样与评审器功能重叠，<strong>边际收益被两者取其一覆盖</strong>。</li>
+</ul>
+<p><strong>取舍 5：把&quot;检索&quot;与&quot;写作&quot;做成强接口（牺牲一点提示词技巧，换可组合）</strong></p>
+<ul>
+<li>得到：可以独立替换检索源、独立测试写作（给定固定资料 → 期望摘要结构）。</li>
+<li>代价：检索结果必须结构化（字段固定），<strong>丢掉了&quot;把原始文档整段塞给模型让它自行取舍&quot;的灵活性</strong>。</li>
+<li>边界：<strong>接口之内</strong>（写作阶段内部）仍可用长上下文技巧 —— 漂移止步于接口。</li>
+</ul>
+<h4 id="h-54-这套设计的承重墙在哪">5.4 这套设计的&quot;承重墙&quot;在哪<a class="anchor" href="#h-54-这套设计的承重墙在哪" aria-label="本节链接">#</a></h4>
+<p>一个可复用的自检：<strong>如果只允许你保留一条设计决策，留哪条？</strong></p>
+<ul>
+<li>本案例里是<strong>取舍 1（两阶段发送）</strong>。</li>
+<li>理由：其余四条被去掉，系统会变差；取舍 1 被去掉，系统会<strong>变危险</strong>（不可逆动作失去拦截）。</li>
+<li>对应的通用判据：<strong>&quot;去掉它会不会让系统从&#39;不好用&#39;变成&#39;不能用/危险&#39;&quot;</strong> —— 会的那条就是承重墙，必须最先实现、最先测试、最不能妥协。</li>
+</ul>
+<h3 id="h-代码把五个目标的度量算出来可运行的度量骨架">代码：把五个目标的度量算出来（可运行的度量骨架）<a class="anchor" href="#h-代码把五个目标的度量算出来可运行的度量骨架" aria-label="本节链接">#</a></h3>
+<p>这个代码不实现 Agent，它实现<strong>度量</strong>。设计决策是：把度量做成可以跑的函数，而不是文档里的一句话 —— <strong>不可执行的度量在项目里必然会腐烂。</strong></p>
+<pre data-lang="python"><code class="language-python">import math
+from dataclasses import dataclass, field
+from typing import Optional
+
+# ---------- 2.1 可靠性：两个数（均值 + 稳定性），外加拒答率 ----------
+def reliability(runs: list[bool], refused: list[bool],
+                p_min: float = 0.8, r_max: float = 0.1) -&gt; dict:
+    &quot;&quot;&quot;
+    runs    : 每次运行是否&#39;可接受完成&#39;
+    refused : 每次运行是否&#39;判为做不到&#39;（反指标！不许靠拒答刷成功率）
+    设计决策：置信区间半宽与拒答率同时入判据 —— 缺任一项，指标都可被游戏化。
+    ⚠️ 注意 half 是&#39;均值的估计精度&#39;，不是&#39;运行间的离散度&#39;：
+       两个成功率相同的系统会有几乎相同的 half。要看稳定性，必须看下面的 stability()。
+    &quot;&quot;&quot;
+    n = len(runs)
+    if n == 0:
+        return {&quot;ok&quot;: False, &quot;why&quot;: &quot;没有样本&quot;}
+    p_hat = sum(runs) / n
+    half = 1.96 * math.sqrt(max(p_hat * (1 - p_hat), 1e-9) / n)   # 正态近似
+    ref = sum(refused) / n
+    return {&quot;成功率&quot;: round(p_hat, 3), &quot;CI95半宽&quot;: round(half, 3),
+            &quot;拒答率&quot;: round(ref, 3),
+            &quot;可靠&quot;: p_hat &gt;= p_min and half &lt;= 0.05 and ref &lt;= r_max}
+
+def stability(costs: list[float]) -&gt; dict:
+    &quot;&quot;&quot;
+    ★ 可靠性的第二个数：运行之间的离散度。看两个无量纲量 ——
+      · CV（变异系数 = sd/mean）：&#39;同样的任务，每次差多少&#39;
+      · p95/p50：长尾倍数。CV 小但 p95/p50 大 ⇒ 偶发灾难（比持续不稳更危险）
+    设计决策：不看方差本身，因为方差的量纲随任务规模变化，无法跨任务比较。
+    &quot;&quot;&quot;
+    n = len(costs)
+    if n &lt; 2:
+        return {&quot;可估&quot;: False}
+    mean = sum(costs) / n
+    sd = math.sqrt(sum((c - mean) ** 2 for c in costs) / (n - 1))
+    s = sorted(costs)
+    p50, p95 = s[n // 2], s[min(n - 1, int(0.95 * n))]
+    return {&quot;CV&quot;: round(sd / max(mean, 1e-9), 3),
+            &quot;p95/p50&quot;: round(p95 / max(p50, 1e-9), 1),
+            &quot;可给SLA&quot;: sd / max(mean, 1e-9) &lt;= 0.3}
+
+def split_variance(groups: dict[str, list[bool]]) -&gt; dict:
+    &quot;&quot;&quot;
+    分维度统计成功率 → 定位方差来源（B 类系统的第一优先级）。
+    设计决策：方差诊断按维度切分，因为&#39;哪一类输入崩&#39;才是可行动的信息。
+    &quot;&quot;&quot;
+    return {k: round(sum(v) / len(v), 3) for k, v in groups.items() if v}
+
+# ---------- 2.5 成本可控：上界 + 长尾 ----------
+@dataclass
+class CostBudget:
+    &quot;&quot;&quot;三维度独立预算。设计决策：token/调用/时延不能合成一个&#39;钱&#39;，因为瓶颈可能只有一个。&quot;&quot;&quot;
+    max_tokens: int = 60_000
+    max_calls: int = 20
+    max_seconds: float = 90.0
+    def check(self, tok: int, calls: int, secs: float) -&gt; Optional[str]:
+        &quot;&quot;&quot;★ 必须在&#39;执行下一步之前&#39;调用 —— 事后再算，钱已经付了。&quot;&quot;&quot;
+        if tok &gt;= self.max_tokens: return f&quot;token 预算耗尽 ({tok}/{self.max_tokens})&quot;
+        if calls &gt;= self.max_calls: return f&quot;调用预算耗尽 ({calls}/{self.max_calls})&quot;
+        if secs &gt;= self.max_seconds: return f&quot;时延预算耗尽 ({secs:.0f}s/{self.max_seconds:.0f}s)&quot;
+        return None
+
+def cost_tail(costs: list[float]) -&gt; dict:
+    &quot;&quot;&quot;看 p99 而不是 mean：Agent 成本是重尾分布，均值会骗你。&quot;&quot;&quot;
+    s = sorted(costs)
+    def q(f): return s[min(len(s) - 1, int(f * len(s)))]
+    return {&quot;p50&quot;: round(q(.5), 2), &quot;p95&quot;: round(q(.95), 2),
+            &quot;p99&quot;: round(q(.99), 2), &quot;mean&quot;: round(sum(s) / len(s), 2),
+            &quot;尾部倍数&quot;: round(q(.99) / max(q(.5), 1e-9), 1)}
+
+# ---------- 2.4 可回滚：覆盖 + 补偿自身的可靠性 ----------
+@dataclass
+class RollbackLedger:
+    writes: int = 0
+    compensable: int = 0
+    compensations_ok: int = 0
+    compensations_tried: int = 0
+    def coverage(self) -&gt; float:
+        return self.compensable / self.writes if self.writes else 1.0
+    def compensation_success(self) -&gt; float:
+        &quot;&quot;&quot;设计决策：补偿也会失败。不度量它，&#39;我们有回滚&#39;就是空话。&quot;&quot;&quot;
+        return (self.compensations_ok / self.compensations_tried
+                if self.compensations_tried else float(&quot;nan&quot;))
+
+# ---------- 2.3 可组合：用&#39;能否无模型单测&#39;做硬测试 ----------
+def is_composable(tool) -&gt; tuple[bool, str]:
+    &quot;&quot;&quot;
+    硬测试：工具能否在没有 LLM 的情况下被断言？
+    不能 → 它的契约寄生在提示词里 → 不可组合（换不掉、测不了）。
+    &quot;&quot;&quot;
+    if not hasattr(tool, &quot;schema&quot;) or not hasattr(tool, &quot;call&quot;):
+        return False, &quot;没有显式 schema/调用入口&quot;
+    if not hasattr(tool, &quot;unit_assertions&quot;):
+        return False, &quot;未提供无模型断言（契约隐含在提示词里）&quot;
+    return True, &quot;ok&quot;
+
+# ---------- 2.2 可观测：层级选择必须与失败代价挂钩 ----------
+def required_observability_level(side_effect: str, spend: bool) -&gt; str:
+    &quot;&quot;&quot;
+    设计决策：可观测层级不是&#39;越高越好&#39;（成本/隐私），而是按下行风险选择。
+    &quot;&quot;&quot;
+    if side_effect == &quot;irreversible&quot; or spend:
+        return &quot;L3 可重放（必须能复现事故现场）&quot;
+    if side_effect == &quot;compensable&quot;:
+        return &quot;L2 因果链（要能定位到补偿点）&quot;
+    return &quot;L1 事件轨迹（只读，重跑即可）&quot;
+
+# ---------- 冲突参数化：预算下的分配启发式 ----------
+def where_to_spend(detect_rate: float, has_rollback: bool,
+                   cost_p99_over_budget: bool) -&gt; str:
+    &quot;&quot;&quot;
+    启发式一：先补齐&#39;使其他手段生效&#39;的那一项（顺序比金额重要）。
+    &quot;&quot;&quot;
+    if detect_rate &lt; 0.5:
+        return &quot;先投可观测/校验：错误静默传播时，重试的收益趋于 0&quot;
+    if not has_rollback:
+        return &quot;投可回滚：错误可检测但不可恢复时，可回滚是唯一能打断漂移放大的手段&quot;
+    if cost_p99_over_budget:
+        return &quot;投预算闸与剪枝：p99 已经超界，此时加采样/重试只会更糟&quot;
+    return &quot;最后才投模型/提示词：前面的杠杆都用尽后，它才是瓶颈&quot;
+
+if __name__ == &quot;__main__&quot;:
+    # ==== 可靠性：成功率 + 拒答率（两个游戏化防线）====
+    A = [True] * 34 + [False] * 6        # 成功 0.85，稳定
+    print(&quot;成功率与拒答率:&quot;, reliability(A, [False] * 40))
+
+    # ==== 稳定性：这才是&#39;两个系统均值相同、可用性不同&#39;的判别处 ====
+    # 两个系统各 40 次运行的&#39;每任务步数&#39;（均值都约 12 步）：
+    stable   = [11, 12, 12, 13, 12, 11, 12, 12, 13, 12] * 4          # 波动小
+    unstable = [4, 5, 6, 38, 40, 42, 7, 36, 5, 39] * 4               # 双峰：偶发 40 步
+    print(&quot;稳定系统:&quot;, stability(stable))
+    print(&quot;不稳定系统:&quot;, stability(unstable))
+    # ★ 两者的均值接近，但 CV 与 p95/p50 差异巨大 →
+    #   只有稳定那个能给 SLA。&#39;可靠性不是一个数&#39;在这里才真正可见。
+
+    print(&quot;分维度成功率:&quot;, split_variance({
+        &quot;短任务&quot;: [True] * 19 + [False],
+        &quot;长任务(&gt;15步)&quot;: [True] * 3 + [False] * 7,   # 方差来源在这里
+    }))
+    print(&quot;成本尾部:&quot;, cost_tail([1.2] * 90 + [8.0, 11.0, 25.0, 3.0, 2.0, 1.5, 1.8, 2.2, 1.9, 2.0]))
+    print(&quot;该往哪花钱:&quot;, where_to_spend(detect_rate=0.2, has_rollback=False,
+                                       cost_p99_over_budget=False))</code></pre>
+<p><strong>这段代码的四处设计意图</strong>：</p>
+<ol>
+<li><code>reliability</code> 把<strong>拒答率</strong>作为判据的一部分。任何只统计成功率的度量都会被&quot;少做少错&quot;策略攻破。</li>
+<li><code>reliability</code> 与 <code>stability</code> <strong>刻意分成两个函数</strong>。因为&quot;均值的估计精度&quot;（CI 半宽）和&quot;运行间的离散度&quot;（CV、p95/p50）是两件事：<strong>两个成功率完全相同的系统会有几乎相同的 CI，却在可用性上天差地别</strong>。把它们合成一个&quot;可靠性得分&quot;，这两种信息会互相掩盖。</li>
+<li><code>CostBudget.check</code> 注释里强调&quot;执行前检查&quot;。这是最容易写错、也最贵的一处 —— 事后统计只让你知道自己超了，不让你避免超。</li>
+<li><code>where_to_spend</code> 返回的是<strong>顺序</strong>而不是金额。因为在收益函数未知时，&quot;先修哪个&quot;比&quot;投多少&quot;更可判断 —— 这正是第四节启发式一的落地。</li>
+</ol>
+<h3 id="h-练习">练习<a class="anchor" href="#h-练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>度量设计</strong>：为&quot;代码修复 Agent&quot;（读 issue → 改代码 → 跑测试 → 提 PR）写出五个目标各自的<strong>主指标 + 反指标</strong>。要求每个反指标都必须是这个任务里<strong>真实可能被游戏化</strong>的那一个，并说明它会被怎么游戏化。</li>
+<li><strong>方差定位</strong>：某 Agent 成功率 78%，但 p50 运行只需 6 步、p95 需要 34 步。请给出<strong>三个</strong>可能的方差来源（提示：与&quot;步数&quot;强相关的因素有哪些），并为每一个设计一个能区分它的切分维度。</li>
+<li><strong>冲突判断</strong>：下面四对目标冲突里，哪些是<strong>结构性冲突</strong>（不可同时最优），哪些其实<strong>正相关</strong>（可以通过设计同时改善）？逐条给理由。
+（a）可观测 vs 成本可控；（b）可回滚 vs 成本可控；（c）可靠性 vs 可组合；（d）可回滚 vs 可靠性。</li>
+<li><strong>写取舍记录</strong>：为练习 1 的代码修复 Agent 写一份<strong>取舍决策记录</strong>，格式照第五节的&quot;取舍 N&quot;（得到 / 代价 / 为什么接受 / 边界条件）。至少写 4 条，并且必须包含一条<strong>关于不可逆动作</strong>的（提示：提 PR 可回滚吗？force push 呢？删分支呢？）。</li>
+<li><strong>承重墙</strong>：从你第 4 题的 4 条取舍里找出&quot;承重墙&quot;（去掉它会让系统从&quot;不好用&quot;变成&quot;危险&quot;），说明理由。然后回答：如果项目时间只够实现两条，你留哪两条，为什么？</li>
+<li><strong>反例</strong>：构造一个例子，说明&quot;把可观测做到 L3 可重放&quot;<strong>反而降低</strong>了系统可靠性（提示：想想热路径开销、记录失败时的行为、以及&quot;为了可重放而把工具也固定住&quot;带来的灵活性损失）。</li>
+</ol>
+<h3 id="h-小结">小结<a class="anchor" href="#h-小结" aria-label="本节链接">#</a></h3>
+<ul>
+<li><strong>五个目标的度量三件套</strong>：主指标 + 稳定性/分布 + <strong>反指标</strong>。没有反指标的度量一定会被&quot;少做少错&quot;游戏化（典型：成功率很漂亮，拒答率 40%）。</li>
+<li><strong>可靠性是两个数</strong>：成功率 + 稳定性。均值相同、方差不同的两个系统，一个能给 SLA，一个不能；后者的第一优先级是<strong>定位方差来源</strong>（分维度切分），不是提高均值。</li>
+<li><strong>可观测有四层</strong>（L1 轨迹 / L2 因果链 / L3 可重放 / L4 可干预），按<strong>失败代价</strong>选择层级，不是越高越好；L2 的成本与隐私冲突必须<strong>把盲区写清楚</strong>。</li>
+<li><strong>可组合的硬测试</strong>：这个部件能不能在没有模型的情况下被断言？不能 → 它的契约寄生在提示词里。</li>
+<li><strong>可回滚分三级</strong>：可逆 / 可补偿 / 不可逆。设计动作发生在<strong>正向动作之前</strong>；不可逆动作<strong>只准预防，不准事后补回滚</strong>。补偿也会失败 —— 必须度量&quot;补偿成功率&quot;。</li>
+<li><strong>成本是约束而不是平等目标</strong>：看 p99 而非均值（重尾分布），必须<strong>执行前检查</strong>，且拒答率要计入成本判据。</li>
+<li><strong>冲突结构</strong>：可靠 / 可观测 / 可组合 / 可回滚之间<strong>基本正相关</strong>（共同基础是&quot;显式化&quot;）；<strong>只有&quot;成本可控&quot;与其余四个是结构性冲突</strong>。所以真正的取舍方向只有一个：<strong>在固定预算下分配&quot;多做一点&quot;的额度</strong>。</li>
+<li><strong>顺序启发式</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">d</span></span></span></span> 低先投可检测性 → 再投可回滚 → 再投预算闸 → <strong>最后才投模型/提示词</strong>。</li>
+<li><strong>承重墙判据</strong>：去掉它会不会让系统从&quot;不好用&quot;变成&quot;危险&quot;？会的那条最先做、最不能妥协。</li>
+</ul>
+<blockquote>
+<p>本章到此结束。五章之后你会拿到具体的设计手法，但<strong>判断标准从这一节开始就不再变</strong>：任何一个 Agent 设计，都要能回答&quot;它的五个目标各自怎么度量、冲突处取舍了什么、承重墙是哪一条&quot;。第 2 章从控制循环开始 —— 循环的基本形态、ReAct 与 plan-execute 的取舍、终止条件的三把闸，以及为第 7 章评测铺路的可观测性设计。</p>
+</blockquote>

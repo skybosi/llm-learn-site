@@ -1,0 +1,109 @@
+<h2 id="h-性能验证">性能验证<a class="anchor" href="#h-性能验证" aria-label="本节链接">#</a></h2>
+<p>部署做完不算完，<strong>没验证过性能的服务，上线就是赌博</strong>。这一课是前 8 课的收口：把功能正确性、延迟 SLO、吞吐、扩展效率、通信带宽、长稳稳定性串成一套<strong>验收清单</strong>，并重点回答一个残酷的问题——<strong>加卡到底值不值</strong>。学完本课，你应当能对任意一套部署方案输出一份可交付的性能验收报告，并判断多卡并行是否真的带来了对应的收益。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-验收要验什么">1. 验收要验什么<a class="anchor" href="#h-1-验收要验什么" aria-label="本节链接">#</a></h4>
+<p>一份完整的性能验收包含六项：</p>
+<ol>
+<li><strong>功能正确性</strong>：输出格式、内容质量是否符合预期，量化后有没有明显退化；</li>
+<li><strong>延迟 SLO</strong>：P99 TTFT / TPOT 是否达标（复用第二章的压测）；</li>
+<li><strong>吞吐</strong>：达标延迟前提下的最大 token/s；</li>
+<li><strong>扩展效率</strong>：加卡/加副本后吞吐是否成比例增长；</li>
+<li><strong>通信带宽</strong>：多卡之间 all-reduce 是否健康（NCCL 测试）；</li>
+<li><strong>长稳与容错</strong>：长时间压测是否泄漏显存、延迟是否漂移、单副本挂掉是否影响整体。</li>
+</ol>
+<h4 id="h-2-扩展效率加卡的性价比尺子">2. 扩展效率：加卡的&quot;性价比尺子&quot;<a class="anchor" href="#h-2-扩展效率加卡的性价比尺子" aria-label="本节链接">#</a></h4>
+<pre><code>扩展效率 = 实际吞吐提升 / 理论吞吐提升</code></pre>
+<ul>
+<li>TP=2 理想吞吐翻倍，但通信 + 负载不均会打折扣，<strong>实测 1.6–1.9 倍是常见区间</strong>；</li>
+<li>数据并行多副本的扩展效率通常高于 TP（副本间无通信），接近线性；</li>
+<li><strong>经验法则</strong>：扩展效率 &lt; 0.7 就要警惕——可能通信瓶颈、负载不均、或单卡已非瓶颈（比如已到 CPU/网络上限）。</li>
+</ul>
+<h4 id="h-3-通信验证nccl-是基础体检">3. 通信验证：NCCL 是基础体检<a class="anchor" href="#h-3-通信验证nccl-是基础体检" aria-label="本节链接">#</a></h4>
+<p>多卡并行的一切都建立在集合通信健康之上。上线前用 <code>nccl-tests</code> 的 <code>all_reduce_perf</code> 测一条基线：</p>
+<pre data-lang="bash"><code class="language-bash"># 2 卡 all-reduce 带宽测试
+mpirun -np 2 ./all_reduce_perf -b 8M -e 128M -f 2 -g 2</code></pre>
+<p>关注：<strong>实测带宽是否接近卡的理论互连带宽</strong>（NVLink 约 600–900 GB/s/卡，PCIe Gen4 约 32 GB/s）。若远低于理论值，说明拓扑/驱动/互连有问题，会直接拖垮 TP 性能。</p>
+<h4 id="h-4-长稳与容错">4. 长稳与容错<a class="anchor" href="#h-4-长稳与容错" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>长稳</strong>：连续压测 1–2 小时，盯 <code>nvidia-smi</code> 显存是否持续增长（碎片/泄漏）、P99 延迟是否漂移；</li>
+<li><strong>容错</strong>：多副本下杀掉一个副本，验证 LB 能否摘除、其余副本能否兜住流量（这是高可用的核心）。</li>
+</ul>
+<p><figure><img class="md-img" src="content/courses/llm-deployment-practice/assets/chapter-3-figure-03.svg" alt="性能验收六项清单：六个图标卡片（功能正确性、延迟 SLO、吞吐、扩展效率、NCCL 带宽、长稳容错），下方一张&quot;扩展效率&quot;曲线对比理想线性（虚线）与实际曲线（实线），标注 0.7 警戒线" loading="lazy" decoding="async"><figcaption>性能验收六项清单：六个图标卡片（功能正确性、延迟 SLO、吞吐、扩展效率、NCCL 带宽、长稳容错），下方一张&quot;扩展效率&quot;曲线对比理想线性（虚线）与实际曲线（实线），标注 0.7 警戒线</figcaption></figure>
+</p>
+<h3 id="h-二可运行示例">二、可运行示例<a class="anchor" href="#h-二可运行示例" aria-label="本节链接">#</a></h3>
+<h4 id="h-示例-1单卡-vs-多卡扩展效率对比脚本">示例 1：单卡 vs 多卡扩展效率对比脚本<a class="anchor" href="#h-示例-1单卡-vs-多卡扩展效率对比脚本" aria-label="本节链接">#</a></h4>
+<pre data-lang="python"><code class="language-python"># -*- coding: utf-8 -*-
+# 扩展效率验证：对比 TP=1 与 TP=2 的实测吞吐，算扩展效率
+# 吞吐数据来自第二章的压测脚本，这里填入实测值
+
+def speedup_analysis(name, tp1_tps, tp2_tps):
+    ideal = tp1_tps * 2              # TP=2 的理想吞吐（翻倍）
+    actual = tp2_tps
+    efficiency = actual / ideal
+    verdict = &quot;合格&quot; if efficiency &gt;= 0.7 else &quot;需排查（通信/负载/瓶颈）&quot;
+    print(f&quot;{name}: TP=1 吞吐={tp1_tps} tok/s, TP=2 吞吐={actual} tok/s, &quot;
+          f&quot;理想={ideal} tok/s, 扩展效率={efficiency:.2f} -&gt; {verdict}&quot;)
+    return efficiency
+
+# 示例实测值：7B 模型 TP=1 vs TP=2（填入你自己的压测结果）
+speedup_analysis(&quot;7B AWQ4 单机双卡&quot;, tp1_tps=2200, tp2_tps=3900)   # 效率 ~0.89
+speedup_analysis(&quot;70B AWQ4 单机双卡&quot;, tp1_tps=1800, tp2_tps=3300)  # 效率 ~0.92
+# 反例：跨机 TP 通信开销大，效率可能跌破 0.7
+speedup_analysis(&quot;70B FP16 跨机 TP=8(示意)&quot;, tp1_tps=1500, tp2_tps=1800)  # 效率 0.6</code></pre>
+<p>解读：单机内 TP 效率普遍 0.85–0.95；一旦跨机通信成为瓶颈，效率可能跌破 0.7，此时&quot;多卡&quot;反而可能不如&quot;单机多副本&quot;划算。</p>
+<h4 id="h-示例-2nccl-带宽基线--长稳监控">示例 2：NCCL 带宽基线 + 长稳监控<a class="anchor" href="#h-示例-2nccl-带宽基线--长稳监控" aria-label="本节链接">#</a></h4>
+<pre data-lang="bash"><code class="language-bash"># 1. 卡间拓扑与 NVLink 状态
+nvidia-smi topo -m
+
+# 2. all-reduce 带宽测试（2 卡，8MB~128MB 消息）
+mpirun -np 2 ./all_reduce_perf -b 8M -e 128M -f 2 -g 2
+
+# 3. 长稳压测时，另开终端盯显存与延迟（每 5 秒采样）
+while true; do
+  nvidia-smi --query-gpu=memory.used,utilization.gpu --format=csv,noheader
+  sleep 5
+done</code></pre>
+<h4 id="h-示例-3容错验证多副本摘除">示例 3：容错验证（多副本摘除）<a class="anchor" href="#h-示例-3容错验证多副本摘除" aria-label="本节链接">#</a></h4>
+<pre data-lang="python"><code class="language-python"># -*- coding: utf-8 -*-
+# 容错验证：杀掉一个副本，看负载均衡是否还能正常服务
+import httpx, itertools, time
+
+REPLICAS = [&quot;http://localhost:8000&quot;, &quot;http://localhost:8001&quot;]
+pool = itertools.cycle(REPLICAS)
+
+def ping(replica):
+    try:
+        return httpx.get(replica + &quot;/health&quot;, timeout=2).status_code == 200
+    except Exception:
+        return False
+
+# 模拟：8001 副本挂掉
+print(&quot;8001 副本已宕机（模拟）&quot;)
+healthy = [r for r in REPLICAS if r != &quot;http://localhost:8001&quot;]
+
+# 只向存活副本发请求，验证仍可服务
+ok = 0
+for i in range(10):
+    try:
+        httpx.post(healthy[i % len(healthy)] + &quot;/v1/chat/completions&quot;,
+                   json={&quot;model&quot;: &quot;m&quot;, &quot;messages&quot;: [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;hi&quot;}]},
+                   timeout=30)
+        ok += 1
+    except Exception:
+        pass
+print(f&quot;存活副本服务成功 {ok}/10，说明摘除宕机副本后仍可兜住流量&quot;)</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>跑真实扩展效率</strong>：用第二章的压测脚本分别测你环境里 TP=1 与 TP=2 的达标吞吐，套进示例 1 的 <code>speedup_analysis</code>，算出你的真实扩展效率。</li>
+<li><strong>画扩展曲线</strong>：收集 TP=1/2/4 三组吞吐，画出&quot;吞吐 vs 卡数&quot;曲线，与理想线性对比，找出你环境里效率开始下跌的卡数。</li>
+<li><strong>NCCL 基线</strong>：运行 <code>all_reduce_perf</code>，记录 NVLink 直连与 PCIe 桥接两对卡的带宽差异，说明它对 TP 组选卡的指导意义。</li>
+<li><strong>写验收报告</strong>：按本课六项清单，为一个已部署的 70B 服务（TP=2 + 2 副本）写一份验收报告模板，列出每项要测什么、用什么命令、达标线是多少。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>vLLM 文档 · 分布式推理与性能调优：<a href="https://docs.vllm.ai/en/latest/serving/distributed_serving.html" target="_blank" rel="noopener noreferrer">https://docs.vllm.ai/en/latest/serving/distributed_serving.html</a></li>
+<li>NVIDIA · NCCL 测试工具（nccl-tests）：<a href="https://github.com/NVIDIA/nccl-tests" target="_blank" rel="noopener noreferrer">https://github.com/NVIDIA/nccl-tests</a></li>
+<li>NVIDIA · nvidia-smi 与拓扑查询：<a href="https://developer.nvidia.com/nvidia-system-management-interface" target="_blank" rel="noopener noreferrer">https://developer.nvidia.com/nvidia-system-management-interface</a></li>
+<li>Google SRE Book · 监控与告警：<a href="https://sre.google/sre-book/monitoring-distributed-systems/" target="_blank" rel="noopener noreferrer">https://sre.google/sre-book/monitoring-distributed-systems/</a></li>
+</ul>
+<p><a href="#/l/deploy-ch4-l1">下一课：OpenAI 兼容 API</a></p>

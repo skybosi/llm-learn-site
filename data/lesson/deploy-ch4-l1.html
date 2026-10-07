@@ -1,0 +1,141 @@
+<h2 id="h-openai-兼容-api">OpenAI 兼容 API<a class="anchor" href="#h-openai-兼容-api" aria-label="本节链接">#</a></h2>
+<p>前面几章我们学会了用 vLLM 把模型&quot;跑起来&quot;、压测出吞吐、甚至多卡并行。但一个推理引擎要真正变成&quot;服务&quot;，必须能被业务方调用——你的上游是 Python、Go、Node 写的业务代码，还有一堆现成的 Agent 框架、LangChain、Dify 之类的工具。它们不认识 vLLM 的内部协议，只认一个事实标准：<strong>OpenAI 的 API 格式</strong>。这一课讲清楚&quot;OpenAI 兼容 API&quot;到底是什么、怎么在自建引擎上开出来、怎么用现成 SDK 直连，以及流式输出背后的原理。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-为什么openai-兼容成了事实标准">1. 为什么&quot;OpenAI 兼容&quot;成了事实标准<a class="anchor" href="#h-1-为什么openai-兼容成了事实标准" aria-label="本节链接">#</a></h4>
+<p>OpenAI 发布 ChatGPT 之后，它那套 HTTP API（尤其是 <code>/v1/chat/completions</code>）被海量应用和 SDK 抢先接入。后来几乎所有开源推理引擎——vLLM、SGLang、TGI、llama.cpp 的 server、Ollama——都选择<strong>实现同一套接口格式</strong>。这样做的收益是巨大的：</p>
+<ul>
+<li><strong>一次接入，处处可用</strong>：业务代码只写一个 OpenAI SDK 调用，把 <code>base_url</code> 换成自己的服务地址，就能在&quot;云厂商 API&quot;和&quot;自建 vLLM&quot;之间无缝切换；</li>
+<li><strong>生态复用</strong>：LangChain、LlamaIndex、AutoGen 以及各类 Agent 框架都内置了 OpenAI 兼容的 connector，你的服务不用做任何适配就能被它们调用；</li>
+<li><strong>减少心智负担</strong>：团队不需要为每个引擎学一套新协议。</li>
+</ul>
+<p>这里要区分两个概念：<strong>协议兼容</strong>（请求/响应的 JSON 字段长得一样）和<strong>语义兼容</strong>（每个参数的含义和取值范围一致）。大多数引擎做到的是前者 + 主要参数的后者，一些冷门采样参数（如 <code>presence_penalty</code>、<code>logit_bias</code>）可能被忽略或映射得不完全一致，接入时要留意。</p>
+<h4 id="h-2-核心接口chatcompletions">2. 核心接口：chat/completions<a class="anchor" href="#h-2-核心接口chatcompletions" aria-label="本节链接">#</a></h4>
+<p>自建服务的&quot;门面&quot;通常是下面几个端点（endpoint），挂在统一前缀 <code>/v1</code> 下：</p>
+<ul>
+<li><code>POST /v1/chat/completions</code>：对话补全，是今天的绝对主力。请求体带 <code>messages</code>（角色 + 内容列表），返回 <code>choices[0].message.content</code>；</li>
+<li><code>POST /v1/completions</code>：老式&quot;文本补全&quot;，只收一个 <code>prompt</code> 字符串，不带对话角色；</li>
+<li><code>GET /v1/models</code>：列出当前服务加载的模型名，前端和框架常靠它做健康探测。</li>
+</ul>
+<p>一次最小请求长什么样见下一节示例。响应里最关键的字段：</p>
+<ul>
+<li><code>choices[0].message.content</code>：模型回复正文；</li>
+<li><code>usage.prompt_tokens</code> / <code>usage.completion_tokens</code>：本次消耗的输入/输出 token 数——<strong>这是算成本、做限流、记日志的基础</strong>；</li>
+<li><code>finish_reason</code>：结束原因（<code>stop</code> 正常、<code>length</code> 被截断、<code>tool_calls</code> 要调用工具）。</li>
+</ul>
+<h4 id="h-3-流式输出streaming不是装饰是体验刚需">3. 流式输出（streaming）：不是装饰，是体验刚需<a class="anchor" href="#h-3-流式输出streaming不是装饰是体验刚需" aria-label="本节链接">#</a></h4>
+<p>把 <code>stream: true</code> 传进去，响应就不再是一个完整 JSON，而是<strong>一串以 <code>data:</code> 开头的 SSE（Server-Sent Events）分片</strong>，每个分片带 <code>choices[0].delta.content</code> 的增量文本，最后一条 <code>data: [DONE]</code> 收尾。</p>
+<p>为什么要流式？因为 LLM 是自回归的，第一个 token 到最后一个 token 之间可能隔几十秒。不流式，用户要盯着空白页面干等；流式则能做到&quot;首字即出&quot;（配合前面学过的 TTFT），体验天差地别。工程上流式也更好做<strong>取消</strong>——用户点停止，直接断开连接即可，省掉后续所有 token 的计算。</p>
+<h4 id="h-4-采样参数如何映射">4. 采样参数如何映射<a class="anchor" href="#h-4-采样参数如何映射" aria-label="本节链接">#</a></h4>
+<p>OpenAI 协议里的采样参数，在 vLLM 里会被翻译成自己的调度参数，常用的对应关系：</p>
+<table>
+<thead>
+<tr>
+<th>OpenAI 参数</th>
+<th>含义</th>
+<th>备注</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>temperature</code></td>
+<td>温度，越高越随机</td>
+<td>与 <code>top_p</code> 二选一或组合</td>
+</tr>
+<tr>
+<td><code>top_p</code></td>
+<td>核采样阈值</td>
+<td></td>
+</tr>
+<tr>
+<td><code>max_tokens</code></td>
+<td>输出上限（不含输入）</td>
+<td>也叫 <code>max_completion_tokens</code></td>
+</tr>
+<tr>
+<td><code>n</code></td>
+<td>采样几个候选</td>
+<td>对应 vLLM 的 best_of</td>
+</tr>
+<tr>
+<td><code>stop</code></td>
+<td>停止词</td>
+<td></td>
+</tr>
+</tbody></table>
+<p>注意 <code>max_tokens</code> 是<strong>输出</strong> token 上限，输入长度由模型上下文窗口与 <code>max_model_len</code> 决定。理解这一点对控制成本很关键：输出 token 比输入更贵，因为它要逐 token 解码。</p>
+<p><figure><img class="md-img" src="content/courses/llm-deployment-practice/assets/chapter-4-figure-01.svg" alt="OpenAI 兼容 API 分层架构图：左侧一排&quot;业务调用方&quot;（Python/Go/Node SDK、LangChain、Agent 框架），中间一条蓝色横带标注&quot;OpenAI 兼容协议：/v1/chat/completions、/v1/models、流式 SSE&quot;，右侧一个方块&quot;自建推理引擎 vLLM&quot;，左右箭头都指向中间协议带，底部一行字&quot;一次接入，处处可用&quot;" loading="lazy" decoding="async"><figcaption>OpenAI 兼容 API 分层架构图：左侧一排&quot;业务调用方&quot;（Python/Go/Node SDK、LangChain、Agent 框架），中间一条蓝色横带标注&quot;OpenAI 兼容协议：/v1/chat/completions、/v1/models、流式 SSE&quot;，右侧一个方块&quot;自建推理引擎 vLLM&quot;，左右箭头都指向中间协议带，底部一行字&quot;一次接入，处处可用&quot;</figcaption></figure>
+</p>
+<h3 id="h-二可运行示例">二、可运行示例<a class="anchor" href="#h-二可运行示例" aria-label="本节链接">#</a></h3>
+<h4 id="h-示例-1启动-vllm-的-openai-兼容服务">示例 1：启动 vLLM 的 OpenAI 兼容服务<a class="anchor" href="#h-示例-1启动-vllm-的-openai-兼容服务" aria-label="本节链接">#</a></h4>
+<pre data-lang="bash"><code class="language-bash"># 启动 vLLM，监听 8000 端口，暴露 OpenAI 兼容 API
+# --served-model-name 决定外部看到的模型名（可以和真实权重名不同）
+vllm serve meta-llama/Llama-3.1-8B-Instruct \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --served-model-name my-llama-8b</code></pre>
+<p>服务起来后，先看模型列表（健康探测）：</p>
+<pre data-lang="bash"><code class="language-bash">curl http://localhost:8000/v1/models
+# 返回 {&quot;object&quot;:&quot;list&quot;,&quot;data&quot;:[{&quot;id&quot;:&quot;my-llama-8b&quot;, ...}]}</code></pre>
+<h4 id="h-示例-2curl-发一次对话补全">示例 2：curl 发一次对话补全<a class="anchor" href="#h-示例-2curl-发一次对话补全" aria-label="本节链接">#</a></h4>
+<pre data-lang="bash"><code class="language-bash">curl http://localhost:8000/v1/chat/completions \
+  -H &quot;Content-Type: application/json&quot; \
+  -d &#39;{
+    &quot;model&quot;: &quot;my-llama-8b&quot;,
+    &quot;messages&quot;: [
+      {&quot;role&quot;: &quot;system&quot;, &quot;content&quot;: &quot;你是严谨的技术助手，回答要简洁。&quot;},
+      {&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;用一句话解释什么是 KV Cache。&quot;}
+    ],
+    &quot;temperature&quot;: 0.3,
+    &quot;max_tokens&quot;: 100
+  }&#39;</code></pre>
+<h4 id="h-示例-3用-openai-python-sdk-直连自建服务">示例 3：用 OpenAI Python SDK 直连自建服务<a class="anchor" href="#h-示例-3用-openai-python-sdk-直连自建服务" aria-label="本节链接">#</a></h4>
+<pre data-lang="python"><code class="language-python"># -*- coding: utf-8 -*-
+# 把官方 OpenAI SDK 的 base_url 指向自建 vLLM，代码零改动
+from openai import OpenAI
+
+client = OpenAI(
+    base_url=&quot;http://localhost:8000/v1&quot;,   # 关键：指向自己的服务
+    api_key=&quot;EMPTY&quot;,                        # 自建服务通常不校验 key，填占位即可
+)
+
+resp = client.chat.completions.create(
+    model=&quot;my-llama-8b&quot;,
+    messages=[
+        {&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;列出三种降低推理成本的方法。&quot;}
+    ],
+    temperature=0.2,
+    max_tokens=200,
+)
+print(resp.choices[0].message.content)
+print(&quot;输入 token:&quot;, resp.usage.prompt_tokens, &quot;输出 token:&quot;, resp.usage.completion_tokens)</code></pre>
+<h4 id="h-示例-4流式输出">示例 4：流式输出<a class="anchor" href="#h-示例-4流式输出" aria-label="本节链接">#</a></h4>
+<pre data-lang="python"><code class="language-python"># 流式读取：边生成边打印，模拟 ChatGPT 打字机效果
+from openai import OpenAI
+
+client = OpenAI(base_url=&quot;http://localhost:8000/v1&quot;, api_key=&quot;EMPTY&quot;)
+
+stream = client.chat.completions.create(
+    model=&quot;my-llama-8b&quot;,
+    messages=[{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;写一段 50 字左右的自我介绍。&quot;}],
+    stream=True,          # 开启流式
+)
+
+for chunk in stream:
+    delta = chunk.choices[0].delta
+    if delta.content is not None:   # 最后一个分片 content 为 None
+        print(delta.content, end=&quot;&quot;, flush=True)
+print()</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>把示例 2 的 <code>max_tokens</code> 改小到 10，观察 <code>finish_reason</code> 变成 <code>length</code>，说明&quot;被截断&quot;是怎么通过协议反馈给调用方的。</li>
+<li>用 <code>GET /v1/models</code> 确认服务可用后，写一个 Go 或 Node 的小脚本，用各自的 OpenAI SDK 连接同一服务，体会&quot;一次接入处处可用&quot;。</li>
+<li>给示例 3 加上 <code>stop=[&quot;。&quot;]</code>，对比加与不加时回复在哪里停住，理解 <code>stop</code> 参数的行为。</li>
+<li>思考：如果一个多租户平台要给不同客户暴露不同模型名，<code>--served-model-name</code> 能解决什么问题？它和真实权重目录名是什么关系？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>vLLM · OpenAI 兼容服务器：<a href="https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html" target="_blank" rel="noopener noreferrer">https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html</a></li>
+<li>OpenAI · Chat Completions API 参考：<a href="https://platform.openai.com/docs/api-reference/chat" target="_blank" rel="noopener noreferrer">https://platform.openai.com/docs/api-reference/chat</a></li>
+<li>OpenAI Python SDK 仓库：<a href="https://github.com/openai/openai-python" target="_blank" rel="noopener noreferrer">https://github.com/openai/openai-python</a></li>
+<li>vLLM · 服务启动参数说明：<a href="https://docs.vllm.ai/en/latest/serving/engine_args.html" target="_blank" rel="noopener noreferrer">https://docs.vllm.ai/en/latest/serving/engine_args.html</a></li>
+</ul>
+<p><a href="#/l/deploy-ch4-l2">下一课：Docker 与容器化</a></p>

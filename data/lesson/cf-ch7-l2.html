@@ -1,0 +1,227 @@
+<h2 id="h-从通用编译到-ml-编译为什么深度学习需要自己的编译器">从通用编译到 ML 编译：为什么深度学习需要自己的编译器<a class="anchor" href="#h-从通用编译到-ml-编译为什么深度学习需要自己的编译器" aria-label="本节链接">#</a></h2>
+<p>一个 512×512 矩阵乘，用 C 三重循环交给 <code>clang -O3</code>，与交给深度学习编译器，性能可以差出数倍；而逐元素算子链的瓶颈往往<strong>不在算，而在搬</strong>。本课把前六章的通用编译视角平移到计算图：哪些能复用，哪些必须重建，为什么&quot;融合&quot;是第一优化。</p>
+<p><figure><img class="md-img" src="content/courses/compiler-foundations/assets/chapter-7-figure-02.svg" alt="ML 编译器的位置：捕获计算图、图 IR 与张量语义、融合与布局优化、调度搜索、代码生成" loading="lazy" decoding="async"><figcaption>ML 编译器的位置：捕获计算图、图 IR 与张量语义、融合与布局优化、调度搜索、代码生成</figcaption></figure>
+</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-编译对象换了从变量--循环到张量--图">1. 编译对象换了：从&quot;变量 + 循环&quot;到&quot;张量 + 图&quot;<a class="anchor" href="#h-1-编译对象换了从变量--循环到张量--图" aria-label="本节链接">#</a></h4>
+<p>通用编译器编译语句与循环；ML 编译器编译框架 trace 出来的<strong>计算图</strong>——第 1 章的前端四步在这里变成&quot;捕获（capture）→ 图 IR&quot;。三个根本差异：</p>
+<ul>
+<li><strong>张量是一等公民</strong>：类型是 <code>(dtype, shape, layout)</code>，换个 layout 就是完全不同的性能。</li>
+<li><strong>算子粒度大</strong>：优化单位从&quot;指令&quot;变成&quot;算子与算子组&quot;。</li>
+<li><strong>程序动态生成</strong>：shape 与控制流到运行期才确定。</li>
+</ul>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>通用编译器</th>
+<th>ML 编译器</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>IR 单位</td>
+<td>指令 / 基本块 / 函数</td>
+<td>张量算子 / 数据流图</td>
+</tr>
+<tr>
+<td>类型系统</td>
+<td>标量类型 + 指针</td>
+<td>dtype + shape + layout</td>
+</tr>
+<tr>
+<td>首要优化</td>
+<td>减少指令数</td>
+<td>省访存与 kernel 启动</td>
+</tr>
+<tr>
+<td>关键搜索</td>
+<td>pass 顺序（固定管道）</td>
+<td>tile/unroll 等<strong>调度</strong></td>
+</tr>
+<tr>
+<td>正确性风险</td>
+<td>别名、UB、浮点重排</td>
+<td>数值等价、layout 语义、guard</td>
+</tr>
+</tbody></table>
+<h4 id="h-2-三个新代价">2. 三个新代价<a class="anchor" href="#h-2-三个新代价" aria-label="本节链接">#</a></h4>
+<p><strong>① 算子边界</strong>。每个算子至少一次 kernel 启动，中间张量还要落显存。设一条 k 个逐元素算子的链、张量 N 个 fp32 元素：不融合时每算子&quot;读 N + 写 N&quot;，共 <code>2k·N·4</code> 字节；融合成一个 kernel 后只&quot;读 1 + 写 1&quot; = <code>2·N·4</code> 字节——<strong>访存比恰好是 k</strong>，本课代码会打印这张表。</p>
+<p><strong>② 内存墙</strong>。逐元素算子算术强度极低，属于 memory-bound，&quot;省一次访存&quot;远比&quot;省一条指令&quot;值钱。这与第 6 章的延迟隐藏同类，只是尺度换成了 HBM 带宽。</p>
+<p><strong>③ 动态形状</strong>。shape 是运行期才知道的值，编译器只能先假设再验证，失败就重编译（guard + 编译缓存）。通用编译器&quot;类型在编译期已知&quot;的前提，在 ML 里变成工程要保证的运行时契约。此外 <strong>layout 变换与传播</strong>（NCHW↔NHWC、matmul 分块）也是图级 pass 的日常。</p>
+<h4 id="h-3-头号优化是融合不是常量折叠">3. 头号优化是融合，不是常量折叠<a class="anchor" href="#h-3-头号优化是融合不是常量折叠" aria-label="本节链接">#</a></h4>
+<p>融合是通用编译器里<strong>循环融合</strong>（loop fusion）的图级形态（龙书第 9 章归入机器无关优化），收益有三处：省中间张量的写回与重读、省 kernel 启动、让中间值留在寄存器里复用。但融合需要<strong>边界</strong>：</p>
+<ul>
+<li>一个结果被<strong>多个</strong>消费者使用就必须落盘，链在此断开（本课代码里 <code>t2</code> 有两条消费者，6 个算子只能压成 3 组）。</li>
+<li>归约链与逐元素点链的融合规则不同，跨 reduce 往往要落盘。</li>
+<li>融合不是越多越好：寄存器压力升高会压低 occupancy，必须用 profiler 回归。</li>
+</ul>
+<h4 id="h-4-调度与自动调优通用编译器不做的事">4. 调度与自动调优：通用编译器不做的事<a class="anchor" href="#h-4-调度与自动调优通用编译器不做的事" aria-label="本节链接">#</a></h4>
+<p>同一个 matmul 数学描述唯一，但&quot;怎么算&quot;选择很多：分块多大、向量化多宽、是否展开、如何并行。TVM 的核心贡献是<strong>算法与调度分离</strong>：算子描述与 schedule 分开写，调度空间交给搜索与代价模型。通用编译器不做这种搜索——pass 管道固定、面向&quot;平均程序&quot;；ML 编译器面对的却是少数占满运行时的热点算子，值得花编译时间去搜。代价是搜索预算与可复现性。</p>
+<h4 id="h-5-哪些能复用哪些必须重建">5. 哪些能复用，哪些必须重建<a class="anchor" href="#h-5-哪些能复用哪些必须重建" aria-label="本节链接">#</a></h4>
+<p><strong>复用</strong>（前六章成果）：SSA 与数据流分析、常量折叠/DCE/CSE、内联、循环变换与向量化、寄存器分配、指令调度、机器码生成。<strong>重建</strong>：图 IR 与张量语义、图级 pass 基础设施、算子分解与融合、调度空间与代价模型、内存规划、动态形状 guard。MLIR 把降级组织成可扩展的多层 dialect，通用编译器退居为最底层后端之一——所以再学 ML 编译器很顺：语言变了，<strong>IR + 优化正确性 + 后端</strong>没变。</p>
+<h4 id="h-6-常见坑">6. 常见坑<a class="anchor" href="#h-6-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>把图优化当&quot;无害&quot;</strong>：浮点加法不满足结合律，NaN/Inf 会破坏重排的等价性；第 5 章的正确性纪律照旧适用。</li>
+<li><strong>认为&quot;融合一定更快&quot;</strong>：寄存器压力、occupancy、归约维度的并行度都可能让它变慢。</li>
+<li><strong>把动态 shape 当静态</strong>：guard 频繁失败会造成重编译风暴。</li>
+<li><strong>只算运行期收益不算编译成本</strong>：搜索时间要进总账。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面这段纯 Python 把上面的代价模型量化：一个 6 算子的小图，用&quot;不融合&quot;和&quot;融合&quot;两条路径执行，逐元素核对一致，再统计 kernel 次数与访存量，并外推到 N=10⁶/10⁸。</p>
+<pre data-lang="python"><code class="language-python"># ---- 算子边界为什么贵：同一个算子链，不融合 vs 融合（纯 Python，无第三方依赖）----
+import struct
+
+N = 8        # 实际执行用的元素个数（小规模，逐元素核对数值）
+K = 5        # 链上算子个数，用于按模型推算访存量
+
+def f32(v):
+    &quot;&quot;&quot;把 Python float 截成 fp32，模拟真实张量的精度&quot;&quot;&quot;
+    return struct.unpack(&#39;f&#39;, struct.pack(&#39;f&#39;, v))[0]
+
+OPS = {   # 逐元素算子：arity=1 -&gt; 一元，2 -&gt; 二元
+    &#39;mul&#39;:  (2, lambda a, b: f32(a * b)),
+    &#39;add&#39;:  (2, lambda a, b: f32(a + b)),
+    &#39;sub&#39;:  (2, lambda a, b: f32(a - b)),
+    &#39;relu&#39;: (1, lambda a: f32(a if a &gt; 0 else 0.0)),
+    &#39;sigmoid&#39;: (1, lambda a: f32(1.0 / (1.0 + pow(2.718281828459045, -a)))),
+}
+
+# 计算图（拓扑序）：relu(x*a+b) 有两条消费者，链在那里被迫断成两个 kernel
+graph = [
+    (&#39;t1&#39;, &#39;mul&#39;,  [&#39;x&#39;, &#39;a&#39;]),
+    (&#39;t2&#39;, &#39;add&#39;,  [&#39;t1&#39;, &#39;b&#39;]),
+    (&#39;t3&#39;, &#39;relu&#39;, [&#39;t2&#39;]),
+    (&#39;t4&#39;, &#39;mul&#39;,  [&#39;t3&#39;, &#39;c&#39;]),
+    (&#39;y&#39;,  &#39;add&#39;,  [&#39;t4&#39;, &#39;d&#39;]),
+    (&#39;y2&#39;, &#39;mul&#39;,  [&#39;t2&#39;, &#39;e&#39;]),          # t2 的第二个消费者 → 融合边界
+]
+
+inputs = {&#39;x&#39;: [f32(v / 2 - 2) for v in range(N)],   # 数组输入
+          &#39;a&#39;: 1.5, &#39;b&#39;: -0.5, &#39;c&#39;: 2.0, &#39;d&#39;: 0.25, &#39;e&#39;: 0.5} # 标量输入（广播）
+
+def elem(name, i, env):
+    v = env[name]
+    return v[i] if isinstance(v, list) else v
+
+def run_unfused(graph, env, n):
+    &quot;&quot;&quot;朴素执行：每个算子一个 kernel，输入输出都要落一遍显存&quot;&quot;&quot;
+    env, launches, bytes_moved = dict(env), 0, 0
+    for out, op, ins in graph:
+        arity, fn = OPS[op]
+        assert len(ins) == arity, f&#39;{op} 需要 {arity} 个输入，收到 {len(ins)} 个&#39;
+        vals = [fn(*[elem(k, i, env) for k in ins]) for i in range(n)]
+        env[out] = vals
+        launches += 1
+        bytes_moved += (len(ins) * n + n) * 4      # 读 n 个输入元素 + 写 n 个输出元素（fp32）
+    return env, launches, bytes_moved
+
+def fusion_groups(graph):
+    &quot;&quot;&quot;融合 pass：把「只被一个后继消费」的逐元素算子串成一组，一组 = 一个 kernel&quot;&quot;&quot;
+    consumers = {}
+    for out, op, ins in graph:
+        for k in ins:
+            consumers.setdefault(k, []).append(out)
+    groups, cur = [], []
+    for out, op, ins in graph:
+        if cur and consumers.get(cur[-1][0], []) != [out]:
+            groups.append(cur); cur = []          # 上一个结果有别的消费者 → 必须落盘，链断
+        cur.append((out, op, ins))
+    if cur:
+        groups.append(cur)
+    return groups
+
+def run_fused(groups, env, n):
+    &quot;&quot;&quot;融合执行：一组内所有中间值留在寄存器（这里的局部变量），只有输入输出走显存&quot;&quot;&quot;
+    env, launches, bytes_moved = dict(env), 0, 0
+    for g in groups:
+        ext = sorted({k for _, _, ins in g for k in ins if k not in {o for o, _, _ in g}})
+        for i in range(n):
+            reg = {k: elem(k, i, env) for k in ext}      # 外部输入读一次
+            for out, op, ins in g:
+                arity, fn = OPS[op]
+                assert len(ins) == arity, f&#39;{op} 需要 {arity} 个输入&#39;
+                reg[out] = fn(*[reg[k] for k in ins])    # 中间结果只在寄存器里
+            env.setdefault(g[-1][0], [0.0] * n)[i] = reg[g[-1][0]]
+        launches += 1
+        bytes_moved += (len(ext) * n + n) * 4
+    return env, launches, bytes_moved
+
+env_u, launches_u, bytes_u = run_unfused(graph, inputs, N)
+groups = fusion_groups(graph)
+env_f, launches_f, bytes_f = run_fused(groups, inputs, N)
+
+print(&#39;计算图（拓扑序）：&#39;)
+for out, op, ins in graph:
+    print(f&#39;  {out} = {op}({&quot;, &quot;.join(ins)})&#39;)
+print(&#39;\n融合 pass 输出（每组 = 一个 kernel）：&#39;)
+for gi, g in enumerate(groups, 1):
+    print(f&#39;  组 {gi}: &#39; + &#39; → &#39;.join(f&#39;{o}={op}&#39; for o, op, _ in g))
+
+print(f&#39;\n--- N={N} 逐元素核对 ---&#39;)
+print(&#39;x  =&#39;, [round(v, 3) for v in inputs[&quot;x&quot;]])
+print(&#39;不融合 y =&#39;, [round(v, 6) for v in env_u[&#39;y&#39;]])
+print(&#39;融合   y =&#39;, [round(v, 6) for v in env_f[&#39;y&#39;]])
+diff = max(max(abs(a - b) for a, b in zip(env_u[o], env_f[o])) for o in (&#39;y&#39;, &#39;y2&#39;))
+print(f&#39;逐元素最大差 = {diff}   （两条路径执行同一串算子，结果必须逐位相同）&#39;)
+print(f&#39;本图实际开销：不融合 {launches_u} 次 kernel / 访存 {bytes_u} 字节；&#39;
+      f&#39;融合 {launches_f} 次 / 访存 {bytes_f} 字节&#39;)
+
+print(&#39;\n--- 算子边界代价（模型推算：fp32、逐元素链、标量为标量输入不占访存）---&#39;)
+print(f&#39;{&quot;链长 k&quot;:&gt;6} {&quot;不融合访存&quot;:&gt;12} {&quot;融合访存&quot;:&gt;10} {&quot;访存比&quot;:&gt;7} {&quot;kernel 次数&quot;:&gt;11}&#39;)
+for k in (2, 5, 10, 20):
+    unfused = 2 * k * 4      # 每算子：读 1 个向量 + 写 1 个向量
+    fused = 2 * 4            # 融合后：读 1 个 + 写 1 个
+    print(f&#39;{k:&gt;6} {unfused:&gt;9} B/元素 {fused:&gt;7} B/元素 {unfused/fused:&gt;6.1f}x {k:&gt;9} → 1&#39;)
+
+print(f&#39;\n{&quot;N（元素）&quot;:&gt;14} {&quot;不融合&quot;:&gt;12} {&quot;融合&quot;:&gt;10} {&quot;省下&quot;:&gt;10}&#39;)
+for n in (10 ** 3, 10 ** 6, 10 ** 8):
+    u, f = 2 * K * n * 4, 8 * n
+    print(f&#39;{n:&gt;14,} {u/2**20:&gt;9.2f} MiB {f/2**20:&gt;7.2f} MiB {(u-f)/2**20:&gt;7.2f} MiB&#39;)</code></pre>
+<p>运行 <code>python3 fusion_demo.py</code> 的真实输出：</p>
+<pre><code>计算图（拓扑序）：
+  t1 = mul(x, a)
+  t2 = add(t1, b)
+  t3 = relu(t2)
+  t4 = mul(t3, c)
+  y = add(t4, d)
+  y2 = mul(t2, e)
+
+融合 pass 输出（每组 = 一个 kernel）：
+  组 1: t1=mul → t2=add
+  组 2: t3=relu → t4=mul → y=add
+  组 3: y2=mul
+
+--- N=8 逐元素核对 ---
+x  = [-2.0, -1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5]
+不融合 y = [0.25, 0.25, 0.25, 0.25, 0.25, 0.75, 2.25, 3.75]
+融合   y = [0.25, 0.25, 0.25, 0.25, 0.25, 0.75, 2.25, 3.75]
+逐元素最大差 = 0.0   （两条路径执行同一串算子，结果必须逐位相同）
+本图实际开销：不融合 6 次 kernel / 访存 544 字节；融合 3 次 / 访存 352 字节
+
+--- 算子边界代价（模型推算：fp32、逐元素链、标量为标量输入不占访存）---
+  链长 k        不融合访存       融合访存     访存比   kernel 次数
+     2        16 B/元素       8 B/元素    2.0x         2 → 1
+     5        40 B/元素       8 B/元素    5.0x         5 → 1
+    10        80 B/元素       8 B/元素   10.0x        10 → 1
+    20       160 B/元素       8 B/元素   20.0x        20 → 1
+
+         N（元素）          不融合         融合         省下
+         1,000      0.04 MiB    0.01 MiB    0.03 MiB
+     1,000,000     38.15 MiB    7.63 MiB   30.52 MiB
+   100,000,000   3814.70 MiB  762.94 MiB 3051.76 MiB</code></pre>
+<p>三个结论：① 两条路径逐元素最大差是 <strong>0.0</strong>——融合只改搬运方式，数值必须一致，这是融合 pass 的验收条件；② 因为 <code>t2</code> 有两个消费者，6 个算子只压成 <strong>3 组</strong>，访存从 544 字节降到 352 字节；③ 纯链模型下访存比等于链长 k，N=10⁶、k=5 时融合省下约 <strong>30.5 MiB</strong> 访存（模型推算，非实测带宽）。这和第 4 章是同一件事的两个尺度：<code>fusion_groups</code> 找&quot;只被一个后继消费&quot;的链，等价于在 CFG 上找可合并的基本块。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：把 <code>fusion_groups</code> 改成&quot;允许跨分支融合&quot;：当 <code>t2</code> 的两个消费者能放进同一组时就不必断链（提示：分组依据从&quot;单个后继&quot;改成&quot;后继集合是否完整落在同组&quot;）。验证分组数与访存量都下降。</li>
+<li><strong>解释</strong>：为什么&quot;访存比 = k&quot;只在 memory-bound 的逐元素链上成立？对 matmul 这类算子，融合的主要收益变成什么？</li>
+<li><strong>对比/验证</strong>：把 <code>K</code> 改成 20，算 N=10⁶ 时融合省下的访存量，并换算成&quot;少读多少倍输入张量&quot;；解释该比值为什么与 N 无关。</li>
+<li><strong>思考</strong>：自动调优把编译时间当成本。&quot;模型每天推理 10⁹ 次、长期上线&quot;与&quot;每次请求都重新编译&quot;两种场景，你会怎么分配搜索预算？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Chen et al., <em>TVM: An Automated End-to-End Optimizing Compiler for Deep Learning</em>（OSDI&#39;18：图 IR、算法与调度分离）：<a href="https://www.usenix.org/conference/osdi18/presentation/chen" target="_blank" rel="noopener noreferrer">https://www.usenix.org/conference/osdi18/presentation/chen</a></li>
+<li>MLIR 官方文档（多层 dialect 与渐进式降级）：<a href="https://mlir.llvm.org/" target="_blank" rel="noopener noreferrer">https://mlir.llvm.org/</a></li>
+<li><em>The Deep Learning Compiler: A Comprehensive Survey</em>（arXiv 2002.03794：图 IR、融合、调度、后端分类）：<a href="https://arxiv.org/abs/2002.03794" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2002.03794</a></li>
+<li>PyTorch 官方文档 <code>torch.compile</code> / TorchInductor（框架里图捕获与代码生成的落地形态）：<a href="https://pytorch.org/docs/stable/torch.compiler.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/docs/stable/torch.compiler.html</a></li>
+</ul>
+<p><a href="#/l/cf-ch7-l3">下一课：项目：实现一个能编译小型语言并正确运行全部用例的编译器</a></p>

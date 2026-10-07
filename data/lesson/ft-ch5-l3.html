@@ -1,0 +1,70 @@
+<h2 id="h-评估">评估<a class="anchor" href="#h-评估" aria-label="本节链接">#</a></h2>
+<p>微调完的模型到底变好了还是变坏了？这是每个实践者最关心、也最容易自欺的问题。因为 LLM 的生成任务是<strong>开放式的</strong>，没有一个&quot;标准答案&quot;可以直接算准确率，所以评估远比分类任务复杂。这一课我们建立一套务实的评估框架：从&quot;它说得多像参考答案&quot;的自动指标，到&quot;它答得对不对&quot;的基准评测，再到&quot;人类觉得好不好&quot;的判断——并强调那个最容易被忽略的问题：<strong>别只看分数，要看它和基座相比有没有真的变强、有没有变傻</strong>。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-为什么-llm-评估难">1. 为什么 LLM 评估难<a class="anchor" href="#h-1-为什么-llm-评估难" aria-label="本节链接">#</a></h4>
+<p>分类任务有唯一标签，算个准确率就完事；但&quot;把这句话翻译成英文&quot;可以有无穷多种正确说法。用 <code>BLEU</code>、<code>ROUGE</code> 这类<strong>基于 n-gram 重叠</strong>的指标去卡生成文本，会把&quot;同样正确但措辞不同&quot;的回答判为低分。所以评估 LLM 要<strong>多指标、多角度</strong>，没有单一银弹。</p>
+<h4 id="h-2-三大类指标">2. 三大类指标<a class="anchor" href="#h-2-三大类指标" aria-label="本节链接">#</a></h4>
+<p><strong>① 困惑度（Perplexity, PPL）</strong>：衡量模型对一段文本&quot;有多不惊讶&quot;。PPL 越低，说明模型认为这段文本越&quot;自然&quot;。它适合在<strong>验证集</strong>上快速比较训练前后的语言建模能力，但它只反映&quot;流畅/拟合&quot;，不反映&quot;回答得对不对&quot;。</p>
+<p><strong>② 重叠类指标（ROUGE / BLEU）</strong>：把生成结果和<strong>参考答案</strong>做词/子串层面的重叠比较。ROUGE-L 看最长公共子序列，对摘要、问答这类&quot;有参考答案&quot;的场景有一定参考价值；但对开放性回答会严重低估质量。适合&quot;有黄金答案&quot;的窄任务。</p>
+<p><strong>③ 偏好/正确性评测（LLM-as-judge、基准集）</strong>：让一个更强的模型（如 GPT-4）当&quot;裁判&quot;，对回答打分或做对比；或者在一批<strong>标准基准</strong>上做题——MMLU（知识问答）、MT-Bench（多轮对话）、AlpacaEval（偏好胜率）、HumanEval（代码）。这类评测更贴近&quot;好不好用&quot;，是当前社区的主流做法。</p>
+<p><figure><img class="md-img" src="content/courses/llm-fine-tuning/assets/chapter-5-figure-03.svg" alt="LLM 评估的三类方法：困惑度 / 重叠指标 / 基准与裁判" loading="lazy" decoding="async"><figcaption>LLM 评估的三类方法：困惑度 / 重叠指标 / 基准与裁判</figcaption></figure>
+</p>
+<h4 id="h-3-最关键的评估原则和基座对比">3. 最关键的评估原则：和基座对比<a class="anchor" href="#h-3-最关键的评估原则和基座对比" aria-label="本节链接">#</a></h4>
+<p>一个微调模型在基准上拿了 60 分，不代表微调成功——<strong>如果基座本来就能拿 62 分，说明这次微调反而有害</strong>。评估 SFT 的标准动作是：</p>
+<ol>
+<li><strong>同题同参</strong>：基座和微调模型用完全相同的 prompt、解码参数跑同一批题；</li>
+<li><strong>看增量</strong>：比较两者分数差，而不是孤立看绝对分；</li>
+<li><strong>防退化</strong>：检查模型是否&quot;过拟合到指令而忘了通用能力&quot;（在通用能力集上是否掉分）；</li>
+<li><strong>留出集</strong>：数据上一定要切一块<strong>从未参与训练</strong>的验证集，训练集上的分数只能证明&quot;背下来了&quot;。</li>
+</ol>
+<h4 id="h-4-评估的工程落地">4. 评估的工程落地<a class="anchor" href="#h-4-评估的工程落地" aria-label="本节链接">#</a></h4>
+<p>评估要自动化、可复现：固定随机种子、固定 <code>temperature</code>（对比正确性时建议用贪心解码）、固定 prompt 模板，把评测脚本纳入 CI。用 <code>lm-evaluation-harness</code>（EleutherAI）可以一键跑 MMLU 等主流基准，省去自己写评测循环。</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面演示两件最小可用的事：计算验证集的<strong>困惑度</strong>，以及用 <strong>ROUGE-L</strong> 对&quot;有参考答案&quot;的摘要任务打分。依赖 <code>transformers</code>、<code>rouge_score</code>（或 <code>evaluate</code>）。</p>
+<pre data-lang="python"><code class="language-python">import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from rouge_score import rouge_scorer
+
+model_id = &quot;gpt2&quot;
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+tokenizer.pad_token = tokenizer.eos_token
+model = AutoModelForCausalLM.from_pretrained(model_id)
+
+# 1) 困惑度：对一段验证文本，算模型&quot;平均每个 token 有多惊讶&quot;
+texts = [
+    &quot;人工智能正在改变世界。&quot;,
+    &quot;大语言模型的微调方法有很多种。&quot;,
+]
+enc = tokenizer(texts, return_tensors=&quot;pt&quot;, padding=True, truncation=True)
+with torch.no_grad():
+    out = model(**enc, labels=enc[&quot;input_ids&quot;])
+    # 语言模型自带 loss = 平均交叉熵；困惑度 = exp(loss)
+    ppl = torch.exp(out.loss).item()
+print(f&quot;验证集困惑度（PPL）：{ppl:.2f}&quot;)
+
+# 2) ROUGE-L：对有参考答案的任务打分
+scorer = rouge_scorer.RougeScorer([&quot;rougeL&quot;], use_stemmer=True)
+reference = &quot;大语言模型可以通过 LoRA 进行高效微调。&quot;
+candidate = &quot;LoRA 是一种大语言模型的高效微调方法。&quot;  # 措辞不同但意思相近
+scores = scorer.score(reference, candidate)
+print(f&quot;ROUGE-L：{scores[&#39;rougeL&#39;]}&quot;)</code></pre>
+<p>运行后你会看到：<code>gpt2</code> 在这两句话上的 PPL 是一个具体数值（越小越好）；而 ROUGE-L 的 <code>fmeasure</code> 通常不高——因为候选句和参考句措辞差异大，尽管意思接近。这正印证了本课的核心观点：<strong>重叠指标会低估开放生成的质量</strong>，所以它只适合&quot;有标准答案&quot;的窄任务，开放对话还得靠基准和裁判。</p>
+<blockquote>
+<p>提示：若要跑 MMLU 等标准基准，推荐直接使用 EleutherAI 的 <code>lm-evaluation-harness</code>，一条命令即可：<code>lm_eval --model hf --model_args pretrained=&lt;model&gt; --tasks mmlu --num_fewshot 5</code>。</p>
+</blockquote>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>用上面 PPL 代码，分别测基座模型和你微调后的模型在<strong>同一批</strong>验证文本上的 PPL，比较两者大小；再想一想：PPL 更低，是否一定代表&quot;更会回答&quot;？为什么？</li>
+<li>把 ROUGE 示例里的 <code>candidate</code> 改成与 <code>reference</code> 几乎逐字相同的句子，观察 <code>fmeasure</code> 的跳升，体会重叠指标&quot;偏爱字面相同&quot;的偏置。</li>
+<li>安装并跑一次 <code>lm-evaluation-harness</code> 的 <code>mmlu</code> 任务（可只跑 <code>mmlu</code> 的一两个子集），记录分数，思考 5-shot 的 few-shot 提示对分数的影响。</li>
+<li>设计一个&quot;防退化&quot;小实验：准备 10 条通用能力题（如简单算术、常识问答），分别让基座和微调模型回答，人工比较——判断你的微调是否损害了通用能力。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>EleutherAI · lm-evaluation-harness：<a href="https://github.com/EleutherAI/lm-evaluation-harness" target="_blank" rel="noopener noreferrer">https://github.com/EleutherAI/lm-evaluation-harness</a></li>
+<li>ROUGE 指标说明（Hugging Face evaluate）：<a href="https://huggingface.co/spaces/evaluate-metric/rouge" target="_blank" rel="noopener noreferrer">https://huggingface.co/spaces/evaluate-metric/rouge</a></li>
+<li>MMLU 基准（Hendrycks 等，2021）：<a href="https://arxiv.org/abs/2009.03300" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2009.03300</a></li>
+<li>MT-Bench 与 LLM-as-a-Judge（Zheng 等，2023）：<a href="https://arxiv.org/abs/2306.05685" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2306.05685</a></li>
+<li>AlpacaEval：<a href="https://github.com/tatsu-lab/alpaca_eval" target="_blank" rel="noopener noreferrer">https://github.com/tatsu-lab/alpaca_eval</a></li>
+</ul>
+<p><a href="#/l/ft-ch6-l1">下一课：用 Hugging Face 微调</a></p>

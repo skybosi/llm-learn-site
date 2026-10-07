@@ -1,0 +1,270 @@
+<h2 id="h-核心实现">核心实现<a class="anchor" href="#h-核心实现" aria-label="本节链接">#</a></h2>
+<p>上一课定好了方向与骨架，这一课把&quot;需求 → 数据 → 模型 → 部署 → 上线&quot;完整实现出来。以<strong>方向 A（私有知识库 RAG 助手）</strong>为主线，逐文件给出可运行代码；每个文件都对应&quot;端到端&quot;里的一个环节。做完这一课，你就拥有了一个真正能问答、能部署、能展示的完整产品。</p>
+<h3 id="h-一目标与步骤">一、目标与步骤<a class="anchor" href="#h-一目标与步骤" aria-label="本节链接">#</a></h3>
+<p>本课按数据流推进，每一步都有明确产出：</p>
+<table>
+<thead>
+<tr>
+<th>步骤</th>
+<th>环节</th>
+<th>产出</th>
+<th>对应文件</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1</td>
+<td>数据</td>
+<td>文档解析 + 切块</td>
+<td><code>src/ingest.py</code></td>
+</tr>
+<tr>
+<td>2</td>
+<td>模型</td>
+<td>向量化入库 + 检索</td>
+<td><code>src/ingest.py</code> + <code>src/retrieve.py</code></td>
+</tr>
+<tr>
+<td>3</td>
+<td>模型</td>
+<td>RAG 生成（接 vLLM）</td>
+<td><code>src/rag.py</code></td>
+</tr>
+<tr>
+<td>4</td>
+<td>部署</td>
+<td>FastAPI 服务化</td>
+<td><code>src/serve.py</code></td>
+</tr>
+<tr>
+<td>5</td>
+<td>上线</td>
+<td>Docker 容器化 + 前端</td>
+<td><code>Dockerfile</code> + <code>web/index.html</code></td>
+</tr>
+</tbody></table>
+<h3 id="h-二实现指导与代码骨架">二、实现指导与代码骨架<a class="anchor" href="#h-二实现指导与代码骨架" aria-label="本节链接">#</a></h3>
+<h4 id="h-步骤-1文档解析与切块srcingestpy">步骤 1：文档解析与切块（<code>src/ingest.py</code>）<a class="anchor" href="#h-步骤-1文档解析与切块srcingestpy" aria-label="本节链接">#</a></h4>
+<p>把 <code>data/</code> 下的 PDF/Markdown 变成结构化&quot;文档块&quot;，并向量化入库。</p>
+<pre data-lang="python"><code class="language-python"># -*- coding: utf-8 -*-
+# ingest.py —— 解析文档 → 切块 → 向量化 → 写入 Chroma
+import os
+import chromadb
+from chromadb.utils import embedding_functions
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+import fitz  # PyMuPDF，解析 PDF
+
+DATA_DIR = &quot;data&quot;
+
+def read_pdf(path: str) -&gt; str:
+    &quot;&quot;&quot;读取一个 PDF 的全文（纯文本抽取）。&quot;&quot;&quot;
+    doc = fitz.open(path)
+    return &quot;\n&quot;.join(page.get_text() for page in doc)
+
+def read_text(path: str) -&gt; str:
+    &quot;&quot;&quot;读取 txt/md 文件。&quot;&quot;&quot;
+    with open(path, encoding=&quot;utf-8&quot;) as f:
+        return f.read()
+
+def load_documents() -&gt; list[tuple[str, str]]:
+    &quot;&quot;&quot;返回 [(来源文件名, 文本内容), ...]。&quot;&quot;&quot;
+    docs = []
+    for name in os.listdir(DATA_DIR):
+        p = os.path.join(DATA_DIR, name)
+        if name.lower().endswith(&quot;.pdf&quot;):
+            docs.append((name, read_pdf(p)))
+        elif name.lower().endswith((&quot;.txt&quot;, &quot;.md&quot;)):
+            docs.append((name, read_text(p)))
+    return docs
+
+def chunk_text(text: str, chunk_size: int = 512, overlap: int = 64) -&gt; list[str]:
+    &quot;&quot;&quot;按字符滑窗切块：块 512 字符、重叠 64，保证上下文不丢。&quot;&quot;&quot;
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size, chunk_overlap=overlap,
+        separators=[&quot;\n\n&quot;, &quot;\n&quot;, &quot;。&quot;, &quot;！&quot;, &quot;？&quot;, &quot; &quot;, &quot;&quot;],
+    )
+    return splitter.split_text(text)
+
+def main():
+    ef = embedding_functions.SentenceTransformerEmbeddingFunction(
+        model_name=&quot;BAAI/bge-small-zh-v1.5&quot;
+    )
+    client = chromadb.PersistentClient(path=&quot;./chroma_db&quot;)
+    col = client.get_or_create_collection(&quot;docs&quot;, embedding_function=ef)
+
+    ids, documents, metadatas = [], [], []
+    for fname, text in load_documents():
+        for i, chunk in enumerate(chunk_text(text)):
+            ids.append(f&quot;{fname}#{i}&quot;)
+            documents.append(chunk)
+            metadatas.append({&quot;source&quot;: fname, &quot;chunk&quot;: i})
+    col.upsert(ids=ids, documents=documents, metadatas=metadatas)
+    print(f&quot;入库完成：共 {len(ids)} 个文档块&quot;)
+
+if __name__ == &quot;__main__&quot;:
+    main()</code></pre>
+<h4 id="h-步骤-2检索srcretrievepy">步骤 2：检索（<code>src/retrieve.py</code>）<a class="anchor" href="#h-步骤-2检索srcretrievepy" aria-label="本节链接">#</a></h4>
+<p>根据问题，从向量库里召回 top-k 个最相关的文档块，<strong>并带上来源</strong>（RAG 的&quot;引用&quot;就是从这里来的）。</p>
+<pre data-lang="python"><code class="language-python"># -*- coding: utf-8 -*-
+# retrieve.py —— 语义检索 top-k 相关块，返回内容 + 来源
+import chromadb
+from chromadb.utils import embedding_functions
+
+def get_collection():
+    ef = embedding_functions.SentenceTransformerEmbeddingFunction(
+        model_name=&quot;BAAI/bge-small-zh-v1.5&quot;
+    )
+    client = chromadb.PersistentClient(path=&quot;./chroma_db&quot;)
+    return client.get_collection(&quot;docs&quot;, embedding_function=ef)
+
+def retrieve(query: str, top_k: int = 4) -&gt; list[dict]:
+    &quot;&quot;&quot;返回 [{&quot;text&quot;:..., &quot;source&quot;:...}, ...]，按相关度排序。&quot;&quot;&quot;
+    col = get_collection()
+    res = col.query(query_texts=[query], n_results=top_k)
+    hits = []
+    for doc, meta, dist in zip(res[&quot;documents&quot;][0],
+                               res[&quot;metadatas&quot;][0],
+                               res[&quot;distances&quot;][0]):
+        hits.append({&quot;text&quot;: doc, &quot;source&quot;: meta.get(&quot;source&quot;, &quot;?&quot;),
+                     &quot;distance&quot;: dist})
+    return hits</code></pre>
+<h4 id="h-步骤-3rag-生成srcragpy">步骤 3：RAG 生成（<code>src/rag.py</code>）<a class="anchor" href="#h-步骤-3rag-生成srcragpy" aria-label="本节链接">#</a></h4>
+<p>把检索到的段落拼进 prompt，调用 P10 部署好的 vLLM 服务生成回答，并要求<strong>引用来源</strong>。</p>
+<pre data-lang="python"><code class="language-python"># -*- coding: utf-8 -*-
+# rag.py —— 拼 prompt 调 LLM 生成带引用的回答
+from openai import OpenAI
+from retrieve import retrieve
+
+# P10 部署的 vLLM 服务（OpenAI 兼容接口），复用前一章的成果
+client = OpenAI(base_url=&quot;http://localhost:8000/v1&quot;, api_key=&quot;EMPTY&quot;)
+MODEL = &quot;Qwen/Qwen2.5-7B-Instruct&quot;
+
+SYSTEM = (
+    &quot;你是一个知识库问答助手。请只根据下面提供的资料回答问题；&quot;
+    &quot;如果资料不足以回答，请明确说&#39;资料中没有相关信息&#39;，不要编造。&quot;
+    &quot;回答末尾用 [来源：文件名] 标注你引用了哪些资料。&quot;
+)
+
+def build_prompt(query: str, hits: list[dict]) -&gt; str:
+    context = &quot;\n\n&quot;.join(
+        f&quot;[{h[&#39;source&#39;]}]\n{h[&#39;text&#39;]}&quot; for h in hits
+    )
+    return f&quot;资料：\n{context}\n\n问题：{query}\n回答：&quot;
+
+def answer(query: str, top_k: int = 4) -&gt; str:
+    hits = retrieve(query, top_k=top_k)
+    user = build_prompt(query, hits)
+    resp = client.chat.completions.create(
+        model=MODEL,
+        messages=[{&quot;role&quot;: &quot;system&quot;, &quot;content&quot;: SYSTEM},
+                  {&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: user}],
+        temperature=0.1,          # 低温度，追求稳定、少胡编
+        max_tokens=256,
+    )
+    return resp.choices[0].message.content
+
+if __name__ == &quot;__main__&quot;:
+    while True:
+        q = input(&quot;问题（q 退出）：&quot;).strip()
+        if q == &quot;q&quot;:
+            break
+        print(answer(q))</code></pre>
+<h4 id="h-步骤-4服务化srcservepy">步骤 4：服务化（<code>src/serve.py</code>）<a class="anchor" href="#h-步骤-4服务化srcservepy" aria-label="本节链接">#</a></h4>
+<p>用 FastAPI 把 <code>rag.answer</code> 包成 HTTP 接口，返回答案 + 引用来源，前端可调用。</p>
+<pre data-lang="python"><code class="language-python"># -*- coding: utf-8 -*-
+# serve.py —— FastAPI 服务：POST /ask 返回答案与引用
+from fastapi import FastAPI
+from pydantic import BaseModel
+from rag import answer
+from retrieve import retrieve
+
+app = FastAPI(title=&quot;知识库助手&quot;)
+
+class AskReq(BaseModel):
+    question: str
+
+@app.post(&quot;/ask&quot;)
+def ask(req: AskReq):
+    hits = retrieve(req.question, top_k=4)
+    reply = answer(req.question)
+    return {
+        &quot;question&quot;: req.question,
+        &quot;answer&quot;: reply,
+        &quot;sources&quot;: [{&quot;source&quot;: h[&quot;source&quot;], &quot;snippet&quot;: h[&quot;text&quot;][:80]}
+                    for h in hits],
+    }
+
+# 启动：uvicorn serve:app --host 0.0.0.0 --port 9000</code></pre>
+<h4 id="h-步骤-5容器化--前端上线">步骤 5：容器化 + 前端（上线）<a class="anchor" href="#h-步骤-5容器化--前端上线" aria-label="本节链接">#</a></h4>
+<p><code>Dockerfile</code> 把服务打成镜像；前端一个极简网页调用 <code>/ask</code> 展示问答与引用。</p>
+<pre data-lang="dockerfile"><code class="language-dockerfile"># Dockerfile —— 构建知识库助手服务镜像
+FROM python:3.10-slim
+
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+
+# 默认暴露 FastAPI 端口
+EXPOSE 9000
+CMD [&quot;uvicorn&quot;, &quot;src.serve:app&quot;, &quot;--host&quot;, &quot;0.0.0.0&quot;, &quot;--port&quot;, &quot;9000&quot;]</code></pre>
+<pre data-lang="html"><code class="language-html">&lt;!-- web/index.html —— 极简前端：输入问题，展示答案与来源 --&gt;
+&lt;!DOCTYPE html&gt;
+&lt;html lang=&quot;zh&quot;&gt;
+&lt;head&gt;&lt;meta charset=&quot;utf-8&quot;&gt;&lt;title&gt;知识库助手&lt;/title&gt;&lt;/head&gt;
+&lt;body&gt;
+  &lt;h2&gt;我的知识库助手&lt;/h2&gt;
+  &lt;input id=&quot;q&quot; placeholder=&quot;输入你的问题&quot; style=&quot;width:80%&quot;&gt;
+  &lt;button onclick=&quot;ask()&quot;&gt;提问&lt;/button&gt;
+  &lt;div id=&quot;answer&quot;&gt;&lt;/div&gt;
+  &lt;script&gt;
+    async function ask() {
+      const q = document.getElementById(&quot;q&quot;).value;
+      const res = await fetch(&quot;http://localhost:9000/ask&quot;, {
+        method: &quot;POST&quot;,
+        headers: {&quot;Content-Type&quot;: &quot;application/json&quot;},
+        body: JSON.stringify({question: q}),
+      });
+      const data = await res.json();
+      document.getElementById(&quot;answer&quot;).innerHTML =
+        &quot;&lt;p&gt;&lt;b&gt;答：&lt;/b&gt;&quot; + data.answer + &quot;&lt;/p&gt;&quot; +
+        &quot;&lt;p&gt;&lt;b&gt;来源：&lt;/b&gt;&quot; + data.sources.map(s =&gt; s.source).join(&quot;、&quot;) + &quot;&lt;/p&gt;&quot;;
+    }
+  &lt;/script&gt;
+&lt;/body&gt;
+&lt;/html&gt;</code></pre>
+<blockquote>
+<p>若目标平台是微信小程序，前端逻辑相同：小程序 <code>wx.request</code> 调 <code>POST /ask</code>，把 <code>answer</code> 与 <code>sources</code> 渲染到页面即可。后端接口不变，只是前端容器从浏览器换成小程序——这正是&quot;服务化&quot;带来的复用价值。</p>
+</blockquote>
+<p><figure><img class="md-img" src="content/courses/ai-projects/assets/chapter-5-figure-02.svg" alt="系统架构图：用户（网页/小程序）→ FastAPI /ask → 检索模块（Chroma 向量库，由 BGE embedding 向量化）→ 取出 top-k 文档块 → 拼 prompt 调 vLLM 部署的 Qwen2.5-7B → 生成答案与引用 → 原路返回前端展示；图中用不同颜色区分&quot;应用层/检索层/模型层&quot;" loading="lazy" decoding="async"><figcaption>系统架构图：用户（网页/小程序）→ FastAPI /ask → 检索模块（Chroma 向量库，由 BGE embedding 向量化）→ 取出 top-k 文档块 → 拼 prompt 调 vLLM 部署的 Qwen2.5-7B → 生成答案与引用 → 原路返回前端展示；图中用不同颜色区分&quot;应用层/检索层/模型层&quot;</figcaption></figure>
+</p>
+<h3 id="h-三验收与复盘">三、验收与复盘<a class="anchor" href="#h-三验收与复盘" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-本课验收实现完成标志">1. 本课验收（实现完成标志）<a class="anchor" href="#h-1-本课验收实现完成标志" aria-label="本节链接">#</a></h4>
+<ul>
+<li><input disabled="" type="checkbox"> <code>python src/ingest.py</code> 能把文档切块入库，打印出块数；</li>
+<li><input disabled="" type="checkbox"> <code>python src/rag.py</code> 能交互问答，且回答带 <code>[来源：文件名]</code>；</li>
+<li><input disabled="" type="checkbox"> <code>uvicorn src.serve:app</code> 起服务后，<code>POST /ask</code> 返回答案 + 来源；</li>
+<li><input disabled="" type="checkbox"> 前端页面能输入问题并展示答案与来源（本地 9000 端口跑通）。</li>
+</ul>
+<h4 id="h-2-动手练习">2. 动手练习<a class="anchor" href="#h-2-动手练习" aria-label="本节链接">#</a></h4>
+<ol>
+<li>把 <code>top_k</code> 从 4 改成 2、8，观察回答质量变化，说明&quot;上下文太少 vs 噪声太多&quot;的权衡。</li>
+<li>给 <code>SYSTEM</code> 加上&quot;先给出结论再给依据&quot;的要求，观察回答结构是否更清晰——体会&quot;系统提示词&quot;对产品体验的影响。</li>
+<li>记录一次完整请求的耗时（检索 + 生成），拆出&quot;检索多少 ms、生成多少 ms&quot;，作为后面性能优化的基线。</li>
+</ol>
+<h4 id="h-3-复盘要点实现阶段要避开的坑">3. 复盘要点（实现阶段要避开的坑）<a class="anchor" href="#h-3-复盘要点实现阶段要避开的坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>胡编（幻觉）</strong>：系统提示词里&quot;资料没有就明说&quot;是防幻觉的第一道闸，务必保留；温度调低（0.1~0.3）也能显著减少瞎编。</li>
+<li><strong>引用丢失</strong>：来源必须在<strong>检索阶段</strong>就带出来（metadata 里存 source），生成阶段只能&quot;引用&quot;不能&quot;编造来源&quot;。</li>
+<li><strong>接口不通</strong>：本地跑通 ≠ 上线能访问，跨域（CORS）与监听地址（0.0.0.0）是网页前端最容易踩的两个坑。</li>
+<li><strong>生成服务没复用</strong>：别忘了 P10 部署的 vLLM 就是本项目的生成后端，复用它是&quot;技能串联&quot;的证明，面试里主动讲这一点。</li>
+</ul>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>PyMuPDF 官方文档（PDF 文本抽取）：<a href="https://pymupdf.readthedocs.io/" target="_blank" rel="noopener noreferrer">https://pymupdf.readthedocs.io/</a></li>
+<li>Chroma 官方文档：<a href="https://docs.trychroma.com/" target="_blank" rel="noopener noreferrer">https://docs.trychroma.com/</a></li>
+<li>LangChain RecursiveCharacterTextSplitter：<a href="https://python.langchain.com/docs/how_to/recursive_text_splitter/" target="_blank" rel="noopener noreferrer">https://python.langchain.com/docs/how_to/recursive_text_splitter/</a></li>
+<li>OpenAI Python SDK（兼容接口客户端）：<a href="https://github.com/openai/openai-python" target="_blank" rel="noopener noreferrer">https://github.com/openai/openai-python</a></li>
+<li>FastAPI 官方文档：<a href="https://fastapi.tiangolo.com/" target="_blank" rel="noopener noreferrer">https://fastapi.tiangolo.com/</a></li>
+<li>vLLM 官方文档（OpenAI 兼容服务）：<a href="https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html" target="_blank" rel="noopener noreferrer">https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html</a></li>
+</ul>
+<p><a href="#/l/proj-ch5-l3">下一课：结果与复盘</a></p>

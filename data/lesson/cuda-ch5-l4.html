@@ -1,0 +1,276 @@
+<h2 id="h-多-gpu-视角从单卡内存模型到集合通信的前置直觉">多 GPU 视角：从单卡内存模型到集合通信的前置直觉<a class="anchor" href="#h-多-gpu-视角从单卡内存模型到集合通信的前置直觉" aria-label="本节链接">#</a></h2>
+<p>单卡上你已经建立三样东西：作用域、内存序、&quot;搬运是一笔要算清楚的账&quot;。从 1 张卡到 8 张，三样全部保留，只是参数恶化一到两个数量级：作用域要放大到 system，搬运要过 NVLink 或 PCIe，而&quot;一次交换&quot;的固定成本开始和带宽一样重要。本课只补&quot;从 kernel 作者视角看多卡&quot;这一层。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-单卡的那套规则怎么延伸到多卡">1. 单卡的那套规则怎么延伸到多卡<a class="anchor" href="#h-1-单卡的那套规则怎么延伸到多卡" aria-label="本节链接">#</a></h4>
+<p>第 2 课作用域表里的 <code>cuda::thread_scope_system</code> 覆盖&quot;整机，含 CPU 与其它 GPU&quot;。官方要求：跨设备并发的线程要建立顺序，必须用 system 作用域的同步操作——<strong>第 2 课的 litmus test 在多卡上仍成立，只需把作用域那一格换成 system</strong>。</p>
+<p>能否直接解引用另一张卡上的指针，取决于四件事：</p>
+<table>
+<thead>
+<tr>
+<th>机制</th>
+<th>入口</th>
+<th>要点</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>peer 访问可用性</td>
+<td><code>cudaDeviceCanAccessPeer(&amp;ok, dev, peer)</code></td>
+<td>是否支持由 PCIe/NVLink 拓扑决定</td>
+</tr>
+<tr>
+<td>开启 peer 访问</td>
+<td><code>cudaDeviceEnablePeerAccess(peer, 0)</code></td>
+<td>非 NVSwitch 系统上每设备最多 8 条 peer 连接</td>
+</tr>
+<tr>
+<td>跨设备拷贝</td>
+<td><code>cudaMemcpyPeer</code> / <code>cudaMemcpyPeerAsync</code></td>
+<td>未开启 peer 时会被迫绕道主机（慢得多）</td>
+</tr>
+<tr>
+<td>坑：<code>cudaDeviceEnablePeerAccess()</code> <strong>全局生效</strong>，会给该 peer 上后续所有分配加开销；更可控的做法是用 VMM API 只对需要的区域声明。</td>
+<td></td>
+<td></td>
+</tr>
+</tbody></table>
+<h4 id="h-2-把搬运账升级成---模型">2. 把&quot;搬运账&quot;升级成 α-β 模型<a class="anchor" href="#h-2-把搬运账升级成---模型" aria-label="本节链接">#</a></h4>
+<p>第 4 章算字节数，多卡要算时间。一次通信的成本是：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.988em;vertical-align:-0.8804em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.1076em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0528em;">β</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">s</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.8804em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></p>
+<p><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span></span></span></span> 是消息字节数，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span> 是<strong>固定延迟项</strong>，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0528em;">β</span></span></span></span> 是<strong>带宽项</strong>，取法就是 ping-pong 实测：小消息测到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span>，大消息的斜率是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1/</span><span class="mord mathnormal" style="margin-right:0.0528em;">β</span></span></span></span>。模型立刻给出判断：<strong>小消息永远被 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span> 支配</strong>。用示例参数（P=8、α=5 μs、β≈300 GB/s）算 ring AllReduce：</p>
+<table>
+<thead>
+<tr>
+<th>消息大小</th>
+<th>总时间</th>
+<th>纯带宽项</th>
+<th>延迟占比</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>4 KiB</td>
+<td>70.2 μs</td>
+<td>0.19 μs</td>
+<td>99.7%</td>
+</tr>
+<tr>
+<td>256 KiB</td>
+<td>82.2 μs</td>
+<td>12.23 μs</td>
+<td>85.1%</td>
+</tr>
+<tr>
+<td>16 MiB</td>
+<td>852.9 μs</td>
+<td>782.94 μs</td>
+<td>8.2%</td>
+</tr>
+</tbody></table>
+<p>&quot;梯度分桶&quot;（把小梯度合成大消息再发）的收益就在这一列：不改变带宽项，但把<strong>次数</strong>降下来，把 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span> 摊薄。</p>
+<h4 id="h-3-ring-allreduce为什么是-2p-1-步">3. ring AllReduce：为什么是 2(p-1) 步<a class="anchor" href="#h-3-ring-allreduce为什么是-2p-1-步" aria-label="本节链接">#</a></h4>
+<p>集合通信里最值得从 kernel 层理解的算法是 ring AllReduce：</p>
+<ol>
+<li><strong>reduce-scatter</strong>（p−1 步）：rank <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span></span></span></span> 只持有全局 chunk <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.0556em;"></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin"><span class="mord"><span class="mord mathrm">mod</span></span></span><span class="mspace" style="margin-right:0.0556em;"></span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span></span></span></span>；第 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 步从左邻居收到 chunk <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7778em;vertical-align:-0.0833em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.0556em;"></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin"><span class="mord"><span class="mord mathrm">mod</span></span></span><span class="mspace" style="margin-right:0.0556em;"></span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span></span></span></span> 的部分和并累加，同时把 chunk <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.0556em;"></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin"><span class="mord"><span class="mord mathrm">mod</span></span></span><span class="mspace" style="margin-right:0.0556em;"></span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span></span></span></span> 的部分和发给右邻居。走完 p−1 步，rank <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span></span></span></span> 手里有一个<strong>完整</strong> chunk。</li>
+<li><strong>allgather</strong>（p−1 步）：把这些完整 chunk 沿同一个环传一圈，每步发一个、收一个。</li>
+</ol>
+<p>合计 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">2</span><span class="mopen">(</span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span></span></span></span> 步、每步每 rank 只发 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span></span></span></span> 字节——这是 ring 在带宽账上<strong>最优</strong>的原因（总传输量 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">2</span><span class="mord mathnormal">s</span><span class="mopen">(</span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span><span class="mord">/</span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&lt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2</span><span class="mord mathnormal">s</span></span></span></span>），代价是延迟项要付 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">2</span><span class="mopen">(</span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span></span></span></span> 次。示例代码用 8 个 numpy 向量跑遍全部 rank：14 步、结果与参考求和一致。</p>
+<p><figure><img class="md-img" src="content/courses/gpu-cuda-kernels/assets/chapter-5-figure-04.svg" alt="ring AllReduce 的两个阶段：reduce-scatter 与 allgather 各 p-1 步" loading="lazy" decoding="async"><figcaption>ring AllReduce 的两个阶段：reduce-scatter 与 allgather 各 p-1 步</figcaption></figure>
+</p>
+<h4 id="h-4-时间账什么时候换算法">4. 时间账：什么时候换算法<a class="anchor" href="#h-4-时间账什么时候换算法" aria-label="本节链接">#</a></h4>
+<p>沿用 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">2</span><span class="mopen">(</span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">s</span><span class="mord">/</span><span class="mord mathnormal" style="margin-right:0.0528em;">β</span><span class="mclose">)</span></span></span></span>，对 100 MiB 梯度算三种情形（同一规模的通信时间）：</p>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>α</th>
+<th>β</th>
+<th>时间</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>同机 8 卡，PCIe 级链路</td>
+<td>5 μs</td>
+<td>≈25 GB/s</td>
+<td>58.79 ms</td>
+</tr>
+<tr>
+<td>同机 8 卡，NVLink 级链路</td>
+<td>5 μs</td>
+<td>≈300 GB/s</td>
+<td>4.96 ms</td>
+</tr>
+<tr>
+<td>4 节点 × 2 卡（节点内快、跨节点 NIC 25 GB/s）</td>
+<td>5 μs</td>
+<td>两级</td>
+<td>12.80 ms</td>
+</tr>
+</tbody></table>
+<p>（α、β 是示例参数，请用自己硬件的实测值替换：<code>nvidia-smi topo -m</code> 看拓扑，<code>nccl-tests</code> 量带宽与延迟。）</p>
+<p>三条结论：</p>
+<ul>
+<li><strong>链路带宽决定量级</strong>：同一算法与规模，25 GB/s 与 300 GB/s 差一个数量级。</li>
+<li><strong>跨节点就换算法层次</strong>：先节点内合并、再让节点代表跨节点，4 节点时从 58.79 ms 降到 12.80 ms；涨到 8 节点又回到 58.79 ms——瓶颈转到 NIC。</li>
+<li><strong>带宽最优 ≠ 最快</strong>：小消息下 ring 的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">2</span><span class="mopen">(</span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span></span></span></span> 次 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span> 是纯亏，树形/二分只要 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">O</span><span class="mopen">(</span><span class="mop">lo<span style="margin-right:0.0139em;">g</span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">p</span><span class="mclose">)</span></span></span></span> 步。用 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">2</span><span class="mopen">(</span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.9386em;vertical-align:-0.2441em;"></span><span class="mord">2</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop"><span class="mop">lo<span style="margin-right:0.0139em;">g</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.207em;"><span style="top:-2.4559em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2441em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">s</span><span class="mord">/</span><span class="mord mathnormal" style="margin-right:0.0528em;">β</span><span class="mclose">)</span></span></span></span> 找交叉点，p=8 时在几十到几百 KiB 量级。</li>
+</ul>
+<h4 id="h-5-从两个点反解--与-">5. 从两个点反解 α 与 β<a class="anchor" href="#h-5-从两个点反解--与-" aria-label="本节链接">#</a></h4>
+<p><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0528em;">β</span></span></span></span> 不用查表，两个点就能解：由 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7651em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord">/</span><span class="mord mathnormal" style="margin-right:0.0528em;">β</span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7651em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord">/</span><span class="mord mathnormal" style="margin-right:0.0528em;">β</span></span></span></span> 相减得</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0528em;">β</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.0963em;vertical-align:-0.836em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.2603em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.836em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7651em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.988em;vertical-align:-0.8804em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.1076em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0528em;">β</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.8804em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></p>
+<p>这正是 <code>nccl-tests</code> 输出表格的读法；示例代码先用模型造数据、再反解回参数。</p>
+<h4 id="h-6-常见坑">6. 常见坑<a class="anchor" href="#h-6-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>用 device 作用域等另一张卡</strong>：作用域不够，行为未定义。</li>
+<li><strong>假设 peer 访问一定可用</strong>：不支持时 <code>cudaMemcpyPeer</code> 退回经主机中转，带宽掉到主机内存量级。</li>
+<li><strong>通信与计算串行排</strong>：不重叠时总时间是两者之和。</li>
+<li><strong>拿 ring 到处用</strong>：小消息下延迟主导，树形等步数更少的算法更快。</li>
+<li><strong>用&quot;理论带宽&quot;当预期</strong>：有效带宽按第 3 课口径核对，实测通常低于峰值。</li>
+</ul>
+<h4 id="h-7-这一课到哪里为止">7. 这一课到哪里为止<a class="anchor" href="#h-7-这一课到哪里为止" aria-label="本节链接">#</a></h4>
+<p>本课只到&quot;前置直觉&quot;：多卡一致性、访问路径、把通信算成一笔时间账。<strong>算法层的完整推导</strong>（三种 AllReduce 的步数、ReduceScatter/AllGather 角色、拓扑感知、NCCL 调参）在分布式训练系统课第 1–4 章。</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>第一段纯 Python/numpy（无 GPU）：把 8 个 rank 抄成 8 个向量本地跑一遍 ring AllReduce，再用 α-β 模型算时间账；第二段给出多卡一致性的最小 CUDA 写法。</p>
+<pre data-lang="python"><code class="language-python"># ===== 示例 1：无 GPU 也能验证的 ring AllReduce（8 个 rank = 8 个 numpy 向量） =====
+import numpy as np
+
+def ring_allreduce(inputs):
+    &quot;&quot;&quot;标准 ring AllReduce：rank r 初始只持有全局 chunk (r+1)%P。
+    reduce-scatter P-1 步：第 k 步收到全局 chunk (r-k-1)%P 并累加；
+    allgather P-1 步：把已完整的 chunk 沿环传一圈。返回 (各 rank 结果, 步数)。&quot;&quot;&quot;
+    P = len(inputs); n = inputs[0].size
+    assert n % P == 0
+    b = [v.reshape(P, n // P).copy() for v in inputs]
+    for k in range(P - 1):                       # reduce-scatter
+        nxt = [c.copy() for c in b]
+        for r in range(P):
+            c = (r - k - 1) % P
+            nxt[r][c] = b[r][c] + b[(r - 1) % P][c]
+        b = nxt
+    for k in range(P - 1):                       # allgather
+        nxt = [c.copy() for c in b]
+        for r in range(P):
+            c = (r - k) % P
+            nxt[r][c] = b[(r - 1) % P][c]
+        b = nxt
+    return [c.reshape(n) for c in b], 2 * (P - 1)
+
+P = 8
+inputs = [np.arange(8192, dtype=np.float64) + r for r in range(P)]
+outs, steps = ring_allreduce(inputs)
+expect = np.sum(inputs, axis=0)
+err = max(float(np.abs(o - expect).max()) for o in outs)
+print(f&quot;ring AllReduce：{P} 个 rank，每个 rank 一份 8192 元素（切成 {P} 块）&quot;)
+print(f&quot;  通信步数 = {steps}（公式 2×(P-1) = {2*(P-1)}）&quot;)
+print(f&quot;  8 个 rank 的结果与逐元素参考求和的最大偏差 = {err:.1e}&quot;)
+
+# ===== 示例 2：α-β 模型 —— 通信时间随消息大小与链路带宽的变化 =====
+def ring_time(nbytes, P, alpha_us, beta_gbps):
+    &quot;&quot;&quot;ring AllReduce：2(P-1) 步，每步 α + s/β。返回微秒。&quot;&quot;&quot;
+    return 2 * (P - 1) * (alpha_us + nbytes / (beta_gbps * 1e9) * 1e6)
+
+def two_level_time(nbytes, P, alpha_us, beta_gbps, nodes, nic_gbps):
+    &quot;&quot;&quot;两级 ring：节点内先在快链路上把同号 chunk 合并，再让节点代表走 NIC 跨节点。&quot;&quot;&quot;
+    per_node = P // nodes
+    inner = 2 * (per_node - 1) * (alpha_us + (nbytes / nodes) / (beta_gbps * 1e9) * 1e6)
+    outer = 2 * (nodes - 1) * (alpha_us + (nbytes / per_node) / (nic_gbps * 1e9) * 1e6)
+    return inner + outer
+
+grad = 100 * 2**20          # 100 MiB 梯度
+print(&quot;\n100 MiB AllReduce（P=8，α=5 μs）：&quot;)
+for beta, tag in ((25.0, &quot;β≈25 GB/s  PCIe 级&quot;), (300.0, &quot;β≈300 GB/s NVLink 级&quot;)):
+    print(f&quot;  {tag:&lt;22} 单层 ring = {ring_time(grad,8,5.0,beta)/1e3:7.2f} ms&quot;)
+print(&quot;  跨节点（节点内 β≈300 GB/s、跨节点 NIC β≈25 GB/s）：&quot;)
+for nodes in (2, 4, 8):
+    t = two_level_time(grad, 8, 5.0, 300.0, nodes, 25.0)
+    print(f&quot;    {nodes} 个节点  两级 ring = {t/1e3:7.2f} ms&quot;)
+
+print(&quot;\n小消息时延迟项主导（P=8，α=5 μs，β=300 GB/s）：&quot;)
+for kb in (4, 256, 16384):
+    s = kb * 1024
+    t = ring_time(s, 8, 5.0, 300.0)
+    bw = 2 * 7 * s / (300e9) * 1e6
+    print(f&quot;  {kb:&gt;6} KiB：总 {t:&gt;8.1f} μs  纯带宽项 {bw:&gt;7.2f} μs  延迟占比 {(t-bw)/t:6.1%}&quot;)
+
+# ===== 示例 3：两个数据点反解 α 与 β（拿到实测数据后的第一步） =====
+def fit_alpha_beta(sizes_bytes, times_us):
+    &quot;&quot;&quot;由 t = α + s/β：两点相减得 β = (s2-s1)/(t2-t1)，回代得 α。&quot;&quot;&quot;
+    (s1, t1), (s2, t2) = list(zip(sizes_bytes, times_us))
+    beta = (s2 - s1) / ((t2 - t1) * 1e-6) / 1e9
+    return t1 - s1 / (beta * 1e9) * 1e6, beta
+
+print(&quot;\n反解流程自检（先用模型造数据，再反解回参数）：&quot;)
+for alpha, beta in ((5.0, 300.0), (3.0, 25.0)):
+    sizes = [1 &lt;&lt; 20, 64 &lt;&lt; 20]
+    times = [alpha + s / (beta * 1e9) * 1e6 for s in sizes]
+    a, b = fit_alpha_beta(sizes, times)
+    print(f&quot;  模型 α={alpha:&gt;4.1f} μs, β={beta:&gt;5.1f} GB/s → 反解 α={a:.3f} μs, β={b:.3f} GB/s&quot;)</code></pre>
+<p>在 Python 3.14.5 + numpy 2.5.3 下实际运行结果：</p>
+<pre data-lang="text"><code class="language-text">ring AllReduce：8 个 rank，每个 rank 一份 8192 元素（切成 8 块）
+  通信步数 = 14（公式 2×(P-1) = 14）
+  8 个 rank 的结果与逐元素参考求和的最大偏差 = 0.0e+00
+
+100 MiB AllReduce（P=8，α=5 μs）：
+  β≈25 GB/s  PCIe 级      单层 ring =   58.79 ms
+  β≈300 GB/s NVLink 级    单层 ring =    4.96 ms
+  跨节点（节点内 β≈300 GB/s、跨节点 NIC β≈25 GB/s）：
+    2 个节点  两级 ring =    3.19 ms
+    4 个节点  两级 ring =   12.80 ms
+    8 个节点  两级 ring =   58.79 ms
+
+小消息时延迟项主导（P=8，α=5 μs，β=300 GB/s）：
+       4 KiB：总     70.2 μs  纯带宽项    0.19 μs  延迟占比  99.7%
+     256 KiB：总     82.2 μs  纯带宽项   12.23 μs  延迟占比  85.1%
+   16384 KiB：总    852.9 μs  纯带宽项  782.94 μs  延迟占比   8.2%
+
+反解流程自检（先用模型造数据，再反解回参数）：
+  模型 α= 5.0 μs, β=300.0 GB/s → 反解 α=5.000 μs, β=300.000 GB/s
+  模型 α= 3.0 μs, β= 25.0 GB/s → 反解 α=3.000 μs, β=25.000 GB/s</code></pre>
+<p>第一段是<strong>可验证产出</strong>：算法正确性不依赖 GPU。第二段把通信时间变成可核对的账；第三段展示把实测数据变成参数的做法。</p>
+<p>下面是把多卡一致性写对的最小 CUDA 片段（跨设备必须 system 作用域）：</p>
+<pre data-lang="cuda"><code class="language-cuda">#include &lt;cuda/atomic&gt;
+
+// 设备 0 上：写数据，再用 system 作用域的 release 发布标志
+__global__ void publishFrom0(int* d_data, cuda::atomic&lt;int, cuda::thread_scope_system&gt;* flag) {
+    if (threadIdx.x == 0) {
+        *d_data = 42;                                        // 数据写在设备 0 的内存里
+        flag-&gt;store(1, cuda::memory_order_release);           // system 作用域：跨设备可见
+    }
+}
+
+// 设备 1 上（需先 cudaDeviceEnablePeerAccess(0, 0)）：acquire 后再读
+__global__ void consumeOn1(const int* d_data,
+                           cuda::atomic&lt;int, cuda::thread_scope_system&gt;* flag, int* ok) {
+    while (flag-&gt;load(cuda::memory_order_acquire) != 1) { }   // 作用域必须匹配
+    if (threadIdx.x == 0) *ok = (*d_data == 42);
+}
+
+// 主机侧：查询可用性并开启 peer 访问（非 NVSwitch 系统每设备最多 8 条连接）
+int ok = 0;
+cudaDeviceCanAccessPeer(&amp;ok, 1, 0);
+if (ok) { cudaSetDevice(1); cudaDeviceEnablePeerAccess(0, 0); }</code></pre>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选：需要 2 张以上 GPU。用官方工具量 α 与 β，而不是猜 ----
+# 1) 看拓扑（哪些卡之间是 NVLink、哪些绕 PCIe）
+nvidia-smi topo -m
+# 2) 量集合通信带宽与延迟（nccl-tests 的 all_reduce_perf；-b 起始、-e 结束、-f 步长）
+# git clone https://github.com/NVIDIA/nccl-tests &amp;&amp; make MPI=1
+./all_reduce_perf -b 8 -e 128M -f 2 -g 8
+# 判读：小消息（8B~8K）那一行的 busbw 反映 α 主导区；
+#       大消息（32M~128M）那一行的 busbw 才是 β 的真实值。
+#       把两组 (size, time) 代进示例 3 的 fit_alpha_beta 就直接得到 α 与 β。
+# 只有 1 张卡时：用 cudaMemcpyPeer/CPU↔GPU 拷贝量一条 α-β 曲线，
+# 结论同样成立（本课的 Python 模型不依赖卡数）。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：把示例 1 的 <code>ring_allreduce</code> 改成 tree 版本（第 1 阶段逐层两两归并、第 2 阶段逐层广播），统计<strong>步数</strong>与<strong>每 rank 的发送量</strong>；对 P=8 与 P=64 各算一遍。</li>
+<li><strong>解释</strong>：为什么 ring 是带宽最优的（总传输量 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">2</span><span class="mord mathnormal">s</span><span class="mopen">(</span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span><span class="mord">/</span><span class="mord mathnormal">p</span></span></span></span>）却不是小消息下最快的？把延迟项与带宽项分别写出来回答。</li>
+<li><strong>对比/验证</strong>：把示例 2 的 <code>alpha_us</code> 从 5 提到 20、<code>beta_gbps</code> 保持 300，重新算 4 KiB / 256 KiB / 16 MiB 三行的延迟占比；解释哪一行受 α 影响最大。</li>
+<li><strong>思考</strong>：如果一次训练的每步梯度是 100 MiB，但你把通信放在同一条流上串行执行，端到端时间会怎么变？要把它藏起来，需要哪两个条件同时成立？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>NVIDIA, <em>CUDA Programming Guide</em> —「Programming Systems with Multiple GPUs」（device 枚举与选择、<code>cudaMemcpyPeer</code>、<code>cudaDeviceCanAccessPeer</code>/<code>cudaDeviceEnablePeerAccess</code>、非 NVSwitch 每设备 8 条 peer 连接、Peer-to-Peer Memory Consistency 要求 system 作用域、跨设备 event 语义）：<a href="https://docs.nvidia.com/cuda/cuda-programming-guide/03-advanced/multi-gpu-systems.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/cuda-programming-guide/03-advanced/multi-gpu-systems.html</a></li>
+<li>NVIDIA, <em>CUDA Programming Guide</em> —「CUDA C++ Memory Model」的 Thread Scopes 小节（<code>thread_scope_system</code> 的定义与跨设备同步要求）：<a href="https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/cuda-cpp-memory-model.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/cuda-cpp-memory-model.html</a></li>
+<li>NVIDIA, <em>NCCL User Guide</em>（<code>all_reduce_perf</code> 等 nccl-tests 收集器、bus bandwidth 的口径、常用环境变量；本课实测 α/β 的工具来源）：<a href="https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/</a></li>
+<li>NVIDIA, <em>Parallel Thread Execution ISA</em> — Memory Consistency Model 及其 Scope 小节（<code>.sys</code> 作用域的精确语义，以及跨设备访问为何必须走它）：<a href="https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#memory-consistency-model" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#memory-consistency-model</a></li>
+<li>P. Patarasuk, X. Yuan, <em>Bandwidth optimal all-reduce algorithms for clusters of workstations</em>, J. Parallel Distrib. Comput.（ring AllReduce 的 reduce-scatter + allgather 结构与 2(p−1) 步的原始分析）：<a href="https://doi.org/10.1016/j.jpdc.2008.09.002" target="_blank" rel="noopener noreferrer">https://doi.org/10.1016/j.jpdc.2008.09.002</a></li>
+<li>Baidu Research, <em>Bringing HPC Techniques to Deep Learning</em>（把 ring AllReduce 带进深度学习训练工程的那篇博文，含 bandwidth-optimal 论证与开源实现说明）：<a href="https://research.baidu.com/Blog/index-view?id=55" target="_blank" rel="noopener noreferrer">https://research.baidu.com/Blog/index-view?id=55</a></li>
+</ul>
+<p><a href="../chapter-6/index.md">下一章：典型算子实现</a></p>

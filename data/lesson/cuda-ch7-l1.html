@@ -1,0 +1,217 @@
+<h2 id="h-triton-编程模型block-级并行与自动调度">Triton 编程模型：block 级并行与自动调度<a class="anchor" href="#h-triton-编程模型block-级并行与自动调度" aria-label="本节链接">#</a></h2>
+<p>写完第 6 章的 CUDA 算子，你已经能回答&quot;我这个 kernel 有多少 shared memory 压力、要多少寄存器&quot;。换成 Triton 后，同样一句 <code>tl.dot</code> 背后既没有 <code>__syncthreads</code> 也没有寄存器分配——<strong>你不是放弃了控制，而是把控制换成了「编译器的调度搜索空间」</strong>。这一课把&quot;换掉了什么、代价是什么&quot;讲成一本能核对的账。</p>
+<p><figure><img class="md-img" src="content/courses/gpu-cuda-kernels/assets/chapter-7-figure-01.svg" alt="Triton 编译路径：块级语义如何降到机器码" loading="lazy" decoding="async"><figcaption>Triton 编译路径：块级语义如何降到机器码</figcaption></figure>
+</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-spmd-的两种切法thread-被-block-取代">1. SPMD 的两种切法：thread 被 block 取代<a class="anchor" href="#h-1-spmd-的两种切法thread-被-block-取代" aria-label="本节链接">#</a></h4>
+<p>CUDA 的并行单位是<strong>线程</strong>（scalar program, blocked threads）：你先写一个线程干的事，再决定一个 block 里放多少个它，grid 与 block 的维度是你手工映射到数据上的。Triton 反过来，是 <strong>blocked program, scalar threads</strong>：一个 program instance 直接领走一整块数据（<code>(BLOCK_M, BLOCK_N)</code>），而你写的语句在<strong>整个块上</strong>生效——<code>tl.arange</code> 造出块内下标、<code>tl.load</code> 搬一整块、<code>tl.sum</code> 沿某一维归约。swizzle、预取、向量化、Tensor Core 指令选择、shared memory 的分配与同步，全部由编译器在 <strong>TTGIR</strong>（Triton GPU IR）这一层决定。</p>
+<p>代码形状的差别很小，语义层次差一档：</p>
+<pre data-lang="text"><code class="language-text">CUDA： 每个线程算 C[m,n]            → 你负责 thread↔数据映射、__syncthreads、bank conflict
+Triton：每个 program 算 C[m:m+BM, n:n+BN] → 你负责 BLOCK 形状与 program↔数据映射</code></pre>
+<p>所以 Triton 里<strong>没有线程号、没有 <code>__syncthreads</code></strong>：块内的协作（归约、布局转换）是编译器的活。</p>
+<h4 id="h-2-program-id-与广播式指针算术">2. program id 与广播式指针算术<a class="anchor" href="#h-2-program-id-与广播式指针算术" aria-label="本节链接">#</a></h4>
+<p><code>tl.program_id(0)</code> 是 program 在 grid 里的序号，处理多维输出时由你把它拆成 <code>pid_m, pid_n</code>。真正让 block 编程可行的是<strong>指针也是块</strong>：对 row-major 的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0785em;">X</span></span></span></span>，<code>X[i,j]</code> 的地址是 <code>X + i*stride_i + j*stride_j</code>，于是</p>
+<pre data-lang="python"><code class="language-python">offs_am = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)      # (BM,)
+offs_bn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)      # (BN,)
+a_ptrs  = a_ptr + offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak   # (BM, BK)</code></pre>
+<p><code>(BM,1)</code> 与 <code>(1,BK)</code> 相加广播成 <code>(BM,BK)</code>——这就是&quot;一个 program 拿到一整块地址&quot;的全部机制，没有循环、没有线程映射。</p>
+<h4 id="h-3-自动调度的清单与它的价码">3. 自动调度的清单，与它的价码<a class="anchor" href="#h-3-自动调度的清单与它的价码" aria-label="本节链接">#</a></h4>
+<p>官方编程指南逐项列出编译器自动做的事：<strong>自动合并访存、线程 swizzling、预取、自动向量化、面向 Tensor Core 的指令选择、shared memory 分配与同步、异步拷贝调度</strong>。对照第 2~4 章：这些正是你手写时要自己判断的每一件事，现在它们成了编译器的搜索空间。</p>
+<p>价码有三条：</p>
+<ol>
+<li><strong>layout 不可直接指定</strong>。数据在寄存器与 shared memory 里怎么排，由编译器定；想知道只能去看 IR（<code>triton.compile</code> 后可读 TTIR/TTGIR/PTX）。需要精细控制 layout 的场合，Triton 提供了更低一层的 <strong>Gluon</strong> 方言作为逃生门。</li>
+<li><strong>每个 meta-parameter 组合都要重新编译</strong>。BLOCK 形状和 <code>num_warps</code> 一变，就是一次新编译：<code>src/ttir → ttgir → llir → ptx → cubin</code>。</li>
+<li><strong>不匹配的形状会先撞 tile</strong>。BLOCK 尺寸按 2 的幂取，M/N/K 不整除时靠 mask 补零，补出来的 lane 照样占位、照样做乘加。</li>
+</ol>
+<h4 id="h-4-两个旋钮num_warps-与-num_stages">4. 两个旋钮：num_warps 与 num_stages<a class="anchor" href="#h-4-两个旋钮num_warps-与-num_stages" aria-label="本节链接">#</a></h4>
+<ul>
+<li><code>num_warps</code>：一个 program 摊到几个 warp 上，决定每线程的累加器份额 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord mathnormal" style="margin-right:0.0502em;">B</span><span class="mord mathnormal">L</span><span class="mord mathnormal" style="margin-right:0.0278em;">O</span><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">K</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.109em;">M</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0502em;">B</span><span class="mord mathnormal">L</span><span class="mord mathnormal" style="margin-right:0.0278em;">O</span><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">K</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.109em;">N</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord">/</span><span class="mopen">(</span><span class="mord">32</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.06em;vertical-align:-0.31em;"></span><span class="mord mathnormal">n</span><span class="mord mathnormal">u</span><span class="mord mathnormal">m</span><span class="mord" style="margin-right:0.0278em;">_</span><span class="mord mathnormal" style="margin-right:0.0269em;">w</span><span class="mord mathnormal">a</span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="mord mathnormal">p</span><span class="mord mathnormal">s</span><span class="mclose">)</span></span></span></span>。</li>
+<li><code>num_stages</code>：软件流水的级数，决定 shared memory 里放几份缓冲（B 条带各一份），也是&quot;延迟藏得住多少&quot;的旋钮。</li>
+</ul>
+<p>它们互相拉扯，和手写时的取舍完全同构——区别只是<strong>你把搜索交给 <code>@triton.autotune</code></strong>，用 <code>key=[&#39;M&#39;,&#39;N&#39;,&#39;K&#39;]</code> 标明&quot;哪些参数变了要重搜&quot;。</p>
+<h4 id="h-5-常见坑">5. 常见坑<a class="anchor" href="#h-5-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>把 mask 当成可有可无的修饰</strong>：越界读要么崩，要么给脏数据；GEMM 里能靠&quot;乘 0&quot;兜住，归约类算子不能（第 2 课展开）。</li>
+<li><strong>忘记 <code>.contiguous()</code></strong>：Triton 的指针算术默认按给定 stride 走，非连续张量会让合并访存失效或需要额外处理。</li>
+<li><strong>autotune 的 key 选错</strong>：key 里没有形状，换形状后不会重搜；key 里带上会变的量（如动态 shape），又会让缓存失效、每步重新编译。</li>
+<li><strong>忽略编译时间</strong>：autotune 是&quot;先付编译、后赚运行&quot;，小 kernel 可能编译时间比跑的时间还长；预热与缓存策略要单独考虑。</li>
+<li><strong>以为 BLOCK 越大越好</strong>：<code>num_stages</code> 与 BLOCK 面积直接吃 shared memory 和寄存器，occupancy 会掉（下一节的表里 128×128 从 3 段到 4 段就掉一半）。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面的纯 numpy 版本把 block 级编程的四件事算成数字：<strong>grid 怎么切、指针块怎么广播、启动顺序省多少 L2 流量、两个旋钮各要多少资源</strong>。不需要 GPU，也不需要 Triton。</p>
+<pre data-lang="python"><code class="language-python"># ===== ch7-l1：Triton block 级并行的账本（纯 numpy / 标准库，无 GPU 也能跑完）=====
+import numpy as np
+
+# ---------- 1. program 划分：grid 形状、每 program 负载、补零 lane 占比 ----------
+def grid_and_load(M, N, BM, BN):
+    pm, pn = (M + BM - 1) // BM, (N + BN - 1) // BN
+    tot = pm * pn
+    full = (M // BM) * (N // BN) * BM * BN   # 完全落在边界内的输出元素
+    return pm, pn, tot, BM * BN, 1 - full / (tot * BM * BN)
+
+M = N = 4097                                  # 故意取质数，逼出边界 mask
+print(f&quot;[1] 输出 {M}x{N}；TL 程序只认 2 的幂 BLOCK 形状&quot;)
+print(f&quot;{&#39;BLOCK&#39;:&gt;10} {&#39;grid&#39;:&gt;10} {&#39;programs&#39;:&gt;9} {&#39;元素/program&#39;:&gt;12} {&#39;无效 lane&#39;:&gt;9}&quot;)
+for BM, BN in [(64, 64), (128, 128), (128, 256), (256, 256)]:
+    pm, pn, tot, per, waste = grid_and_load(M, N, BM, BN)
+    print(f&quot;{f&#39;{BM}x{BN}&#39;:&gt;10} {f&#39;{pm}x{pn}&#39;:&gt;10} {tot:&gt;9} {per:&gt;12} {waste:&gt;8.2%}&quot;)
+
+# ---------- 2. 广播式指针算术：在 CPU 上复现 tl.arange 的语义 ----------
+def ptr_block(pid_m, pid_n, BM, BN, stride_m, stride_n):
+    offs_m = pid_m * BM + np.arange(BM)
+    offs_n = pid_n * BN + np.arange(BN)
+    return offs_m[:, None] * stride_m + offs_n[None, :] * stride_n   # (BM,1)+(1,BN) -&gt; (BM,BN)
+
+addr, = (ptr_block(1, 2, 4, 8, 32, 1),)
+print(f&quot;\n[2] pid=(1,2)、BLOCK=4x8：地址块 shape={addr.shape}，首行地址={addr[0].tolist()}&quot;)
+
+# ---------- 3. 分组启动顺序（对应教程的 GROUP_SIZE_M，换的是顺序不是结果）----------
+def grouped_pids(num_pm, num_pn, GROUP):
+    order = []
+    for pid in range(num_pm * num_pn):
+        npg = GROUP * num_pn
+        gid = pid // npg
+        first = gid * GROUP
+        gsm = min(num_pm - first, GROUP)
+        order.append((first + (pid % npg) % gsm, (pid % npg) // gsm))
+    return order
+
+num_pm, num_pn, G = 9, 9, 3
+row_major = [(p // num_pn, p % num_pn) for p in range(num_pm * num_pn)]
+grouped = grouped_pids(num_pm, num_pn, G)
+def strips(order, n_blocks):
+    seen = set()
+    for pm, pn in order[:n_blocks]:
+        seen |= {(pm, &#39;A&#39;), (pn, &#39;B&#39;)}
+    return len(seen)
+print(f&quot;\n[3] 9x9 个输出块：算完前 9 块，需要从 HBM 搬进多少条带（每条带 = 一个 K 段）&quot;)
+print(f&quot;    行优先：{strips(row_major, 9)} 条   分组顺序 GROUP={G}：{strips(grouped, 9)} 条&quot;
+      f&quot;   → 省 {(1 - strips(grouped,9)/strips(row_major,9)):.0%} 的 L2 流量&quot;)
+
+# ---------- 4. num_warps / num_stages 两个旋钮的代价账 ----------
+def analyze(BM, BN, BK, num_warps, num_stages, elem=2,
+            smem_sm=228 * 1024, regfile=65536, threads_per_sm=2048):
+    stage = (BM * BK + BK * BN) * elem          # 一级流水缓冲：A 条带 + B 条带
+    smem = num_stages * stage
+    acc = BM * BN // (num_warps * 32)           # 每线程累加器
+    alloc = int(np.ceil((acc + 40) / 8.0)) * 8  # +40 其他寄存器，按 8 个/线程粒度分配
+    regs_blocks = regfile // (alloc * 32 * num_warps)
+    warps_blocks = threads_per_sm // (num_warps * 32)
+    smem_blocks = smem_sm // smem
+    blocks = max(0, min(regs_blocks, warps_blocks, smem_blocks, 32))
+    limiter = &#39;寄存器&#39; if regs_blocks &lt;= min(warps_blocks, smem_blocks) else (&#39;shared&#39; if smem_blocks &lt;= warps_blocks else &#39;线程数&#39;)
+    return smem, acc, alloc, blocks, blocks * num_warps * 32 / threads_per_sm, limiter
+
+print(f&quot;\n[4] BLOCK_M=BLOCK_N=128、BLOCK_K=64（fp16 输入）时两个旋钮的后果&quot;)
+print(f&quot;{&#39;warps&#39;:&gt;6} {&#39;stages&#39;:&gt;7} {&#39;smem/块&#39;:&gt;9} {&#39;acc/线程&#39;:&gt;8} {&#39;regs/线程&#39;:&gt;9} {&#39;驻留块&#39;:&gt;7} {&#39;occupancy&#39;:&gt;10}  限制因素&quot;)
+for w, s in [(4, 2), (4, 3), (8, 2), (8, 3), (8, 4), (16, 3)]:
+    smem, acc, alloc, blk, occ, lim = analyze(128, 128, 64, w, s)
+    print(f&quot;{w:&gt;6} {s:&gt;7} {smem/1024:&gt;8.0f}K {acc:&gt;8} {alloc:&gt;9} {blk:&gt;7} {occ:&gt;9.1%}  {lim}&quot;)
+
+# ---------- 5. 语义核对：block 级伪代码 == numpy 参考（M/K/N 都不整除）----------
+def tl_like_matmul(A, B, BM, BN, BK):
+    M, K = A.shape; N = B.shape[1]
+    C = np.zeros((M, N), dtype=np.float32)
+    for pm in range((M + BM - 1) // BM):
+        for pn in range((N + BN - 1) // BN):
+            acc = np.zeros((BM, BN), dtype=np.float32)
+            for k in range(0, K, BK):
+                am = np.arange(pm*BM, pm*BM + BM) % M       # mask 越界的行（教程的 % M 写法）
+                ak = np.arange(k, min(k + BK, K))           # 对应 mask=offs_k &lt; K-k*BK
+                bn = np.arange(pn*BN, pn*BN + BN) % N
+                a = np.zeros((BM, BK), np.float32); b = np.zeros((BK, BN), np.float32)
+                a[:, :ak.size] = A[np.ix_(am, ak)]          # other=0.0
+                b[:ak.size, :] = B[np.ix_(ak, bn)]
+                acc += a @ b                                # ← tl.dot(a, b, acc)
+            mm = min(BM, M - pm*BM); nn = min(BN, N - pn*BN)
+            C[pm*BM:pm*BM+mm, pn*BN:pn*BN+nn] = acc[:mm, :nn]   # ← 带 mask 的 tl.store
+    return C
+
+rng = np.random.default_rng(7)
+A = rng.standard_normal((130, 70), dtype=np.float32)
+B = rng.standard_normal((70, 258), dtype=np.float32)
+ref = A @ B
+print()
+for BM, BN, BK in [(64, 64, 32), (128, 128, 64)]:
+    C = tl_like_matmul(A, B, BM, BN, BK)
+    print(f&quot;[5] BLOCK={BM}x{BN}x{BK}：M/K/N 全不整除，max|C-ref| = {np.abs(C-ref).max():.2e}&quot;)</code></pre>
+<p>在 <code>python3.10</code>（numpy 1.26.2）下实际运行结果：</p>
+<pre data-lang="text"><code class="language-text">[1] 输出 4097x4097；TL 程序只认 2 的幂 BLOCK 形状
+     BLOCK       grid  programs   元素/program   无效 lane
+     64x64      65x65      4225         4096    3.05%
+   128x128      33x33      1089        16384    5.97%
+   128x256      33x17       561        32768    8.73%
+   256x256      17x17       289        65536   11.42%
+
+[2] pid=(1,2)、BLOCK=4x8：地址块 shape=(4, 8)，首行地址=[144, 145, 146, 147, 148, 149, 150, 151]
+
+[3] 9x9 个输出块：算完前 9 块，需要从 HBM 搬进多少条带（每条带 = 一个 K 段）
+    行优先：10 条   分组顺序 GROUP=3：6 条   → 省 40% 的 L2 流量
+
+[4] BLOCK_M=BLOCK_N=128、BLOCK_K=64（fp16 输入）时两个旋钮的后果
+ warps  stages    smem/块   acc/线程   regs/线程     驻留块  occupancy  限制因素
+     4       2       64K      128       168       3     18.8%  寄存器
+     4       3       96K      128       168       2     12.5%  shared
+     8       2       64K       64       104       2     25.0%  寄存器
+     8       3       96K       64       104       2     25.0%  寄存器
+     8       4      128K       64       104       1     12.5%  shared
+    16       3       96K       32        72       1     25.0%  寄存器
+
+[5] BLOCK=64x64x32：M/K/N 全不整除，max|C-ref| = 1.34e-05
+[5] BLOCK=128x128x64：M/K/N 全不整除，max|C-ref| = 7.63e-06</code></pre>
+<p>三处值得盯住：</p>
+<ul>
+<li><strong>补零 lane 是真的在算</strong>：4097×4097 用 128×128 时有 5.97% 的 lane 落在边界外，它们照样被 <code>tl.dot</code> 乘加；256×256 涨到 11.42%。形状越&quot;不齐&quot;，浪费越大——这是&quot;BLOCK 必须是 2 的幂&quot;的直接代价。</li>
+<li><strong>换启动顺序不换结果</strong>：分组顺序把前 9 块所需的条带从 10 条压到 6 条（省 40%），数学完全不变。Triton 教程把它打包成 <code>GROUP_SIZE_M</code>，并说明在某些硬件上能带来 10% 以上的提升（教程给的是 A100 上 220→245 TFLOPS 这一具体量级的例子，请以你自己卡的实测为准）。</li>
+<li><strong>两个旋钮都是乘法</strong>：8 warps / 3 stages 时每线程 64 个累加器、约 104 个寄存器、shared 96 KB，2 块同驻（25%）；把 stages 提到 4，shared 涨到 128 KB，驻留跌到 1 块（12.5%）。这套账与第 4 课的 occupancy 计算逐条同构。</li>
+</ul>
+<p><strong>可选，需自备或云上按需</strong>：装好 Triton 与 CUDA 后，一个最小的 Triton GEMM 长这样（对照上面的 <code>tl_like_matmul</code>，会发现语义逐行对应）：</p>
+<pre data-lang="python"><code class="language-python"># pip install triton；需要 NVIDIA GPU。语义与上面 numpy 版本一致
+import torch, triton, triton.language as tl
+
+@triton.jit
+def matmul_kernel(a_ptr, b_ptr, c_ptr, M, N, K,
+                  stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+                  BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_M); num_pid_n = tl.cdiv(N, BLOCK_N)
+    pid_m, pid_n = pid // num_pid_n, pid % num_pid_n      # 简化版：未做 GROUP_SIZE_M 分组
+    offs_am = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
+    offs_bn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
+    offs_k  = tl.arange(0, BLOCK_K)
+    a_ptrs = a_ptr + offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k in range(0, tl.cdiv(K, BLOCK_K)):
+        a = tl.load(a_ptrs, mask=offs_k[None, :] &lt; K - k * BLOCK_K, other=0.0)
+        b = tl.load(b_ptrs, mask=offs_k[:, None] &lt; K - k * BLOCK_K, other=0.0)
+        acc = tl.dot(a, b, acc)                           # ← 块内乘加，编译器负责布局与同步
+        a_ptrs += BLOCK_K * stride_ak; b_ptrs += BLOCK_K * stride_bk
+    c = acc.to(tl.float16)
+    offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    c_ptrs = c_ptr + offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn
+    tl.store(c_ptrs, c, mask=(offs_cm[:, None] &lt; M) &amp; (offs_cn[None, :] &lt; N))
+
+# 观察替代方案（无 GPU 也能做）：
+#   ① 把上面的 numpy 版本当作参考实现，它就是&quot;没有 GPU 时的 Triton 语义副本&quot;；
+#   ② 有 GPU 时对比 torch.matmul（走 cuBLAS）与 Triton 的输出：torch.allclose(atol=1e-2)；
+#   ③ 想看编译器替你做了什么，读 IR 与编译日志：
+#        kernel = matmul_kernel.warmup(a, b, c, M, N, K, ..., grid=(1,))
+#        print(kernel.asm[&#39;ttgir&#39;][:2000])   # 布局转换就在 TTGIR 这一层
+#   ④ 用 ncu 的 sm__throughput / dram__bytes_read.sum 核对&quot;搬运有没有降下来&quot;。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：把上面 <code>grouped_pids</code> 的 <code>GROUP</code> 改成 1、2、3、5、9，重跑第 3 段，记录&quot;前 9 块所需条带数&quot;。（本机实测：行优先 10 条；GROUP=1 也是 10 条，GROUP=2、3、5 分别是 7、6、7 条，GROUP≥9 又回到 10 条。）解释为什么取 1 或取到不小于行数时分组完全失效，而中间存在一个最优点。</li>
+<li><strong>解释</strong>：为什么 Triton 里没有 <code>__syncthreads</code> 这个原语？从&quot;一个 program 负责一整块、块内协作由编译器插入&quot;这个前提，说明第 2 章的同步原语被谁接管了。</li>
+<li><strong>对比/验证</strong>：用 <code>analyze</code> 扫一遍 <code>BLOCK_M=BLOCK_N∈{64,128,256}</code>、<code>num_warps∈{4,8}</code>、<code>num_stages∈{2,3,4}</code>，找出&quot;限制因素从寄存器变成 shared memory&quot;的那条分界线，并与第 4 课的 occupancy 表对照说明差异从何而来。</li>
+<li><strong>思考</strong>：<code>@triton.autotune</code> 会在首次遇到新 key 时枚举所有配置，这意味着延迟毛刺。如果这是线上推理服务，你会怎么设计 key 与预热策略来避免用户请求撞上编译？反过来说，什么样的情况下&quot;不 autotune、写死一组配置&quot;反而更对？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Triton, <em>Programming Guide · Introduction</em>（&quot;Blocked Program, Scalar Threads&quot; 的原始对照表，以及自动合并访存 / swizzling / 预取 / 向量化 / Tensor Core 指令选择 / shared memory 分配同步 / 异步拷贝调度这一串自动优化清单）：<a href="https://triton-lang.org/main/programming-guide/chapter-1/introduction.html" target="_blank" rel="noopener noreferrer">https://triton-lang.org/main/programming-guide/chapter-1/introduction.html</a></li>
+<li>Triton, <em>Tutorials · Matrix Multiplication</em>（块级算法伪代码、广播式指针算术、<code>GROUP_SIZE_M</code> 的 L2 复用排序、<code>triton.Config</code> 的 <code>num_warps</code>/<code>num_stages</code> 取值）：<a href="https://triton-lang.org/main/getting-started/tutorials/03-matrix-multiplication.html" target="_blank" rel="noopener noreferrer">https://triton-lang.org/main/getting-started/tutorials/03-matrix-multiplication.html</a></li>
+<li>Triton, <em>Python API · triton.language</em>（<code>program_id</code>、<code>arange</code>、<code>load</code>、<code>cdiv</code>、<code>assume</code>、<code>static_range</code> 等 API 的权威定义）：<a href="https://triton-lang.org/main/python-api/triton.language.html" target="_blank" rel="noopener noreferrer">https://triton-lang.org/main/python-api/triton.language.html</a></li>
+<li>NVIDIA, <em>CUDA C++ Best Practices Guide</em>（本课 occupancy 与资源核算的口径来源：寄存器/线程/块数与 shared memory 的联合限制）：<a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/contents.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/contents.html</a></li>
+</ul>
+<p><a href="#/l/cuda-ch7-l2">下一课：用 Triton 重写第 6 章的两个算子并对比</a></p>

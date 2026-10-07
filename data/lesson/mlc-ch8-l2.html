@@ -1,0 +1,232 @@
+<h2 id="h-编译缓存与多设备端侧与云侧的差异">编译缓存与多设备：端侧与云侧的差异<a class="anchor" href="#h-编译缓存与多设备端侧与云侧的差异" aria-label="本节链接">#</a></h2>
+<p>上一课算的都是&quot;模型跑起来之后&quot;的账。服务扩容时最刺眼的数字却在第一次请求上：8 个新进程同时冷启，各自从头编译同一张图。缓存的难点不在&quot;存&quot;而在<strong>键</strong>——键少了会把云侧产物发给手机（正确性事故），键多了又会让端侧因机型碎片化永远命不中。本课讲清键的构成、命中率的三条杠杆，以及端侧与云侧的两种约束。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-缓存省的是编译延迟不是执行延迟">1. 缓存省的是编译延迟，不是执行延迟<a class="anchor" href="#h-1-缓存省的是编译延迟不是执行延迟" aria-label="本节链接">#</a></h4>
+<p><strong>编译缓存</strong>（compilation cache）保存&quot;某个键 → 一份可加载产物&quot;的映射，命中就跳过捕获与代码生成直接加载。第 1 课埋过一个细节：TVM 运行时会缓存首次取到的函数句柄，那是最小粒度的进程内缓存；这里讲跨进程、跨重启甚至跨机器的<strong>磁盘/远端缓存</strong>。它只减少<strong>冷启动</strong>（cold start）时间，与 kernel 快不快无关——两者必须分开度量，否则会把&quot;命中&quot;当成&quot;编译效果好&quot;。</p>
+<h4 id="h-2-三层缓存与它们的键">2. 三层缓存与它们的键<a class="anchor" href="#h-2-三层缓存与它们的键" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>层</th>
+<th>典型形态</th>
+<th>作用范围</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>进程内</td>
+<td>guard 与形状判定、句柄缓存</td>
+<td>单个进程生命周期</td>
+</tr>
+<tr>
+<td>磁盘</td>
+<td>Inductor 的 FXGraphCache、TritonCache、AOTAutogradCache、PGO/AutotuningCache，统一写在 <code>TORCHINDUCTOR_CACHE_DIR</code>；JAX 的 <code>jax_compilation_cache_dir</code></td>
+<td>同机、跨进程、跨重启</td>
+</tr>
+<tr>
+<td>远端</td>
+<td>Redis 式远程缓存；Mega-Cache 用 <code>save_cache_artifacts()</code> / <code>load_cache_artifacts()</code> 跨机搬运产物</td>
+<td>跨机器、跨实例</td>
+</tr>
+</tbody></table>
+<p>键里必须放什么，JAX 文档给了清单：<strong>非优化 HLO、jaxlib 版本、相关 XLA 选项、设备配置（设备数与拓扑、GPU 名称）、压缩算法、自定义 hook</strong>。PyTorch 的表述同样直接：缓存会校验产物来自<strong>相同的 PyTorch 与 Triton 版本</strong>，CUDA 设备还要求<strong>相同 GPU</strong>。两条合起来是硬结论：<strong>缓存绑定&quot;设备 + 编译栈&quot;</strong>——换机型不是换参数，是换键。</p>
+<p><figure><img class="md-img" src="content/courses/ml-compilers/assets/chapter-8-figure-03.svg" alt="编译缓存的三层（进程内 / 磁盘 / 远端）与作用范围，以及键为什么绑定设备与编译栈" loading="lazy" decoding="async"><figcaption>编译缓存的三层（进程内 / 磁盘 / 远端）与作用范围，以及键为什么绑定设备与编译栈</figcaption></figure>
+</p>
+<h4 id="h-3-命中率的三条杠杆">3. 命中率的三条杠杆<a class="anchor" href="#h-3-命中率的三条杠杆" aria-label="本节链接">#</a></h4>
+<ol>
+<li><strong>共享介质</strong>。多机多进程时只有 rank 0 写持久缓存、其余进程都读，因此缓存必须落在共享文件系统或远端存储上。代码第 1 节 C 与 A 就是这个对比：同样 8 个请求，缓存各挂本地总编译 20.0 s，共享盘 2.5 s。</li>
+<li><strong>容量 ≥ 工作集</strong>。代码第 2 节用 3 轮遍历 6 个键模拟多设备轮转：容量 2/4 条时 LRU 循环淘汰，18 次请求全未命中；容量到 6 条才有 66.7% 命中。真实访问有热点时部分容量够用，但&quot;每种 SoC 一份&quot;是并列工作集，不是热点。</li>
+<li><strong>键的粒度</strong>。形状特化会把每个 batch 变成新键；符号形状加 PGO 式运行时决策，就是用少量运行期判断换掉整次重编。还有阈值：JAX 默认要编译时间超过 <code>jax_persistent_cache_min_compile_time_secs</code>（默认 1.0 秒）且条目够大才落盘。</li>
+</ol>
+<h4 id="h-4-端侧与云侧一套编译器两种约束">4. 端侧与云侧：一套编译器，两种约束<a class="anchor" href="#h-4-端侧与云侧一套编译器两种约束" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>云侧</th>
+<th>端侧</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>编译时机</td>
+<td>JIT 为主 + 预热；AOT 用于压低冷启动</td>
+<td>必须 AOT：端上没有编译器与功耗预算</td>
+</tr>
+<tr>
+<td>运行时代价</td>
+<td>可接受较大运行时与依赖</td>
+<td>越小越好（TVM 运行时约 200K–600K 字节）</td>
+</tr>
+<tr>
+<td>缓存介质</td>
+<td>共享盘/对象存储/Redis，重启仍在</td>
+<td>包内静态资源 + 首启落盘，升级即失效</td>
+</tr>
+<tr>
+<td>键的维度</td>
+<td>机型池化、代内同构 → 命中率高</td>
+<td>SoC × ABI × 形状组合多 → 键爆炸</td>
+</tr>
+<tr>
+<td>自动调优</td>
+<td>预算充足，结果也要进缓存</td>
+<td>离线 tune 后固化，端上不再搜索</td>
+</tr>
+<tr>
+<td>更新与回滚</td>
+<td>服务端灰度、可回滚</td>
+<td>随 App 发版，受商店审核与升级率限制</td>
+</tr>
+<tr>
+<td>主要风险</td>
+<td>首 token 延迟抖动、扩容风暴</td>
+<td>首启白屏、包体膨胀</td>
+</tr>
+</tbody></table>
+<h4 id="h-5-常见坑">5. 常见坑<a class="anchor" href="#h-5-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>把&quot;清缓存&quot;当万能药</strong>：重编不是 bug，是键变了；不看键就清缓存，等于把延迟换成事故。</li>
+<li><strong>漏维度</strong>：代码第 3 节里漏掉目标设备后两个键哈希相同——省 2.5 秒编译，代价是加载即崩或静默算错；命中后必须校验产物元信息。</li>
+<li><strong>缓存是受信任的输入</strong>：文档明确警告，能写缓存目录的人等于能在你的进程里执行代码；不要放进人人可写的目录。</li>
+<li><strong>跨机并发写</strong>：多节点同写共享缓存会撞车，实践上挂到具备单写者语义的共享文件系统。</li>
+<li><strong>升级后不失效</strong>：编译栈版本进键就是为了让升级自动重编；绕过校验会把两代产物混在一起。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面这段纯 Python（无第三方依赖）模拟缓存全过程：<strong>六维键</strong>构造、LRU 磁盘缓存、四种部署形态的编译账、容量对命中率的影响，以及&quot;漏键维度&quot;的正确性后果；耗时为假设参数。</p>
+<pre data-lang="python"><code class="language-python"># ---- 第 2 课示例：纯 Python 模拟&quot;编译缓存 + 多设备&quot; ----------------
+# 无第三方依赖。COMPILE_S / HIT_LAT_MS 都是显式假设的模型参数，不是任何真实平台的实测值。
+import json, hashlib
+
+COMPILE_S   = 2.5     # 假设：一次未命中触发的编译耗时（秒）
+HIT_LAT_MS  = 0.4     # 假设：命中读盘 + 反序列化耗时（毫秒）
+COLD_LAT_MS = COMPILE_S * 1000 + HIT_LAT_MS
+
+# 缓存键的六个维度：少任何一个都可能造成&quot;错误复用&quot;，多任何一个都可能让键爆炸
+def make_key(spec):
+    return hashlib.sha1(json.dumps(spec, sort_keys=True).encode()).hexdigest()[:8]
+
+def spec(graph, shape_mode, dtype, target, stack, flags):
+    return {&#39;graph&#39;: graph, &#39;shape_mode&#39;: shape_mode, &#39;dtype&#39;: dtype,
+            &#39;target&#39;: target, &#39;stack&#39;: stack, &#39;flags&#39;: flags}
+
+class Cache:
+    &quot;&quot;&quot;磁盘缓存：容量按条目数限制，LRU 淘汰（真实系统还会按体积/时间限制）。&quot;&quot;&quot;
+    def __init__(self, cap=None):
+        self.cap, self.d, self.tick = cap, {}, 0
+        self.hit = self.miss = self.evict = 0
+    def get(self, k):
+        self.tick += 1
+        if k in self.d:
+            self.hit += 1; self.d[k] = self.tick; return True
+        self.miss += 1; self.d[k] = self.tick
+        if self.cap and len(self.d) &gt; self.cap:
+            del self.d[min(self.d, key=self.d.get)]; self.evict += 1
+        return False
+
+def run(requests, cap=None, drop_field=None):
+    &quot;&quot;&quot;requests: [(spec, 节点数)]；drop_field 用来模拟&quot;键里漏了某个维度&quot;。&quot;&quot;&quot;
+    c = Cache(cap); total_compile, lat, keys = 0.0, [], {}
+    for sp, _ in requests:
+        s = dict(sp)
+        if drop_field: s.pop(drop_field, None)          # ← 故意的缺陷：键退化了
+        k = make_key(s); keys.setdefault(k, len(keys))
+        hit = c.get(k)
+        if not hit: total_compile += COMPILE_S
+        lat.append(HIT_LAT_MS if hit else COLD_LAT_MS)
+    n = len(requests)
+    return {&#39;req&#39;: n, &#39;keys&#39;: len(keys), &#39;hit&#39;: c.hit, &#39;miss&#39;: c.miss, &#39;evict&#39;: c.evict,
+            &#39;compile_s&#39;: total_compile, &#39;hit_rate&#39;: c.hit / n,
+            &#39;first_ms&#39;: lat[0], &#39;p95_ms&#39;: sorted(lat)[int(n * 0.95) - 1]}
+
+def merge(rs):
+    a = {&#39;req&#39;: 0, &#39;keys&#39;: 0, &#39;hit&#39;: 0, &#39;miss&#39;: 0, &#39;evict&#39;: 0, &#39;compile_s&#39;: 0.0}
+    for r in rs:
+        for k in a: a[k] += r[k]
+    a[&#39;hit_rate&#39;] = a[&#39;hit&#39;] / a[&#39;req&#39;]; a[&#39;first_ms&#39;] = a[&#39;p95_ms&#39;] = COLD_LAT_MS
+    return a
+
+def specs(target, stack=&#39;abi64&#39;, flags=&#39;-O2&#39;, shape_mode=&#39;symbolic&#39;, n=1):
+    return [(spec(&#39;mlp-2layer&#39;, shape_mode, &#39;f16&#39;, target, stack, flags), 9)] * n
+
+def show(name, r):
+    print(f&#39;  {name:&lt;28}{r[&quot;req&quot;]:&gt;4}{r[&quot;keys&quot;]:&gt;7}{r[&quot;hit&quot;]:&gt;6}{r[&quot;miss&quot;]:&gt;7}{r[&quot;evict&quot;]:&gt;6}&#39;
+          f&#39;{r[&quot;hit_rate&quot;]*100:&gt;8.1f}%{r[&quot;compile_s&quot;]:&gt;9.1f}s{r[&quot;first_ms&quot;]:&gt;9.1f}ms{r[&quot;p95_ms&quot;]:&gt;9.1f}ms&#39;)
+
+if __name__ == &#39;__main__&#39;:
+    print(&#39;=== 1. 四种部署形态的缓存账（假设：编译 2.5 s、命中 0.4 ms）===&#39;)
+    print(f&#39;  {&quot;场景&quot;:&lt;28}{&quot;请求&quot;:&gt;4}{&quot;唯一键&quot;:&gt;7}{&quot;命中&quot;:&gt;6}{&quot;未命中&quot;:&gt;7}{&quot;淘汰&quot;:&gt;6}{&quot;命中率&quot;:&gt;9}{&quot;总编译&quot;:&gt;10}{&quot;首请求&quot;:&gt;9}{&quot;p95&quot;:&gt;9}&#39;)
+    show(&#39;A 云侧 8 进程(共享盘)&#39;, run(specs(&#39;cloud-gpu-x&#39;, n=8)))
+    show(&#39;B 云侧滚动升级(双编译栈)&#39;, run(specs(&#39;cloud-gpu-x&#39;, stack=&#39;stack-A&#39;, n=4)
+                                      + specs(&#39;cloud-gpu-x&#39;, stack=&#39;stack-B&#39;, n=4)))
+    show(&#39;C 多机 8 进程(缓存各挂本地)&#39;, merge([run(specs(&#39;cloud-gpu-x&#39;, n=1)) for _ in range(8)]))
+    edge = []
+    for t in (&#39;edge-soc-a&#39;, &#39;edge-soc-b&#39;, &#39;edge-soc-c&#39;):
+        for abi in (&#39;abi32&#39;, &#39;abi64&#39;):
+            edge += specs(t, stack=abi, n=2)
+    show(&#39;D 端侧碎片化(3 SoC×2 ABI)&#39;, run(edge))
+    print(&#39;  读法：请求数一样时，唯一键的数量决定编译次数；C 与 A 的差别只在&quot;缓存是否共享&quot;&#39;)
+
+    print(&#39;\n=== 2. 磁盘缓存容量对命中率的影响（3 轮遍历 6 个键 = 18 次请求，LRU）===&#39;)
+    ws_specs = [sp for t in (&#39;edge-soc-a&#39;, &#39;edge-soc-b&#39;, &#39;edge-soc-c&#39;)
+                   for abi in (&#39;abi32&#39;, &#39;abi64&#39;) for sp in [spec(&#39;mlp-2layer&#39;, &#39;symbolic&#39;, &#39;f16&#39;, t, abi, &#39;-O2&#39;)]]
+    work = [(sp, 9) for _ in range(3) for sp in ws_specs]   # 每轮把 6 个键各请求一次
+    for cap in (2, 4, 6, 8):
+        r = run(work, cap=cap)
+        print(f&#39;  容量 {cap:&gt;3} 条  命中率 {r[&quot;hit_rate&quot;]*100:&gt;5.1f}%  未命中 {r[&quot;miss&quot;]:&gt;2} 次&#39;
+              f&#39;  淘汰 {r[&quot;evict&quot;]:&gt;2} 条  总编译 {r[&quot;compile_s&quot;]:&gt;5.1f} s&#39;)
+    print(f&#39;  工作集 {len(ws_specs)} 个键：容量 &lt; 工作集时 LRU 循环淘汰，命中率直接归零&#39;)
+
+    print(&#39;\n=== 3. 键里少一个维度：不是性能问题，是正确性问题 ===&#39;)
+    a = spec(&#39;mlp-2layer&#39;, &#39;symbolic&#39;, &#39;f16&#39;, &#39;cloud-gpu-x&#39;, &#39;stack-A&#39;, &#39;-O2&#39;)
+    b = spec(&#39;mlp-2layer&#39;, &#39;symbolic&#39;, &#39;f16&#39;, &#39;edge-soc-a&#39;,  &#39;stack-A&#39;, &#39;-O2&#39;)
+    print(f&#39;  完整键（目标不同）: {make_key(a)} vs {make_key(b)}  → 不同，安全&#39;)
+    a2 = {k: v for k, v in a.items() if k != &#39;target&#39;}; b2 = {k: v for k, v in b.items() if k != &#39;target&#39;}
+    print(f&#39;  漏掉 target 维度  : {make_key(a2)} vs {make_key(b2)}  → 相同，云侧 artifact 会发给端侧&#39;)
+    r = run(specs(&#39;cloud-gpu-x&#39;, n=4) + specs(&#39;edge-soc-a&#39;, n=4), drop_field=&#39;target&#39;)
+    print(f&#39;  该缺陷下的账：唯一键 {r[&quot;keys&quot;]} 个（正确应为 2）→ 省下 {COMPILE_S:.1f} s 编译，&#39;)
+    print(&#39;  代价是加载即崩或静默算错；所以命中后必须校验 artifact 的元信息（版本、目标、dtype）&#39;)</code></pre>
+<p>实际运行结果（Python 3.14，无第三方依赖）：</p>
+<pre data-lang="text"><code class="language-text">=== 1. 四种部署形态的缓存账（假设：编译 2.5 s、命中 0.4 ms）===
+  场景                            请求    唯一键    命中    未命中    淘汰      命中率       总编译      首请求      p95
+  A 云侧 8 进程(共享盘)                 8      1     7      1     0    87.5%      2.5s   2500.4ms      0.4ms
+  B 云侧滚动升级(双编译栈)                 8      2     6      2     0    75.0%      5.0s   2500.4ms   2500.4ms
+  C 多机 8 进程(缓存各挂本地)              8      8     0      8     0     0.0%     20.0s   2500.4ms   2500.4ms
+  D 端侧碎片化(3 SoC×2 ABI)          12      6     6      6     0    50.0%     15.0s   2500.4ms   2500.4ms
+  读法：请求数一样时，唯一键的数量决定编译次数；C 与 A 的差别只在&quot;缓存是否共享&quot;
+
+=== 2. 磁盘缓存容量对命中率的影响（3 轮遍历 6 个键 = 18 次请求，LRU）===
+  容量   2 条  命中率   0.0%  未命中 18 次  淘汰 16 条  总编译  45.0 s
+  容量   4 条  命中率   0.0%  未命中 18 次  淘汰 14 条  总编译  45.0 s
+  容量   6 条  命中率  66.7%  未命中  6 次  淘汰  0 条  总编译  15.0 s
+  容量   8 条  命中率  66.7%  未命中  6 次  淘汰  0 条  总编译  15.0 s
+  工作集 6 个键：容量 &lt; 工作集时 LRU 循环淘汰，命中率直接归零
+
+=== 3. 键里少一个维度：不是性能问题，是正确性问题 ===
+  完整键（目标不同）: 3c4508f8 vs 9840497d  → 不同，安全
+  漏掉 target 维度  : 5a5bf848 vs 5a5bf848  → 相同，云侧 artifact 会发给端侧
+  该缺陷下的账：唯一键 1 个（正确应为 2）→ 省下 2.5 s 编译，
+  代价是加载即崩或静默算错；所以命中后必须校验 artifact 的元信息（版本、目标、dtype）</code></pre>
+<p>三个可核对结论：<strong>共享与否比&quot;缓存多大&quot;更早决定成败</strong>（8 个进程本地盘 20.0 s、共享盘 2.5 s）；<strong>容量低于工作集时 LRU 退化成 0 命中</strong>（2/4 条容量下 18 次全未命中）；<strong>键少一个维度换的是省时间、赌的是正确性</strong>（两个不同目标哈希相同）。</p>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选：需要 torch / jax（本机未安装也能读，装了再跑）----
+# torch：观察磁盘缓存与缓存目录
+#   python3 -c &quot;import torch; print(torch._inductor.config.cache_dir)&quot;
+#   环境变量 TORCHINDUCTOR_CACHE_DIR=/tmp/ti_cache python3 your_bench.py
+#   # 同一个脚本连跑两次，第二次的编译阶段日志应显著变短；目录里可见 fxgraph/triton 等子目录
+# jax：打开持久缓存并打印命中情况
+#   JAX_COMPILATION_CACHE_DIR=/tmp/jax_cache JAX_DEBUG_LOG_MODULES=jax._src.compiler,jax._src.lru_cache \
+#     python3 -c &quot;import jax,jax.numpy as jnp; f=jax.jit(lambda x:x+1); f(jnp.zeros((2,2))); f(jnp.zeros((2,2)))&quot;
+# 没有这些依赖不影响本课：上面纯 Python 版本已经把键、命中率与容量账跑通了。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：给 <code>Cache</code> 加&quot;按字节容量&quot;淘汰（每条目假设 4 MiB、上限 20 MiB），重跑第 2 节，解释两种口径为何给出不同最优配置。</li>
+<li><strong>解释</strong>：第 1 节 B 行里两个编译栈版本各占 2 个键。若滚动升级中<strong>故意</strong>让新版本复用旧缓存，哪些信号能最快发现问题？提示：从产物元信息与端到端数值校验两边找。</li>
+<li><strong>对比/验证</strong>：把 <code>drop_field</code> 依次换成 <code>&#39;stack&#39;</code>、<code>&#39;flags&#39;</code>、<code>&#39;dtype&#39;</code>，记录唯一键数量与&quot;省下的编译时间&quot;，并讨论哪种漏维度最危险。</li>
+<li><strong>思考</strong>：App 升级让旧缓存全部失效。要让用户升级后首启不卡，除了&quot;不失效&quot;还有什么办法？提示：权衡包内预编译产物数量与机型覆盖率。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>PyTorch 官方教程 <em>Compile Time Caching in torch.compile</em>（Mega-Cache 与 FXGraphCache / TritonCache / AOTAutogradCache / PGO / AutotuningCache 的分层，统一写入 <code>TORCHINDUCTOR_CACHE_DIR</code>，以及&quot;需相同 PyTorch/Triton 版本与相同 GPU&quot;的校验）：<a href="https://docs.pytorch.org/tutorials/recipes/torch_compile_caching_tutorial.html" target="_blank" rel="noopener noreferrer">https://docs.pytorch.org/tutorials/recipes/torch_compile_caching_tutorial.html</a></li>
+<li>PyTorch 官方教程 <em>Compile Time Caching Configuration</em>（缓存目录、远程 Redis 缓存与环境变量的配置口径）：<a href="https://docs.pytorch.org/tutorials/recipes/torch_compile_caching_configuration_tutorial.html" target="_blank" rel="noopener noreferrer">https://docs.pytorch.org/tutorials/recipes/torch_compile_caching_configuration_tutorial.html</a></li>
+<li>JAX 官方文档 <em>Persistent compilation cache</em>（缓存键的六项构成、<code>jax_persistent_cache_min_compile_time_secs</code> 阈值、多节点仅 rank 0 写入与共享文件系统要求、缓存受信任的安全警告）：<a href="https://docs.jax.dev/en/latest/persistent_compilation_cache.html" target="_blank" rel="noopener noreferrer">https://docs.jax.dev/en/latest/persistent_compilation_cache.html</a></li>
+<li>Apache TVM, <em>TVM Runtime System</em>（最小运行时体积与 driver 模块的关系、跨设备/远程部署的 RPC 路径 —— 端侧缓存与体积约束的背景）：<a href="https://tvm.apache.org/docs/arch/runtime.html" target="_blank" rel="noopener noreferrer">https://tvm.apache.org/docs/arch/runtime.html</a></li>
+</ul>
+<p><a href="#/l/mlc-ch8-l3">下一课：与推理引擎的关系：TensorRT-LLM / vLLM 里编译器的位置</a></p>

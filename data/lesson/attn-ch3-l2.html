@@ -1,0 +1,88 @@
+<h2 id="h-前馈与残差">前馈与残差<a class="anchor" href="#h-前馈与残差" aria-label="本节链接">#</a></h2>
+<p>上一课的编码器块里，除了注意力还有一个我们一笔带过的部件：<strong>前馈网络（FFN）</strong>。以及每个子层外面套着的那句 <code>x + sublayer(x)</code>——<strong>残差连接</strong>。这两个&quot;配角&quot;其实撑起了 Transformer 的半壁江山：一个负责在每个位置做深度非线性变换，一个负责让几十层深的大模型能被训练起来。这一课把它们讲透。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-前馈网络每个位置独立的感知机">1. 前馈网络：每个位置独立的&quot;感知机&quot;<a class="anchor" href="#h-1-前馈网络每个位置独立的感知机" aria-label="本节链接">#</a></h4>
+<p>注意力负责让<strong>位置之间</strong>交换信息，但它本身（除去投影）基本是线性的加权求和。要让每个位置拥有更丰富的表示能力，需要加非线性。前馈网络干的就是这件事：</p>
+<pre><code>FFN(x) = W₂ · ReLU(W₁ · x + b₁) + b₂</code></pre>
+<p>它由两层线性变换夹一个 ReLU 组成，中间维度 <code>d_ff</code> 通常放大到 <code>d_model</code> 的 <strong>4 倍</strong>（论文取 <code>d_ff = 2048, d_model = 512</code>）。放大再缩回，给了模型足够的&quot;思考空间&quot;去组合特征。</p>
+<p>关键在于&quot;<strong>位置独立</strong>&quot;：同一个 FFN 对每个位置<strong>分别、独立</strong>地作用（对同一位置的所有特征做变换，但不同位置之间不交互），参数在所有位置<strong>共享</strong>。这就像对序列的每个位置各打一针&quot;同样的激活剂&quot;，位置间的信息流动仍完全由注意力负责。</p>
+<h4 id="h-2-为什么需要残差连接">2. 为什么需要残差连接<a class="anchor" href="#h-2-为什么需要残差连接" aria-label="本节链接">#</a></h4>
+<p>Transformer 可以堆得很深（论文 6 层，后来的模型动辄几十层）。深层网络有个老大难：<strong>梯度消失/爆炸</strong>。信息经过几十层变换，反向传播时梯度连乘，很容易衰减到接近 0，前面的层几乎学不动。</p>
+<p>残差连接的写法是：</p>
+<pre><code>输出 = x + sublayer(x)</code></pre>
+<p>它给信息开了一条<strong>直通高速公路</strong>：<code>x</code> 不经过 <code>sublayer</code>，原样加到输出上。反向传播时，梯度沿着这条直路<strong>原样回传</strong>（对 <code>x</code> 的导数是 1），不会被连续的非线性变换&quot;磨没&quot;。于是即使子层学得不好、梯度很小，输入支路仍能把梯度完整送回前面——深层网络因此可以被稳定训练。</p>
+<h4 id="h-3-先残差再归一化的顺序">3. &quot;先残差，再归一化&quot;的顺序<a class="anchor" href="#h-3-先残差再归一化的顺序" aria-label="本节链接">#</a></h4>
+<p>每个子层的完整形式是：</p>
+<pre><code>x = LayerNorm(x + sublayer(x))</code></pre>
+<p>即<strong>先做残差相加，再做层归一化</strong>。残差保证梯度畅通，层归一化（下一课详讲）保证每层的数值尺度稳定。两者配合，构成了 Transformer 块的基本骨架，也成了后来几乎所有大模型（BERT、GPT）的标准配方。</p>
+<p><figure><img class="md-img" src="content/courses/attention-transformer/assets/chapter-3-figure-02.svg" alt="前馈网络&quot;放大-非线性-缩回&quot;的结构与残差连接的直通支路" loading="lazy" decoding="async"><figcaption>前馈网络&quot;放大-非线性-缩回&quot;的结构与残差连接的直通支路</figcaption></figure>
+</p>
+<h4 id="h-4-残差的直观理解">4. 残差的直观理解<a class="anchor" href="#h-4-残差的直观理解" aria-label="本节链接">#</a></h4>
+<p>可以把每个子层看成&quot;在已有表示上做一次<strong>修正</strong>&quot;：<code>sublayer(x)</code> 输出的是对 <code>x</code> 的增量，残差连接把增量加回原值。如果这个修正没有用，网络可以让 <code>sublayer</code> 输出接近 0，从而保持 <code>x</code> 不变——这让网络<strong>&quot;学不坏&quot;</strong>：最差也只是维持原样，不会因为多加一层而把已经学好的表示搅乱。</p>
+<p>这也是为什么 Transformer 能叠得很深而不崩：每一层都有&quot;啥也不改、原地踏步&quot;的退路。</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面实现论文里的位置前馈网络，验证其形状与参数量，并用一个标量小例子直观展示残差连接对梯度的保护作用。</p>
+<pre data-lang="python"><code class="language-python">import torch
+import torch.nn as nn
+
+torch.manual_seed(0)
+
+class PositionwiseFFN(nn.Module):
+    &quot;&quot;&quot;论文里的前馈网络：两层线性 + ReLU，中间放大到 4 倍。&quot;&quot;&quot;
+    def __init__(self, d_model, d_ff):
+        super().__init__()
+        self.linear1 = nn.Linear(d_model, d_ff)
+        self.linear2 = nn.Linear(d_ff, d_model)
+
+    def forward(self, x):
+        return self.linear2(torch.relu(self.linear1(x)))
+
+d_model, d_ff = 16, 64
+ffn = PositionwiseFFN(d_model, d_ff)
+
+x = torch.randn(2, 5, d_model)       # (batch, seq, d_model)，每个位置独立过同一套 FFN
+y = ffn(x)
+print(&quot;FFN 输出形状:&quot;, y.shape)       # (2, 5, 16)，与输入一致
+
+# 参数量：d_model*d_ff + d_ff + d_ff*d_model + d_model
+print(&quot;FFN 参数量:&quot;, sum(p.numel() for p in ffn.parameters()))
+
+# 残差连接：x + sublayer(x)，形状不变
+residual = x + y
+print(&quot;残差输出形状:&quot;, residual.shape)
+
+# 残差对梯度的保护：用一个标量演示&quot;直通支路&quot;如何把梯度原样回传
+a = torch.tensor(1.0, requires_grad=True)
+f = nn.Linear(1, 1, bias=False)
+with torch.no_grad():
+    f.weight.fill_(0.01)             # 故意让子层权重很小，梯度很弱
+
+out = a + f(a.unsqueeze(0)).squeeze(0)   # 残差：输入直接 + 子层变换
+out.backward()
+print(&quot;残差连接下 a 的梯度:&quot;, a.grad.item())   # 至少包含直连支路贡献的 1.0
+
+# 对比：没有残差时，梯度会被小权重&quot;磨小&quot;
+a2 = torch.tensor(1.0, requires_grad=True)
+out2 = f(a2.unsqueeze(0)).squeeze(0)       # 没有直连支路
+out2.backward()
+print(&quot;无残差时 a2 的梯度:&quot;, a2.grad.item())  # 只有 0.01，明显更小</code></pre>
+<p>运行后重点看最后两行：</p>
+<ul>
+<li><strong>有残差</strong>时，<code>a</code> 的梯度是 1.0（直通支路）加上子层那点小贡献，约为 1.01；</li>
+<li><strong>无残差</strong>时，<code>a2</code> 的梯度只有 0.01，被小权重直接&quot;吃&quot;掉了。</li>
+</ul>
+<p>这就是残差连接的核心价值：<strong>无论子层学成什么样，输入支路都能保证一条畅通的梯度通路</strong>。在几十层的 Transformer 里，这条通路是训练不崩的关键。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>把 <code>d_ff</code> 从 64 改成 16（等于 <code>d_model</code>），观察参数量减少、输出形状不变，思考&quot;放大 4 倍&quot;这个设计是否必要，能否用更小的 <code>d_ff</code> 换来近似的效果。</li>
+<li>把 <code>PositionwiseFFN</code> 里的 <code>relu</code> 换成 <code>gelu</code>（<code>F.gelu</code>），观察输出分布的变化；查询资料了解为什么后来的很多 Transformer 变体改用 GELU。</li>
+<li>打印 <code>residual</code> 与 <code>x</code> 的差的范数（<code>(residual - x).norm()</code>），验证&quot;残差输出 = 输入 + 子层增量&quot;；再把子层换成&quot;恒等映射&quot;（直接返回 <code>x</code>），看看会变成什么样。</li>
+<li>思考：残差连接的直通支路为什么要求&quot;输入和子层输出同维度&quot;？如果 <code>sublayer</code> 改变了维度，还能直接相加吗？这如何限制了 Transformer 块的设计？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Vaswani et al. · Attention Is All You Need：<a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1706.03762</a></li>
+<li>He et al. · Deep Residual Learning for Image Recognition：<a href="https://arxiv.org/abs/1512.03385" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1512.03385</a></li>
+<li>Jay Alammar · The Illustrated Transformer：<a href="https://jalammar.github.io/illustrated-transformer/" target="_blank" rel="noopener noreferrer">https://jalammar.github.io/illustrated-transformer/</a></li>
+</ul>
+<p><a href="#/l/attn-ch3-l3">下一课：层归一化</a></p>

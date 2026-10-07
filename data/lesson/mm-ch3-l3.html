@@ -1,0 +1,121 @@
+<h2 id="h-采样与加速">采样与加速<a class="anchor" href="#h-采样与加速" aria-label="本节链接">#</a></h2>
+<p>文生图模型&quot;质量高&quot;和&quot;采样慢&quot;是一体两面：第 2 章的 DDPM 要跑 <code>T=1000</code> 步，每步都过一次 U-Net，慢得难以商用。这一课解决这个问题——<strong>在几乎不损失质量的前提下，把采样步数从上千步压到几十步甚至个位数</strong>。核心是三件事：更聪明的<strong>采样调度器</strong>、<strong>确定性去噪（DDIM）</strong>带来的跳步能力，以及<strong>蒸馏</strong>等工程加速手段。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-采样调度器决定怎么一步步去噪">1. 采样调度器：决定&quot;怎么一步步去噪&quot;<a class="anchor" href="#h-1-采样调度器决定怎么一步步去噪" aria-label="本节链接">#</a></h4>
+<p>调度器（scheduler）是去噪循环的&quot;步进策略&quot;，决定每步减多少噪声、注不注入随机噪声。不同调度器的数学形式不同，但都围绕第 2 课的骨架变形：</p>
+<ul>
+<li><strong>DDPM 调度器</strong>：第 2 课的原版，随机采样，需 <code>T</code> 步，最慢但理论最正；</li>
+<li><strong>DDIM 调度器</strong>：把采样改成<strong>确定性</strong>过程，允许<strong>跳步</strong>（如每 50 步取 1 步），几十步即可；</li>
+<li><strong>PNDM / Euler / DPM-Solver</strong>：高阶数值求解器，用更少步逼近更优解，是 <code>diffusers</code> 的常见默认。</li>
+</ul>
+<h4 id="h-2-ddim确定性--跳步是加速的钥匙">2. DDIM：确定性 + 跳步是&quot;加速&quot;的钥匙<a class="anchor" href="#h-2-ddim确定性--跳步是加速的钥匙" aria-label="本节链接">#</a></h4>
+<p>DDIM 的关键洞见：<strong>采样不必严格沿马尔可夫链一步一步走</strong>。它把 DDPM 的随机采样改写成确定性映射，于是可以只选<strong>子序列</strong> <code>{t_1, t_2, ...}</code> 采样——<code>1000</code> 步缩到 <code>50</code> 步甚至 <code>20</code> 步，质量仍保持很好。直觉上，&quot;去噪&quot;是一个平滑过程，相邻两步高度冗余，跳着走损失很小。</p>
+<p>代价是：<strong>确定性采样牺牲了随机多样性</strong>（同一个噪声种子永远出同一张图），且步数过低时质量仍会明显下滑。但对&quot;快&quot;的需求来说，这笔交易非常划算。</p>
+<h4 id="h-3-从潜变量到图像解码也是成本">3. 从潜变量到图像：解码也是成本<a class="anchor" href="#h-3-从潜变量到图像解码也是成本" aria-label="本节链接">#</a></h4>
+<p>别忘了 Stable Diffusion 的流水线末端还有一步：VAE 解码器把潜变量放大 8 倍成像素。它只跑一次前向，通常远快于去噪循环，但在极速场景（个位数采样步）里占比会凸显。<strong>整体耗时 = 去噪步数 × U-Net 单步耗时 + VAE 解码耗时</strong>，加速要同时盯着这两项。</p>
+<h4 id="h-4-工程与算法层面的更多加速">4. 工程与算法层面的更多加速<a class="anchor" href="#h-4-工程与算法层面的更多加速" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>蒸馏</strong>：把&quot;50 步的模型&quot;蒸馏成&quot;1~4 步的学生模型&quot;。代表有 <strong>LCM（Latent Consistency Models）</strong>、<strong>Turbo/SDXL-Turbo</strong>，能在极少步数内逼近原质量；</li>
+<li><strong>精度与量化</strong>：<code>fp16/bf16</code>、INT8 量化，降低单步算力；</li>
+<li><strong>缓存与算子</strong>：缓存文本嵌入、VAE 结果；用 TensorRT、xFormers（省显存注意力）等加速算子；</li>
+<li><strong>换小模型</strong>：SD 1.5 / SDXL / SD 2.1 参数量差异大，选小模型本身就是最直接的加速。</li>
+</ul>
+<p><figure><img class="md-img" src="content/courses/multimodal-diffusion/assets/chapter-3-figure-04.svg" alt="采样调度器与加速对比：左图是&quot;步数 vs 质量&quot;曲线，横轴采样步数（1、4、8、20、50），纵轴图像质量，三条曲线分别标 DDPM（最慢、满步）、DDIM/DPM-Solver（几十步达高质）、LCM/蒸馏（个位数步逼近）；右图是加速手段清单卡片——蒸馏、量化、算子加速、潜空间解码、换小模型，各配一个小图标" loading="lazy" decoding="async"><figcaption>采样调度器与加速对比：左图是&quot;步数 vs 质量&quot;曲线，横轴采样步数（1、4、8、20、50），纵轴图像质量，三条曲线分别标 DDPM（最慢、满步）、DDIM/DPM-Solver（几十步达高质）、LCM/蒸馏（个位数步逼近）；右图是加速手段清单卡片——蒸馏、量化、算子加速、潜空间解码、换小模型，各配一个小图标</figcaption></figure>
+</p>
+<h4 id="h-5-质量速度的权衡总结">5. 质量—速度的权衡总结<a class="anchor" href="#h-5-质量速度的权衡总结" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>方法</th>
+<th align="center">典型步数</th>
+<th align="center">质量</th>
+<th>特点</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>DDPM</td>
+<td align="center">1000</td>
+<td align="center">高</td>
+<td>理论正、最慢</td>
+</tr>
+<tr>
+<td>DDIM</td>
+<td align="center">20~50</td>
+<td align="center">高</td>
+<td>确定性、可跳步</td>
+</tr>
+<tr>
+<td>DPM-Solver / PNDM</td>
+<td align="center">20~50</td>
+<td align="center">很高</td>
+<td>高阶求解、默认首选</td>
+</tr>
+<tr>
+<td>LCM / Turbo（蒸馏）</td>
+<td align="center">1~4</td>
+<td align="center">较高</td>
+<td>极快、适合实时</td>
+</tr>
+</tbody></table>
+<p>结论一句话：<strong>默认用 DPM-Solver 类调度器跑 25 步；追求极致速度上蒸馏模型；追求最大多样性用 DDPM。</strong> 选型本质是在&quot;步数、质量、多样性&quot;三者间找平衡。</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>用 <code>diffusers</code> 在同一句 prompt 下切换调度器与步数，直接对比效果。首次运行会下载权重。</p>
+<pre data-lang="python"><code class="language-python">from diffusers import (
+    StableDiffusionPipeline,
+    DDIMScheduler,
+    DPMSolverMultistepScheduler,
+)
+import torch
+
+pipe = StableDiffusionPipeline.from_pretrained(
+    &quot;runwayml/stable-diffusion-v1-5&quot;, torch_dtype=torch.float16
+).to(&quot;cuda&quot;)
+
+prompt = &quot;a red panda reading a book, studio light&quot;
+
+# 1) 默认调度器（PNDM），25 步
+img1 = pipe(prompt, num_inference_steps=25).images[0]
+img1.save(&quot;pndm_25.png&quot;)
+
+# 2) 换成 DDIM，15 步（确定性、更快，质量略降）
+pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
+img2 = pipe(prompt, num_inference_steps=15).images[0]
+img2.save(&quot;ddim_15.png&quot;)
+
+# 3) 换成 DPM-Solver 多步，25 步（高阶求解，通常质量更高）
+pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+img3 = pipe(prompt, num_inference_steps=25).images[0]
+img3.save(&quot;dpm_25.png&quot;)
+
+print(&quot;已生成 pndm_25.png / ddim_15.png / dpm_25.png&quot;)</code></pre>
+<p>再体验一下<strong>蒸馏加速</strong>的威力（LCM，个位数步数）：</p>
+<pre data-lang="python"><code class="language-python">from diffusers import DiffusionPipeline
+import torch
+
+# —— LCM 蒸馏版：1~4 步即可出图，实时生成 ——
+pipe = DiffusionPipeline.from_pretrained(
+    &quot;SimianLuo/LCM_Dreamshaper_v7&quot;, torch_dtype=torch.float16
+).to(&quot;cuda&quot;)
+
+prompt = &quot;a red panda reading a book, studio light&quot;
+image = pipe(prompt, num_inference_steps=4, guidance_scale=8.0).images[0]
+image.save(&quot;lcm_4.png&quot;)
+print(&quot;已生成 lcm_4.png（仅 4 步）&quot;)</code></pre>
+<p>对比 <code>ddim_15.png</code>（15 步）与 <code>lcm_4.png</code>（4 步）：后者用不到三分之一的时间，画质却接近。<strong>这就是&quot;蒸馏把几十步的知识压进几步&quot;的直观效果。</strong></p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>固定 prompt，用同一调度器把 <code>num_inference_steps</code> 依次设为 5、10、25、50，逐张比较质量与耗时，画出&quot;步数—质量&quot;的经验曲线。</li>
+<li>手推 DDIM 与 DDPM 的关键差异：说明 DDIM 去掉随机噪声项后为何变成确定性映射，以及&quot;确定性&quot;如何换来&quot;可跳步&quot;。</li>
+<li>在代码里把调度器换成 <code>EulerDiscreteScheduler</code> 再跑 25 步，与 DPM-Solver 对比，说说不同高阶求解器之间的观感差异。</li>
+<li>思考题：为什么&quot;蒸馏&quot;能让学生在 4 步内逼近教师 50 步的效果？从&quot;蒸馏让学生直接学教师的多步映射结果&quot;这个角度说明。</li>
+<li>调研题：查阅 LCM（Latent Consistency Models）论文，了解&quot;一致性模型&quot;如何把多步采样压缩成极少数步，写一段 200 字以内的总结。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Song et al., <em>Denoising Diffusion Implicit Models</em>（DDIM，确定性采样与跳步）：<a href="https://arxiv.org/abs/2010.02502" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2010.02502</a></li>
+<li>Lu et al., <em>DPM-Solver: A Fast ODE Solver for Diffusion Probabilistic Model Sampling</em>：<a href="https://arxiv.org/abs/2206.00927" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2206.00927</a></li>
+<li>Luo et al., <em>Latent Consistency Models</em>（LCM，蒸馏加速）：<a href="https://arxiv.org/abs/2310.04378" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2310.04378</a></li>
+<li>Ho et al., <em>Denoising Diffusion Probabilistic Models</em>（DDPM 采样基线）：<a href="https://arxiv.org/abs/2006.11239" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2006.11239</a></li>
+<li>Hugging Face diffusers 文档（调度器一览）：<a href="https://huggingface.co/docs/diffusers/index" target="_blank" rel="noopener noreferrer">https://huggingface.co/docs/diffusers/index</a></li>
+</ul>
+<p><a href="#/l/mm-ch4-l1">下一课：多模态对齐</a></p>

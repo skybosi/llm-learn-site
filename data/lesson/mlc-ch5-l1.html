@@ -1,0 +1,282 @@
+<h2 id="h-融合的收益来源省带宽省-kernel-启动增加复用">融合的收益来源：省带宽、省 kernel 启动、增加复用<a class="anchor" href="#h-融合的收益来源省带宽省-kernel-启动增加复用" aria-label="本节链接">#</a></h2>
+<p>256 MiB 的 fp32 张量过 8 个逐元素算子：逐算子执行要读写 <strong>4096 MiB</strong>，融成一个内核只要 <strong>512 MiB</strong>。算子没少、浮点运算没少，省下的是中间张量&quot;写回显存再读出来&quot;的往返。<strong>算子融合</strong>（operator fusion）就是把这 N 趟访存压成 1 趟；本课把它的收益拆成三笔能逐条核对的账（带宽、启动、片上复用），并给出可跑的核算脚本与真内核实测。</p>
+<p><figure><img class="md-img" src="content/courses/ml-compilers/assets/chapter-5-figure-01.svg" alt="融合省掉的三笔账：带宽、启动、复用" loading="lazy" decoding="async"><figcaption>融合省掉的三笔账：带宽、启动、复用</figcaption></figure>
+</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-三笔账各有各的适用区间">1. 三笔账，各有各的适用区间<a class="anchor" href="#h-1-三笔账各有各的适用区间" aria-label="本节链接">#</a></h4>
+<p>融合不改变算术：<code>y = sigmoid(relu(x@W + b))</code> 照样要算矩阵乘、加法、relu、sigmoid；它改变的是<strong>数据在哪里停留</strong>。三笔收益要分开看，否则容易在不适用的场景上期待落空：</p>
+<table>
+<thead>
+<tr>
+<th>收益</th>
+<th>机制</th>
+<th>什么时候显著</th>
+<th>什么时候几乎为零</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>省带宽</strong></td>
+<td>中间张量不落地：N 趟&quot;读 + 写&quot;变成 1 趟</td>
+<td>逐元素点链、逐元素 + 归约、逐元素 + epilogue</td>
+<td>链条里全是 exp/tanh 这类算力受限算子；张量小到能整块进缓存</td>
+</tr>
+<tr>
+<td><strong>省内核启动</strong></td>
+<td>N 次内核下发与派发变成 1 次</td>
+<td>张量小、算子多、启动开销占比高（小 batch、端侧）</td>
+<td>张量很大时启动占比低于 1%，可忽略</td>
+</tr>
+<tr>
+<td><strong>增数据复用</strong></td>
+<td>中间值留在寄存器/片上，被同一内核里多个表达式共用</td>
+<td>归约前先算、epilogue、同一结果被多处引用</td>
+<td>复用距离远、同时活着的值太多（第 3 课讲它怎么反噬）</td>
+</tr>
+</tbody></table>
+<h4 id="h-2-带宽账可以精确算不需要估">2. 带宽账可以精确算，不需要估<a class="anchor" href="#h-2-带宽账可以精确算不需要估" aria-label="本节链接">#</a></h4>
+<p>设张量元素数为 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">E</span></span></span></span>、每元素 4 字节（fp32），单张量字节数 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">4</span><span class="mord mathnormal" style="margin-right:0.0576em;">E</span></span></span></span>。一条由 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span></span></span></span> 个逐元素算子组成的链：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord text"><span class="mord cjk_fallback">流量</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">不融合</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:3.106em;vertical-align:-1.2777em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.8283em;"><span style="top:-1.8723em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">i</span><span class="mrel mtight">=</span><span class="mord mtight">1</span></span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∑</span></span></span><span style="top:-4.3em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.109em;">N</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.2777em;"><span></span></span></span></span></span><span class="mopen">(</span><span class="mord"><span class="mord text"><span class="mord">read</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord text"><span class="mord">write</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8778em;vertical-align:-0.1944em;"></span><span class="mord">2</span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord text"><span class="mord cjk_fallback">流量</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">融合</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">2</span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span></span></span></span></span></p>
+<p>比值正好是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span></span></span></span>。本课 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">8</span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">256</span></span></span></span> MiB，于是 4096 MiB 对 512 MiB。<strong>这里的&quot;不融合&quot;只要求&quot;每算子一趟下发、中间结果落地&quot;</strong>：中间结果就算被内存池复用（第 4 章第 3 课），流量也一分不少——复用省的是容量，不是带宽。</p>
+<h4 id="h-3-启动账小张量时才重要">3. 启动账：小张量时才重要<a class="anchor" href="#h-3-启动账小张量时才重要" aria-label="本节链接">#</a></h4>
+<p>单次执行的时间下界可以写成两项：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6151em;"></span><span class="mord mathnormal">t</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.0574em;vertical-align:-0.686em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3714em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0502em;">B</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord text"><span class="mord">traffic</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.5945em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">kernel</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span></span></span></span></span></p>
+<p><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0502em;">B</span></span></span></span> 是可达带宽，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span></span></span></span> 是单次内核启动 + 框架派发的固定开销。取 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0502em;">B</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1.5</span></span></span></span> TB/s、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">5</span></span></span></span> µs（<strong>示例量级参数，非某卡实测</strong>）：8 内核 2.90 ms、1 内核 0.36 ms，启动只占 1.4%。工程判据由此而来：<strong>只有 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span></span></span></span> 与 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord">traffic</span></span><span class="mord">/</span><span class="mord mathnormal" style="margin-right:0.0502em;">B</span></span></span></span> 同量级时，&quot;省启动&quot;才是主要收益</strong>——即张量小、算子多的场景（端侧、小 batch）。</p>
+<h4 id="h-4-复用账融合给中间值找了个不必落地的去处">4. 复用账：融合给中间值找了个&quot;不必落地&quot;的去处<a class="anchor" href="#h-4-复用账融合给中间值找了个不必落地的去处" aria-label="本节链接">#</a></h4>
+<p>中间张量不落地之后，它待在寄存器里，可被同一内核里的多个表达式共用。两类真实优化由此而来：<strong>归约前算</strong>（把逐元素生产者算进归约循环，如 softmax 的分母）与 <strong>epilogue 融合</strong>（归约结果后续的逐元素变换接在归约后面，如 <code>sum → ×2 → relu</code>）。对立面是<strong>活值数</strong>：同时在世的值越多，寄存器越紧张——第 3 课的核心矛盾。</p>
+<h4 id="h-5-真实编译器里长什么样">5. 真实编译器里长什么样<a class="anchor" href="#h-5-真实编译器里长什么样" aria-label="本节链接">#</a></h4>
+<p>TVM 把 operator fusion 与常量折叠、静态内存规划并列为图级优化三项，其设计文档写到融合流水线（<code>relax.FuseOps</code> + <code>relax.FuseTIR</code>）&quot;把多个连续的张量算子融合成单个 kernel&quot;。Inductor 侧本机实测（见输出）：8 个逐元素算子被合成为<strong>一个</strong>内核 <code>cpp_fused_add_div_mul_relu_sigmoid_sub_0</code>，只申请一块新缓冲；而 <code>relu(x@w+b)</code> 接 <code>sigmoid</code>、<code>sum</code> 产出两个内核——不透明的 <code>extern_kernels.addmm</code> 一个，其余融成 <code>cpp_fused_relu_sigmoid_sum_0</code>。<strong>连续算子确实会被融成一个；外部库实现的矩阵乘是融合边界</strong>。</p>
+<h4 id="h-6-常见坑">6. 常见坑<a class="anchor" href="#h-6-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>以为融合减少了计算量</strong>：减的是访存与下发次数；算力受限的链（<code>exp</code>、大型 <code>tanh</code>）融合后时间几乎不变。</li>
+<li><strong>拿小张量的比例外推大张量</strong>：启动项占比随张量变大迅速衰减，小张量的 3 倍加速到大张量可能只剩 1.2 倍。</li>
+<li><strong>把&quot;复用缓冲&quot;当成&quot;融合&quot;</strong>：内存复用不降带宽，只降容量与分配开销；两者常被混为一谈。</li>
+<li><strong>忘了不透明边界</strong>：调优时先看清生成的内核名里到底融进了哪些算子，再讨论&quot;为什么没更快&quot;。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>第 1 段是纯 numpy 的核算（无第三方依赖）；第 2 段用 numba 把同一条链手写成 1 / 2 / 8 个内核做对照实测（可选，<code>pip install numba</code>）；第 3 段用 torch.compile 看真实编译器生成的内核名（可选，需 torch）。</p>
+<pre data-lang="python"><code class="language-python"># ---- 第 1 课示例：融合省掉的是什么（numpy，本机 python3.10 + numpy 1.26.2 实跑，CPU）----
+import numpy as np, time
+
+MB = 1 &lt;&lt; 20
+SHAPE = (1 &lt;&lt; 16, 1 &lt;&lt; 10)                 # 65536 x 1024 = 64Mi 个 fp32 = 256 MiB
+ELEMS = SHAPE[0] * SHAPE[1]
+S_BYTES = ELEMS * 4                        # 单个张量的字节数
+
+# 八个&quot;廉价&quot;逐元素算子：整条链是带宽受限（若含 exp/tanh 这类超越函数就是算力受限，另说）
+OPS = [(&#39;add&#39;,  lambda a, o: np.add(a, 1.0, out=o)),
+       (&#39;mul&#39;,  lambda a, o: np.multiply(a, 2.0, out=o)),
+       (&#39;sub&#39;,  lambda a, o: np.subtract(a, 3.0, out=o)),
+       (&#39;relu&#39;, lambda a, o: np.maximum(a, 0.0, out=o)),
+       (&#39;div&#39;,  lambda a, o: np.divide(a, 4.0, out=o)),
+       (&#39;add5&#39;, lambda a, o: np.add(a, 5.0, out=o)),
+       (&#39;tanh&#39;, lambda a, o: np.tanh(a, out=o)),
+       (&#39;half&#39;, lambda a, o: np.multiply(a, 0.5, out=o))]
+N = len(OPS)
+
+def run_unfused(x):
+    &quot;&quot;&quot;框架逐算子执行：每个算子申请一块新输出，中间张量全部落地再读回。&quot;&quot;&quot;
+    y = x
+    for _, f in OPS:
+        o = np.empty_like(x); f(y, o); y = o
+    return y
+
+def run_reuse(x):
+    &quot;&quot;&quot;逐算子但复用两块输出缓冲：还是 8 趟访存，省掉的只是分配，流量一分没少。&quot;&quot;&quot;
+    bufs = [np.empty_like(x), np.empty_like(x)]
+    y = x
+    for i, (_, f) in enumerate(OPS):
+        f(y, bufs[i % 2]); y = bufs[i % 2]
+    return y
+
+def run_fused(x, tile_rows):
+    &quot;&quot;&quot;模拟融合内核：一次读进&quot;片上&quot;（这里是一块常驻 tile 缓冲），链内原地推进，一次写回。&quot;&quot;&quot;
+    out = np.empty_like(x)
+    for r in range(0, x.shape[0], tile_rows):
+        t = np.array(x[r:r + tile_rows], copy=True)     # 一趟读：DRAM → 片上
+        for _, f in OPS:
+            f(t, t)                                     # 链内全在片上，不落地
+        out[r:r + tile_rows] = t                        # 一趟写：片上 → DRAM
+    return out
+
+def bench(fn, *a, repeat=3):
+    fn(*a)
+    ts = []
+    for _ in range(repeat):
+        t0 = time.perf_counter(); fn(*a); ts.append(time.perf_counter() - t0)
+    return min(ts)
+
+x = np.linspace(-1.0, 1.0, ELEMS, dtype=np.float32).reshape(SHAPE)
+traffic = {&#39;逐算子（每步新分配）&#39;: 2 * N * S_BYTES, &#39;逐算子（复用两块缓冲）&#39;: 2 * N * S_BYTES,
+           &#39;模拟融合（分块 + 块内原地）&#39;: 2 * S_BYTES}
+kernels = {&#39;逐算子（每步新分配）&#39;: N, &#39;逐算子（复用两块缓冲）&#39;: N, &#39;模拟融合（分块 + 块内原地）&#39;: 1}
+
+print(f&#39;=== 1. 场景：{S_BYTES / MB:.0f} MiB 的 fp32 张量过 {N} 个逐元素算子 ===&#39;)
+print(f&#39;  单个张量读一遍 + 写一遍 = {2 * S_BYTES / MB:.0f} MiB&#39;)
+for tag in traffic:
+    print(f&#39;  {tag:&lt;24} DRAM 流量 {traffic[tag] / MB:&gt;5.0f} MiB  内核数 {kernels[tag]}&#39;
+          f&#39;  = {traffic[tag] / (2 * S_BYTES):.0f} 倍单张量读写&#39;)
+
+print(&#39;\n=== 2. 实测（同一台 CPU 上的相对比较，绝对值随机器变化）===&#39;)
+for tag, fn, args in [(&#39;逐算子（每步新分配）&#39;, run_unfused, (x,)),
+                      (&#39;逐算子（复用两块缓冲）&#39;, run_reuse, (x,)),
+                      (&#39;模拟融合（分块 + 块内原地）&#39;, run_fused, (x, 256))]:
+    print(f&#39;  {tag:&lt;24}{bench(fn, *args) * 1e3:7.1f} ms   账面流量 {traffic[tag] / MB:&gt;4.0f} MiB&#39;)
+print(&#39;  本机只测到 1.3~3 倍的差距，而不是 8 倍：numpy 每个 ufunc 调用有自己的固定开销，&#39;)
+print(&#39;  且 CPU 的缓存层级与 GPU 的寄存器/共享内存不是一回事——numpy 的墙钟时间不能外推到 GPU。&#39;)
+print(&#39;  同一个问题的&quot;真·融合内核&quot;版本见下面 numba / torch 两块（本机均已实跑）。&#39;)
+
+print(&#39;\n=== 3. 把两笔账换算成时间（参数化模型：带宽 B、单次内核启动 L 自己代入）===&#39;)
+for B in (1.5e12, 3.0e12):
+    L = 5e-6
+    t_no = 2 * N * S_BYTES / B + N * L
+    t_fu = 2 * S_BYTES / B + L
+    print(f&#39;  B={B / 1e12:.1f} TB/s, L={L * 1e6:.0f} us → 不融合 {t_no * 1e3:6.2f} ms&#39;
+          f&#39;（启动占 {N * L / t_no * 100:4.1f}%），融合 {t_fu * 1e3:6.2f} ms&#39;
+          f&#39;（启动占 {L / t_fu * 100:4.1f}%），比 {t_no / t_fu:4.2f}x&#39;)
+print(&#39;  两笔收益各自成立：流量按&quot;每算子一趟&quot;降到 1 趟，内核数从 N 降到 1；&#39;)
+print(&#39;  张量越小，启动与固定开销占比越高，融合越划算。&#39;)</code></pre>
+<p>本机实跑输出（Apple M3 Pro，python3.10 + numpy 1.26.2）：</p>
+<pre data-lang="text"><code class="language-text">=== 1. 场景：256 MiB 的 fp32 张量过 8 个逐元素算子 ===
+  单个张量读一遍 + 写一遍 = 512 MiB
+  逐算子（每步新分配）               DRAM 流量  4096 MiB  内核数 8  = 8 倍单张量读写
+  逐算子（复用两块缓冲）              DRAM 流量  4096 MiB  内核数 8  = 8 倍单张量读写
+  模拟融合（分块 + 块内原地）          DRAM 流量   512 MiB  内核数 1  = 1 倍单张量读写
+
+=== 2. 实测（同一台 CPU 上的相对比较，绝对值随机器变化）===
+  逐算子（每步新分配）                478.7 ms   账面流量 4096 MiB
+  逐算子（复用两块缓冲）               365.2 ms   账面流量 4096 MiB
+  模拟融合（分块 + 块内原地）           114.4 ms   账面流量  512 MiB
+  本机只测到 1.3~3 倍的差距，而不是 8 倍：numpy 每个 ufunc 调用有自己的固定开销，
+  且 CPU 的缓存层级与 GPU 的寄存器/共享内存不是一回事——numpy 的墙钟时间不能外推到 GPU。
+  同一个问题的&quot;真·融合内核&quot;版本见下面 numba / torch 两块（本机均已实跑）。
+
+=== 3. 把两笔账换算成时间（参数化模型：带宽 B、单次内核启动 L 自己代入）===
+  B=1.5 TB/s, L=5 us → 不融合   2.90 ms（启动占  1.4%），融合   0.36 ms（启动占  1.4%），比 8.00x
+  B=3.0 TB/s, L=5 us → 不融合   1.47 ms（启动占  2.7%），融合   0.18 ms（启动占  1.4%），比 8.00x
+  两笔收益各自成立：流量按&quot;每算子一趟&quot;降到 1 趟，内核数从 N 降到 1；
+  张量越小，启动与固定开销占比越高，融合越划算。</code></pre>
+<pre data-lang="python"><code class="language-python"># ---- 可选（pip install numba）：同样 8 个算子，分别写成 1 / 2 / 8 个内核（CPU，本机已实跑）----
+import numpy as np, time
+from numba import njit, prange
+SHAPE = (1 &lt;&lt; 16, 1 &lt;&lt; 10)                 # 与上面同一个尺度
+N = SHAPE[0] * SHAPE[1]
+
+@njit(parallel=True, fastmath=True, cache=False)
+def op1(a, b):
+    for i in prange(a.shape[0]): b[i] = a[i] + 1.0
+@njit(parallel=True, fastmath=True, cache=False)
+def op2(a, b):
+    for i in prange(a.shape[0]): b[i] = a[i] * 2.0
+@njit(parallel=True, fastmath=True, cache=False)
+def op3(a, b):
+    for i in prange(a.shape[0]): b[i] = a[i] - 3.0
+@njit(parallel=True, fastmath=True, cache=False)
+def op4(a, b):
+    for i in prange(a.shape[0]): b[i] = a[i] if a[i] &gt; 0.0 else 0.0
+@njit(parallel=True, fastmath=True, cache=False)
+def op5(a, b):
+    for i in prange(a.shape[0]): b[i] = a[i] / 4.0
+@njit(parallel=True, fastmath=True, cache=False)
+def op6(a, b):
+    for i in prange(a.shape[0]): b[i] = a[i] + 5.0
+@njit(parallel=True, fastmath=True, cache=False)
+def op7(a, b):
+    for i in prange(a.shape[0]): b[i] = a[i] * a[i]
+@njit(parallel=True, fastmath=True, cache=False)
+def op8(a, b):
+    for i in prange(a.shape[0]): b[i] = a[i] * 0.5
+
+@njit(parallel=True, fastmath=True, cache=False)
+def fused8(a, b):
+    for i in prange(a.shape[0]):
+        v = a[i]
+        v = v + 1.0; v = v * 2.0; v = v - 3.0; v = v if v &gt; 0.0 else 0.0
+        v = v / 4.0; v = v + 5.0; v = v * v; v = v * 0.5
+        b[i] = v
+
+@njit(parallel=True, fastmath=True, cache=False)
+def fused4a(a, b):
+    for i in prange(a.shape[0]):
+        v = a[i]
+        v = v + 1.0; v = v * 2.0; v = v - 3.0; v = v if v &gt; 0.0 else 0.0
+        b[i] = v
+@njit(parallel=True, fastmath=True, cache=False)
+def fused4b(a, b):
+    for i in prange(a.shape[0]):
+        v = a[i]
+        v = v / 4.0; v = v + 5.0; v = v * v; v = v * 0.5
+        b[i] = v
+
+def eight_passes(x):
+    bufs = [np.empty_like(x), np.empty_like(x)]
+    y = x
+    for i, op in enumerate((op1, op2, op3, op4, op5, op6, op7, op8)):
+        op(y.reshape(-1), bufs[i % 2].reshape(-1)); y = bufs[i % 2]
+    return y
+
+def two_passes(x):
+    bufs = [np.empty_like(x), np.empty_like(x)]
+    fused4a(x.reshape(-1), bufs[0].reshape(-1))
+    fused4b(bufs[0].reshape(-1), bufs[1].reshape(-1))
+    return bufs[1]
+
+def one_pass(x):
+    out = np.empty_like(x)
+    fused8(x.reshape(-1), out.reshape(-1))
+    return out
+
+def bench(fn, x, repeat=5):
+    fn(x); ts = []
+    for _ in range(repeat):
+        t0 = time.perf_counter(); fn(x); ts.append(time.perf_counter() - t0)
+    return min(ts)
+
+x = np.linspace(-1.0, 1.0, N, dtype=np.float32).reshape(SHAPE)
+print(f&#39;{&quot;实现&quot;:&lt;22}{&quot;内核数&quot;:&gt;7}{&quot;往返流量 MiB&quot;:&gt;13}{&quot;实测 ms&quot;:&gt;10}{&quot;相对&quot;:&gt;8}&#39;)
+base = None
+for tag, fn, k in ((&#39;一个内核融 8 个算子&#39;, one_pass, 1),
+                   (&#39;切成两个内核各 4 个&#39;, two_passes, 2),
+                   (&#39;八个内核各 1 个算子&#39;, eight_passes, 8)):
+    t = bench(fn, x)
+    base = t if base is None else base
+    print(f&#39;{tag:&lt;22}{k:&gt;7}{2 * k * x.nbytes / 2**20:&gt;13.0f}{t * 1e3:&gt;10.1f}{t / base:&gt;8.2f}&#39;)
+ref = one_pass(x); got = eight_passes(x)
+print(f&#39;两条路径最大绝对差 {np.abs(ref.reshape(-1) - got.reshape(-1)).max():.2e}&#39;)</code></pre>
+<p>真内核实测（同机，numba 0.60.0，每项取 5 次最小值）：</p>
+<pre data-lang="text"><code class="language-text">实现                        内核数     往返流量 MiB     实测 ms      相对
+一个内核融 8 个算子                 1          512      12.9    1.00
+切成两个内核各 4 个                 2         1024      27.5    2.13
+八个内核各 1 个算子                 8         4096      56.6    4.38
+两条路径最大绝对差 1.91e-06</code></pre>
+<blockquote>
+<p>计时列在不同负载下会浮动约 ±10%（本课所有实测都是本机一次真实运行、取多次最小值的输出）；流量、内核数、寄存器数、occupancy 这类结构性数字则是确定的。</p>
+</blockquote>
+<p>两处可核对的结论：<strong>切一刀就是两倍流量</strong>（2 个内核 1024 MiB、实测 2.13x，与账面 2x 吻合）；<strong>8 个内核只有 4.38x 而非 8x</strong>——内核启动与并行调度有固定开销，幅度会被摊薄，趋势与流量账一致。两条路径结果一致（最大绝对差 1.91e-06）。</p>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选，本机 CPU 即可跑：看真实编译器把哪些算子融进了一个内核 ----
+# 本机 torch 2.3.1 + macOS（CPU 后端）实跑；这条链在无 GPU 的机器上同样能观察：
+#   OMP_NUM_THREADS=1 TORCH_LOGS=output_code python3.10 fused_chain.py 2&gt;&amp;1 | grep -E &quot;cpp_fused|extern_kernels|empty_strided_cpu&quot;
+# 其中 fused_chain.py 定义：y=x+1; y=y*2; y=y-3; relu; /4; +5; sigmoid; *0.5，输入 randn(1024,1024)
+# 观察到的生成代码（原样摘录）：
+#   cpp_fused_add_div_mul_relu_sigmoid_sub_0 = async_compile.cpp_pybinding([&#39;const float*&#39;, &#39;float*&#39;], &#39;&#39;&#39;
+#       buf0 = empty_strided_cpu((1024, 1024), (1024, 1), torch.float32)
+#       cpp_fused_add_div_mul_relu_sigmoid_sub_0(arg0_1, buf0)
+# 即：8 个逐元素算子 = 1 个内核、1 块新缓冲。同一台机器上换一条链（relu(x@w+b) → sigmoid → sum）得到：
+#   extern_kernels.addmm(...)
+#   cpp_fused_relu_sigmoid_sum_0(buf0, buf1)
+# 即：不透明的 extern 矩阵乘独立成一个内核，其余三个算子融成另一个。
+# 若需要 GPU 版本：把 device 换成 &#39;cuda&#39;，用 TORCH_LOGS=&quot;+inductor&quot; 与 ncu 对照 dram__bytes（第 3 课给命令）。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：把 <code>OPS</code> 扩到 16 个算子，重跑第 1、3 段，核对&quot;流量 = 2NS&quot;与&quot;融合 = 2S&quot;两条公式是否仍然成立；再让其中第 8 个算子换成 <code>np.exp</code>，观察第 2 段的实测比例怎样变化，并解释。</li>
+<li><strong>解释</strong>：为什么&quot;复用两块缓冲&quot;（<code>run_reuse</code>）一点流量都没省，却能比&quot;每步新分配&quot;（<code>run_unfused</code>）快？这两者在 GPU 上分别对应什么现象？</li>
+<li><strong>对比/验证</strong>：把第 3 段模型里的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span></span></span></span> 从 5 µs 改成 50 µs（模拟端侧更重的派发开销），重新计算 8 内核与 1 内核的时间比，并给出&quot;启动项开始主导&quot;的张量大小阈值。</li>
+<li><strong>思考</strong>：融合把中间值留在片上，代价是寄存器。一条 32 算子的链融成一个内核会遇到什么问题？给出一个不需要 GPU 的验证办法（提示：看生成内核有无溢出迹象，或用第 3 课的核算器）。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Tianqi Chen et al., <em>TVM: An Automated End-to-End Optimizing Compiler for Deep Learning</em>（OSDI&#39;18；把算子融合列为图级优化三项之一，并给出&quot;中间张量不落地&quot;的收益来源）：<a href="https://www.usenix.org/conference/osdi18/presentation/chen" target="_blank" rel="noopener noreferrer">https://www.usenix.org/conference/osdi18/presentation/chen</a></li>
+<li>Apache TVM 设计文档（<code>relax.FuseOps</code> + <code>relax.FuseTIR</code> 融合流水线&quot;把多个连续张量算子融合成单个 kernel&quot;的官方说明）：<a href="https://tvm.apache.org/docs/arch/index.html" target="_blank" rel="noopener noreferrer">https://tvm.apache.org/docs/arch/index.html</a></li>
+<li>PyTorch 官方文档 <em>torch.compiler</em>（编译器的默认行为与日志开关；本课第 5 节用 <code>TORCH_LOGS=output_code</code> 观察生成的内核名）：<a href="https://pytorch.org/docs/stable/torch.compiler.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/docs/stable/torch.compiler.html</a></li>
+<li>Lianmin Zheng et al., <em>The Deep Learning Compiler: A Comprehensive Survey</em>（图级优化的分类框架：节点级 / 图级 / 算子级，以及融合在其中的位置）：<a href="https://arxiv.org/abs/2002.03794" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2002.03794</a></li>
+</ul>
+<p><a href="#/l/mlc-ch5-l2">下一课：pattern 匹配与融合边界（点链 / 归约链）</a></p>

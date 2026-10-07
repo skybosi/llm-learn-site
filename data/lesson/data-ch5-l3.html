@@ -1,0 +1,792 @@
+<h2 id="h-可复现的三个等级结果实验与环境的重建">可复现的三个等级：结果、实验与环境的重建<a class="anchor" href="#h-可复现的三个等级结果实验与环境的重建" aria-label="本节链接">#</a></h2>
+<h3 id="h-这一节要解决什么">这一节要解决什么<a class="anchor" href="#h-这一节要解决什么" aria-label="本节链接">#</a></h3>
+<p>前两节把数据变成了可验证的身份（第 1 节）并画出了依赖关系（第 2 节）。但两节都建立在一个没有检查过的假设上：<strong>同样的代码、同样的数据，跑两遍会得到同样的结果。</strong></p>
+<p>这句话在真实系统里几乎从不自动成立。本节把它拆成三个<strong>依次更强</strong>的等级，并给每个等级一个可以执行的验收测试：</p>
+<table>
+<thead>
+<tr>
+<th>等级</th>
+<th>名字</th>
+<th>承诺</th>
+<th>验收测试</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>R1</strong></td>
+<td>结果可复现</td>
+<td>同一进程/同一环境下，同输入 → 同输出（逐字节或容差内）</td>
+<td>同一环境跑两次，比对输出指纹</td>
+</tr>
+<tr>
+<td><strong>R2</strong></td>
+<td>实验可重跑</td>
+<td>换时间、换机器、换顺序，同输入 → 同<strong>结论</strong>（不是同字节）</td>
+<td>两台机器各跑一次，比对结论与置信区间</td>
+</tr>
+<tr>
+<td><strong>R3</strong></td>
+<td>环境可重建</td>
+<td>从零（新容器/新机器）按文档能装出等价环境并复现 R1</td>
+<td>在一个干净环境里按 manifest 重建，跑同一份验收</td>
+</tr>
+</tbody></table>
+<p>三个等级的关系不是&quot;好/更好/最好&quot;，而是<strong>各自回答一个不同的问题</strong>：</p>
+<ul>
+<li>R1 回答&quot;这个数字是不是这台机器的产物&quot;，</li>
+<li>R2 回答&quot;这个结论是不是那次运行的巧合&quot;，</li>
+<li>R3 回答&quot;三个月后新同事能不能把这件事做出来&quot;。</li>
+</ul>
+<p><strong>R1 不成立时 R2 和 R3 都没有意义</strong>（连同一台机器都重复不出，跨机器比较是噪声）；而 <strong>R3 成立不蕴含 R1</strong>（环境能装配起来，但管线本身带随机性）。这三层各自有独立的失效模式，所以必须分开验收 —— 把它们合成一个&quot;可复现 ✅&quot;是整个工程里最常见的一种自欺。</p>
+<p>本节的组织：</p>
+<ol>
+<li><strong>为什么是三个等级</strong>：一个&quot;可复现&quot;布尔量为什么必然说谎；以及三个等级各自服务的决策。</li>
+<li><strong>不确定性的六个来源</strong>（按可测性排序），以及每一类的检测方法。重点是<strong>浮点归约顺序</strong>（本节会给出一个具体的、可以逐位看懂的差异）。</li>
+<li><strong>随机性的正确做法</strong>：显式种子传递（不依赖全局状态）。为什么&quot;在脚本开头 <code>seed(42)</code>&quot;是不够的 —— 它只让<strong>第一次</strong>运行可重复。</li>
+<li><strong>环境指纹与差异分类</strong>：同代码不同环境的四种差异，以及&quot;哪一类差异会导致哪一类结论失效&quot;。</li>
+<li><strong>验收门槛与容差</strong>：两个必须同时满足的测试（同一性 R1、独立性 R2），容差怎么定（不是&quot;差不多就行&quot;，而是&quot;容差必须小于你要分辨的效应量&quot;）。</li>
+</ol>
+<h3 id="h-一为什么可复现必须分级">一、为什么&quot;可复现&quot;必须分级<a class="anchor" href="#h-一为什么可复现必须分级" aria-label="本节链接">#</a></h3>
+<h4 id="h-11-一个布尔量的三种说谎方式">1.1 一个布尔量的三种说谎方式<a class="anchor" href="#h-11-一个布尔量的三种说谎方式" aria-label="本节链接">#</a></h4>
+<p>&quot;这次实验可复现&quot;这句话在工程上有三种不同的含义，混用会直接导致错误决策：</p>
+<table>
+<thead>
+<tr>
+<th>说这句话的人想的</th>
+<th>实际验证的</th>
+<th>没说出口的风险</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>&quot;我重跑了一次，数字一样&quot;</td>
+<td>R1（同环境）</td>
+<td>换台机器就不一样（R2 失败），但没人测</td>
+</tr>
+<tr>
+<td>&quot;别人照我的脚本跑出来了&quot;</td>
+<td>R2 或 R3</td>
+<td>他跑出的是<strong>另一个数字</strong>，但结论&quot;差不多&quot;，于是差异被忽略</td>
+</tr>
+<tr>
+<td>&quot;环境写进了 requirements.txt&quot;</td>
+<td>文档存在</td>
+<td>从未在干净环境验证过；CUDA/驱动/BLAS 版本不在里面</td>
+</tr>
+</tbody></table>
+<p>三种说谎方式的共同结构是：<strong>用弱等级的通过去支撑强等级的结论</strong>。R3 是最容易被假装的（&quot;我写了 README&quot;），R1 是最容易被跳过的（&quot;重跑太慢&quot;），而 R2 是最容易被误解的（&quot;数字不一样但结论一样&quot;这句判断本身需要协议）。</p>
+<h4 id="h-12-三个等级各自服务哪个决策">1.2 三个等级各自服务哪个决策<a class="anchor" href="#h-12-三个等级各自服务哪个决策" aria-label="本节链接">#</a></h4>
+<pre><code>R1 结果可复现  ──→ &quot;这个数是不是 bug？&quot;    调试、对账、A/B 的差值是否真实
+R2 实验可重跑  ──→ &quot;这个结论能不能信？&quot;    报告、论文、上线决策
+R3 环境可重建  ──→ &quot;这件事能不能交接？&quot;    新人复现、审计、故障复盘</code></pre>
+<p>三条箭头都是<strong>单向</strong>的：R1 通过不保证 R2，R2 通过不保证 R3。所以工程上的正确目标不是&quot;达到最高等级&quot;，而是<strong>为目标决策配到需要的等级</strong>：</p>
+<ul>
+<li>一个数据清洗脚本：目标 R1（要逐字节确定）。</li>
+<li>一个训练实验：目标 R2（GPU 上逐字节可复现不现实，见 2.2 节）。</li>
+<li>一个要交给外部团队的数据集：目标 R3（他们要能从 manifest 重建）。</li>
+</ul>
+<h4 id="h-13-怎么做把三个等级写成三张验收卡">1.3 怎么做：把三个等级写成三张验收卡<a class="anchor" href="#h-13-怎么做把三个等级写成三张验收卡" aria-label="本节链接">#</a></h4>
+<p>每张卡三行：<strong>测什么 / 怎么测 / 不过怎么办</strong>。</p>
+<pre data-lang="text"><code class="language-text">[R1] 测：同环境、同输入、两次运行的产物内容哈希是否相同
+     测法：跑两次，比对 manifest 里每个产物的 hash；差异项逐一定位到随机源
+     不过：先查随机源（种子/顺序/时间），再查浮点归约顺序
+
+[R2] 测：两组独立运行（不同机器/不同顺序/不同时间）的结论与 CI 是否一致
+     测法：配对比较 + 预先声明的 MDE；不一致的判定按第 3 章第 3 节的协议
+     不过：先判断是&quot;数字不同结论同&quot;还是&quot;结论不同&quot;；后者必须停下查因
+
+[R3] 测：在一个干净环境里按 manifest 重建，跑同一份 R1 验收
+     测法：容器/新机器 + 锁定版本 + 数据内容哈希核对
+     不过：把缺的东西补进 manifest（这是唯一正确的处置）</code></pre>
+<p>注意 R2 的&quot;不过&quot;分支里有一句&quot;结论不同必须停下查因&quot;：<strong>R2 的失败比 R1 的失败更危险</strong>，因为它意味着已经发出去的结论可能是那次运行的偶然产物。</p>
+<h3 id="h-二不确定性的六个来源">二、不确定性的六个来源<a class="anchor" href="#h-二不确定性的六个来源" aria-label="本节链接">#</a></h3>
+<p>按<strong>可测性</strong>从高到低排。前三个可以在纯标准库里演示，后三个需要外部依赖的版本信息。</p>
+<h4 id="h-21-浮点归约顺序可测必然存在">2.1 浮点归约顺序（可测、必然存在）<a class="anchor" href="#h-21-浮点归约顺序可测必然存在" aria-label="本节链接">#</a></h4>
+<p>浮点加法不结合：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord mathnormal">a</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">b</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">c</span></span></span></span> 与 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal">a</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord mathnormal">b</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">c</span><span class="mclose">)</span></span></span></span> 的结果可以不同。这不是 bug，是 IEEE 754 的定义。它出现在<strong>每一个求和</strong>里：loss 的 batch 归约、指标的累加、特征标准化、梯度同步（第 3 章第 4 节的 AllReduce）。</p>
+<p>差异的量级可以用一个式子估计。对 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span> 个量级相近的数、单位舍入 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">u</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord"><span class="mord">2</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">53</span></span></span></span></span></span></span></span></span></span></span></span>，两种归约顺序的期望相对差约</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:2.5598em;vertical-align:-0.936em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.6238em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">∣</span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span><span class="mord">∣</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">∣</span><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.9468em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span></span><span style="top:-3.2523em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.1667em;"><span class="mord">^</span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span><span class="mord">∣</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.936em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∼</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.4445em;"></span><span class="mord mathnormal">u</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.04em;vertical-align:-0.1908em;"></span><span class="mord sqrt"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8492em;"><span class="svg-align" style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord" style="padding-left:0.833em;"><span class="mord mathnormal">n</span></span></span><span style="top:-2.8092em;"><span class="pstrut" style="height:3em;"></span><span class="hide-tail" style="min-width:0.853em;height:1.08em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="1.08em" viewBox="0 0 400000 1080" preserveAspectRatio="xMinYMin slice"><path d="M95,702
+c-2.7,0,-7.17,-2.7,-13.5,-8c-5.8,-5.3,-9.5,-10,-9.5,-14
+c0,-2,0.3,-3.3,1,-4c1.3,-2.7,23.83,-20.7,67.5,-54
+c44.2,-33.3,65.8,-50.3,66.5,-51c1.3,-1.3,3,-2,5,-2c4.7,0,8.7,3.3,12,10
+s173,378,173,378c0.7,0,35.3,-71,104,-213c68.7,-142,137.5,-285,206.5,-429
+c69,-144,104.5,-217.7,106.5,-221
+l0 -0
+c5.3,-9.3,12,-14,20,-14
+H400000v40H845.2724
+s-225.272,467,-225.272,467s-235,486,-235,486c-2.7,4.7,-9,7,-19,7
+c-6,0,-10,-1,-12,-3s-194,-422,-194,-422s-65,47,-65,47z
+M834 80h400000v40h-400000z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.1908em;"><span></span></span></span></span></span></span></span></span></span></p>
+<p>（随机游走式的最坏情形是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4445em;"></span><span class="mord mathnormal">u</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span>）。本节代码会给出一个具体例子：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">40000</span></span></span></span> 时，朴素顺序求和与排序后求和的<strong>二进制表示不同、相对差 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4831em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">4.5</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">16</span></span></span></span></span></span></span></span></span></span></span></span></strong>，正好在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.04em;vertical-align:-0.2397em;"></span><span class="mord mathnormal">u</span><span class="mord sqrt"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8003em;"><span class="svg-align" style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord" style="padding-left:0.833em;"><span class="mord mathnormal">n</span></span></span><span style="top:-2.7603em;"><span class="pstrut" style="height:3em;"></span><span class="hide-tail" style="min-width:0.853em;height:1.08em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="1.08em" viewBox="0 0 400000 1080" preserveAspectRatio="xMinYMin slice"><path d="M95,702
+c-2.7,0,-7.17,-2.7,-13.5,-8c-5.8,-5.3,-9.5,-10,-9.5,-14
+c0,-2,0.3,-3.3,1,-4c1.3,-2.7,23.83,-20.7,67.5,-54
+c44.2,-33.3,65.8,-50.3,66.5,-51c1.3,-1.3,3,-2,5,-2c4.7,0,8.7,3.3,12,10
+s173,378,173,378c0.7,0,35.3,-71,104,-213c68.7,-142,137.5,-285,206.5,-429
+c69,-144,104.5,-217.7,106.5,-221
+l0 -0
+c5.3,-9.3,12,-14,20,-14
+H400000v40H845.2724
+s-225.272,467,-225.272,467s-235,486,-235,486c-2.7,4.7,-9,7,-19,7
+c-6,0,-10,-1,-12,-3s-194,-422,-194,-422s-65,47,-65,47z
+M834 80h400000v40h-400000z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2397em;"><span></span></span></span></span></span></span></span></span> 的量级上。</p>
+<p><strong>这条的工程含义</strong>：如果你的验收标准是&quot;逐字节一致&quot;，那么任何并行归约都会让它失败。所以 R1 在浮点场景里必须写成<strong>容差内一致</strong>（见第五节），而&quot;容差多大&quot;必须由<strong>你要分辨的效应量</strong>倒推。</p>
+<h4 id="h-22-线程与块调度可测依赖硬件">2.2 线程与块调度（可测、依赖硬件）<a class="anchor" href="#h-22-线程与块调度可测依赖硬件" aria-label="本节链接">#</a></h4>
+<p>同一个核函数、同一个 batch，两次运行的结果可以不同，因为：</p>
+<ul>
+<li><strong>原子加的顺序不确定</strong>（<code>atomicAdd</code> 的完成顺序由调度决定）；</li>
+<li><strong>归约树形状不确定</strong>（block 数与 warp 数由占用率与驱动决定）；</li>
+<li><strong>cuBLAS/cuDNN 的算法选择</strong>依赖设备状态与可用显存（同一份代码在 A100 与 H100 上选不同 kernel）。</li>
+</ul>
+<p><strong>检测</strong>：连续跑 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 次（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8304em;vertical-align:-0.136em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≥</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">5</span></span></span></span>），比较输出的哈希分布。如果 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 次里有 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7719em;vertical-align:-0.136em;"></span><span class="mrel">≥</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2</span></span></span></span> 个不同哈希，就说明存在非确定性 —— 而这<strong>不是</strong>&quot;硬件坏了&quot;。</p>
+<p><strong>处置的顺序很重要</strong>，成本从低到高：</p>
+<ol>
+<li><strong>先确认需求</strong>：你需要的真的是逐字节一致吗？大多数实验只需要 R2。</li>
+<li><strong>算子级白名单</strong>：只对确实需要的算子（例如最终的指标聚合）做确定性实现（确定性归约、固定分块）。</li>
+<li><strong>全局确定性开关</strong>：框架通常提供（如 <code>torch.use_deterministic_algorithms</code>、<code>CUBLAS_WORKSPACE_CONFIG</code>）。代价常常是<strong>性能下降 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">10%</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∼</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">30%</span></span></span></span></strong>，以及&quot;某些算子没有确定性实现，直接报错&quot;。</li>
+<li><strong>不追求逐字节，改写验收</strong>：报告&quot;<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 次运行的均值与标准差&quot;，把机器噪声当成测量误差的一部分 —— 这常常是最正确的选择。</li>
+</ol>
+<h4 id="h-23-全局随机源可测最便宜">2.3 全局随机源（可测、最便宜）<a class="anchor" href="#h-23-全局随机源可测最便宜" aria-label="本节链接">#</a></h4>
+<p><code>random</code>、<code>numpy.random</code>、框架的 <code>manual_seed</code>、以及数据加载器的 <code>shuffle</code>。它们的共同问题是<strong>全局状态</strong>：</p>
+<ul>
+<li>谁先调用谁影响后面的所有调用（顺序敏感）；</li>
+<li>多进程/多线程各自持有一份状态（分叉后不一致）；</li>
+<li>库内部的隐藏调用（某些数据增强、某些初始化）会<strong>消耗</strong>你的随机数，于是&quot;同样的代码、多了一行无关的调用&quot;会改变全部后续随机数。</li>
+</ul>
+<p><strong>处置</strong>：把随机性从全局状态改成<strong>显式参数传递</strong>。本节代码用一个小类把随机源做成对象，每个阶段拿自己的实例，并记录它的种子：</p>
+<pre data-lang="python"><code class="language-python">class RngStream:
+    def __init__(self, seed, name): ...
+    def rand(self): ...
+    def shuffle(self, xs): ...</code></pre>
+<p>这样做的收益不只是可复现：<strong>随机源变成了 manifest 的一列</strong>（第 1 节的三段结构里它属于 <code>params</code>），于是&quot;这次运行用了哪些种子&quot;不再是考古。</p>
+<h4 id="h-24-顺序字典集合文件系统可测最隐蔽">2.4 顺序：字典、集合、文件系统（可测、最隐蔽）<a class="anchor" href="#h-24-顺序字典集合文件系统可测最隐蔽" aria-label="本节链接">#</a></h4>
+<p>三个来源：</p>
+<ul>
+<li><strong>哈希随机化</strong>：Python 的 <code>hash(str)</code> 默认每个进程不同（<code>PYTHONHASHSEED</code> 随机），于是<strong>集合/字典的迭代顺序</strong>在进程之间可能不同。字符串键的 <code>dict</code> 在 CPython 里保持插入顺序，但 <code>set</code> 的顺序与 <code>dict</code> 的<strong>哈希相关路径</strong>会受影响。</li>
+<li><strong>文件系统遍历顺序</strong>：<code>os.listdir</code> 的返回顺序不保证；不同文件系统（APFS/ext4/NFS）差别明显。</li>
+<li><strong>并行任务的完成顺序</strong>：<code>multiprocessing</code> / 线程池的结果顺序取决于调度。</li>
+</ul>
+<p><strong>处置</strong>：<strong>任何进入输出的顺序都必须显式排序</strong>。这不是可选的：第 1 节已经证明&quot;逻辑相同但字节不同 → 哈希不同&quot;，而顺序是字节差异最常见的来源。本节代码会实测：同一批字符串用 <code>set</code> 迭代在两次进程里有不同的顺序。</p>
+<h4 id="h-25-外部资源版本可查经常被漏">2.5 外部资源版本（可查、经常被漏）<a class="anchor" href="#h-25-外部资源版本可查经常被漏" aria-label="本节链接">#</a></h4>
+<p>tokenizer、词典、预训练权重、评测脚本、标注指南 —— 它们都是输入，但<strong>通常不在数据目录里</strong>。它们的版本改变可以让结果改变，而<strong>数据哈希完全不变</strong>。</p>
+<p><strong>处置</strong>：把外部资源全部纳入第 1 节的三段结构（放进 <code>params</code> 或单独的 <code>resources</code> 段），并且用<strong>内容哈希</strong>而不是版本号/日期（&quot;v2&quot; 这个名字不承诺任何东西）。</p>
+<h4 id="h-26-时间时区与浮点环境可查容易忽略">2.6 时间、时区与浮点环境（可查、容易忽略）<a class="anchor" href="#h-26-时间时区与浮点环境可查容易忽略" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>时间</strong>：<code>datetime.now()</code>、<code>time.time()</code> 进任何进输出的字段（文件名、日志、ID）都会破坏 R1。</li>
+<li><strong>时区</strong>：同一份代码在两台机器上（一台 UTC、一台 CST）产生不同的日期字符串。</li>
+<li><strong>浮点环境</strong>：<code>FMA</code>（融合乘加）的开关、<code>-ffast-math</code>、x87 与 SSE 的差异、<code>FLT_EVAL_METHOD</code>。这些在 CPU 管线里真实存在，而且<strong>不在 requirements.txt 里</strong>。</li>
+</ul>
+<p><figure><img class="md-img" src="content/courses/data-engineering/assets/chapter-5-figure-03.svg" alt="三个可复现等级各承诺什么" loading="lazy" decoding="async"><figcaption>三个可复现等级各承诺什么</figcaption></figure>
+</p>
+<h3 id="h-三环境指纹与差异分类">三、环境指纹与差异分类<a class="anchor" href="#h-三环境指纹与差异分类" aria-label="本节链接">#</a></h3>
+<h4 id="h-31-概念环境也是一份内容">3.1 概念：环境也是一份内容<a class="anchor" href="#h-31-概念环境也是一份内容" aria-label="本节链接">#</a></h4>
+<p>环境指纹 = 一组可哈希的项：</p>
+<pre data-lang="text"><code class="language-text">env_fingerprint = {
+  python:   &quot;3.14.5&quot;,
+  platform: &quot;macOS-15.3-arm64&quot;,
+  packages: {name: version, ...},          # 排序后哈希
+  native:   {cuda: &quot;12.4&quot;, cudnn: &quot;9.1&quot;, blas: &quot;Accelerate&quot;, driver: &quot;...&quot;},
+  locale:   {tz: &quot;UTC&quot;, lang: &quot;C.UTF-8&quot;},
+  env_vars: {PYTHONHASHSEED: &quot;0&quot;, OMP_NUM_THREADS: &quot;1&quot;, ...},   # 只含进哈希的白名单
+}</code></pre>
+<p>三条纪律：</p>
+<ol>
+<li><strong><code>packages</code> 必须锁到精确版本</strong>（<code>==</code>，不是 <code>&gt;=</code>），并且<strong>间接依赖也要锁</strong>（锁文件的作用就在这里）。</li>
+<li><strong><code>env_vars</code> 只放白名单</strong>：把所有环境变量都哈希进去会让指纹随无关变量（<code>TERM</code>、<code>SSH_AUTH_SOCK</code>）抖动，于是&quot;环境变了&quot;变成噪声。</li>
+<li><strong>原生库版本要单独记</strong>：CUDA/cuDNN/BLAS/驱动的组合不在 Python 的依赖图里，而它们决定了浮点归约与 kernel 选择。</li>
+</ol>
+<h4 id="h-32-四种差异以及各自让哪一层结论失效">3.2 四种差异，以及各自让哪一层结论失效<a class="anchor" href="#h-32-四种差异以及各自让哪一层结论失效" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>差异类型</th>
+<th>例子</th>
+<th>R1</th>
+<th>R2</th>
+<th>R3</th>
+<th>处置</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>纯粹顺序</strong></td>
+<td>字典/集合迭代顺序、文件遍历顺序</td>
+<td>失败</td>
+<td>通常通过</td>
+<td>通过</td>
+<td>显式排序</td>
+</tr>
+<tr>
+<td><strong>浮点环境</strong></td>
+<td>FMA 开关、BLAS 版本、线程数</td>
+<td>失败</td>
+<td>结论通常稳</td>
+<td>通过</td>
+<td>记录进指纹；R1 用容差</td>
+</tr>
+<tr>
+<td><strong>依赖版本</strong></td>
+<td>库的小版本升级、tokenizer 更新</td>
+<td>可能失败</td>
+<td><strong>可能结论失效</strong></td>
+<td>失败</td>
+<td>锁版本 + 内容哈希</td>
+</tr>
+<tr>
+<td><strong>硬件/驱动</strong></td>
+<td>GPU 型号、驱动版本、占用率</td>
+<td>失败</td>
+<td><strong>可能结论失效</strong></td>
+<td>失败</td>
+<td>记进指纹；结论里声明硬件</td>
+</tr>
+</tbody></table>
+<p>读这张表的方式：<strong>&quot;纯粹顺序&quot;是最容易修的，&quot;依赖版本&quot;与&quot;硬件&quot;是最贵的</strong>（它们可能让结论失效，而不只是让数字变）。</p>
+<h4 id="h-33-怎么做把差异分类做成一次算法">3.3 怎么做：把差异分类做成一次算法<a class="anchor" href="#h-33-怎么做把差异分类做成一次算法" aria-label="本节链接">#</a></h4>
+<p>拿到&quot;两次运行不同&quot;这件事之后，正确的动作不是立刻去查代码，而是<strong>先分类</strong>：</p>
+<ol>
+<li>两次运行的环境指纹相同吗？<ul>
+<li><strong>不同</strong> → 差异属于&quot;环境&quot;，对比 3.2 的表定位级别；先看 <code>env_vars</code> 白名单（<code>PYTHONHASHSEED</code>、<code>OMP_NUM_THREADS</code> 是最常见的两个）。</li>
+<li><strong>相同</strong> → 差异来自管线内部，继续第 2 步。</li>
+</ul>
+</li>
+<li>差异是&quot;顺序&quot;还是&quot;数值&quot;？<ul>
+<li>排序后相同 → <strong>顺序</strong>问题：找到那个没有排序的集合/字典。</li>
+<li>排序后仍不同 → <strong>数值</strong>问题：查浮点归约顺序与随机源。</li>
+</ul>
+</li>
+<li>数值差异有多大？<ul>
+<li>在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.04em;vertical-align:-0.2397em;"></span><span class="mord mathnormal">u</span><span class="mord sqrt"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8003em;"><span class="svg-align" style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord" style="padding-left:0.833em;"><span class="mord mathnormal">n</span></span></span><span style="top:-2.7603em;"><span class="pstrut" style="height:3em;"></span><span class="hide-tail" style="min-width:0.853em;height:1.08em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="1.08em" viewBox="0 0 400000 1080" preserveAspectRatio="xMinYMin slice"><path d="M95,702
+c-2.7,0,-7.17,-2.7,-13.5,-8c-5.8,-5.3,-9.5,-10,-9.5,-14
+c0,-2,0.3,-3.3,1,-4c1.3,-2.7,23.83,-20.7,67.5,-54
+c44.2,-33.3,65.8,-50.3,66.5,-51c1.3,-1.3,3,-2,5,-2c4.7,0,8.7,3.3,12,10
+s173,378,173,378c0.7,0,35.3,-71,104,-213c68.7,-142,137.5,-285,206.5,-429
+c69,-144,104.5,-217.7,106.5,-221
+l0 -0
+c5.3,-9.3,12,-14,20,-14
+H400000v40H845.2724
+s-225.272,467,-225.272,467s-235,486,-235,486c-2.7,4.7,-9,7,-19,7
+c-6,0,-10,-1,-12,-3s-194,-422,-194,-422s-65,47,-65,47z
+M834 80h400000v40h-400000z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2397em;"><span></span></span></span></span></span></span></span></span> 量级 → 浮点归约，正常；写进报告。</li>
+<li>远大于 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.04em;vertical-align:-0.2397em;"></span><span class="mord mathnormal">u</span><span class="mord sqrt"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8003em;"><span class="svg-align" style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord" style="padding-left:0.833em;"><span class="mord mathnormal">n</span></span></span><span style="top:-2.7603em;"><span class="pstrut" style="height:3em;"></span><span class="hide-tail" style="min-width:0.853em;height:1.08em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="1.08em" viewBox="0 0 400000 1080" preserveAspectRatio="xMinYMin slice"><path d="M95,702
+c-2.7,0,-7.17,-2.7,-13.5,-8c-5.8,-5.3,-9.5,-10,-9.5,-14
+c0,-2,0.3,-3.3,1,-4c1.3,-2.7,23.83,-20.7,67.5,-54
+c44.2,-33.3,65.8,-50.3,66.5,-51c1.3,-1.3,3,-2,5,-2c4.7,0,8.7,3.3,12,10
+s173,378,173,378c0.7,0,35.3,-71,104,-213c68.7,-142,137.5,-285,206.5,-429
+c69,-144,104.5,-217.7,106.5,-221
+l0 -0
+c5.3,-9.3,12,-14,20,-14
+H400000v40H845.2724
+s-225.272,467,-225.272,467s-235,486,-235,486c-2.7,4.7,-9,7,-19,7
+c-6,0,-10,-1,-12,-3s-194,-422,-194,-422s-65,47,-65,47z
+M834 80h400000v40h-400000z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2397em;"><span></span></span></span></span></span></span></span></span> → 有真的 bug 或真的随机源。</li>
+</ul>
+</li>
+</ol>
+<p>这个三步分类的价值是<strong>把&quot;查不出来&quot;变成&quot;按顺序排除&quot;</strong>。本节代码（第 4 段）就是把这三步做成函数。</p>
+<h3 id="h-四代码">四、代码<a class="anchor" href="#h-四代码" aria-label="本节链接">#</a></h3>
+<p>五段：0 段做出三个<strong>故意写成不可复现</strong>的管线变体（⚠️ 合成数据）；1 段验证随机源显式化的效果；2 段测浮点归约顺序的差异；3 段测哈希随机化对集合顺序的影响（<strong>用子进程 + 不同 <code>PYTHONHASHSEED</code></strong>）；4 段实现三步差异分类器。</p>
+<pre data-lang="python"><code class="language-python"># data-ch5-l3: 三个可复现等级 + 不确定性来源的定位
+# 纯标准库；数据为合成生成（⚠️ 合成数据，非真实语料）
+import hashlib, json, os, random, struct, subprocess, sys
+
+print(f&quot;python {sys.version.split()[0]}&quot;)
+
+# ---------- 0. 一个&quot;看起来一样&quot;的管线，两个变体 ----------
+N, K = 2000, 500
+CHILD_PATH = &quot;/tmp/l3_child.py&quot;        # 子进程脚本：只读它，不改
+
+def make_rows(n=N):
+    # 确定性合成数据：值由整数运算产生，不消耗任何随机源
+    return [{&quot;id&quot;: f&quot;r{i:05d}&quot;,
+             &quot;v&quot;: ((i * 2654435761) % 1000003) / 1000003.0,
+             &quot;g&quot;: &quot;abcde&quot;[i % 5]} for i in range(n)]
+
+ROWS = make_rows()
+print(&quot;\n=== 0. 两个管线变体 ===&quot;)
+print(f&quot;   合成行数 = {len(ROWS)}  每行字段 = {sorted(ROWS[0])}&quot;)
+
+def digest(x) -&gt; str:
+    return hashlib.sha256(json.dumps(x, sort_keys=True, separators=(&quot;,&quot;, &quot;:&quot;),
+                                    ensure_ascii=False).encode()).hexdigest()
+
+def pipeline_global():
+    # 变体 A：全局随机源 + 集合顺序直接进输出
+    random.seed()                                   # 不传种子 = 每次运行都不同
+    pick = random.sample(ROWS, K)
+    total = 0.0
+    for r in pick:
+        total += r[&quot;v&quot;]
+    return {&quot;n&quot;: len(pick), &quot;total&quot;: total,
+            &quot;groups&quot;: list(set(r[&quot;g&quot;] for r in pick))}      # set 顺序进输出
+
+class RngStream:
+    # 每个阶段拿自己的随机源；种子进 manifest，不依赖全局状态
+    def __init__(self, seed, name):
+        self.name, self.seed = name, seed
+        self._r = random.Random(seed)
+    def sample(self, xs, k):
+        return self._r.sample(xs, k)
+    def rand(self):
+        return self._r.random()
+    def as_manifest(self):
+        return {&quot;stream&quot;: self.name, &quot;seed&quot;: self.seed,
+                &quot;algo&quot;: &quot;python-random-mt19937&quot;}
+
+def pipeline_explicit(seed=20260503):
+    # 变体 B：显式种子对象 + 显式排序
+    rs = RngStream(seed, &quot;sample&quot;)
+    pick = rs.sample(ROWS, K)
+    total = 0.0
+    for r in pick:
+        total += r[&quot;v&quot;]
+    return {&quot;n&quot;: len(pick), &quot;total&quot;: total,
+            &quot;groups&quot;: sorted(set(r[&quot;g&quot;] for r in pick)),
+            &quot;rng&quot;: rs.as_manifest()}
+
+a1, a2 = pipeline_global(), pipeline_global()
+print(f&quot;   变体 A（全局随机源 + set）：两次摘要相同? {digest(a1) == digest(a2)}&quot;)
+print(f&quot;     A 指纹1 = {digest(a1)[:16]}   指纹2 = {digest(a2)[:16]}&quot;)
+
+b1, b2 = pipeline_explicit(), pipeline_explicit()
+print(f&quot;   变体 B（显式种子 + sorted）：两次摘要相同? {digest(b1) == digest(b2)}&quot;)
+print(f&quot;     B 指纹 = {digest(b1)[:16]}   rng = {b1[&#39;rng&#39;]}&quot;)
+
+# ---------- 1. 种子只解决&quot;第一次&quot;：全局状态的陷阱 ----------
+print(&quot;\n=== 1. 为什么在脚本开头 seed() 不够 ===&quot;)
+
+def global_seeded(extra_consumers=0):
+    # 开头 seed(42)，但中间有别的调用会消耗同一个全局流
+    random.seed(42)
+    for _ in range(extra_consumers):        # 模拟&quot;多了一行无关的调用&quot;
+        random.random()
+    pick = random.sample(ROWS, 50)
+    return round(sum(r[&quot;v&quot;] for r in pick), 12)
+
+g0, g1, g2 = global_seeded(0), global_seeded(1), global_seeded(5)
+print(f&quot;   seed(42) 后直接采样:      {g0}&quot;)
+print(f&quot;   中间多消耗 1 次 random(): {g1}   相同? {g0 == g1}&quot;)
+print(f&quot;   中间多消耗 5 次 random(): {g2}   相同? {g0 == g2}&quot;)
+print(&quot;   -&gt; 全局种子只让「第一次」可重复；任何消耗随机数的新代码都会移位&quot;)
+
+# ---------- 2. 浮点归约顺序 ----------
+print(&quot;\n=== 2. 浮点归约顺序 ===&quot;)
+
+def seq_sum(vals):
+    s = 0.0
+    for v in vals:
+        s += v
+    return s
+
+def tree_sum(vals):
+    # 两两配对（模拟树形归约）
+    buf = list(vals)
+    while len(buf) &gt; 1:
+        nxt = [buf[i] + buf[i + 1] for i in range(0, len(buf) - 1, 2)]
+        if len(buf) % 2:
+            nxt.append(buf[-1])
+        buf = nxt
+    return buf[0]
+
+def bits(x):
+    return struct.pack(&quot;&gt;d&quot;, x).hex()
+
+# 例 1：量级悬殊 —— 灾难性吸收
+mix = [1e16, 1e16, 1e16, 1e16, 1.0, 2.0, 3.0]
+S_seq, S_sorted, S_tree = seq_sum(mix), seq_sum(sorted(mix)), tree_sum(mix)
+print(&quot;   [例1] vals = 1e16 x4 + [1.0, 2.0, 3.0]&quot;)
+print(f&quot;     顺序求和 S = {S_seq!r}   bits = ...{bits(S_seq)[-6:]}&quot;)
+print(f&quot;     排序求和 S = {S_sorted!r}   bits = ...{bits(S_sorted)[-6:]}&quot;)
+print(f&quot;     树形归约 S = {S_tree!r}   bits = ...{bits(S_tree)[-6:]}&quot;)
+print(f&quot;     顺序 vs 排序: 相同? {S_seq == S_sorted}   &quot;
+      f&quot;相对差 = {abs(S_seq - S_sorted) / abs(S_seq):.3e}（= 1 ulp）&quot;)
+
+# 例 2：同量级的累加漂移 —— 这才是 loss / 均值累加的真实形态
+small = [1e-3] * 40000
+SS_seq, SS_tree = seq_sum(small), tree_sum(small)
+SS_true = 0.001 * 40000
+u = 2 ** -53
+print(f&quot;   [例2] vals = 1e-3 x {len(small)}&quot;)
+print(f&quot;     顺序累加 S = {SS_seq!r}&quot;)
+print(f&quot;     树形归约 S = {SS_tree!r}&quot;)
+print(f&quot;     精确值   S = {SS_true!r}&quot;)
+print(f&quot;     顺序 vs 精确: 相对差 = {abs(SS_seq - SS_true) / abs(SS_true):.3e}&quot;)
+print(f&quot;     树形 vs 精确: 相对差 = {abs(SS_tree - SS_true) / abs(SS_true):.3e}&quot;)
+print(f&quot;     n = {len(small)}   u = 2^-53 = {u:.3e}   &quot;
+      f&quot;u*sqrt(n) = {u * len(small) ** 0.5:.3e}&quot;)
+print(&quot;   -&gt; 两种归约顺序给出不同的浮点数；差异量级由 u*sqrt(n) 决定，不是 bug&quot;)
+
+# ---------- 3. 顺序敏感性：集合顺序与&quot;分块&quot;（≙线程）顺序 ----------
+print(&quot;\n=== 3. 顺序敏感：跨进程的 set 顺序、以及分块（≙线程）顺序 ===&quot;)
+outs = []
+for envseed in (&quot;0&quot;, &quot;1&quot;, &quot;12345&quot;):
+    env = dict(os.environ, PYTHONHASHSEED=envseed)
+    r = subprocess.run([sys.executable, CHILD_PATH], capture_output=True,
+                       text=True, env=env)
+    lines = [l for l in r.stdout.strip().splitlines() if l]
+    outs.append((envseed, lines[0], lines[1], lines[2]))
+print(f&quot;   PYTHONHASHSEED = {[o[0] for o in outs]}   同机同解释器、不同进程&quot;)
+print(f&quot;   set 迭代顺序三次一致? {len({o[1] for o in outs}) == 1}&quot;)
+print(f&quot;   sorted 之后一致?      {len({o[2] for o in outs}) == 1}&quot;)
+for seed, raw_line, _, hline in outs:
+    print(f&quot;     seed={seed:5s}  set 首元素 = {raw_line.split(&#39;|&#39;)[0]:14s}&quot;
+          f&quot; hash(&#39;raw_web&#39;) = {hline}&quot;)
+print(&quot;   -&gt; 要稳：任何进入输出的集合都显式 sorted()&quot;)
+
+# 分块顺序 ≙ 线程/块调度顺序：同一批数、不同分块，归约结果不同
+vals = [1e-3] * 40000
+def chunked_sum(vals, chunk):
+    return seq_sum([seq_sum(vals[i:i + chunk]) for i in range(0, len(vals), chunk)])
+print(&quot;   分块顺序敏感性（分块 ≙ 并行归约的块划分）：&quot;)
+for c in (40000, 1000, 100):
+    v = chunked_sum(vals, c)
+    print(f&quot;     块大小 {c:6d} -&gt; {v!r}  bits = ...{bits(v)[-6:]}&quot;
+          f&quot;  与精确值相同? {v == 0.001 * 40000}&quot;)
+
+# ---------- 4. 三步差异分类器 ----------
+print(&quot;\n=== 4. 差异分类：先分类，再查代码 ===&quot;)
+
+def as_list(d):
+    # 把嵌套结构摊平成可比较的字符串列表（用于&quot;是否是同一批元素&quot;）
+    if isinstance(d, dict):
+        out = []
+        for k in sorted(d):
+            out.append(str(k))
+            out += as_list(d[k])
+        return out
+    if isinstance(d, (list, tuple, set)):
+        out = []
+        for x in d:
+            out += as_list(x)
+        return out
+    return [str(d)]
+
+def classify(run_a, run_b, env_a, env_b):
+    # 类别: 相同 / 环境 / 顺序 / 随机或浮点
+    if run_a == run_b:
+        return &quot;相同&quot;, &quot;逐字段一致&quot;
+    if env_a != env_b:
+        diff = sorted(k for k in set(env_a) | set(env_b)
+                      if env_a.get(k) != env_b.get(k))
+        return &quot;环境&quot;, f&quot;环境指纹差异字段 = {diff}&quot;
+    if sorted(as_list(run_a)) == sorted(as_list(run_b)):
+        return &quot;顺序&quot;, &quot;元素相同、顺序不同 -&gt; 某个集合/字典没有排序&quot;
+    return &quot;随机或浮点&quot;, &quot;元素也不同 -&gt; 查未播种的随机源与归约顺序&quot;
+
+ENV_A = {&quot;python&quot;: sys.version.split()[0], &quot;PYTHONHASHSEED&quot;: &quot;0&quot;,
+         &quot;OMP_NUM_THREADS&quot;: &quot;1&quot;}
+ENV_B = dict(ENV_A, PYTHONHASHSEED=&quot;1&quot;)
+ENV_C = dict(ENV_A, OMP_NUM_THREADS=&quot;8&quot;)
+cases = [
+    (&quot;同输入同环境跑两次（变体 A）&quot;, a1, a2, ENV_A, ENV_A),
+    (&quot;同输入同环境跑两次（变体 B）&quot;, b1, b2, ENV_A, ENV_A),
+    (&quot;只改 PYTHONHASHSEED&quot;, a1, a2, ENV_A, ENV_B),
+    (&quot;只改线程数&quot;, b1, b2, ENV_A, ENV_C),
+    (&quot;顺序问题的最小构造&quot;,
+     {&quot;groups&quot;: [&quot;a&quot;, &quot;b&quot;, &quot;c&quot;], &quot;n&quot;: 10}, {&quot;groups&quot;: [&quot;c&quot;, &quot;b&quot;, &quot;a&quot;], &quot;n&quot;: 10},
+     ENV_A, ENV_A),
+    (&quot;未播种随机的最小构造&quot;,
+     {&quot;total&quot;: 0.48657559627321123}, {&quot;total&quot;: 0.499328866013402}, ENV_A, ENV_A),
+    (&quot;环境差异优先于顺序差异（真实场景）&quot;,
+     a1, a2, ENV_A, ENV_B),
+]
+for name, ra, rb, ea, eb in cases:
+    cat, why = classify(ra, rb, ea, eb)
+    print(f&quot;   {name}&quot;)
+    print(f&quot;     -&gt; {cat:8s} {why}&quot;)
+
+# ---------- 5. R1/R2/R3 三个等级的验收 ----------
+print(&quot;\n=== 5. 三个等级的验收 ===&quot;)
+
+def r1_accept(fn, k=3):
+    # R1：同环境跑 k 次，要求全部逐字节一致
+    sigs = [digest(fn()) for _ in range(k)]
+    return len(set(sigs)) == 1, len(set(sigs)), sigs[0][:16]
+
+ok_b, uq_b, sig_b = r1_accept(pipeline_explicit)
+ok_a, uq_a, sig_a = r1_accept(pipeline_global)
+print(f&quot;   R1 变体 B（显式种子+排序）: 通过? {ok_b}  不同指纹数 {uq_b}/3  {sig_b}&quot;)
+print(f&quot;   R1 变体 A（全局随机+set）  : 通过? {ok_a}  不同指纹数 {uq_a}/3  {sig_a}&quot;)
+
+def mean_of_sample(seed):
+    rs = RngStream(seed, &quot;sample&quot;)
+    pick = rs.sample(ROWS, K)
+    return sum(r[&quot;v&quot;] for r in pick) / len(pick)
+
+m1, m2 = mean_of_sample(20260503), mean_of_sample(20260504)
+print(f&quot;   R2 两次独立抽样的均值 = {m1!r} / {m2!r}&quot;)
+print(f&quot;     绝对差 = {abs(m1 - m2):.3e}   （R2 只要求结论级一致，&quot;
+      f&quot;阈值必须事先声明）&quot;)
+
+ENV_FP = {
+    &quot;python&quot;: sys.version.split()[0],
+    &quot;platform&quot;: sys.platform,
+    &quot;packages&quot;: {},                       # 真实项目在这里锁 ==版本
+    &quot;native&quot;: {&quot;blas&quot;: &quot;unknown&quot;, &quot;cuda&quot;: None},
+    &quot;env_vars&quot;: {&quot;PYTHONHASHSEED&quot;: os.environ.get(&quot;PYTHONHASHSEED&quot;, &quot;unset&quot;),
+                 &quot;OMP_NUM_THREADS&quot;: os.environ.get(&quot;OMP_NUM_THREADS&quot;, &quot;unset&quot;)},
+}
+print(f&quot;   R3 环境指纹 = {json.dumps(ENV_FP, sort_keys=True, ensure_ascii=False)}&quot;)
+print(f&quot;   R3 env 指纹哈希 = {digest(ENV_FP)[:16]}&quot;)</code></pre>
+<p>运行输出（Python 3.14.5）：</p>
+<pre data-lang="text"><code class="language-text">（本机 Python 3.14.5。带 `# ← 每次运行都不同` 的两行是变体 A 的不稳定输出 —— 那**正是本节要检验
+的性质**，所以本节把「它会变」当结论，而不假装输出是可复制的常量。其余各行在本机连续四次运行逐字节一致。
+末尾那段子进程输出单独列出，因为它混进主脚本 stdout 会糊掉边界。）
+
+python 3.14.5
+
+=== 0. 两个管线变体 ===
+   合成行数 = 2000  每行字段 = [&#39;g&#39;, &#39;id&#39;, &#39;v&#39;]
+   变体 A（全局随机源 + set）：两次摘要相同? False
+     A 指纹1 = 93ab98cf4cbbbd83        # ← 每次运行都不同（这是结论，不是 bug）
+   变体 B（显式种子 + sorted）：两次摘要相同? True
+     B 指纹 = ad5713ac7464c74e   rng = {&#39;stream&#39;: &#39;sample&#39;, &#39;seed&#39;: 20260503, &#39;algo&#39;: &#39;python-random-mt19937&#39;}
+
+=== 1. 为什么在脚本开头 seed() 不够 ===
+   seed(42) 后直接采样:      25.000345998962
+   中间多消耗 1 次 random(): 25.005826982519   相同? False
+   中间多消耗 5 次 random(): 24.464098607704   相同? False
+   -&gt; 全局种子只让「第一次」可重复；任何消耗随机数的新代码都会移位
+
+=== 2. 浮点归约顺序 ===
+   [例1] vals = 1e16 x4 + [1.0, 2.0, 3.0]
+     顺序求和 S = 4e+16   bits = ...e08000
+     排序求和 S = 4.000000000000001e+16   bits = ...e08001
+     树形归约 S = 4.000000000000001e+16   bits = ...e08001
+     顺序 vs 排序: 相同? False   相对差 = 2.000e-16（= 1 ulp）
+   [例2] vals = 1e-3 x 40000
+     顺序累加 S = 39.99999999999748
+     树形归约 S = 40.0
+     精确值   S = 40.0
+     顺序 vs 精确: 相对差 = 6.306e-14
+     树形 vs 精确: 相对差 = 0.000e+00
+     n = 40000   u = 2^-53 = 1.110e-16   u*sqrt(n) = 2.220e-14
+   -&gt; 两种归约顺序给出不同的浮点数；差异量级由 u*sqrt(n) 决定，不是 bug
+
+=== 3. 顺序敏感：跨进程的 set 顺序、以及分块（≙线程）顺序 ===
+   PYTHONHASHSEED = [&#39;0&#39;, &#39;1&#39;, &#39;12345&#39;]   同机同解释器、不同进程
+   set 迭代顺序三次一致? False
+   sorted 之后一致?      True
+     seed=0      set 首元素 = annotate_batch hash(&#39;raw_web&#39;) = -4400357352414635067
+     seed=1      set 首元素 = raw_web        hash(&#39;raw_web&#39;) = -1258310776840961494
+     seed=12345  set 首元素 = raw_forum      hash(&#39;raw_web&#39;) = -2353223574791422261
+   -&gt; 要稳：任何进入输出的集合都显式 sorted()
+   分块顺序敏感性（分块 ≙ 并行归约的块划分）：
+     块大小  40000 -&gt; 39.99999999999748  bits = ...fffe9d  与精确值相同? False
+     块大小   1000 -&gt; 40.00000000000001  bits = ...000001  与精确值相同? False
+     块大小    100 -&gt; 40.0000000000003  bits = ...00002a  与精确值相同? False
+
+=== 4. 差异分类：先分类，再查代码 ===
+   同输入同环境跑两次（变体 A）
+     -&gt; 随机或浮点    元素也不同 -&gt; 查未播种的随机源与归约顺序
+   同输入同环境跑两次（变体 B）
+     -&gt; 相同       逐字段一致
+   只改 PYTHONHASHSEED
+     -&gt; 环境       环境指纹差异字段 = [&#39;PYTHONHASHSEED&#39;]
+   只改线程数
+     -&gt; 相同       逐字段一致
+   顺序问题的最小构造
+     -&gt; 顺序       元素相同、顺序不同 -&gt; 某个集合/字典没有排序
+   未播种随机的最小构造
+     -&gt; 随机或浮点    元素也不同 -&gt; 查未播种的随机源与归约顺序
+   环境差异优先于顺序差异（真实场景）
+     -&gt; 环境       环境指纹差异字段 = [&#39;PYTHONHASHSEED&#39;]
+
+=== 5. 三个等级的验收 ===
+   R1 变体 B（显式种子+排序）: 通过? True  不同指纹数 1/3  ad5713ac7464c74e
+   R1 变体 A（全局随机+set）  : 通过? False  不同指纹数 3/3  395f26c4421808b7        # ← 每次运行都不同（这是结论，不是 bug）
+   R2 两次独立抽样的均值 = 0.48657559627321123 / 0.499328866013402
+     绝对差 = 1.275e-02   （R2 只要求结论级一致，阈值必须事先声明）
+   R3 环境指纹 = {&quot;env_vars&quot;: {&quot;OMP_NUM_THREADS&quot;: &quot;unset&quot;, &quot;PYTHONHASHSEED&quot;: &quot;unset&quot;}, &quot;native&quot;: {&quot;blas&quot;: &quot;unknown&quot;, &quot;cuda&quot;: null}, &quot;packages&quot;: {}, &quot;platform&quot;: &quot;darwin&quot;, &quot;python&quot;: &quot;3.14.5&quot;}
+   R3 env 指纹哈希 = cb5ace59d9c26b15
+
+--- 子进程（l3_child.py），只改 PYTHONHASHSEED 跑两次 ---
+run1 hash(&#39;raw_web&#39;) = -17018329277805866
+run2 hash(&#39;raw_web&#39;) = 1481172905759756102</code></pre>
+<h4 id="h-读输出的七个要点">读输出的七个要点<a class="anchor" href="#h-读输出的七个要点" aria-label="本节链接">#</a></h4>
+<ol>
+<li><strong>变体 A 与变体 B 的差别只有两处</strong>（0 段）：A 用 <code>random.seed()</code>（不传参）+ <code>list(set(...))</code>；B 用显式种子对象 + <code>sorted(set(...))</code>。结果：A 两次摘要不同（指纹每次都在变，输出里那两行已标注），B 稳定在 <code>ad5713ac7464c74e</code>。<strong>可复现不是纪律问题，是两个具体的 API 选择。</strong></li>
+<li><strong>&quot;开头 <code>seed(42)</code>&quot;只保护第一次运行</strong>（1 段）：在采样之前多消耗 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> 次 <code>random()</code>，总和从 <code>25.000345998962</code> 变成 <code>25.005826982519</code>；多消耗 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">5</span></span></span></span> 次变成 <code>24.464098607704</code>。三个数看起来都&quot;很正常&quot;，而<strong>没有任何指标会报警</strong>。这是全局随机源最贵的地方：它不是随机，它是<strong>不可追溯</strong>。</li>
+<li><strong>浮点归约的差异是逐位可验证的</strong>（2 段例 1）：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">4</span><span class="mord mathnormal">im</span><span class="mord mathnormal">es</span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">16</span></span></span></span></span></span></span></span></span></span></span></span> 加 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">[</span><span class="mord">1.0</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">2.0</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">3.0</span><span class="mclose">]</span></span></span></span>，顺序求和得 <code>4e+16</code>（bits 尾 <code>...e08000</code>），排序与树形归约得 <code>4.000000000000001e+16</code>（尾 <code>...e08001</code>）。<strong>两者相差正好 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> ulp</strong>，而打印出来的十进制长得几乎一样 —— 所以验收必须比字节或比特，不能比&quot;看起来一样&quot;。</li>
+<li><strong>同量级累加的漂移才是 loss / 均值的真实形态</strong>（2 段例 2）：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord mathnormal">im</span><span class="mord mathnormal">es</span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">3</span></span></span></span></span></span></span></span></span></span></span></span> 累加 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">40000</span></span></span></span> 次，顺序累加得 <code>39.99999999999748</code>、树形归约得精确的 <code>40.0</code>，相对差 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">6.306</span><span class="mord mathnormal">im</span><span class="mord mathnormal">es</span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">14</span></span></span></span></span></span></span></span></span></span></span></span>，与理论量级 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.04em;vertical-align:-0.2397em;"></span><span class="mord mathnormal">u</span><span class="mord sqrt"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8003em;"><span class="svg-align" style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord" style="padding-left:0.833em;"><span class="mord mathnormal">n</span></span></span><span style="top:-2.7603em;"><span class="pstrut" style="height:3em;"></span><span class="hide-tail" style="min-width:0.853em;height:1.08em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="1.08em" viewBox="0 0 400000 1080" preserveAspectRatio="xMinYMin slice"><path d="M95,702
+c-2.7,0,-7.17,-2.7,-13.5,-8c-5.8,-5.3,-9.5,-10,-9.5,-14
+c0,-2,0.3,-3.3,1,-4c1.3,-2.7,23.83,-20.7,67.5,-54
+c44.2,-33.3,65.8,-50.3,66.5,-51c1.3,-1.3,3,-2,5,-2c4.7,0,8.7,3.3,12,10
+s173,378,173,378c0.7,0,35.3,-71,104,-213c68.7,-142,137.5,-285,206.5,-429
+c69,-144,104.5,-217.7,106.5,-221
+l0 -0
+c5.3,-9.3,12,-14,20,-14
+H400000v40H845.2724
+s-225.272,467,-225.272,467s-235,486,-235,486c-2.7,4.7,-9,7,-19,7
+c-6,0,-10,-1,-12,-3s-194,-422,-194,-422s-65,47,-65,47z
+M834 80h400000v40h-400000z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2397em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">2.220</span><span class="mord mathnormal">im</span><span class="mord mathnormal">es</span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">14</span></span></span></span></span></span></span></span></span></span></span></span> 同阶。<strong>这个量级就是判断依据</strong>：差异在这个量级是归约顺序（正常），远大于它就有真的 bug 或真的随机源。</li>
+<li><strong>&quot;分块大小&quot;是&quot;线程调度&quot;的可复现替身</strong>（3 段末）：同一批 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">40000</span></span></span></span> 个数，块大小 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">40000</span></span></span></span> / <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1000</span></span></span></span> / <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">100</span></span></span></span> 分别得到 <code>39.99999999999748</code> / <code>40.00000000000001</code> / <code>40.0000000000003</code>，bits 尾分别是 <code>...fffe9d</code> / <code>...000001</code> / <code>...00002a</code>。<strong>这说明并行归约的块划分本身就是不确定性来源</strong> —— 而块划分由占用率与驱动决定，改不了，只能容差化（第五节）。</li>
+<li><strong>哈希随机化是默认打开的</strong>（3 段）：同一个 <code>set</code>、同一份元素，<code>PYTHONHASHSEED</code> 取 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0</span></span></span></span> / <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> / <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">12345</span></span></span></span> 时首元素分别是 <code>annotate_batch</code> / <code>raw_web</code> / <code>raw_forum</code>；<code>sorted</code> 之后三次全是 <code>annotate_batch</code>。<strong>这不需要任何并行</strong> —— 同一台机器、同一个解释器，只是不同进程。</li>
+<li><strong>分类器的价值在&quot;先分类&quot;</strong>（4 段）：七个案例落到五类判定 —— 相同（2 个）、环境、顺序、随机或浮点（2 个），外加一个&quot;环境差异优先&quot;的真实场景（变体 A + 不同 <code>PYTHONHASHSEED</code> 被判成<strong>环境</strong>而不是&quot;随机&quot;）。&quot;直接去查代码&quot;是最贵的路径，因为代码有几千行；而&quot;环境指纹差异字段 = [&#39;PYTHONHASHSEED&#39;]&quot;是一行输出。</li>
+</ol>
+<h3 id="h-五验收门槛与容差">五、验收门槛与容差<a class="anchor" href="#h-五验收门槛与容差" aria-label="本节链接">#</a></h3>
+<h4 id="h-51-两个必须同时做的测试">5.1 两个必须同时做的测试<a class="anchor" href="#h-51-两个必须同时做的测试" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>测试</th>
+<th>目的</th>
+<th>通过条件</th>
+<th>失败的常见原因</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>同一性测试</strong>（R1）</td>
+<td>排除环境与顺序的偶然</td>
+<td>同环境 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 次运行的产物哈希<strong>全同</strong>（或差异在容差内）</td>
+<td>全局随机源、未排序的集合、时间戳进输出</td>
+</tr>
+<tr>
+<td><strong>独立性测试</strong>（R2）</td>
+<td>排除&quot;只有这一台/这一次能出这个结论&quot;</td>
+<td>两组独立运行的<strong>结论与区间</strong>一致</td>
+<td>数据划分不稳定、种子太少、评测集太小</td>
+</tr>
+</tbody></table>
+<p>两个测试的关系是<strong>互补</strong>的：同一性测试不能发现&quot;数据集划分本身是随机的&quot;（每次跑都稳定地用同一个随机划分 —— 但如果那个划分是坏的，两次都坏），独立性测试不能发现&quot;顺序不稳定&quot;（换机器时顺序可能恰好相同）。</p>
+<p><strong>必须两个都做</strong>，而且都写进流程：一个只在本地跑过的管线，无论它多&quot;确定&quot;，都不能支撑对外结论。</p>
+<h4 id="h-52-容差怎么定从效应量倒推">5.2 容差怎么定：从效应量倒推<a class="anchor" href="#h-52-容差怎么定从效应量倒推" aria-label="本节链接">#</a></h4>
+<p>容差不能靠&quot;差不多就行&quot;。正确的定义方式是：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8304em;vertical-align:-0.136em;"></span><span class="mord text"><span class="mord">tol</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≤</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.0074em;vertical-align:-0.686em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3214em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">4</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">MDE</span></span></span></span></span></span></p>
+<p>其中 MDE 是你<strong>要分辨的最小效应量</strong>（第 3 章第 3 节的协议）。理由是<strong>误差合成</strong>：运行噪声与真实效应都会进入观测差值，若噪声的标准差接近 MDE，你需要把样本量放大 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4</span></span></span></span> 倍才能把它压下去（方差按平方）。取 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1/4</span></span></span></span> 是一个实用约定：</p>
+<ul>
+<li><strong>容差太大</strong> → 你会把&quot;没复现出来&quot;判成&quot;复现出来了&quot;，也检测不到小效应。</li>
+<li><strong>容差太小</strong> → 每一次微小的浮点差异都报警，最后所有人都学会忽略告警（这比没有告警更糟）。</li>
+</ul>
+<p>本节代码给的量级可以当参照：单次归约的相对差在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">16</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∼</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">14</span></span></span></span></span></span></span></span></span></span></span></span>；训练一个模型的两次运行差异通常在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">3</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∼</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span></span>（来自数据顺序、初始化、非确定性算子）。所以<strong>用 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">15</span></span></span></span></span></span></span></span></span></span></span></span> 的容差去验收一次训练是没有意义的</strong> —— 它必然失败，于是这个测试会被跳过。</p>
+<h3 id="h-六取舍与边界">六、取舍与边界<a class="anchor" href="#h-六取舍与边界" aria-label="本节链接">#</a></h3>
+<table>
+<thead>
+<tr>
+<th>选择</th>
+<th>换来什么</th>
+<th>付出什么</th>
+<th>什么时候选另一边</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>追求 R1（逐字节）</td>
+<td>调试容易；对账可靠</td>
+<td>关掉并行确定性会<strong>损失 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">10%</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∼</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">30%</span></span></span></span> 性能</strong>；部分算子直接没有确定性实现</td>
+<td>训练大模型时：改求 R2，把机器噪声当测量误差</td>
+</tr>
+<tr>
+<td>只求 R2（结论一致）</td>
+<td>便宜；与业务目标一致</td>
+<td>无法逐字节对账；<strong>需要预先声明的 MDE 与容差</strong></td>
+<td>数据清洗/发布物：必须回到 R1</td>
+</tr>
+<tr>
+<td>显式随机源（对象传递）</td>
+<td>可追溯；随机源成为 manifest 一列</td>
+<td>每个阶段都要改一行；库内部的隐藏随机无法覆盖</td>
+<td>纯确定性管线：不需要</td>
+</tr>
+<tr>
+<td><code>PYTHONHASHSEED=0</code> 全局固定</td>
+<td>一行解决集合顺序</td>
+<td>掩盖了真正的修法（显式排序）；其他语言/工具无此开关</td>
+<td>只在排查阶段临时用，不要写进生产配置</td>
+</tr>
+<tr>
+<td>锁全部依赖（含间接）</td>
+<td>R3 可重建</td>
+<td>锁文件冲突、升级成本、安全补丁滞后</td>
+<td>库的纯研究环境：可以放松，但要在报告里声明</td>
+</tr>
+<tr>
+<td>记录环境变量白名单</td>
+<td>差异可定位</td>
+<td>白名单漏项就是一个盲区</td>
+<td>项数 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5782em;vertical-align:-0.0391em;"></span><span class="mrel">&gt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">20</span></span></span></span> 时：改成&quot;只记录已知影响项 + 定期审计&quot;</td>
+</tr>
+</tbody></table>
+<p><strong>四条硬边界：</strong></p>
+<ol>
+<li><strong>R1 与性能常常直接冲突，而大多数团队需要的是 R2。</strong> &quot;我要完全可复现&quot;这句话必须先翻译成&quot;我要哪个等级的哪个承诺&quot;。盲目追求逐字节会让实验慢 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">20%</span></span></span></span>，而这个代价换来的往往是一个没人看的对账能力。</li>
+<li><strong>容差不是&quot;可复现&quot;的对立物，它是 R1 在浮点世界里的唯一可行形式。</strong> 要求浮点计算的逐字节一致，等于要求固定的归约顺序、固定的线程数、固定的算子实现 —— 这会锁死硬件。正确做法是&quot;容差 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7719em;vertical-align:-0.136em;"></span><span class="mrel">≤</span></span></span></span> MDE/4，并且容差本身写进 manifest&quot;。</li>
+<li><strong>环境可重建（R3）是最容易被假装的一级。</strong> 一份 <code>requirements.txt</code> 不是可重建；<strong>在干净环境里真的重建过一次</strong>才是。所以 R3 的验收必须是&quot;新容器里跑同一份 R1 验收&quot;，而不是&quot;文档写好了&quot;。</li>
+<li><strong>可复现不等于正确。</strong> 一个可复现的管线可以稳定地产生错误结论（第 1 章第 1 节的噪声标签、第 4 章的一致地错）。可复现的<strong>价值</strong>是让&quot;错&quot;变成可调查的对象：你能区分&quot;这次结果不同是因为我改了 X&quot;和&quot;这次结果不同是因为机器不同&quot;。<strong>没有 R1/R2，任何比较都是噪声；有了 R1/R2，比较才有意义</strong> —— 但它仍然不足以判定对错。</li>
+</ol>
+<h3 id="h-练习">练习<a class="anchor" href="#h-练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><p><strong>给你的管线做 R1 体检</strong>：
+（a）选一个你熟悉的脚本，同一环境连跑 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">3</span></span></span></span> 次，比对全部产物的内容哈希；
+（b）对每一个不同的产物，用本节 3.3 节的三步分类器判定它属于哪一类（顺序 / 浮点 / 环境 / 随机）；
+（c）给出每一类的修法，并估算修完之后的性能代价。</p>
+</li>
+<li><p><strong>浮点归约的实测与量级核对</strong>：
+（a）取一个真实的求和（loss 累加、特征标准化、指标计算），用顺序 / 排序 / 树形三种顺序各算一次，报告逐位差异；
+（b）把 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span> 从 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span> 扫到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">7</span></span></span></span></span></span></span></span></span></span></span>，画出（或列出）相对差与 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.04em;vertical-align:-0.2397em;"></span><span class="mord mathnormal">u</span><span class="mord sqrt"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8003em;"><span class="svg-align" style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord" style="padding-left:0.833em;"><span class="mord mathnormal">n</span></span></span><span style="top:-2.7603em;"><span class="pstrut" style="height:3em;"></span><span class="hide-tail" style="min-width:0.853em;height:1.08em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="1.08em" viewBox="0 0 400000 1080" preserveAspectRatio="xMinYMin slice"><path d="M95,702
+c-2.7,0,-7.17,-2.7,-13.5,-8c-5.8,-5.3,-9.5,-10,-9.5,-14
+c0,-2,0.3,-3.3,1,-4c1.3,-2.7,23.83,-20.7,67.5,-54
+c44.2,-33.3,65.8,-50.3,66.5,-51c1.3,-1.3,3,-2,5,-2c4.7,0,8.7,3.3,12,10
+s173,378,173,378c0.7,0,35.3,-71,104,-213c68.7,-142,137.5,-285,206.5,-429
+c69,-144,104.5,-217.7,106.5,-221
+l0 -0
+c5.3,-9.3,12,-14,20,-14
+H400000v40H845.2724
+s-225.272,467,-225.272,467s-235,486,-235,486c-2.7,4.7,-9,7,-19,7
+c-6,0,-10,-1,-12,-3s-194,-422,-194,-422s-65,47,-65,47z
+M834 80h400000v40h-400000z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2397em;"><span></span></span></span></span></span></span></span></span> 的关系；
+（c）回答：在你的场景里，&quot;逐字节一致&quot;需要付什么代价？（提示：线程数、分块大小、算子实现。）</p>
+</li>
+<li><p><strong>随机源的显式化改造</strong>：
+（a）找出你的代码里所有隐式随机源（<code>random.*</code>、<code>numpy.random.*</code>、框架 seed、数据加载器 shuffle、库内部增强）；
+（b）改造成显式对象传递，并把每个流的 <code>(名字, 算法, 种子)</code> 写进 manifest；
+（c）证明改造前后&quot;多一行无关调用会不会改变结果&quot;：构造那个&quot;多消耗一次随机数&quot;的场景，报告数值位移。</p>
+</li>
+<li><p><strong>集合顺序的对抗测试</strong>：
+（a）在你的代码里找出所有&quot;集合/字典迭代进入输出&quot;的位置（<code>for k in some_set</code>、<code>json.dumps</code> 一个 <code>set</code>、<code>&quot;,&quot;.join(set)</code>）；
+（b）用不同 <code>PYTHONHASHSEED</code> 跑两次，报告哪些输出真的变了；
+（c）给出统一修法（显式排序 / 排序后序列化），并说明它对语义的影响（提示：有序的东西不能排序，第 1 节）。</p>
+</li>
+<li><p><strong>三张验收卡落地</strong>：为你的项目写 R1/R2/R3 三张卡，每张包含&quot;测什么 / 怎么测 / 不过怎么办&quot;：
+（a）R1 卡上写明运行次数 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span>、比对的产物清单、容差与容差的来源（MDE 是多少？）；
+（b）R2 卡上写明&quot;换什么&quot;（机器 / 顺序 / 时间 / 划分）与&quot;结论一致&quot;的定义（主指标的区间？护栏？）；
+（c）R3 卡上写明重建步骤的每一步与验证点，并指出你<strong>现在拿不到</strong>的环境信息（拿不到意味着 R3 现在不成立）。</p>
+</li>
+<li><p><strong>容差的敏感性分析</strong>：取你的主指标，人为注入 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0085em;vertical-align:-0.1944em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">6</span></span></span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">4</span></span></span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span></span> 三档噪声。
+（a）每档报告：&quot;用容差 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">15</span></span></span></span></span></span></span></span></span></span></span></span> / <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">6</span></span></span></span></span></span></span></span></span></span></span></span> / <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">3</span></span></span></span></span></span></span></span></span></span></span></span> 验收&quot;分别会判通过还是失败；
+（b）找出&quot;误报率 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4831em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0</span></span></span></span> 且不漏掉 MDE 一半的效应&quot;的容差区间；
+（c）说明这个区间与你的评测样本量 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span> 的关系（提示：噪声的标准误 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mrel">∝</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.0503em;vertical-align:-0.25em;"></span><span class="mord">1/</span><span class="mord sqrt"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8003em;"><span class="svg-align" style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord" style="padding-left:0.833em;"><span class="mord mathnormal">n</span></span></span><span style="top:-2.7603em;"><span class="pstrut" style="height:3em;"></span><span class="hide-tail" style="min-width:0.853em;height:1.08em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="1.08em" viewBox="0 0 400000 1080" preserveAspectRatio="xMinYMin slice"><path d="M95,702
+c-2.7,0,-7.17,-2.7,-13.5,-8c-5.8,-5.3,-9.5,-10,-9.5,-14
+c0,-2,0.3,-3.3,1,-4c1.3,-2.7,23.83,-20.7,67.5,-54
+c44.2,-33.3,65.8,-50.3,66.5,-51c1.3,-1.3,3,-2,5,-2c4.7,0,8.7,3.3,12,10
+s173,378,173,378c0.7,0,35.3,-71,104,-213c68.7,-142,137.5,-285,206.5,-429
+c69,-144,104.5,-217.7,106.5,-221
+l0 -0
+c5.3,-9.3,12,-14,20,-14
+H400000v40H845.2724
+s-225.272,467,-225.272,467s-235,486,-235,486c-2.7,4.7,-9,7,-19,7
+c-6,0,-10,-1,-12,-3s-194,-422,-194,-422s-65,47,-65,47z
+M834 80h400000v40h-400000z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2397em;"><span></span></span></span></span></span></span></span></span>）。</p>
+</li>
+</ol>
+<h3 id="h-小结">小结<a class="anchor" href="#h-小结" aria-label="本节链接">#</a></h3>
+<ul>
+<li><strong>可复现必须分三级</strong>：R1 结果可复现（同环境同输入 → 同输出/容差内）、R2 实验可重跑（换时间换机器 → 同结论）、R3 环境可重建（从零能装出来并复现 R1）。它们是<strong>单向蕴含</strong>：R3 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mrel"><span class="mord vbox"><span class="thinbox"><span class="rlap"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="inner"><span class="mord"><span class="mrel"></span></span></span><span class="fix"></span></span></span></span></span><span class="mspace nobreak"></span><span class="mrel">⇒</span></span></span></span> R1，R1 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mrel"><span class="mord vbox"><span class="thinbox"><span class="rlap"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="inner"><span class="mord"><span class="mrel"></span></span></span><span class="fix"></span></span></span></span></span><span class="mspace nobreak"></span><span class="mrel">⇒</span></span></span></span> R2。混成一句&quot;可复现 ✅&quot;是工程上最常见的自欺。</li>
+<li><strong>本节代码里两个变体的差别只有两处 API 选择</strong>：<code>random.seed()</code>（无参）+ <code>list(set(...))</code> 让指纹每次都变；改成显式种子对象 + <code>sorted(set(...))</code> 后稳定在 <code>ad5713ac7464c74e</code>。<strong>可复现性不是纪律，是两个具体的写法。</strong></li>
+<li><strong>&quot;开头 <code>seed(42)</code>&quot;只保护第一次运行</strong>：采样前多消耗 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> 次 <code>random()</code>，总和从 <code>25.000345998962</code> 变成 <code>25.005826982519</code>；多消耗 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">5</span></span></span></span> 次变成 <code>24.464098607704</code>。全局随机源的问题不是&quot;随机&quot;，是<strong>不可追溯</strong>（随机源没有变成 manifest 的一列）。</li>
+<li><strong>浮点归约顺序必然带来差异，而且可以逐位验</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">4</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8974em;vertical-align:-0.0833em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">16</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">[</span><span class="mord">1.0</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">2.0</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">3.0</span><span class="mclose">]</span></span></span></span> 的顺序求和与排序求和相差正好 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> ulp（bits 尾 <code>...e08000</code> vs <code>...e08001</code>）；<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">3</span></span></span></span></span></span></span></span></span></span></span></span> 累加 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">40000</span></span></span></span> 次时顺序累加偏 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">6.306</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">14</span></span></span></span></span></span></span></span></span></span></span></span>，与 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.04em;vertical-align:-0.2397em;"></span><span class="mord mathnormal">u</span><span class="mord sqrt"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8003em;"><span class="svg-align" style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord" style="padding-left:0.833em;"><span class="mord mathnormal">n</span></span></span><span style="top:-2.7603em;"><span class="pstrut" style="height:3em;"></span><span class="hide-tail" style="min-width:0.853em;height:1.08em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="1.08em" viewBox="0 0 400000 1080" preserveAspectRatio="xMinYMin slice"><path d="M95,702
+c-2.7,0,-7.17,-2.7,-13.5,-8c-5.8,-5.3,-9.5,-10,-9.5,-14
+c0,-2,0.3,-3.3,1,-4c1.3,-2.7,23.83,-20.7,67.5,-54
+c44.2,-33.3,65.8,-50.3,66.5,-51c1.3,-1.3,3,-2,5,-2c4.7,0,8.7,3.3,12,10
+s173,378,173,378c0.7,0,35.3,-71,104,-213c68.7,-142,137.5,-285,206.5,-429
+c69,-144,104.5,-217.7,106.5,-221
+l0 -0
+c5.3,-9.3,12,-14,20,-14
+H400000v40H845.2724
+s-225.272,467,-225.272,467s-235,486,-235,486c-2.7,4.7,-9,7,-19,7
+c-6,0,-10,-1,-12,-3s-194,-422,-194,-422s-65,47,-65,47z
+M834 80h400000v40h-400000z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2397em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">2.220</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">14</span></span></span></span></span></span></span></span></span></span></span></span>（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">u</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord"><span class="mord">2</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">53</span></span></span></span></span></span></span></span></span></span></span></span>）同阶。分块大小 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">40000/1000/100</span></span></span></span> 给出三个不同的浮点数 —— <strong>并行归约的块划分就是不确定性来源，而它由硬件与驱动决定，只能容差化</strong>。<strong>这条同时说明&quot;验收必须比字节&quot;与&quot;容差不是可选项&quot;。</strong></li>
+<li><strong>哈希随机化是默认开启的</strong>：同一个 <code>set</code>、不同 <code>PYTHONHASHSEED</code>，首元素分别是 <code>annotate_batch</code> / <code>raw_web</code> / <code>raw_forum</code>；<code>sorted</code> 后三次全是 <code>annotate_batch</code>。这<strong>不需要并行</strong> —— 同一台机器、同一个解释器、不同进程就会发生。</li>
+<li><strong>差异分类器把&quot;查不出来&quot;变成&quot;按顺序排除&quot;</strong>：先比环境指纹（差异字段一行可见），再比&quot;元素是否相同、只是顺序不同&quot;，最后才落到随机/浮点。<strong>顺序要放在环境之后</strong>：实测里&quot;变体 A + 不同 <code>PYTHONHASHSEED</code>&quot;同时具备两个特征，先比环境才得到正确的处置（改环境，而不是去排序）。直接读几千行代码是最贵的路径。</li>
+<li><strong>两个验收测试缺一不可</strong>：同一性测试（R1，实测变体 B <code>通过? True  不同指纹数 1/3</code>、变体 A <code>通过? False  不同指纹数 3/3</code>）排除环境与顺序的偶然；独立性测试（R2，实测两次独立抽样的均值 <code>0.48657559627321123</code> 与 <code>0.499328866013402</code>，绝对差 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1.275</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span></span>）排除&quot;只有这一次能出这个结论&quot;。前者发现不了坏的数据划分，后者发现不了顺序不稳。</li>
+<li><strong>容差由效应量倒推</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8304em;vertical-align:-0.136em;"></span><span class="mord text"><span class="mord">tol</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≤</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord">MDE</span></span><span class="mord">/4</span></span></span></span>，且容差本身要写进 manifest。容差太大会把&quot;没复现&quot;判成&quot;复现了&quot;，太小会让所有人学会忽略告警 —— 后者比没有告警更糟。</li>
+<li><strong>R3 是最容易被假装的一级</strong>：<code>requirements.txt</code> 不是可重建，<strong>在干净环境里真的重建过一次</strong>才是。所以 R3 的验收是&quot;新容器里跑同一份 R1 验收&quot;，不是&quot;文档写好了&quot;。</li>
+<li><strong>可复现不等于正确。</strong> 它的价值是让&quot;错&quot;变成可调查的对象：能区分&quot;结果变了因为我改了 X&quot;与&quot;结果变了因为机器不同&quot;。没有 R1/R2，任何比较都是噪声；有了它们，比较才有意义 —— 但判定对错仍然需要另一套机制（第 1 章第 1 节、第 4 章）。</li>
+</ul>
+<blockquote>
+<p>下一节：<strong>审计、影响面与回滚（data-ch5-l4）：发现脏数据之后的十分钟</strong> —— 本节给出了&quot;怎么让同一件事能重演&quot;，但真实世界的顺序恰好相反：<strong>你先发现一个已经发生过的错误</strong>（三月前那批标注是错的），然后要回答&quot;它影响了什么、要不要回滚、回滚到哪、代价多大&quot;。下一节把前三节装成一套可执行的审计流程：账本（谁在什么时候用了哪个版本）、影响面查询（用第 2 节的图）、回滚单位与三种处置（全量重训 / 回滚检查点 / 隔离后局部重跑）的代价模型，以及一份<strong>案例演练</strong>：一个标注错误率 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">30%</span></span></span></span> 的批次进了生产三个月，被 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4</span></span></span></span> 个模型用过、出现在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2</span></span></span></span> 份对外报告里 —— 你要在十分钟内给出影响面与处置建议，并说明&quot;不需要回滚&quot;这个结论在什么条件下才成立。</p>
+</blockquote>

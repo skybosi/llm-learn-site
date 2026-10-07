@@ -1,0 +1,249 @@
+<h2 id="h-目标代码与汇编从-ir-到可运行程序">目标代码与汇编：从 IR 到可运行程序<a class="anchor" href="#h-目标代码与汇编从-ir-到可运行程序" aria-label="本节链接">#</a></h2>
+<p>前三课分别解决了&quot;选哪条指令&quot;&quot;用哪个寄存器&quot;&quot;按什么顺序发&quot;，但合起来仍是一串抽象操作。要让它真的跑起来，还得走完最后一段：发射成汇编（或目标文件）、交给汇编器与链接器、变成一个进程。本课用 Python 发射一段真实的 AArch64 汇编，用系统自带的 <code>clang</code> 汇编链接后<strong>直接运行</strong>，并用退出码验证语义；顺带看清 <code>.s</code> 里除了指令还有什么，以及为什么&quot;符号名差一个下划线&quot;就能让链接失败。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-最后一段路从-ir-到可执行">1. 最后一段路：从 IR 到可执行<a class="anchor" href="#h-1-最后一段路从-ir-到可执行" aria-label="本节链接">#</a></h4>
+<p>LLVM 的目标无关代码生成文档把后端拆成七步：<strong>指令选择 → 调度与形成 → SSA 机器码优化 → 寄存器分配 → 序言/尾声插入 → 晚期机器码优化 → 代码发射</strong>。第 1–3 课覆盖前四步的主体，本课走完剩下的部分：</p>
+<table>
+<thead>
+<tr>
+<th>产物</th>
+<th>谁产生</th>
+<th>里面有什么</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>.ll</code>（IR）</td>
+<td>前端 + 中端 pass</td>
+<td>类型化 SSA，优化在这一层</td>
+</tr>
+<tr>
+<td><code>.s</code>（汇编）</td>
+<td>后端代码发射</td>
+<td>段、标签、指令、符号声明</td>
+</tr>
+<tr>
+<td><code>.o</code>（目标文件）</td>
+<td>汇编器 <code>as</code></td>
+<td>机器码 + 符号表 + 重定位</td>
+</tr>
+<tr>
+<td>可执行文件</td>
+<td>链接器 <code>ld</code></td>
+<td>多个 <code>.o</code> + 启动代码，地址定下来</td>
+</tr>
+</tbody></table>
+<p>关键认知：<strong>IR 的语义在每一步都会被&quot;具体化&quot;一次</strong>，每次具体化都可能引入新的正确性责任——指令编码范围、寄存器占用、栈对齐、符号可见性。前面几课验证&quot;语义等价&quot;，从 <code>.o</code> 往后验证的是&quot;链接与装载能不能成立&quot;。</p>
+<p><figure><img class="md-img" src="content/courses/compiler-foundations/assets/chapter-6-figure-04.svg" alt="后端七步与产物链：从 .ll 到 .s、.o 与可执行文件" loading="lazy" decoding="async"><figcaption>后端七步与产物链：从 .ll 到 .s、.o 与可执行文件</figcaption></figure>
+</p>
+<h4 id="h-2-汇编文件里除了指令还有什么">2. 汇编文件里除了指令还有什么<a class="anchor" href="#h-2-汇编文件里除了指令还有什么" aria-label="本节链接">#</a></h4>
+<p>看本课产物就能对上：<code>.text</code> 说明内容进代码段，<code>.globl main</code> 声明全局符号，<code>main:</code> 是标签（符号的地址），<code>.L1:</code> 是单元内可见的局部标签。真正让程序&quot;成为进程&quot;的不是 <code>main</code>，而是启动代码（crt）——它准备参数、调用 <code>main</code>、把返回值交给 <code>exit</code>。这也是本课用<strong>退出码</strong>验证的原因：<code>main</code> 返回 55，<code>./demo</code> 的退出码就是 55。</p>
+<h4 id="h-3-调用约定是一份契约">3. 调用约定是一份契约<a class="anchor" href="#h-3-调用约定是一份契约" aria-label="本节链接">#</a></h4>
+<p><strong>调用约定</strong>（calling convention）规定参数放哪、返回值放哪、哪些寄存器由被调用者保存：</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>AArch64（AAPCS64）</th>
+<th>x86-64（System V AMD64）</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>前几个整型参数</td>
+<td><code>x0</code>–<code>x7</code></td>
+<td><code>rdi, rsi, rdx, rcx, r8, r9</code></td>
+</tr>
+<tr>
+<td>返回值</td>
+<td><code>x0</code></td>
+<td><code>rax</code></td>
+</tr>
+<tr>
+<td>被调用者保存</td>
+<td><code>x19</code>–<code>x28</code>、<code>x29</code>(FP)、<code>x30</code>(LR)、<code>sp</code></td>
+<td><code>rbx, rbp, r12</code>–<code>r15</code></td>
+</tr>
+<tr>
+<td>栈对齐</td>
+<td>16 字节</td>
+<td>16 字节（调用点）</td>
+</tr>
+</tbody></table>
+<p>这份契约直接落到第 2 课的分配器上：被调用者保存的寄存器若要跨调用使用，必须在序言里存、尾声里恢复；调用者保存的寄存器在调用点之后就地失效。更麻烦的是<strong>固定寄存器</strong>——某些指令强制结果落在指定寄存器（如 x86 的 <code>div</code> 只能用 <code>EAX</code>/<code>EDX</code>），指令选择器必须插入搬运，分配器必须把它当作&quot;已占用&quot;。所以&quot;分配&quot;从来不是纯图着色，而是&quot;图着色 + 契约约束&quot;。</p>
+<h4 id="h-4-从-s-到进程符号重定位与两种目标格式">4. 从 .s 到进程：符号、重定位与两种目标格式<a class="anchor" href="#h-4-从-s-到进程符号重定位与两种目标格式" aria-label="本节链接">#</a></h4>
+<p>汇编器把 <code>.s</code> 变成 <code>.o</code>，其中每个未解析的引用变成一条<strong>重定位</strong>记录，链接器负责补上地址。这一步最容易踩的坑是<strong>符号命名</strong>：ELF（Linux）里 C 符号就叫 <code>main</code>，Mach-O（macOS）里要加下划线 <code>_main</code>。本课实测（macOS + Apple clang 17.0.0）：把 ELF 风格的 <code>main</code> 交上去链接，链接器直接报 <code>Undefined symbols ... &quot;_main&quot;</code>；改成 <code>_main</code> 就能跑通。这不是编译器 bug，而是<strong>目标文件格式约定</strong>——移植后端时，符号前缀、段名、重定位类型都要一起改。</p>
+<h4 id="h-5--o0-与--o2后端的上限由中端决定">5. -O0 与 -O2：后端的上限由中端决定<a class="anchor" href="#h-5--o0-与--o2后端的上限由中端决定" aria-label="本节链接">#</a></h4>
+<p>同一段 C（<code>int main(){int s=0;for(int i=1;i&lt;=10;i++)s+=i;return s;}</code>），本机实测两种优化级别：<code>-O0</code> 老实分配栈帧（<code>sub sp, sp, #16</code>）、把 <code>s</code>/<code>i</code> 放栈上反复 <code>ldr</code>/<code>str</code>、写成三段式循环；<code>-O2</code> 把整段循环折叠成 <code>mov w0, #55</code> + <code>ret</code>——常量传播 + 循环消除（第 5 章）让后端无事可做。</p>
+<p>这个对照比&quot;优化很重要&quot;有用：<strong>后端只能把已经确定的工作高效落地</strong>。如果中端没把 <code>i</code>、<code>s</code> 提升成 SSA 值、没做归纳变量分析，后端就只能生成 <code>-O0</code> 那种反复访存的代码。Kaleidoscope 教程第 4 章把 IR 交给优化器、第 8 章编译到目标文件，官方路径同样是&quot;先把中端做对，再谈发射&quot;。</p>
+<h4 id="h-6-常见坑">6. 常见坑<a class="anchor" href="#h-6-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>栈对齐</strong>：调用点前 <code>sp</code> 必须是 16 字节对齐，少调一次就可能在某些 SIMD 访存上崩。</li>
+<li><strong>调用者/被调用者保存弄反</strong>：把 <code>x19</code> 当临时寄存器用而不保存，调用者会看到被悄悄改掉的值——这类 bug 在不同优化级别下表现不同。</li>
+<li><strong>只写 <code>.s</code> 忘了汇编/链接</strong>：<code>clang -c</code> 只出 <code>.o</code>、<code>clang -S</code> 只出 <code>.s</code>，要可执行必须走完整流程。</li>
+<li><strong>位宽混用</strong>：AArch64 的 <code>w0</code> 与 <code>x0</code> 是同一寄存器的低 32 位与全 64 位；<code>-O0</code> 代码里到处是 <code>w</code>，而指针与长度必须是 <code>x</code>；另外 <code>main</code> 的返回值只是退出码，不是打印输出。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面这段纯 Python（无第三方依赖）把&quot;寄存器已定&quot;的 IR 发射成 AArch64 汇编，并用一个 20 行的解释器跑同一份 IR 做对拍基准。示例是 <code>sum = 1+2+…+10</code>，返回值即退出码。</p>
+<pre data-lang="python"><code class="language-python"># ---- 从 IR 到可运行程序：AArch64（ARM64）目标代码生成 + 语义解释器 ----
+# 纯 Python，无第三方依赖。
+# 目标一：把已定寄存器映射的 IR 发射成汇编文本（AArch64 / AAPCS64）
+# 目标二：同一份 IR 用一个 20 行的解释器跑一遍，用来对拍汇编的语义
+import sys
+
+# ---------- 1. 输入：已经过指令选择 / 寄存器分配 / 调度 的 IR ----------
+#   每个变量已经映射到一个物理寄存器（第 2 课的分配结果）
+REGMAP = {&#39;sum&#39;: &#39;x19&#39;, &#39;i&#39;: &#39;x20&#39;}
+IR = [
+    (&#39;mov_imm&#39;, &#39;sum&#39;, 0, None),          # sum = 0
+    (&#39;mov_imm&#39;, &#39;i&#39;, 1, None),            # i = 1
+    (&#39;label&#39;, &#39;L1&#39;, None, None),
+    (&#39;cmp_br&#39;, &#39;gt&#39;, &#39;i&#39;, 10, &#39;L2&#39;),      # if i &gt; 10 goto L2
+    (&#39;add_rr&#39;, &#39;sum&#39;, &#39;sum&#39;, &#39;i&#39;),        # sum = sum + i
+    (&#39;add_imm&#39;, &#39;i&#39;, &#39;i&#39;, 1),             # i = i + 1
+    (&#39;br&#39;, &#39;L1&#39;, None, None),             # goto L1
+    (&#39;label&#39;, &#39;L2&#39;, None, None),
+    (&#39;ret&#39;, &#39;sum&#39;, None, None),           # return sum（main 返回值 = 进程退出码）
+]
+
+# ---------- 2. 目标代码生成：IR 指令 → 汇编行 ----------
+CC = {&#39;gt&#39;: &#39;b.gt&#39;, &#39;lt&#39;: &#39;b.lt&#39;, &#39;ge&#39;: &#39;b.ge&#39;, &#39;le&#39;: &#39;b.le&#39;, &#39;eq&#39;: &#39;b.eq&#39;, &#39;ne&#39;: &#39;b.ne&#39;}
+
+def emit(ir, regmap, symbol_prefix=&#39;&#39;):
+    &quot;&quot;&quot;symbol_prefix：Linux ELF 与 macOS Mach-O 的差别之一 —— Mach-O 的 C 符号带下划线&quot;&quot;&quot;
+    out = [&#39;    .text&#39;,
+           f&#39;    .globl {symbol_prefix}main&#39;,
+           f&#39;{symbol_prefix}main:&#39;]
+    for ins in ir:
+        op = ins[0]
+        if op == &#39;mov_imm&#39;:   out.append(f&#39;    mov   {regmap[ins[1]]}, #{ins[2]}&#39;)
+        elif op == &#39;add_rr&#39;:  out.append(f&#39;    add   {regmap[ins[1]]}, {regmap[ins[2]]}, {regmap[ins[3]]}&#39;)
+        elif op == &#39;add_imm&#39;: out.append(f&#39;    add   {regmap[ins[1]]}, {regmap[ins[2]]}, #{ins[3]}&#39;)
+        elif op == &#39;label&#39;:   out.append(f&#39;.L{ins[1]}:&#39;)
+        elif op == &#39;br&#39;:      out.append(f&#39;    b     .L{ins[1]}&#39;)
+        elif op == &#39;cmp_br&#39;:
+            _, cond, lhs, rhs, tgt = ins
+            out.append(f&#39;    cmp   {regmap[lhs]}, #{rhs}&#39;)
+            out.append(f&#39;    {CC[cond]:&lt;5} .L{tgt}&#39;)
+        elif op == &#39;ret&#39;:
+            out.append(f&#39;    mov   x0, {regmap[ins[1]]}&#39;)   # AAPCS64：返回值放 x0
+            out.append(&#39;    ret&#39;)
+        else:
+            raise ValueError(f&#39;未知操作码 {op}&#39;)
+    return out
+
+# ---------- 3. 同一份 IR 的解释器：不依赖汇编器，用来对拍语义 ----------
+def run_ir(ir, regmap, limit=10**6):
+    val = {v: 0 for v in regmap}
+    pos, steps = 0, 0
+    labels = {ins[1]: k for k, ins in enumerate(ir) if ins[0] == &#39;label&#39;}
+    while pos &lt; len(ir):
+        steps += 1
+        if steps &gt; limit: raise RuntimeError(&#39;疑似死循环&#39;)
+        ins = ir[pos]; op = ins[0]
+        if op == &#39;mov_imm&#39;: val[ins[1]] = ins[2]
+        elif op == &#39;add_rr&#39;: val[ins[1]] = val[ins[2]] + val[ins[3]]
+        elif op == &#39;add_imm&#39;: val[ins[1]] = val[ins[2]] + ins[3]
+        elif op == &#39;cmp_br&#39;:
+            _, cond, lhs, rhs, tgt = ins
+            taken = {&#39;gt&#39;: val[lhs] &gt; rhs, &#39;lt&#39;: val[lhs] &lt; rhs,
+                     &#39;ge&#39;: val[lhs] &gt;= rhs, &#39;le&#39;: val[lhs] &lt;= rhs,
+                     &#39;eq&#39;: val[lhs] == rhs, &#39;ne&#39;: val[lhs] != rhs}[cond]
+            if taken:
+                pos = labels[tgt]; continue
+        elif op == &#39;br&#39;:
+            pos = labels[ins[1]]; continue
+        elif op == &#39;ret&#39;:
+            return val[ins[1]], steps
+        pos += 1
+
+if __name__ == &#39;__main__&#39;:
+    pre = &#39;_&#39; if &#39;--darwin&#39; in sys.argv else &#39;&#39;
+    asm = emit(IR, REGMAP, pre)
+    if &#39;--emit&#39; in sys.argv:
+        path = sys.argv[sys.argv.index(&#39;--emit&#39;) + 1]
+        open(path, &#39;w&#39;).write(&#39;\n&#39;.join(asm) + &#39;\n&#39;)
+        print(f&#39;已写出 {path}（{len(asm)} 行）&#39;)
+    else:
+        print(&#39;=== 发射出的 AArch64 汇编 ===&#39;)
+        print(&#39;\n&#39;.join(asm))
+        result, steps = run_ir(IR, REGMAP)
+        print(f&#39;\n=== 同一份 IR 的解释器结果 ===&#39;)
+        print(f&#39;返回值 = {result}（共执行 {steps} 条 IR 指令）&#39;)
+        print(f&#39;main 的返回值就是进程退出码，所以 ./demo 的退出码应为 {result}&#39;)</code></pre>
+<p>运行结果（本机实跑，输出原样粘贴）：</p>
+<pre><code>=== 发射出的 AArch64 汇编 ===
+    .text
+    .globl main
+main:
+    mov   x19, #0
+    mov   x20, #1
+.LL1:
+    cmp   x20, #10
+    b.gt  .LL2
+    add   x19, x19, x20
+    add   x20, x20, #1
+    b     .LL1
+.LL2:
+    mov   x0, x19
+    ret
+
+=== 同一份 IR 的解释器结果 ===
+返回值 = 55（共执行 56 条 IR 指令）
+main 的返回值就是进程退出码，所以 ./demo 的退出码应为 55</code></pre>
+<p>接着把这段汇编真的跑起来（<code>--darwin</code> 让符号带下划线，适配 macOS；Linux 上去掉这个参数）：</p>
+<pre data-lang="bash"><code class="language-bash">python3 l4_codegen.py --emit demo.s --darwin    # 已写出 demo.s（14 行）
+clang -o demo demo.s                            # 汇编 + 链接
+./demo; echo &quot;exit=$?&quot;</code></pre>
+<pre><code>exit=55</code></pre>
+<p>解释器算出 55，真实进程的退出码也是 55——两条独立路径对上了。再把符号换成 ELF 风格（不带下划线）链接一次：</p>
+<pre data-lang="bash"><code class="language-bash">python3 l4_codegen.py --emit demo_elf.s         # 符号名是 main
+clang -o demo_elf demo_elf.s</code></pre>
+<pre><code>Undefined symbols for architecture arm64:
+  &quot;_main&quot;, referenced from:
+      &lt;initial-undefines&gt;
+ld: symbol(s) not found for architecture arm64
+clang: error: linker command failed with exit code 1 (use -v to see invocation)</code></pre>
+<p>最后看一眼&quot;优化的上限由中端决定&quot;这件事。同一段 C（<code>int main(){int s=0;for(int i=1;i&lt;=10;i++)s+=i;return s;}</code>）：</p>
+<pre data-lang="bash"><code class="language-bash">clang -O0 -S demo.c -o demo_O0.s    # 看忠实的循环与栈访问
+clang -O2 -S demo.c -o -            # 看中端把活干完之后的样子
+nm demo | head -4                   # 目标文件里的符号表
+file demo                           # 产物类型</code></pre>
+<pre><code># clang -O2 -S（关键两行）
+_main:                                  ; @main
+    mov	w0, #55                         ; =0x37
+    ret
+
+# clang -O0 -S（节选：栈帧 + 把 i、s 放在栈上）
+_main:                                  ; @main
+    sub	sp, sp, #16
+    str	wzr, [sp, #12]
+    str	wzr, [sp, #8]
+    mov	w8, #1                          ; =0x1
+    str	w8, [sp, #4]
+    b	LBB0_1
+LBB0_1:                                 ; =&gt;This Inner Loop Header: Depth=1
+    ldr	w8, [sp, #4]
+    subs	w8, w8, #10
+    b.gt	LBB0_4
+
+# nm / file
+00000001000002e0 t .LL1
+00000001000002f4 t .LL2
+0000000100000000 T __mh_execute_header
+00000001000002d8 T _main
+demo: Mach-O 64-bit executable arm64</code></pre>
+<p>四件事一次看全：<code>-O0</code> 忠实到&quot;每次用 <code>i</code> 都从栈上取&quot;，<code>-O2</code> 把循环折叠成 <code>mov w0, #55</code>，符号表里 <code>.LL1</code>/<code>.LL2</code> 是局部符号（<code>t</code>）、<code>_main</code> 是全局符号（<code>T</code>），产物是 Mach-O 可执行文件。<strong>&quot;能读懂汇编 + 能对照 IR&quot;，到这里闭环。</strong></p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：给示例 IR 加一条&quot;从内存数组读元素&quot;的指令，让程序改成计算数组前 n 项和；先跑解释器、再跑 <code>clang</code> 链接，确认两条路径一致。</li>
+<li><strong>解释</strong>：为什么只 <code>.globl</code> 了 <code>main</code>，而 <code>.LL1</code>/<code>.LL2</code> 不需要？若把局部标签也声明成全局符号，链接同名符号的大程序会怎样？</li>
+<li><strong>对比/验证</strong>：在 Linux（ELF）或 macOS（Mach-O）上验证符号前缀规则；再对同一段 C 用 <code>-O0 -S</code> 与 <code>-O2 -S</code>，找出三处中端优化导致的后端差异。</li>
+<li><strong>思考</strong>：本课用退出码验证结果，真实程序为什么不能这样？若改成输出到标准输出，要引入哪些新约定（参数传递、库调用、调用者保存寄存器）？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>LLVM 官方 Kaleidoscope 教程第 8 章「Compiling to Object Code」（从 IR 到目标代码/目标文件的官方路径）：<a href="https://llvm.org/docs/tutorial/MyFirstLanguageFrontend/LangImpl08.html" target="_blank" rel="noopener noreferrer">https://llvm.org/docs/tutorial/MyFirstLanguageFrontend/LangImpl08.html</a></li>
+<li>LLVM 官方 Kaleidoscope 教程第 4 章「Adding JIT and Optimizer Support」（IR 交给优化器与执行引擎）：<a href="https://llvm.org/docs/tutorial/MyFirstLanguageFrontend/LangImpl04.html" target="_blank" rel="noopener noreferrer">https://llvm.org/docs/tutorial/MyFirstLanguageFrontend/LangImpl04.html</a></li>
+<li>ARM, <em>Procedure Call Standard for the Arm 64-bit Architecture (AAPCS64)</em>（x0–x7 传参、x0 返回、x19–x28 被调用者保存、16 字节栈对齐）：<a href="https://github.com/ARM-software/abi-aa/blob/main/aapcs64/aapcs64.rst" target="_blank" rel="noopener noreferrer">https://github.com/ARM-software/abi-aa/blob/main/aapcs64/aapcs64.rst</a></li>
+<li>LLVM 官方文档《The LLVM Target-Independent Code Generator》（后端七阶段、固定寄存器与调用约定、代码发射）：<a href="https://llvm.org/docs/CodeGenerator.html" target="_blank" rel="noopener noreferrer">https://llvm.org/docs/CodeGenerator.html</a></li>
+</ul>
+<p><a href="#/learn/../chapter-7/lesson-01">下一章：工程与衔接</a></p>

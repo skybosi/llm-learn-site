@@ -1,0 +1,89 @@
+<h2 id="h-多-gpu-拓扑">多 GPU 拓扑<a class="anchor" href="#h-多-gpu-拓扑" aria-label="本节链接">#</a></h2>
+<p>前两课讲的是&quot;怎么切&quot;，这一课讲&quot;切完之后它们靠什么连起来&quot;。分布式推理的性能，很大程度不取决于算力，而取决于<strong>卡与卡、机与机之间搬运数据的路径</strong>。同样的模型、同样的并行配置，放在 NVLink 全互联的机器上和放在普通 PCIe 机器上，延迟可能差出数倍。本课带你读懂 GPU 互联拓扑、集合通信的开销，以及如何据此决定并行的摆放位置。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-互联的三层机内机间网络">1. 互联的三层：机内、机间、网络<a class="anchor" href="#h-1-互联的三层机内机间网络" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>机内（节点内）</strong>：GPU 之间通过 <strong>NVLink / NVSwitch</strong> 互联，带宽可达数百 GB/s 到 TB/s 级，是 GPU 之间最快的通道。NVSwitch 让机内所有 GPU 之间点对点全互联，任意两卡通信都不必经过 CPU。</li>
+<li><strong>PCIe</strong>：GPU 与 CPU、网卡、以及没有 NVLink 的 GPU 之间走 PCIe 总线，带宽通常只有 NVLink 的几分之一，且要经过 CPU/根复合体转发，延迟更高。</li>
+<li><strong>机间（节点间）</strong>：跨服务器靠 <strong>InfiniBand（IB）或 RoCE（RDMA over Converged Ethernet）</strong> 网络。IB 有 HDR/NDR 等代际，带宽 100~400 Gbps；RoCE 用普通以太网实现 RDMA，成本更低。跨机通信的瓶颈在网络，不在 GPU。</li>
+</ul>
+<p>判断拓扑最常用的命令是 <code>nvidia-smi topo -m</code>，它打印一张矩阵，标注两两 GPU 之间的通道类型（NVLink / PCIe / SYS，其中 SYS 表示要绕道 CPU，最慢）。</p>
+<h4 id="h-2-为什么通信会拖垮并行">2. 为什么通信会拖垮并行<a class="anchor" href="#h-2-为什么通信会拖垮并行" aria-label="本节链接">#</a></h4>
+<p>张量并行里每一次&quot;行并行收尾&quot;都是一次 AllReduce。以推理为例，每生成一个 token 都要做若干次 AllReduce，若单次 AllReduce 耗时 100 微秒，而单卡计算这个 token 只要 200 微秒，通信就吃掉了一半时间。<strong>当通信时间接近甚至超过计算时间，并行就失去意义</strong>。这解释了上一课的结论：TP 吃带宽，必须放在 NVLink 域内；PP 通信少，跨机才划算。</p>
+<h4 id="h-3-集合通信的原语与成本">3. 集合通信的原语与成本<a class="anchor" href="#h-3-集合通信的原语与成本" aria-label="本节链接">#</a></h4>
+<p>多卡协同靠 NCCL 这类库提供集合通信原语，最常用的几个：</p>
+<ul>
+<li><strong>AllReduce</strong>：所有卡各自持有一份数据，求和后广播给所有人；</li>
+<li><strong>AllGather</strong>：每卡持有一块切片，拼接后让所有人拿到完整数据；</li>
+<li><strong>ReduceScatter</strong>：AllReduce 的&quot;半程&quot;——求和后按块分发，每人只留一块；</li>
+<li><strong>All-to-All</strong>：每人给每人发一份不同数据，MoE 里 token 路由到不同专家时大量使用。</li>
+</ul>
+<p>它们的成本与<strong>数据量、卡数、拓扑</strong>强相关。在环形拓扑里，AllReduce 分两步：先环形 <strong>ReduceScatter</strong>（每卡累加一块），再环形 <strong>AllGather</strong>，总数据搬运量约 <code>2(N-1)/N × 数据量</code>，随卡数趋近 2 倍——所以卡越多、切得越细，通信放大越明显。树形/分层拓扑可减少跳数但需要更多交换机。</p>
+<h4 id="h-4-拓扑如何决定摆放策略">4. 拓扑如何决定摆放策略<a class="anchor" href="#h-4-拓扑如何决定摆放策略" aria-label="本节链接">#</a></h4>
+<p>一条实用经验：<strong>把通信频繁的并行维度，放到带宽最高的层级</strong>。</p>
+<ul>
+<li>张量并行 → 放同一台机器的 NVSwitch 域内；</li>
+<li>流水线并行 → 段与段之间通信少，可跨机，但要保证每段内部张量并行仍同机；</li>
+<li>数据并行 → 副本之间推理期几乎不通信，天然跨机；</li>
+<li>MoE 的专家并行 → all-to-all 通信量大，最理想是放在 NVLink 域内，否则路由会成为瓶颈。</li>
+</ul>
+<p>落地时，先用 <code>nvidia-smi topo -m</code> 摸清拓扑，再据此把 <code>tensor_parallel_size</code> 限制在单机内、把跨机额度留给 PP/DP。</p>
+<p><figure><img class="md-img" src="content/courses/llm-inference-optimization/assets/chapter-5-figure-03.svg" alt="多 GPU 拓扑分层示意：NVSwitch 机内全互联 → 网卡跨机（IB/RoCE）" loading="lazy" decoding="async"><figcaption>多 GPU 拓扑分层示意：NVSwitch 机内全互联 → 网卡跨机（IB/RoCE）</figcaption></figure>
+</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<h4 id="h-示例-1查看机器上的-gpu-互联拓扑">示例 1：查看机器上的 GPU 互联拓扑<a class="anchor" href="#h-示例-1查看机器上的-gpu-互联拓扑" aria-label="本节链接">#</a></h4>
+<p>拿到一台新服务器，第一步永远是摸拓扑：</p>
+<pre data-lang="bash"><code class="language-bash"># 查看 GPU 型号、数量与两两之间的通道类型
+nvidia-smi topo -m
+
+# 查看每个 GPU 的 NVLink 配置
+nvidia-smi nvlink --status
+
+# 查看 GPU 与网卡的亲和性（NUMA 拓扑，决定数据该放哪）
+nvidia-smi topo -mp</code></pre>
+<p>矩阵里 <code>NV12</code> 表示两卡间有 NVLink，<code>PIX</code> 表示同 PCIe 根复合体，<code>SYS</code> 表示要跨 CPU/走内存，最慢。部署张量并行时，优先把卡选在 <code>NV</code> 标签的组内。</p>
+<h4 id="h-示例-2用-pytorch-测一次-allreduce-的真实开销">示例 2：用 PyTorch 测一次 AllReduce 的真实开销<a class="anchor" href="#h-示例-2用-pytorch-测一次-allreduce-的真实开销" aria-label="本节链接">#</a></h4>
+<p>下面脚本在两条&quot;假想的卡&quot;上各建一个张量，用 <code>torch.distributed</code> 的 gloo 后端（无需 GPU 即可跑）测量 AllReduce 往返耗时，直观感受通信量级与数据量的关系：</p>
+<pre data-lang="python"><code class="language-python">import os
+import time
+import torch
+import torch.distributed as dist
+
+def run(rank, world_size):
+    # 用文件方式初始化，免去复杂的网络配置；真实多机用 nccl + TCP/IB
+    dist.init_process_group(&quot;gloo&quot;, init_method=&quot;tcp://127.0.0.1:29500&quot;,
+                            rank=rank, world_size=world_size)
+    for n in [1024, 1024 * 1024]:          # 1 KB 与 1 MB 的数据
+        t = torch.ones(n, dtype=torch.float32)
+        dist.barrier()                      # 对齐起跑线
+        start = time.perf_counter()
+        for _ in range(10):
+            dist.all_reduce(t)              # 10 次 AllReduce 求平均
+        dist.barrier()
+        ms = (time.perf_counter() - start) / 10 * 1000
+        if rank == 0:
+            print(f&quot;数据量 {n*4/1e6:.2f} MB，单次 AllReduce 平均 {ms:.3f} ms&quot;)
+    dist.destroy_process_group()
+
+if __name__ == &quot;__main__&quot;:
+    world_size = 2
+    os.environ[&quot;MASTER_ADDR&quot;] = &quot;127.0.0.1&quot;
+    os.environ[&quot;MASTER_PORT&quot;] = &quot;29500&quot;
+    import torch.multiprocessing as mp
+    mp.spawn(run, args=(world_size,), nprocs=world_size)</code></pre>
+<p>你会看到 AllReduce 耗时随数据量近似线性增长，且存在一个<strong>固定启动延迟（约几十微秒）</strong>。这就是为什么&quot;小而频繁&quot;的张量并行通信会被这个固定开销拖累——每次同步都要付一笔&quot;起步价&quot;。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>在你有权限的机器上执行 <code>nvidia-smi topo -m</code>，解读矩阵：找出哪些 GPU 对之间是 NVLink、哪些要经过 <code>SYS</code>；据此圈出适合放张量并行的卡组。</li>
+<li>用示例 2 分别测 1 KB / 1 MB / 100 MB 数据的 AllReduce，画出&quot;耗时—数据量&quot;曲线，估算固定启动延迟，并解释它对 TP 与 DP 的不同影响。</li>
+<li>比较环形 AllReduce 与&quot;每卡先发到一张主卡、主卡求和再广播&quot;的朴素做法，从数据搬运量角度说明环形为何更优（提示：朴素做法主卡成为瓶颈）。</li>
+<li>讨论：一个含 MoE 层的模型，专家路由产生的 all-to-all 通信应优先放在哪个拓扑层级？如果只能跨机，会带来什么后果？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>NVIDIA · NVLink 与 NVSwitch 介绍：<a href="https://www.nvidia.com/en-us/data-center/nvlink/" target="_blank" rel="noopener noreferrer">https://www.nvidia.com/en-us/data-center/nvlink/</a></li>
+<li>NVIDIA NCCL 源码与文档（集合通信）：<a href="https://github.com/NVIDIA/nccl" target="_blank" rel="noopener noreferrer">https://github.com/NVIDIA/nccl</a></li>
+<li>PyTorch · torch.distributed 文档：<a href="https://pytorch.org/docs/stable/distributed.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/docs/stable/distributed.html</a></li>
+<li>NVIDIA · nvidia-smi topo 用法说明：<a href="https://developer.nvidia.com/nvidia-system-management-interface" target="_blank" rel="noopener noreferrer">https://developer.nvidia.com/nvidia-system-management-interface</a></li>
+</ul>
+<p><a href="#/l/inf-ch6-l1">下一课：FlashAttention</a></p>

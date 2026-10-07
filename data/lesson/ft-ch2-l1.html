@@ -1,0 +1,145 @@
+<h2 id="h-全参数微调原理">全参数微调原理<a class="anchor" href="#h-全参数微调原理" aria-label="本节链接">#</a></h2>
+<p>全参数微调（Full Fine-Tuning）是最&quot;朴素&quot;的微调方式：把预训练权重当作起点，用任务数据继续做梯度下降，<strong>更新模型里的每一个参数</strong>。本章先讲清它背后的计算原理和成本来源，后面两课再讲数据准备与训练配置。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-全参数微调到底改了什么">1. 全参数微调到底改了什么<a class="anchor" href="#h-1-全参数微调到底改了什么" aria-label="本节链接">#</a></h4>
+<p>预训练结束后，模型有了一组权重 θ₀。全参数微调做的事情是：</p>
+<pre data-lang="text"><code class="language-text">θ_t+1 = θ_t - η · ∇L(θ_t)</code></pre>
+<p>以 θ₀ 为初始值，在任务数据上最小化损失 L（对因果语言模型来说，通常仍是<strong>下一个 token 的交叉熵损失</strong>），逐步把所有权重 θ 更新到 θ*。这里&quot;全参数&quot;的含义是：<strong>梯度 ∇L 会回传到模型的每一个可训练参数上</strong>，包括注意力层的 Q/K/V/O 投影、FFN 的两层、词嵌入和输出层等。</p>
+<p>它和预训练的唯一区别在于<strong>起点不同、数据不同、步数不同</strong>：预训练从随机初始化出发、跑海量通用语料；微调从预训练权重出发、跑少量任务数据。因此微调通常能用很小的学习率和很少的步数就收敛。</p>
+<p><figure><img class="md-img" src="content/courses/llm-fine-tuning/assets/chapter-2-figure-01.svg" alt="全参数微调：所有参数都参与梯度更新" loading="lazy" decoding="async"><figcaption>全参数微调：所有参数都参与梯度更新</figcaption></figure>
+</p>
+<h4 id="h-2-损失函数与梯度回传">2. 损失函数与梯度回传<a class="anchor" href="#h-2-损失函数与梯度回传" aria-label="本节链接">#</a></h4>
+<p>对&quot;指令微调&quot;这类典型的全参数微调任务，每个样本被组织成一段对话文本，模型的目标仍然是最大化目标回答部分 token 的概率。损失函数写作：</p>
+<pre data-lang="text"><code class="language-text">L = -Σ_{t} log P(y_t | y_&lt;t, x)     （只对&quot;回答&quot;部分的 token 求和）</code></pre>
+<p>实现上，通常对 prompt 部分的标签位置做掩码（把 label 设成 -100 忽略掉），只计算回答部分的交叉熵。这样模型学到的是&quot;给定指令，如何生成期望回答&quot;，而不是浪费算力去预测指令本身。</p>
+<p>反向传播时，梯度从损失出发，沿计算图一路回传到嵌入层。<strong>所有参数的梯度都要被计算、累积、再用于更新</strong>——这正是全参数微调算力和显存开销的根本来源。</p>
+<h4 id="h-3-优化器adamw-与显存开销">3. 优化器：AdamW 与显存开销<a class="anchor" href="#h-3-优化器adamw-与显存开销" aria-label="本节链接">#</a></h4>
+<p>全参数微调几乎都用 <strong>AdamW</strong>（带权重衰减的 Adam）。它的显存消耗比&quot;只存权重&quot;大得多，因为每个参数还要额外存两份状态：</p>
+<table>
+<thead>
+<tr>
+<th>内容</th>
+<th>数量级（以 bf16 权重、参数量 P 计）</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>模型权重</td>
+<td>2P 字节（bf16）</td>
+</tr>
+<tr>
+<td>梯度</td>
+<td>2P 字节</td>
+</tr>
+<tr>
+<td>Adam 一阶动量 m</td>
+<td>2P 字节（通常 fp32，4P）</td>
+</tr>
+<tr>
+<td>Adam 二阶动量 v</td>
+<td>2P 字节（通常 fp32，4P）</td>
+</tr>
+</tbody></table>
+<p>一个粗略经验值是：<strong>全参数微调的显存需求大约是推理的 4–6 倍</strong>（权重 + 梯度 + 优化器状态，还要算上激活值）。这也解释了为什么 70 亿参数的模型，用 bf16 全参数微调时，即便激活值做了检查点优化，通常也需要多张 80GB 显卡或一张 H100 级别的卡——这也是第 3 章 LoRA 要解决的痛点。</p>
+<h4 id="h-4-学习率与调度">4. 学习率与调度<a class="anchor" href="#h-4-学习率与调度" aria-label="本节链接">#</a></h4>
+<p>全参数微调对学习率很敏感：</p>
+<ul>
+<li><strong>学习率要远小于预训练</strong>：预训练可能用 1e-4 量级，微调通常用 <strong>1e-5 ~ 5e-5</strong>，因为模型已经&quot;接近好位置&quot;，步子太大会破坏已有能力。</li>
+<li><strong>Warmup（预热）</strong>：训练初期用极小学习率线性爬升，避免一开始梯度方向不稳定时&quot;冲出去&quot;。</li>
+<li><strong>衰减（Decay）</strong>：中后期用余弦或线性衰减把学习率降下来，帮助收敛到更稳的极小值。</li>
+</ul>
+<h4 id="h-5-灾难性遗忘">5. 灾难性遗忘<a class="anchor" href="#h-5-灾难性遗忘" aria-label="本节链接">#</a></h4>
+<p>全参数微调最大的风险是<strong>灾难性遗忘（catastrophic forgetting）</strong>：因为所有参数都在改，如果任务数据分布太窄、或学习率太大、或训练步数过多，模型会&quot;过度贴合&quot;任务数据，丢掉预训练阶段学到的通用能力（常识、推理、多语言等）。</p>
+<p>常见缓解手段：控制学习率和步数、混合通用数据（数据配比）、使用 LoRA 这类只改少量参数的方法（对原权重的扰动更小）。这是第 3 章 LoRA 受欢迎的另一个原因。</p>
+<p><figure><img class="md-img" src="content/courses/llm-fine-tuning/assets/chapter-2-figure-02.svg" alt="全参数微调的收益与灾难性遗忘风险" loading="lazy" decoding="async"><figcaption>全参数微调的收益与灾难性遗忘风险</figcaption></figure>
+</p>
+<p>一句话总结：<strong>全参数微调 = 从预训练权重出发，用任务数据对所有参数做小步长的梯度下降；它效果好但显存/算力成本高，且有过拟合和遗忘风险。</strong></p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面用 Hugging Face <code>Trainer</code> 走一遍<strong>极简的全参数微调</strong>：在一个玩具数据集上，把一个小型因果模型的所有参数都纳入训练。</p>
+<pre data-lang="python"><code class="language-python">from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    Trainer,
+    TrainingArguments,
+)
+from datasets import Dataset
+
+# 1) 加载一个小型基座模型，全参数微调的起点
+model_name = &quot;Qwen/Qwen2.5-0.5B&quot;
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+# pad_token 需要显式设置，避免右对齐时出错
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+
+model = AutoModelForCausalLM.from_pretrained(model_name)
+
+# 2) 构造一个极小的指令微调玩具数据（仅演示流程）
+raw = [
+    {&quot;instruction&quot;: &quot;把下面的句子翻译成英文&quot;, &quot;input&quot;: &quot;今天天气很好。&quot;, &quot;output&quot;: &quot;The weather is nice today.&quot;},
+    {&quot;instruction&quot;: &quot;把下面的句子翻译成英文&quot;, &quot;input&quot;: &quot;我喜欢学习编程。&quot;, &quot;output&quot;: &quot;I like learning to program.&quot;},
+    {&quot;instruction&quot;: &quot;总结下面这句话&quot;, &quot;input&quot;: &quot;模型在大量文本上预训练后，再用任务数据微调。&quot;, &quot;output&quot;: &quot;预训练后再微调。&quot;},
+]
+
+def format_and_tokenize(example):
+    &quot;&quot;&quot;拼成 chat 模板文本，并对 prompt 部分做 label 掩码&quot;&quot;&quot;
+    messages = [
+        {&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: example[&quot;instruction&quot;] + &quot;\n&quot; + example[&quot;input&quot;]},
+        {&quot;role&quot;: &quot;assistant&quot;, &quot;content&quot;: example[&quot;output&quot;]},
+    ]
+    prompt_text = tokenizer.apply_chat_template(
+        [messages[0]], tokenize=False, add_generation_prompt=True
+    )
+    full_text = tokenizer.apply_chat_template(messages, tokenize=False)
+
+    prompt_ids = tokenizer(prompt_text)[&quot;input_ids&quot;]
+    full_ids = tokenizer(full_text)[&quot;input_ids&quot;]
+    # prompt 部分对应 label 置为 -100，训练时不计算损失
+    labels = [-100] * len(prompt_ids) + full_ids[len(prompt_ids):]
+
+    return {&quot;input_ids&quot;: full_ids, &quot;labels&quot;: labels}
+
+dataset = Dataset.from_list(raw).map(format_and_tokenize)
+
+# 3) 训练配置：小学习率、小步数，体现&quot;从预训练权重出发做小幅修正&quot;
+training_args = TrainingArguments(
+    output_dir=&quot;./ft-output&quot;,
+    per_device_train_batch_size=1,
+    gradient_accumulation_steps=4,   # 等效 batch size = 4
+    learning_rate=2e-5,              # 远小于预训练学习率
+    num_train_epochs=2,
+    warmup_ratio=0.1,                # 前 10% 步数做预热
+    lr_scheduler_type=&quot;cosine&quot;,      # 余弦衰减
+    weight_decay=0.01,
+    logging_steps=1,
+    report_to=&quot;none&quot;,                # 演示时不接 wandb
+)
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=dataset,
+    tokenizer=tokenizer,
+)
+
+# 4) 开始训练：这里会更新模型的所有参数
+trainer.train()
+
+print(&quot;\n全参数微调完成。训练过程中，模型的每一个参数都参与了梯度更新。&quot;)
+print(&quot;（数据量极小，仅用于演示流程，不具备实际效果。）&quot;)</code></pre>
+<blockquote>
+<p>说明：真实全参数微调通常需要 GPU 和足够的显存。上面的玩具数据只有 3 条，只用于演示&quot;全参数&quot;意味着什么；若要真正训练，请准备更大规模的数据（下一课讲数据准备）。</p>
+</blockquote>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>填空</strong>：全参数微调以 ____ 权重为初始值，用任务数据最小化 ____ 损失（对因果语言模型而言），并把梯度回传到 ____ 参数上。</li>
+<li><strong>显存估算</strong>：设模型参数量为 P，用 bf16 存储权重、fp32 存储 Adam 状态。请列出全参数微调需要驻留显存的主要项，并说明为什么它大约是推理显存的 4–6 倍。</li>
+<li><strong>动手实验</strong>：把上面代码里的 <code>learning_rate</code> 从 <code>2e-5</code> 改成 <code>1e-3</code>，观察训练 loss 是否发散或剧烈震荡。结合&quot;预训练权重已经很接近好位置&quot;解释你看到的现象。</li>
+<li><strong>思考题</strong>：为什么微调的学习率要远小于预训练？如果学习率设置得太大，可能引发什么后果（结合灾难性遗忘）？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Hugging Face Transformers 训练文档：<a href="https://huggingface.co/docs/transformers/training" target="_blank" rel="noopener noreferrer">https://huggingface.co/docs/transformers/training</a></li>
+<li>Hugging Face 因果语言模型微调教程：<a href="https://huggingface.co/docs/transformers/tasks/language_modeling" target="_blank" rel="noopener noreferrer">https://huggingface.co/docs/transformers/tasks/language_modeling</a></li>
+<li>AdamW 论文（Decoupled Weight Decay Regularization）：<a href="https://arxiv.org/abs/1711.05101" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1711.05101</a></li>
+<li>灾难性遗忘综述（Continual Learning）：<a href="https://arxiv.org/abs/1802.07569" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1802.07569</a></li>
+</ul>
+<p><a href="#/l/ft-ch2-l2">下一课：数据准备</a></p>

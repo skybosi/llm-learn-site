@@ -1,0 +1,122 @@
+<h2 id="h-特征工程">特征工程<a class="anchor" href="#h-特征工程" aria-label="本节链接">#</a></h2>
+<blockquote>
+<p>深度模型很强，但推荐系统里有句老话：<strong>&quot;特征决定了模型效果的上限，模型只是逼近这个上限。&quot;</strong> 排序模型吃的是特征，垃圾特征进、垃圾分数出。本课把推荐系统排序阶段的特征工程拆开讲：有哪些特征、每种特征怎么处理、以及工业界最容易踩的&quot;线上线下不一致&quot;这个大坑。</p>
+</blockquote>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-排序阶段的特征全景">1. 排序阶段的特征全景<a class="anchor" href="#h-1-排序阶段的特征全景" aria-label="本节链接">#</a></h4>
+<p>排序模型的特征可以从&quot;描述谁、在什么场景、对什么物品&quot;三个维度来梳理：</p>
+<ul>
+<li><strong>用户侧特征</strong>：人口属性（年龄、性别、地域）、用户兴趣标签、账号活跃度、历史行为统计（近 7 天点击了哪些类目、消费金额、观看时长分布）。</li>
+<li><strong>物品侧特征</strong>：类目、标签、价格、作者/店铺、发布时间、内容质量分、历史 CTR（点击率）和转化率。</li>
+<li><strong>上下文特征</strong>：时间（早中晚、周末）、场景（搜索 / 推荐流 / 详情页）、设备、网络、地理位置、是否新用户。</li>
+<li><strong>交叉特征</strong>：用户与物品的组合，例如&quot;用户历史中该类目的占比 × 当前物品类目匹配度&quot;。</li>
+<li><strong>序列/行为特征</strong>：用户最近点击、收藏、购买的一串物品 ID 序列——这是深度模型（尤其 DIN 一类）的输入，也是现在排序模型里信息量最大的一块。</li>
+</ul>
+<p>一个实用的判断标准是：<strong>特征是否和&quot;用户会不会点击&quot;这个目标有稳定的相关性</strong>。没有相关性的特征加了只会引入噪声、增加过拟合风险。所以特征工程的第一原则不是&quot;越多越好&quot;，而是&quot;<strong>相关、稳定、可得</strong>&quot;。</p>
+<h4 id="h-2-连续特征归一化分桶缺失与异常">2. 连续特征：归一化、分桶、缺失与异常<a class="anchor" href="#h-2-连续特征归一化分桶缺失与异常" aria-label="本节链接">#</a></h4>
+<p>连续特征（年龄、价格、时长）直接进模型有三个问题：量纲不一致（年龄几十、价格几万）、分布有长尾、树模型之外对尺度敏感。常见处理：</p>
+<ul>
+<li><strong>归一化 / 标准化</strong>：把特征压到相近的尺度。min-max 归一化 <code>(x-min)/(max-min)</code> 适合有界特征；z-score 标准化 <code>(x-μ)/σ</code> 适合近似正态的特征。</li>
+<li><strong>分桶（离散化）</strong>：把连续值切成若干区间，比如年龄切成 <code>[&lt;18, 18-24, 25-34, 35-44, 45+]</code>。分桶能捕捉非线性、抑制异常值，还能让&quot;桶&quot;变成一个可被 Embedding 的离散特征。</li>
+<li><strong>缺失值</strong>：缺失本身可能是信号（&quot;用户没填年龄&quot;）。常见做法是单独给一个&quot;缺失&quot;桶，或填充默认值，而不是简单丢弃。</li>
+<li><strong>异常值</strong>：用截断（clip 到分位数区间）或取对数 <code>log(1+x)</code> 压缩长尾。</li>
+</ul>
+<h4 id="h-3-类别特征one-hotembedding-与哈希">3. 类别特征：one-hot、Embedding 与哈希<a class="anchor" href="#h-3-类别特征one-hotembedding-与哈希" aria-label="本节链接">#</a></h4>
+<p>类别特征（类目、城市、品牌）的处理核心是<strong>控制基数</strong>：</p>
+<ul>
+<li><strong>one-hot</strong>：适合基数很小的特征（性别、是否 VIP）。</li>
+<li><strong>Embedding</strong>：适合高基数特征（用户 ID、物品 ID、长尾标签）。上一课讲过，它把 ID 映射成稠密向量，让&quot;相似的 ID 学到相近的表示&quot;。</li>
+<li><strong>哈希（hashing trick）</strong>：对超高基数、且不断新增取值的特征（如搜索词、长尾 ID），用一个固定的哈希函数把取值映射到固定数量的桶，避免特征表无限膨胀；代价是可能发生哈希冲突，用多哈希或更大桶数来缓解。</li>
+</ul>
+<p>还有一个高频操作：<strong>低频取值合并</strong>。把出现次数少于阈值的类别统一归入一个 <code>&lt;unk&gt;</code> 桶，避免为几乎不出现的取值浪费一个 Embedding 参数。</p>
+<h4 id="h-4-序列特征把历史变成可计算的量">4. 序列特征：把&quot;历史&quot;变成可计算的量<a class="anchor" href="#h-4-序列特征把历史变成可计算的量" aria-label="本节链接">#</a></h4>
+<p>用户的历史行为序列是最宝贵的特征，但模型不能直接吃&quot;一串物品 ID&quot;。常用转化方式：</p>
+<ul>
+<li><strong>聚合统计</strong>：把序列聚合成&quot;近 7 天各 top 类目的点击占比&quot;&quot;平均观看时长&quot;等标量。</li>
+<li><strong>时间衰减加权</strong>：越近的行为越能代表当前兴趣，给行为按 <code>exp(-λ·Δt)</code> 加权后再聚合。</li>
+<li><strong>序列建模</strong>：把物品 ID 序列先 Embedding，再喂给 DIN 的注意力或 Transformer，让模型自己决定&quot;当前候选物品应该参考历史里的哪些&quot;。</li>
+</ul>
+<h4 id="h-5-最致命的坑训练线上特征不一致">5. 最致命的坑：训练/线上特征不一致<a class="anchor" href="#h-5-最致命的坑训练线上特征不一致" aria-label="本节链接">#</a></h4>
+<p>这是推荐系统特征工程里<strong>代价最高</strong>的问题，值得单独拎出来讲。模型在训练时看到的是&quot;离线表里存好的特征&quot;，上线时看到的是&quot;实时服务里现算的特征&quot;，两者只要有一点点定义差异，效果就会雪崩。典型不一致来源：</p>
+<ul>
+<li><strong>口径漂移</strong>：训练用&quot;历史 CTR 特征&quot;是离线按整表统计的，线上却是实时增量算的，两个值对不上。</li>
+<li><strong>时序穿越</strong>：训练时用到了&quot;未来&quot;信息（比如用&quot;今天是否购买&quot;去预测&quot;今天是否点击&quot;），线上拿不到这个特征，模型学到的是假关系。</li>
+<li><strong>特征缺失</strong>：线上某些字段缺失时用 0 填充，而训练时这些字段从不缺失，分布不一致。</li>
+</ul>
+<p>工程上要靠&quot;<strong>特征统一管理平台 + 特征一致性监控</strong>&quot;来解决：同一个特征只定义一次，离线和在线从同一个地方取，并持续监控线上线下特征分布的漂移。</p>
+<p><figure><img class="md-img" src="content/courses/recommendation-systems/assets/chapter-4-figure-03.svg" alt="排序特征工程的整体流程" loading="lazy" decoding="async"><figcaption>排序特征工程的整体流程</figcaption></figure>
+</p>
+<h3 id="h-二可运行示例">二、可运行示例<a class="anchor" href="#h-二可运行示例" aria-label="本节链接">#</a></h3>
+<h4 id="h-示例-1连续特征的分桶与归一化">示例 1：连续特征的分桶与归一化<a class="anchor" href="#h-示例-1连续特征的分桶与归一化" aria-label="本节链接">#</a></h4>
+<pre data-lang="python"><code class="language-python">import numpy as np
+
+def min_max_scale(x):
+    &quot;&quot;&quot;min-max 归一化到 [0, 1]。&quot;&quot;&quot;
+    lo, hi = x.min(), x.max()
+    return (x - lo) / (hi - lo + 1e-9)
+
+def z_score(x):
+    &quot;&quot;&quot;z-score 标准化：减均值、除标准差。&quot;&quot;&quot;
+    return (x - x.mean()) / (x.std() + 1e-9)
+
+def bucketize(x, edges):
+    &quot;&quot;&quot;把连续值按区间边界分桶，返回桶编号（-1 表示缺失）。edges 是升序的分界点。&quot;&quot;&quot;
+    return np.digitize(x, bins=edges)
+
+# 模拟&quot;价格&quot;特征：长尾分布，且有一个异常大值
+price = np.array([10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 5000.0])
+print(&quot;原始价格:&quot;, price)
+print(&quot;min-max 归一化:&quot;, np.round(min_max_scale(price), 3))
+print(&quot;取对数后 min-max:&quot;, np.round(min_max_scale(np.log1p(price)), 3))
+
+# 年龄分桶
+age = np.array([15, 22, 30, 38, 50, np.nan])
+edges = [18, 25, 35, 45]           # 区间: &lt;=18, 18-25, 25-35, 35-45, &gt;45
+clean_age = np.nan_to_num(age, nan=-1)   # 缺失先用 -1 占位，后续映射为&quot;缺失桶&quot;
+print(&quot;年龄分桶编号:&quot;, bucketize(clean_age, edges))</code></pre>
+<h4 id="h-示例-2类别特征的低频合并--哈希">示例 2：类别特征的低频合并 + 哈希<a class="anchor" href="#h-示例-2类别特征的低频合并--哈希" aria-label="本节链接">#</a></h4>
+<pre data-lang="python"><code class="language-python">from collections import Counter
+
+def merge_low_freq(ids, min_count=3):
+    &quot;&quot;&quot;把出现次数 &lt; min_count 的类别合并成 &lt;unk&gt;。&quot;&quot;&quot;
+    counts = Counter(ids)
+    return [i if counts[i] &gt;= min_count else &quot;&lt;unk&gt;&quot; for i in ids]
+
+def hash_feature(s, num_buckets):
+    &quot;&quot;&quot;对任意字符串做哈希，映射到固定数量的桶。&quot;&quot;&quot;
+    return hash(s) % num_buckets   # Python 内置 hash 每次进程可能不同，仅作演示
+
+raw = [&quot;北京&quot;, &quot;上海&quot;, &quot;广州&quot;, &quot;北京&quot;, &quot;深圳&quot;, &quot;广州&quot;, &quot;北京&quot;, &quot;上海&quot;, &quot;苏州&quot;, &quot;杭州&quot;]
+print(&quot;低频合并:&quot;, merge_low_freq(raw, min_count=2))
+print(&quot;哈希到 8 个桶:&quot;)
+for c in [&quot;北京&quot;, &quot;上海&quot;, &quot;广州&quot;, &quot;深圳&quot;]:
+    print(f&quot;  {c} -&gt; 桶 {hash_feature(c, 8)}&quot;)</code></pre>
+<h4 id="h-示例-3行为序列的时间衰减加权">示例 3：行为序列的时间衰减加权<a class="anchor" href="#h-示例-3行为序列的时间衰减加权" aria-label="本节链接">#</a></h4>
+<pre data-lang="python"><code class="language-python">import numpy as np
+
+def time_decay_weighted(events, halflife_hours=24.0):
+    &quot;&quot;&quot;events: [(发生时间距现在的小时数, 行为强度)]，越近权重越高。&quot;&quot;&quot;
+    lam = np.log(2) / halflife_hours      # 半衰期换算成衰减系数
+    weights = np.exp(-lam * np.array([e[0] for e in events]))
+    strengths = np.array([e[1] for e in events])
+    return (weights * strengths).sum() / weights.sum()
+
+# 假设：1 小时前看过 1 次、6 小时前看过 1 次、48 小时前看过 1 次
+events = [(1, 1.0), (6, 1.0), (48, 1.0)]
+print(&quot;时间衰减加权(半衰期24h) =&quot;, round(time_decay_weighted(events), 4))
+print(&quot;简单平均                =&quot;, round(np.mean([e[1] for e in events]), 4))
+# 衰减加权会明显抬高&quot;最近行为&quot;的贡献，更贴近用户当下的兴趣</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>在示例 1 中，把&quot;取对数后再 min-max&quot;与&quot;直接 min-max&quot;对比，解释为什么长尾价格特征更该先取对数。</li>
+<li>自己设计一个&quot;用户历史类目占比&quot;的交叉特征：给定用户历史行为序列和当前候选物品的类目，写出它的计算过程，并说明这个特征为什么对点击预测有用。</li>
+<li>举一个&quot;时序穿越（data leakage）&quot;的具体例子：某个特征训练时能拿到、线上拿不到，会导致离线 AUC 虚高而线上失效。</li>
+<li>思考题：为什么说&quot;哈希冲突&quot;对高基数类别特征是可接受的代价？在什么情况下哈希冲突会真正伤害模型？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>王喆《深度学习推荐系统》配套论文清单 Reco-papers：<a href="https://github.com/wzhe06/Reco-papers" target="_blank" rel="noopener noreferrer">https://github.com/wzhe06/Reco-papers</a></li>
+<li>scikit-learn 预处理官方文档（标准化、分桶、OneHot、FeatureHasher）：<a href="https://scikit-learn.org/stable/modules/preprocessing.html" target="_blank" rel="noopener noreferrer">https://scikit-learn.org/stable/modules/preprocessing.html</a></li>
+<li>Google《Rules of Machine Learning: Best Practices for ML Engineering》（特征与线上一致性相关章节）：<a href="https://developers.google.com/machine-learning/guides/rules-of-ml" target="_blank" rel="noopener noreferrer">https://developers.google.com/machine-learning/guides/rules-of-ml</a></li>
+</ul>
+<p><a href="#/l/rec-ch5-l1">下一课：多路召回</a></p>

@@ -1,0 +1,192 @@
+<h2 id="h-符号表与作用域链">符号表与作用域链<a class="anchor" href="#h-符号表与作用域链" aria-label="本节链接">#</a></h2>
+<p><code>a + b</code> 已经能正确解析成语法树了，但语法树没回答一个更基本的问题：<code>a</code> 和 <code>b</code> 到底是谁？局部变量、函数参数还是全局？同名声明有好几个时，这行代码在加哪两个东西？把&quot;名字&quot;接到&quot;声明&quot;上的这一步叫<strong>绑定</strong>（binding）或<strong>名字解析</strong>（resolution），它与类型检查一起构成<strong>语义分析</strong>（static analysis）。本课只解决一个问题：编译器凭什么为每个名字挑出唯一正确的那个声明。</p>
+<p><figure><img class="md-img" src="content/courses/compiler-foundations/assets/chapter-3-figure-01.svg" alt="作用域链：每层一张符号表，查找由内向外沿 enclosing 上溯" loading="lazy" decoding="async"><figcaption>作用域链：每层一张符号表，查找由内向外沿 enclosing 上溯</figcaption></figure>
+</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-语义分析把能解析变成有含义">1. 语义分析：把&quot;能解析&quot;变成&quot;有含义&quot;<a class="anchor" href="#h-1-语义分析把能解析变成有含义" aria-label="本节链接">#</a></h4>
+<p>语法分析只关心结构是否合法：<code>a + b</code> 的语法树记录了&quot;这是一个二元加法&quot;，但 <code>a</code>、<code>b</code> 只是拼写，不是含义。Crafting Interpreters 第 2 章讲得很直白：静态分析的第一步是 <strong>binding / resolution</strong>，为每个标识符找出它的声明并接起来；而<strong>作用域</strong>（scope）的定义正是&quot;某个名字可以指代某个声明的那段源码区域&quot;。若语言是静态类型的，也在这里做类型检查。</p>
+<p>解析结果存哪里？第 2 章给了三条路：写回语法树节点当<strong>属性</strong>、放在旁边一张以标识符为键的<strong>符号表</strong>（symbol table）、或换成语义更显式的新结构。本章走第二条路。</p>
+<h4 id="h-2-符号表里的一条记录放什么">2. 符号表里的一条记录放什么<a class="anchor" href="#h-2-符号表里的一条记录放什么" aria-label="本节链接">#</a></h4>
+<p>一条记录不是&quot;名字 → 值&quot;，而是&quot;名字 → 一切编译期已知的声明信息&quot;。缺字段的符号表会在报错与后续阶段立刻露馅：</p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>含义</th>
+<th>写入者 → 读取者</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>name</code></td>
+<td>标识符拼写（词法器给出）</td>
+<td>声明语句 → 所有引用</td>
+</tr>
+<tr>
+<td><code>kind</code></td>
+<td>类别：var / func / param / type</td>
+<td>声明语句 → 语义检查</td>
+</tr>
+<tr>
+<td><code>type</code></td>
+<td>类型表达式（下一课展开）</td>
+<td>声明语句 → 类型检查器</td>
+</tr>
+<tr>
+<td><code>depth</code> / <code>scope</code></td>
+<td>所属作用域层</td>
+<td>进入作用域时 → 遮蔽判定</td>
+</tr>
+<tr>
+<td><code>decl_line</code></td>
+<td>声明所在行</td>
+<td>声明语句 → 报错定位</td>
+</tr>
+<tr>
+<td><code>storage</code></td>
+<td>存储类别：参数 / 局部 / 全局</td>
+<td>语义分析 → 后端分配地址</td>
+</tr>
+</tbody></table>
+<p>龙书 §2.7 讨论了符号表的多种实现（线性表、有序表、哈希表等）：线性表插入便宜、查找 O(n)；有序表可二分但插入要挪；哈希表两边都平衡，因此生产编译器几乎都用它，再外套一层作用域结构。</p>
+<h4 id="h-3-作用域链一层一张表--一个-enclosing-指针">3. 作用域链：一层一张表 + 一个 enclosing 指针<a class="anchor" href="#h-3-作用域链一层一张表--一个-enclosing-指针" aria-label="本节链接">#</a></h4>
+<p>作用域是<strong>词法</strong>的：由代码文本的嵌套结构决定（lexical scope），而不是由函数调用的先后顺序决定（dynamic scope）。最直观的实现是链式环境：</p>
+<pre><code>Scope { table: {name → Symbol}, enclosing: Scope | None }</code></pre>
+<p><code>declare(sym)</code> 只写当前层；<code>resolve(name)</code> 从当前层开始沿 <code>enclosing</code> 上溯，命中即停，走到 <code>None</code> 还没命中就报&quot;未定义变量&quot;。内层同名声明因此<strong>遮蔽</strong>（shadowing）外层——遮蔽既是语言特性，也是&quot;由内向外查找&quot;的自动结果。</p>
+<h4 id="h-4-两种工程实现">4. 两种工程实现<a class="anchor" href="#h-4-两种工程实现" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>做法</th>
+<th>怎么做</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>链式映射（environment chain）</td>
+<td>每层一个哈希表，表间用指针串起来</td>
+<td>查找 O(depth)；结构清晰，闭包直接引用环境即可</td>
+</tr>
+<tr>
+<td>单表 + 作用域栈</td>
+<td>全程序一张表，条目带 scope 字段；进出作用域时压/弹可见性（或用 undo log 撤销插入）</td>
+<td>查找 O(1)；必须显式处理遮蔽与回滚</td>
+</tr>
+</tbody></table>
+<p>Crafting Interpreters 的 jlox 走第一条路：<code>Environment</code> 持有 <code>values</code> 与 <code>enclosing</code>，进入块建子环境、离开块丢弃。收益在实现闭包时完全体现：函数抓住定义处的环境，就自然捕获外层变量。</p>
+<h4 id="h-5-为什么名字必须在编译期解析掉">5. 为什么名字必须在编译期解析掉<a class="anchor" href="#h-5-为什么名字必须在编译期解析掉" aria-label="本节链接">#</a></h4>
+<p>这不只是为了快。<strong>早绑定</strong>让每个名字在编译期唯一确定到某个声明，含义与运行路径无关；<strong>晚绑定</strong>（运行时查表）会让同名引用随运行状态漂移。例 2 用三行 Python 演示：<code>[lambda: i for i in range(3)]</code> 里的 <code>i</code> 在调用时才查表，三个函数返回同一个 <code>i</code>；写成 <code>lambda i=i:</code> 把名字在定义处绑死，才得到 0、1、2。同一个语法，两种绑定策略，两种程序。</p>
+<h4 id="h-6-常见坑">6. 常见坑<a class="anchor" href="#h-6-常见坑" aria-label="本节链接">#</a></h4>
+<ol>
+<li><strong>进入作用域压表、离开时忘了弹出</strong>：后面所有名字都被污染。作用域生命周期必须与语法结构的进入/退出严格配对。</li>
+<li><strong>同一层重复声明</strong>：<code>int x; int x;</code> 有的语言报错，有的允许后者覆盖前者。这是语言规范的选择，不是实现细节——两种都要在 <code>declare</code> 里写清。</li>
+<li><strong>单遍编译的副作用</strong>：没有全局符号表，编译器只能&quot;看到什么才知道什么&quot;，这正是 C 需要显式前向声明的原因。</li>
+<li><strong>行号来源搞混</strong>：报&quot;未定义变量&quot;要给<strong>引用处</strong>的行号，而符号表里存的是<strong>声明处</strong>的行号，两个字段都要有。</li>
+</ol>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>例 1 是最小可用的符号表：<code>Scope</code> 就是上面那个 <code>table + enclosing</code> 结构，<code>PROGRAM</code> 列表描述一段带块作用域的源码，我们一步步走，看每次引用的绑定结果。</p>
+<pre data-lang="python"><code class="language-python"># ---- 例 1：符号表 + 作用域链：声明、遮蔽、解析 ----
+class Symbol:
+    &quot;&quot;&quot;符号表里的一条记录：名字 + 类别 + 类型 + 声明所在行&quot;&quot;&quot;
+    def __init__(self, name, kind, typ, line):
+        self.name, self.kind, self.typ, self.line = name, kind, typ, line
+    def __repr__(self):
+        return f&#39;&lt;{self.kind} {self.name}:{self.typ} @L{self.line}&gt;&#39;
+
+class Scope:
+    &quot;&quot;&quot;一层作用域 = 一张哈希表 + 指向外层的 enclosing 指针&quot;&quot;&quot;
+    def __init__(self, kind, parent=None):
+        self.kind = kind
+        self.parent = parent
+        self.table = {}
+        self.depth = 0 if parent is None else parent.depth + 1
+
+    def declare(self, sym):
+        if sym.name in self.table:              # 同一层重复声明 → 报错
+            raise NameError(f&#39;L{sym.line}: 重复声明 {sym.name}&#39;)
+        self.table[sym.name] = sym
+        return sym
+
+    def resolve(self, name):
+        &quot;&quot;&quot;作用域链：由内向外逐层查找，返回 (命中层, 符号)&quot;&quot;&quot;
+        s = self
+        while s is not None:
+            if name in s.table:
+                return s, s.table[name]
+            s = s.parent
+        return None, None
+
+    def chain(self):
+        s, out = self, []
+        while s is not None:
+            out.append(f&#39;{s.kind}#{s.depth}&#39;)
+            s = s.parent
+        return &#39; &lt;- &#39;.join(out)
+
+# 与下面这段源码一一对应：
+#   x = 1                              ← 全局
+#   { x = 1.5; y = 2; y + 1; x * 2 }   ← 块内 x 遮蔽全局 x
+#   print(x)
+PROGRAM = [
+    (&#39;decl&#39;,  &#39;x&#39;,   &#39;int&#39;,   1),
+    (&#39;enter&#39;, None,  None,    2),
+    (&#39;decl&#39;,  &#39;x&#39;,   &#39;float&#39;, 2),
+    (&#39;decl&#39;,  &#39;y&#39;,   &#39;int&#39;,   3),
+    (&#39;use&#39;,   &#39;y&#39;,   None,    3),
+    (&#39;use&#39;,   &#39;x&#39;,   None,    4),
+    (&#39;leave&#39;, None,  None,    4),
+    (&#39;use&#39;,   &#39;x&#39;,   None,    5),
+    (&#39;use&#39;,   &#39;avg&#39;, None,    6),          # 从未声明
+]
+
+scope = Scope(&#39;global&#39;)
+for op, name, typ, line in PROGRAM:
+    if op == &#39;enter&#39;:
+        scope = Scope(&#39;block&#39;, parent=scope)
+        print(f&#39;L{line} 进入块 -&gt; 当前链 {scope.chain()}&#39;)
+    elif op == &#39;leave&#39;:
+        print(f&#39;L{line} 离开块 -&gt; 弹出 {scope.kind}#{scope.depth}&#39;)
+        scope = scope.parent
+    elif op == &#39;decl&#39;:
+        scope.declare(Symbol(name, &#39;var&#39;, typ, line))
+        print(f&#39;L{line} 声明 {name}:{typ} -&gt; 写入 {scope.kind}#{scope.depth}&#39;)
+    else:
+        hit, sym = scope.resolve(name)
+        if sym is None:
+            print(f&#39;L{line} 引用 {name} -&gt; 未定义（查完 {scope.chain()}）&#39;)
+        else:
+            print(f&#39;L{line} 引用 {name} -&gt; 绑定 {sym}（命中 depth={hit.depth}）&#39;)</code></pre>
+<p>运行输出（每一行都是一次真实查表）：</p>
+<pre><code>L1 声明 x:int -&gt; 写入 global#0
+L2 进入块 -&gt; 当前链 block#1 &lt;- global#0
+L2 声明 x:float -&gt; 写入 block#1
+L3 声明 y:int -&gt; 写入 block#1
+L3 引用 y -&gt; 绑定 &lt;var y:int @L3&gt;（命中 depth=1）
+L4 引用 x -&gt; 绑定 &lt;var x:float @L2&gt;（命中 depth=1）
+L4 离开块 -&gt; 弹出 block#1
+L5 引用 x -&gt; 绑定 &lt;var x:int @L1&gt;（命中 depth=0）
+L6 引用 avg -&gt; 未定义（查完 global#0）</code></pre>
+<p>注意 L4 与 L5 的对照：块内 <code>x</code> 命中 <code>depth=1</code> 的 float 声明，离开块后再引用 <code>x</code> 就落回 <code>depth=0</code> 的全局声明。<strong>同一个名字，两处绑定</strong>——这就是遮蔽。</p>
+<p>例 2 把&quot;晚绑定会改变程序含义&quot;压到三行 Python 里：</p>
+<pre data-lang="python"><code class="language-python"># ---- 例 2：为什么名字要在编译期&quot;解析&quot;掉，而不是运行时再查表 ----
+fns_late = [lambda: i for i in range(3)]          # 名字晚绑定：三个函数查的是同一个 i
+fns_early = [lambda i=i: i for i in range(3)]     # 名字早绑定：各捕获自己的 i
+print(&#39;晚绑定（运行时查表）:&#39;, [f() for f in fns_late])
+print(&#39;早绑定（静态解析）  :&#39;, [f() for f in fns_early])</code></pre>
+<pre><code>晚绑定（运行时查表）: [2, 2, 2]
+早绑定（静态解析）  : [0, 1, 2]</code></pre>
+<p>这也是&quot;名字解析必须在编译期做完&quot;的最短论据：若推到运行期，同一段源码的含义就取决于&quot;运行时那张表里恰好有什么&quot;。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：给 <code>Scope</code> 加 <code>resolve_cost(name)</code>，返回从当前层到命中层走过的层数；对一段嵌套 5 层、共 100 次引用的样例程序统计总代价，再比较&quot;链式映射&quot;与&quot;单表 + 作用域栈&quot;的最坏情况。</li>
+<li><strong>解释</strong>：为什么&quot;内层遮蔽外层&quot;在链式映射里是查找顺序的自动结果，在&quot;单表 + 作用域栈&quot;里却必须额外处理？两种做法各要多存什么？</li>
+<li><strong>对比/验证</strong>：把例 1 的 <code>PROGRAM</code> 改成&quot;块内不声明 <code>x</code> 只引用 <code>x</code>&quot;，看解析结果如何从 <code>depth=1</code> 变成 <code>depth=0</code>；再把最后一行改成引用 <code>y</code>（<code>y</code> 声明在已退出的块里），解释输出说明了什么。</li>
+<li><strong>思考</strong>：C 的 <code>static</code> 局部变量、Python 的 <code>global</code>、JavaScript 的 <code>var</code> 提升，各自是对符号表的哪种干预？能否只用&quot;声明写进哪一层的表&quot;解释这三者？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Robert Nystrom, <em>Crafting Interpreters</em> 第 2 章「A Map of the Territory」（binding / resolution、scope 定义、符号表的三种落地方式）：<a href="https://craftinginterpreters.com/a-map-of-the-territory.html" target="_blank" rel="noopener noreferrer">https://craftinginterpreters.com/a-map-of-the-territory.html</a></li>
+<li>Robert Nystrom, <em>Crafting Interpreters</em> 第 8 章「Statements and State」（<code>Environment</code> 的 <code>values</code> + <code>enclosing</code> 链与遮蔽）：<a href="https://craftinginterpreters.com/statements-and-state.html" target="_blank" rel="noopener noreferrer">https://craftinginterpreters.com/statements-and-state.html</a></li>
+<li>Aho, Lam, Sethi, Ullman, <em>Compilers: Principles, Techniques, and Tools</em>（龙书，2nd ed.）§2.7「Symbol Tables」：符号表内容与线性表 / 有序表 / 哈希表</li>
+<li>LLVM 官方 Kaleidoscope 教程第 3 章（<code>NamedValues</code>：codegen 期的符号表）：<a href="https://llvm.org/docs/tutorial/MyFirstLanguageFrontend/LangImpl03.html" target="_blank" rel="noopener noreferrer">https://llvm.org/docs/tutorial/MyFirstLanguageFrontend/LangImpl03.html</a></li>
+</ul>
+<p><a href="#/l/cf-ch3-l2">下一课：类型系统与类型检查规则</a></p>

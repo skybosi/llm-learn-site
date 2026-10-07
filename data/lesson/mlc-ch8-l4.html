@@ -1,0 +1,283 @@
+<h2 id="h-项目把同一模型编译到多个后端给出性能与收益归因报告">项目：把同一模型编译到多个后端，给出性能与收益归因报告<a class="anchor" href="#h-项目把同一模型编译到多个后端给出性能与收益归因报告" aria-label="本节链接">#</a></h2>
+<p>前三课给了三块零件：运行时（第 1 课）、缓存与多设备（第 2 课）、引擎里的位置与 roofline 归因（第 3 课）。这一课把它们收成一个可交付物：<strong>同一张计算图、多个后端、一张报告卡</strong>。难点不在跑得快，而在<strong>说清为什么快</strong>——把&quot;融合省字节&quot;&quot;回放省下发&quot;&quot;权重变窄省带宽&quot;分别量化，并诚实写出没生效的那部分。没有 GPU 也能完成：把计数与模型算清楚，真机只用来替换实测列。</p>
+<p><figure><img class="md-img" src="content/courses/ml-compilers/assets/chapter-8-figure-02.svg" alt="多后端对比与收益归因的报告卡流程" loading="lazy" decoding="async"><figcaption>多后端对比与收益归因的报告卡流程</figcaption></figure>
+</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-项目定义与交付物">1. 项目定义与交付物<a class="anchor" href="#h-1-项目定义与交付物" aria-label="本节链接">#</a></h4>
+<p><strong>输入</strong>：一个确定的模型（本课用两层 MLP）、固定的输入分布与 batch、一份后端清单。<strong>输出</strong>：一张报告卡：</p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>口径</th>
+<th>为什么必须有</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>后端与配置</td>
+<td>融合边界、分块、是否图回放</td>
+<td>无配置的性能数字不可比</td>
+</tr>
+<tr>
+<td>正确性门</td>
+<td>与基准逐元素对比的 max|Δ|</td>
+<td>没过门不许进性能表</td>
+</tr>
+<tr>
+<td>计时</td>
+<td>热身后取最小值 + 报极差</td>
+<td>抗抖动，并可判断可信度</td>
+</tr>
+<tr>
+<td>计数</td>
+<td>kernel 数、中间张量、MACs、搬运字节</td>
+<td>与硬件无关，跨机可比</td>
+</tr>
+<tr>
+<td>模型时间</td>
+<td>搬运/带宽、下发次数×单次开销</td>
+<td>解释实测数字来自哪一层</td>
+</tr>
+<tr>
+<td>归因</td>
+<td>消融得到的每一步贡献</td>
+<td>报告的核心结论</td>
+</tr>
+<tr>
+<td>端到端换算</td>
+<td>Amdahl 折成整体收益</td>
+<td>防止把局部加速当结论</td>
+</tr>
+</tbody></table>
+<h4 id="h-2-三个后端的最小定义">2. 三个后端的最小定义<a class="anchor" href="#h-2-三个后端的最小定义" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>B0 逐算子</strong>：每算子一次 kernel、一个中间张量，即&quot;回退到 eager&quot;的形态。</li>
+<li><strong>B1 融合</strong>：<code>matmul+bias+relu</code> 与 <code>matmul+bias</code> 各融成一个 kernel，中间张量与 kernel 数都减少。</li>
+<li><strong>B2 融合+分块</strong>：把 batch 按 BM 行分块，让激活块有机会留在片上；<strong>代价是权重按块重读</strong>。</li>
+</ul>
+<p>B2 的取舍是真问题：块越小权重重读越多（本例权重 360 MB，BM=1 时搬运翻到 2885.9 MB）；块越大，激活块超过片上容量才付写回代价。<strong>分块不是无条件更优</strong>。</p>
+<h4 id="h-3-归因方法三本账--消融--amdahl">3. 归因方法：三本账 + 消融 + Amdahl<a class="anchor" href="#h-3-归因方法三本账--消融--amdahl" aria-label="本节链接">#</a></h4>
+<p><strong>三本账</strong>：算子时间（MACs/有效算力）、下发时间（kernel 数×单次下发）、搬运时间（字节/带宽），统一到毫秒才可相加。<strong>消融</strong>：逐个打开后端特性，每步差分就是该特性的贡献（与第 3 课同法）。<strong>Amdahl</strong>：段内提速要除以覆盖率才是端到端收益，段内 2.00x 在覆盖率 30% 时只剩 1.176x。</p>
+<h4 id="h-4-无-gpu-也能完成可打印的模拟">4. 无 GPU 也能完成：可打印的模拟<a class="anchor" href="#h-4-无-gpu-也能完成可打印的模拟" aria-label="本节链接">#</a></h4>
+<p>代码做四件事：跑通四个后端并过正确性门、统计搬运字节与 kernel 数、把流量模型放大到真实尺寸、按 Amdahl 折成端到端。真实尺寸那节只做<strong>计数与换算</strong>（权重 360.7 MB、激活 344 KiB/张量、假设带宽 2000 GB/s）：这正是无 GPU 时最值得练的部分——<strong>把归因写成公式</strong>。有 GPU 时只替换实测列，方法不变。</p>
+<h4 id="h-5-报告卡的四条纪律">5. 报告卡的四条纪律<a class="anchor" href="#h-5-报告卡的四条纪律" aria-label="本节链接">#</a></h4>
+<ol>
+<li><strong>写负结果</strong>：本例激活侧融合只省 0.7 MB（362.4→361.7 MB），&quot;分块&quot;更是负收益。只报赢的结果，报告没有参考价值。</li>
+<li><strong>报噪声</strong>：第 1 部分四个后端的最大差 0.14 ms，而单后端重复测量的极差最大 0.45 ms——差异被噪声淹没，此时<strong>不许</strong>下&quot;谁更快&quot;的结论。</li>
+<li><strong>标口径</strong>：实测、计数、模型三列分别标来源；混着写就无法判断哪条能复现。</li>
+<li><strong>可复现</strong>：随机种子、输入分布、热身次数与取值口径，都要写进报告。</li>
+</ol>
+<h4 id="h-6-常见坑">6. 常见坑<a class="anchor" href="#h-6-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>不做正确性门就比性能</strong>：融合会改变算子顺序，浮点结果有差异；门不过，性能数字毫无意义。</li>
+<li><strong>只测一次</strong>：单次测量把冷启动、GC、邻进程影响全算进来；至少热身 2 次、测量 9 次以上。</li>
+<li><strong>把模型时间当预测</strong>：模型时间只说明&quot;哪一层主导&quot;，不能替代实测；B3 的 1.999x 只是流量模型结论。</li>
+<li><strong>忘记端到端</strong>：段内 2x 很容易让人兴奋，覆盖率一折算就打回原形。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面这段纯 Python（无第三方依赖）就是项目本身：四个后端共用一个驱动，先过正确性门，再输出四部分报告卡。计时真实（热身 2 次、测量 10 次取最小值并报极差），搬运字节与 kernel 数精确计数，带宽/下发/片上容量为显式假设参数。</p>
+<pre data-lang="python"><code class="language-python"># ---- 第 4 课示例：把同一模型编译到多个&quot;后端&quot;，产出性能与收益归因报告卡 ----
+# 纯 Python、无第三方依赖。计时是真实测量；搬运字节与算子数是精确计数；
+# 带宽/下发开销/片上容量是**显式假设的模型参数**（不是任何真实设备的实测值）。
+import time, math, random
+
+B, I, H, O = 32, 48, 48, 48          # batch、输入维、隐藏维、输出维（纯 Python 可跑的尺寸）
+F32 = 4
+BW_GBPS, LAUNCH_US = 2000.0, 3.0     # 假设：带宽 2000 GB/s、单次下发 3 µs
+CACHE_BYTES = 256 * 1024             # 假设：片上能留住的激活块上限 256 KiB
+
+def newc(): return {&#39;launches&#39;: 0, &#39;temps&#39;: 0, &#39;reads&#39;: 0, &#39;writes&#39;: 0, &#39;macs&#39;: 0}
+
+def eager(X, W1, b1, W2, b2, c):
+    &quot;&quot;&quot;后端 0：逐算子。3 个 kernel，中间张量各读写一遍。&quot;&quot;&quot;
+    t1 = [0.0] * (B * H); c[&#39;launches&#39;] += 1; c[&#39;temps&#39;] += 1
+    for i in range(B):
+        for j in range(H):
+            s = b1[j]
+            for t in range(I): s += X[i*I+t] * W1[t*H+j]
+            t1[i*H+j] = s
+    c[&#39;macs&#39;] += B*I*H; c[&#39;writes&#39;] += B*H*F32; c[&#39;reads&#39;] += (B*I + I*H)*F32
+    t2 = [0.0] * (B * H); c[&#39;launches&#39;] += 1; c[&#39;temps&#39;] += 1
+    for k in range(B * H): t2[k] = max(t1[k], 0.0)
+    c[&#39;writes&#39;] += B*H*F32; c[&#39;reads&#39;] += B*H*F32
+    y = [0.0] * (B * O); c[&#39;launches&#39;] += 1; c[&#39;temps&#39;] += 1
+    for i in range(B):
+        for j in range(O):
+            s = b2[j]
+            for t in range(H): s += t2[i*H+t] * W2[t*O+j]
+            y[i*O+j] = s
+    c[&#39;macs&#39;] += B*H*O; c[&#39;writes&#39;] += B*O*F32; c[&#39;reads&#39;] += (B*H + H*O)*F32
+    return y
+
+def fused(X, W1, b1, W2, b2, c):
+    &quot;&quot;&quot;后端 1：把 matmul+bias+relu 与 matmul+bias 各融成 1 个 kernel（2 个 kernel、1 个中间张量）。&quot;&quot;&quot;
+    h = [0.0] * (B * H); c[&#39;launches&#39;] += 1; c[&#39;temps&#39;] += 1
+    for i in range(B):
+        for j in range(H):
+            s = b1[j]
+            for t in range(I): s += X[i*I+t] * W1[t*H+j]
+            h[i*H+j] = s if s &gt; 0.0 else 0.0
+    c[&#39;macs&#39;] += B*I*H; c[&#39;writes&#39;] += B*H*F32; c[&#39;reads&#39;] += (B*I + I*H)*F32
+    y = [0.0] * (B * O); c[&#39;launches&#39;] += 1
+    for i in range(B):
+        for j in range(O):
+            s = b2[j]
+            for t in range(H): s += h[i*H+t] * W2[t*O+j]
+            y[i*O+j] = s
+    c[&#39;macs&#39;] += B*H*O; c[&#39;writes&#39;] += B*O*F32; c[&#39;reads&#39;] += (B*H + H*O)*F32
+    return y
+
+def blocked(X, W1, b1, W2, b2, c, BM):
+    &quot;&quot;&quot;后端 2：再按 BM 行分块，让激活块有机会留在片上；代价是权重按块重读。&quot;&quot;&quot;
+    h = [0.0] * (B * H); c[&#39;temps&#39;] += 1
+    nblk = math.ceil(B / BM); c[&#39;launches&#39;] += 2 * nblk
+    for i in range(B):
+        for j in range(H):
+            s = b1[j]
+            for t in range(I): s += X[i*I+t] * W1[t*H+j]
+            h[i*H+j] = s if s &gt; 0.0 else 0.0
+    y = [0.0] * (B * O)
+    for i in range(B):
+        for j in range(O):
+            s = b2[j]
+            for t in range(H): s += h[i*H+t] * W2[t*O+j]
+            y[i*O+j] = s
+    c[&#39;macs&#39;] += B*I*H + B*H*O
+    # 流量模型：X 读一次；权重按块重读；激活只在块超出片上容量时才写回并再读
+    X_b, W_b, Y_b, Act_b = B*I*F32, (I*H + H*O)*F32, B*O*F32, B*H*F32
+    spill = 2 * Act_b if BM*H*F32 &gt; CACHE_BYTES else 0
+    c[&#39;reads&#39;] += X_b + nblk * W_b + spill // 2
+    c[&#39;writes&#39;] += Y_b + spill // 2
+    return y
+
+def bench(fn, reps=10):
+    &quot;&quot;&quot;返回 (输出, 计数, 最小耗时 ms, 极差 ms)。热身 2 次且丢掉第 1 个计时样本，
+    让解释器/分配器的冷启动效应出局；极差说明这行实测有多可信。&quot;&quot;&quot;
+    fn(newc()); fn(newc())
+    times, out, c = [], None, None
+    for _ in range(reps):
+        c = newc(); t0 = time.perf_counter(); out = fn(c); times.append((time.perf_counter() - t0) * 1e3)
+    times = times[1:]
+    return out, c, min(times), max(times) - min(times)
+
+def scale(B2, I2, H2, O2, BM, wbytes=F32):
+    &quot;&quot;&quot;放大到真实尺寸：只算流量模型（不做真实计算）。wbytes = 权重每元素字节数。&quot;&quot;&quot;
+    X_b, W_b, Y_b, Act_b = B2*I2*F32, (I2*H2 + H2*O2)*wbytes, B2*O2*F32, B2*H2*F32
+    nblk = math.ceil(B2 / BM)
+    spill = 2 * Act_b if BM*H2*F32 &gt; CACHE_BYTES else 0
+    return {&#39;B0 eager 逐算子&#39;:   X_b + W_b + 4*Act_b + Y_b,
+            &#39;B1 融合(2 kernel)&#39;: X_b + W_b + 2*Act_b + Y_b,
+            f&#39;B2 融合+分块 BM={BM}&#39;: X_b + nblk*W_b + Y_b + spill,
+            &#39;B3 融合+权重 int8&#39;: X_b + W_b/2 + 2*Act_b + Y_b}
+
+if __name__ == &#39;__main__&#39;:
+    rnd = random.Random(7)
+    X = [rnd.uniform(-1, 1) for _ in range(B*I)]
+    W1 = [rnd.uniform(-1, 1) for _ in range(I*H)]; b1 = [rnd.uniform(-1, 1) for _ in range(H)]
+    W2 = [rnd.uniform(-1, 1) for _ in range(H*O)]; b2 = [rnd.uniform(-1, 1) for _ in range(O)]
+    ref = None; rows = []
+    for name, fn in ((&#39;B0 eager 逐算子&#39;, lambda c: eager(X, W1, b1, W2, b2, c)),
+                     (&#39;B1 融合(2 kernel)&#39;, lambda c: fused(X, W1, b1, W2, b2, c)),
+                     (&#39;B2 融合+分块 BM=8&#39;, lambda c: blocked(X, W1, b1, W2, b2, c, 8)),
+                     (&#39;B2 融合+分块 BM=32&#39;, lambda c: blocked(X, W1, b1, W2, b2, c, 32))):
+        out, c, ms, sp = bench(fn)
+        if ref is None: ref = out
+        rows.append((name, out, c, ms, sp))
+
+    print(f&#39;=== 报告卡（第 1 部分）：实测与计数（B={B} I={I} H={H} O={O}，fp32，纯 Python）===&#39;)
+    print(f&#39;  {&quot;后端&quot;:&lt;22}{&quot;kernel&quot;:&gt;7}{&quot;中间张量&quot;:&gt;9}{&quot;MACs&quot;:&gt;10}{&quot;搬运字节&quot;:&gt;11}{&quot;实测(min9)&quot;:&gt;12}{&quot;极差&quot;:&gt;9}{&quot;正确性&quot;:&gt;8}&#39;)
+    ok = True
+    for name, out, c, ms, sp in rows:
+        d = max(abs(a - b) for a, b in zip(out, ref)); ok &amp;= (d == 0.0)
+        print(f&#39;  {name:&lt;22}{c[&quot;launches&quot;]:&gt;7}{c[&quot;temps&quot;]:&gt;9}{c[&quot;macs&quot;]:&gt;10,}&#39;
+              f&#39;{(c[&quot;reads&quot;]+c[&quot;writes&quot;])/1024:&gt;10.1f}K{ms:&gt;11.2f}ms{sp:&gt;8.2f}ms{(&quot;通过&quot; if d == 0 else &quot;不通过&quot;):&gt;8}&#39;)
+    print(f&#39;  正确性门：四个后端与 B0 逐元素完全相同（同一累加顺序）→ {&quot;通过&quot; if ok else &quot;不通过 ← 有 bug&quot;}&#39;)
+    dmax = max(r[3] for r in rows) - min(r[3] for r in rows)
+    spmax = max(r[4] for r in rows)
+    print(f&#39;  后端之间的最大差 {dmax:.2f} ms，而单后端重复测量的极差最大 {spmax:.2f} ms —— &#39;
+          f&#39;{&quot;差异被噪声淹没，本行不出性能结论&quot; if dmax &lt; spmax else &quot;差异超出噪声，可作初步观察&quot;}&#39;)
+    print(f&#39;  同时 B2(BM=8) 的搬运字节 {((rows[2][2][&quot;reads&quot;]+rows[2][2][&quot;writes&quot;])/1024):.1f}K &#39;
+          f&#39;高于 B1 的 {((rows[1][2][&quot;reads&quot;]+rows[1][2][&quot;writes&quot;])/1024):.1f}K：&#39;
+          f&#39;计数与实测指向不同结论，报告必须分别标注口径&#39;)
+
+    print(&#39;\n=== 报告卡（第 2 部分）：放大到真实尺寸的流量模型（B=8,I=4096,H=11008,O=4096）===&#39;)
+    print(f&#39;  假设带宽 {BW_GBPS:.0f} GB/s；激活侧 {8*11008*F32/1024:.0f} KiB/张量，权重侧 &#39;
+          f&#39;{(4096*11008 + 11008*4096)*F32/1e6:.1f} MB&#39;)
+    M = scale(8, 4096, 11008, 4096, 8)
+    base = M[&#39;B0 eager 逐算子&#39;]
+    print(f&#39;  {&quot;后端&quot;:&lt;24}{&quot;搬运&quot;:&gt;11}{&quot;模型内存时间&quot;:&gt;14}{&quot;相对 B0&quot;:&gt;10}&#39;)
+    for k, v in M.items():
+        print(f&#39;  {k:&lt;24}{v/1e6:&gt;9.1f}MB{v/(BW_GBPS*1e9)*1e3:&gt;13.4f}ms{base/v:&gt;9.3f}x&#39;)
+    print(f&#39;  结论：该形状下激活侧融合只省 {(base-M[&quot;B1 融合(2 kernel)&quot;])/1e6:.1f} MB；&#39;
+          f&#39;真正的大杠杆是权重字节数（int8 后可到 {base/M[&quot;B3 融合+权重 int8&quot;]:.2f}x）&#39;)
+
+    print(&#39;\n=== 报告卡（第 3 部分）：分块大小 BM 的取舍 ===&#39;)
+    for BM in (1, 2, 4, 8):
+        v = scale(8, 4096, 11008, 4096, BM)[f&#39;B2 融合+分块 BM={BM}&#39;]
+        print(f&#39;  BM={BM:&lt;2} 块数 {math.ceil(8/BM):&lt;2} 权重重读 {math.ceil(8/BM):&lt;2} 次  &#39;
+              f&#39;搬运 {v/1e6:&gt;8.1f} MB  模型内存时间 {v/(BW_GBPS*1e9)*1e3:&gt;8.4f} ms&#39;)
+    print(&#39;  读法：块越小权重重读越多；块越大，激活块超出片上容量才付写回代价。&#39;)
+    print(&#39;  本例权重 360 MB 主导，分块不划算 —— 报告卡必须把负结果如实写出来，而不是只报赢的&#39;)
+
+    print(&#39;\n=== 报告卡（第 4 部分）：换算成端到端收益（Amdahl）===&#39;)
+    for share in (0.3, 0.65):
+        k = base / M[&#39;B3 融合+权重 int8&#39;]
+        print(f&#39;  若该段占端到端 {share:.0%}、段内提速 {k:.2f}x → 端到端 {1/((1-share)+share/k):.3f}x&#39;)
+    print(&#39;  报告卡的最后一栏必须是端到端换算：段内 2x 在覆盖率 30% 时只剩约 1.2x&#39;)</code></pre>
+<p>实际运行结果（Python 3.14，无第三方依赖）：</p>
+<pre data-lang="text"><code class="language-text">=== 报告卡（第 1 部分）：实测与计数（B=32 I=48 H=48 O=48，fp32，纯 Python）===
+  后端                     kernel     中间张量      MACs       搬运字节    实测(min9)       极差     正确性
+  B0 eager 逐算子                3        3   147,456      54.0K       9.42ms    0.41ms      通过
+  B1 融合(2 kernel)             2        1   147,456      42.0K       9.28ms    0.45ms      通过
+  B2 融合+分块 BM=8               8        1   147,456      84.0K       9.28ms    0.24ms      通过
+  B2 融合+分块 BM=32              2        1   147,456      30.0K       9.30ms    0.28ms      通过
+  正确性门：四个后端与 B0 逐元素完全相同（同一累加顺序）→ 通过
+  后端之间的最大差 0.14 ms，而单后端重复测量的极差最大 0.45 ms —— 差异被噪声淹没，本行不出性能结论
+  同时 B2(BM=8) 的搬运字节 84.0K 高于 B1 的 42.0K：计数与实测指向不同结论，报告必须分别标注口径
+
+=== 报告卡（第 2 部分）：放大到真实尺寸的流量模型（B=8,I=4096,H=11008,O=4096）===
+  假设带宽 2000 GB/s；激活侧 344 KiB/张量，权重侧 360.7 MB
+  后端                               搬运        模型内存时间     相对 B0
+  B0 eager 逐算子                362.4MB       0.1812ms    1.000x
+  B1 融合(2 kernel)             361.7MB       0.1808ms    1.002x
+  B2 融合+分块 BM=8               361.7MB       0.1808ms    1.002x
+  B3 融合+权重 int8               181.3MB       0.0907ms    1.999x
+  结论：该形状下激活侧融合只省 0.7 MB；真正的大杠杆是权重字节数（int8 后可到 2.00x）
+
+=== 报告卡（第 3 部分）：分块大小 BM 的取舍 ===
+  BM=1  块数 8  权重重读 8  次  搬运   2885.9 MB  模型内存时间   1.4430 ms
+  BM=2  块数 4  权重重读 4  次  搬运   1443.1 MB  模型内存时间   0.7216 ms
+  BM=4  块数 2  权重重读 2  次  搬运    721.7 MB  模型内存时间   0.3608 ms
+  BM=8  块数 1  权重重读 1  次  搬运    361.7 MB  模型内存时间   0.1808 ms
+  读法：块越小权重重读越多；块越大，激活块超出片上容量才付写回代价。
+  本例权重 360 MB 主导，分块不划算 —— 报告卡必须把负结果如实写出来，而不是只报赢的
+
+=== 报告卡（第 4 部分）：换算成端到端收益（Amdahl）===
+  若该段占端到端 30%、段内提速 2.00x → 端到端 1.176x
+  若该段占端到端 65%、段内提速 2.00x → 端到端 1.481x
+  报告卡的最后一栏必须是端到端换算：段内 2x 在覆盖率 30% 时只剩约 1.2x</code></pre>
+<p>四处可核对结论：<strong>正确性门与性能表必须分开</strong>（四个后端逐元素一致，max|Δ|=0，没过门不该看性能）；<strong>实测与计数可指向不同结论</strong>（B2 搬运 84.0K &gt; B1 的 42.0K，实测差异却落在噪声内，说明本机测的是 Python 开销层）；<strong>流量模型指出真正的杠杆</strong>（权重 360.7 MB 主导，激活侧融合只省 0.7 MB，int8 权重才拿到 1.999x）；<strong>收益必须折成端到端</strong>（段内 2.00x、覆盖率 30% → 1.176x）。</p>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选：需要 GPU 与 torch（自备或云上按需）；把上面的&quot;模型列&quot;换成真机实测 ----
+# ① 同一模型跑三个后端：eager / torch.compile / torch.compile(mode=&quot;reduce-overhead&quot;)
+#    import torch; m = torch.nn.Sequential(...); cm = torch.compile(m)
+#    计时口径与本课一致：热身 ≥2 次、重复 ≥9 次取最小值，并打印极差
+# ② 计数口径：TORCH_LOGS=output_code 看生成了几个 kernel、有几个中间张量被物化
+# ③ 搬运口径：torch.cuda.memory_stats() 看 allocated/峰值；再与&quot;字节/带宽&quot;估算对账
+# ④ 消融：逐个关闭融合、图回放，得到每步贡献；最后用 Amdahl 折成端到端
+# 没有 GPU 不影响本课：把报告卡的第 1 部分换成&quot;计数 + 正确性 + 噪声&quot;，模型列照样成立。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：加后端 B4：融合 + 把权重转置成访存友好的布局（一次 layout 变换）。它不减少字节，但改变&quot;能否向量化&quot;——为它补一个 <code>eff</code>（有效算力比例）参数，把结论写进报告卡。</li>
+<li><strong>解释</strong>：第 1 部分里 B2(BM=8) 的 kernel 数是 8、搬运 84.0K，而 B1 是 2 和 42.0K。为什么 B2 在计数上更差？若换成权重只有 2 MB 的小模型（批量 32），B2 的排名会怎么变？提示：先看 <code>nblk * W_b</code> 与 <code>Act_b</code> 的量级。</li>
+<li><strong>对比/验证</strong>：把 <code>CACHE_BYTES</code> 从 256 KiB 调到 8 KiB，重跑第 3 部分，记录 spill 从哪档 BM 开始出现；再调到 4 MiB，说明结论怎么变、为什么&quot;片上容量&quot;这个假设必须写进报告。</li>
+<li><strong>思考</strong>：若 vLLM 打开 <code>-O3</code> 后吞吐提升 15%，用哪几步把收益拆成&quot;编译覆盖&quot;&quot;内核选择&quot;&quot;图回放&quot;&quot;调度&quot;四份？每一份需要什么证据？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Lianmin Zheng et al., <em>Ansor: Generating High-Performance Tensor Programs for Deep Learning</em>（OSDI&#39;20；实测定标 vs 代价模型、搜索预算与可复现性）：<a href="https://www.usenix.org/conference/osdi20/presentation/zheng" target="_blank" rel="noopener noreferrer">https://www.usenix.org/conference/osdi20/presentation/zheng</a></li>
+<li>PyTorch 官方教程 <em>Introduction to torch.compile</em>（真实模型上改前改后对照的官方流程，含计时与 warmup 注意事项）：<a href="https://docs.pytorch.org/tutorials/intermediate/torch_compile_tutorial.html" target="_blank" rel="noopener noreferrer">https://docs.pytorch.org/tutorials/intermediate/torch_compile_tutorial.html</a></li>
+<li>Lianmin Zheng et al., <em>The Deep Learning Compiler: A Comprehensive Survey</em>（编译器评估与基准章节）：<a href="https://arxiv.org/abs/2002.03794" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2002.03794</a></li>
+<li>Triton 官方文档（kernel 级性能与自动调优：从单 kernel 实测到整网归因的微观一层）：<a href="https://triton-lang.org/main/index.html" target="_blank" rel="noopener noreferrer">https://triton-lang.org/main/index.html</a></li>
+</ul>
+<p><a href="#/l/inf-ch1-l1">下一门课：prefill 与 decode</a></p>
+<p>恭喜你完成《深度学习编译器与算子生成》！这门课的图 IR、pass、融合、调度、代码生成与运行时知识，接下来会直接用在《LLM 推理优化》里：引擎里每一处性能变化，都能用本课的&quot;三本账 + 覆盖率 + Amdahl&quot;拆开说清楚。</p>

@@ -1,0 +1,271 @@
+<h2 id="h-回退与兜底生成失败时的正确性保障">回退与兜底：生成失败时的正确性保障<a class="anchor" href="#h-回退与兜底生成失败时的正确性保障" aria-label="本节链接">#</a></h2>
+<p>编译器不能承诺&quot;我支持所有算子&quot;，它只能承诺&quot;我不支持的时候结果仍然是对的&quot;。这句话把回退从&quot;失败分支&quot;变成了必须被设计、被记账、被验收的<strong>一等路径</strong>：默认行为是切开图、编译能编译的、其余交给 eager（PyTorch 文档称之为 skipped function / graph break）；开关一拨可以是 <code>fullgraph=True</code> 直接报错，也可以 <code>suppress_errors</code> 把编译异常吞掉整图降级。本课用六十行 Python 把三种策略、区域边界的成本、兜底的红线（原地写）与三重验收全部跑出来。</p>
+<p><figure><img class="md-img" src="content/courses/ml-compilers/assets/chapter-7-figure-02.svg" alt="回退与兜底的决策链：从发现不支持到验收通过" loading="lazy" decoding="async"><figcaption>回退与兜底的决策链：从发现不支持到验收通过</figcaption></figure>
+</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-三种兜底策略三种失败模式">1. 三种兜底策略，三种失败模式<a class="anchor" href="#h-1-三种兜底策略三种失败模式" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>报错</strong>（<code>fullgraph=True</code>，等价于 <code>error_on_graph_break</code>）：遇到不支持就抛错。好处是性能不静默流失，代价是模型里有一个未支持算子就完全跑不起来——适合性能回归必须拦住的生产基线。</li>
+<li><strong>切区域回退</strong>（默认）：把图切成&quot;编译区域&quot;与&quot;回退区域&quot;，回退区域按 eager 语义执行。性能有损但可用，是绝大多数框架的默认选择。</li>
+<li><strong>静默降级</strong>（<code>torch._dynamo.config.suppress_errors</code> 一类开关）：把编译异常吞掉、整图退化到 eager，只在日志里留一句警告。它是排障期的救命开关，也是生产事故的常见来源——<strong>没人看日志，加速比就悄悄回到 1.0</strong>。</li>
+</ul>
+<h4 id="h-2-区域边界的成本是具体的">2. 区域边界的成本是具体的<a class="anchor" href="#h-2-区域边界的成本是具体的" aria-label="本节链接">#</a></h4>
+<p>代码第 1 节对一张 6 节点图给出分区结果：<code>const→mm→add→relu</code>（编译）、<code>rmsnorm</code>（回退）、<code>mul</code>（编译），区域数 3、边界 2 处、kernel 启动约 3 次。每一条边界都意味着：上游区域的结果必须<strong>材料化到内存</strong>（否则回退算子看不到），下游区域必须重新读入（否则没法融合）。回退的代价因此不是&quot;多一个算子&quot;，而是&quot;多两处 DRAM 往返 + 一次框架调用 + 一段无法融合的图&quot;。</p>
+<h4 id="h-3-兜底的红线原地写与状态">3. 兜底的红线：原地写与状态<a class="anchor" href="#h-3-兜底的红线原地写与状态" aria-label="本节链接">#</a></h4>
+<p>第 4 节给出的是一个真实故障模式：区域里既有读 <code>x</code> 的算子（<code>t = mul(x, w)</code>），又有原地修改 <code>x</code> 的算子（回退的 <code>iadd</code>），最后还有用到修改后 <code>x</code> 的算子。如果生成器把整个区域当成纯函数、在<strong>区域入口</strong>把输入快照进寄存器复用，结果就完全错了——<code>y</code> 从 <code>[13, 18, 25, 34]</code> 变成 <code>[3, 8, 15, 24]</code>，差 <code>[10, 10, 10, 10]</code>。这不是精度问题，是读到了过期值。合法的收口只有两条：把原地写<strong>函数化</strong>成新张量，或在原地写处插屏障、把该区域降级。TorchInductor 的作者在公告讨论里也承认这一点——IR 直接支持 mutation 与 scatter，同时依赖 dispatcher 层做函数化，而&quot;把一串只改少量元素的 scatter 函数化&quot;会把 O(n) 变成 O(n²)。</p>
+<h4 id="h-4-回退节点的准入也要检查">4. 回退节点的准入也要检查<a class="anchor" href="#h-4-回退节点的准入也要检查" aria-label="本节链接">#</a></h4>
+<p>TVM BYOC 的 check 函数给了工业范例：除了 dtype 与 shape 约束，还要拒绝<strong>中间结果泄漏到融合组之外</strong>（<code>has_leaking_intermediate_variables()</code>）的片段，否则外部库算出的中间值没人接得住，只能整段失效。分区不是&quot;pattern 匹配到就行&quot;，而是&quot;匹配 + 可交付&quot;两件事。</p>
+<h4 id="h-5-验收容差nan台账">5. 验收：容差、NaN、台账<a class="anchor" href="#h-5-验收容差nan台账" aria-label="本节链接">#</a></h4>
+<p>第 5 节给出三件必须同时做的事：
+<strong>容差</strong>：同一组数 <code>[1e16, 1, 1, -1e16]</code>，顺序累加得 <code>0.0</code>、精确累加得 <code>2.0</code>——抵消型差异是路径变了的信号，任何容差都不该放行；而 <code>[0.1]*10</code> 的差异只有 1e-16，相对容差应当放行。<strong>先分类，再比较</strong>。
+<strong>特殊值</strong>：<code>nan == nan</code> 恒为 <code>False</code>，验收脚本必须显式判 <code>math.isnan</code>，并单独列出 <code>inf</code> / <code>-0.0</code>。
+<strong>台账</strong>：把每次回退记成 <code>(算子, 原因, 段数)</code>。回退段数为 0，才能说&quot;这个模型被真正编译了&quot;。</p>
+<h4 id="h-6-常见坑">6. 常见坑<a class="anchor" href="#h-6-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>用 <code>suppress_errors</code> 换&quot;跑得起来&quot;</strong>：结果对但加速比归零，且日志里只有一行警告。</li>
+<li><strong>只对拍最终输出</strong>：中间张量的原地写可能被后续算子掩盖，要用随机输入 + 多次运行 + 逐层对拍。</li>
+<li><strong>把 graph break 当纯性能问题</strong>：断裂点两侧的编译区域各自优化，语义没变，但&quot;看不到对方的假设&quot;会让优化机会消失（第 2 章已量化过代价）。</li>
+<li><strong>忘了回退路径的精度/顺序可能与生成路径不同</strong>：容忍它，但要在容差与特殊值上写清楚。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>纯标准库 Python（本机 <code>python3.10.16</code> 实跑）。五段：分区与台账、<code>fullgraph</code> 报错、区域编译 + 回退执行的逐元素对拍、原地写故障复现、容差/NaN/台账验收。</p>
+<pre data-lang="python"><code class="language-python"># ---- 第 3 课：回退与兜底（纯标准库，无需 numpy / GPU）----
+import math
+
+# ============ 0. 一张带「编译器没实现」算子的图 ============
+# 节点 = (op, [输入名], 输出名, attrs)；x/b/s 是外部输入，w 是常量
+GRAPH = [
+    (&quot;const&quot;,   [],           &quot;w&quot;,  {&quot;value&quot;: [2.0, 3.0, 4.0, 5.0]}),
+    (&quot;mm&quot;,      [&quot;x&quot;, &quot;w&quot;],   &quot;h&quot;,  {}),      # 有 lowering
+    (&quot;add&quot;,     [&quot;h&quot;, &quot;b&quot;],   &quot;h1&quot;, {}),      # 有 lowering
+    (&quot;relu&quot;,    [&quot;h1&quot;],       &quot;h2&quot;, {}),      # 有 lowering
+    (&quot;rmsnorm&quot;, [&quot;h2&quot;],       &quot;h3&quot;, {}),      # 没有 lowering → 回退
+    (&quot;mul&quot;,     [&quot;h3&quot;, &quot;s&quot;],  &quot;y&quot;,  {}),      # 有 lowering
+]
+SUPPORTED = {&quot;const&quot;, &quot;mm&quot;, &quot;add&quot;, &quot;relu&quot;, &quot;mul&quot;}
+FALLBACK_REASON = {&quot;rmsnorm&quot;: &quot;没有 IR lowering（算子尚未接入）&quot;}
+
+def op_eager(op, ins, at):
+    &quot;&quot;&quot;回退路径的语义基准：与框架 eager 完全一致的解释执行。&quot;&quot;&quot;
+    if op == &quot;const&quot;:   return list(at[&quot;value&quot;])
+    if op == &quot;mm&quot;:      return [u * v for u, v in zip(ins[0], ins[1])]
+    if op == &quot;add&quot;:     return [u + v for u, v in zip(ins[0], ins[1])]
+    if op == &quot;relu&quot;:    return [max(u, 0.0) for u in ins[0]]
+    if op == &quot;rmsnorm&quot;: return [u / math.sqrt(sum(v * v for v in ins[0]) / len(ins[0]) + 1e-6)
+                                for u in ins[0]]
+    if op == &quot;mul&quot;:     return [u * v for u, v in zip(ins[0], ins[1])]
+    raise KeyError(op)
+
+def run_eager(graph, feeds):
+    env = {k: (list(v) if isinstance(v, list) else v) for k, v in feeds.items()}
+    for op, deps, out, at in graph:
+        env[out] = op_eager(op, [env[d] for d in deps], at)
+    return env
+
+# ============ 1. 分区：连续支持算子合成区域，中间夹回退节点 ============
+def partition(graph, supported):
+    regions, cur = [], []
+    for node in graph:
+        if node[0] in supported:
+            cur.append(node)
+        else:
+            if cur:
+                regions.append((&quot;compiled&quot;, cur)); cur = []
+            regions.append((&quot;fallback&quot;, [node]))
+    if cur:
+        regions.append((&quot;compiled&quot;, cur))
+    return regions
+
+def report(regions):
+    n_comp = sum(1 for kind, _ in regions if kind == &quot;compiled&quot;)
+    n_fb = sum(1 for kind, _ in regions if kind == &quot;fallback&quot;)
+    print(f&quot;  区域数 = {len(regions)}（编译区域 {n_comp}，回退区域 {n_fb}）&quot;)
+    print(f&quot;  区域边界（张量必须落到内存） = {max(len(regions) - 1, 0)} 处&quot;)
+    print(f&quot;  kernel 启动次数 ≈ {n_comp + n_fb}（回退区域就是一次框架算子调用）&quot;)
+    for i, (kind, nodes) in enumerate(regions):
+        print(f&quot;    region{i}: [{kind:&lt;8}] &quot; + &quot; → &quot;.join(n[0] for n in nodes))
+
+print(&quot;=== 1. 分区结果：回退节点把图切成区域 ===&quot;)
+regions = partition(GRAPH, SUPPORTED)
+report(regions)
+print(&quot;  回退原因台账：&quot; + &quot;; &quot;.join(f&quot;{op}（{why}）&quot; for op, why in FALLBACK_REASON.items()))
+
+# ============ 2. 策略 A：fullgraph / error_on_graph_break ============
+print(&quot;\n=== 2. 策略 A：fullgraph=True（等价于 error_on_graph_break）===&quot;)
+def compile_fullgraph(graph, supported):
+    for op, _, out, _ in graph:
+        if op not in supported:
+            raise RuntimeError(f&quot;Unsupported: {op}（输出 {out}）—— fullgraph 下这是编译错误，不是警告&quot;)
+    return &quot;整图已编译&quot;
+
+try:
+    compile_fullgraph(GRAPH, SUPPORTED)
+except RuntimeError as e:
+    print(f&quot;  抛错：{e}&quot;)
+print(&quot;  好处：性能不会静默丢失；代价：模型里只要有一个未支持算子就跑不起来&quot;)
+
+# ============ 3. 策略 B：区域编译 + 回退执行，逐元素对拍 ============
+def run_partitioned(graph, feeds, regions):
+    env = {k: (list(v) if isinstance(v, list) else v) for k, v in feeds.items()}
+    trace, ledger = [], []
+    for kind, nodes in regions:
+        if kind == &quot;compiled&quot;:
+            local = {}                                  # 区域内中间值只活在「寄存器」里
+
+            def val(name):
+                return local[name] if name in local else env[name]
+
+            for op, deps, out, at in nodes:
+                local[out] = op_eager(op, [val(d) for d in deps], at)
+            env.update(local)
+            trace.append((nodes[-1][2], &quot;compiled&quot;, &quot;,&quot;.join(n[0] for n in nodes)))
+        else:
+            op, deps, out, at = nodes[0]
+            env[out] = op_eager(op, [env[d] for d in deps], at)
+            trace.append((out, &quot;fallback&quot;, op))
+            ledger.append((op, out, FALLBACK_REASON.get(op, &quot;未知&quot;)))
+    return env, trace, ledger
+
+feeds = {&quot;x&quot;: [1.0, -2.0, 3.0, 4.0], &quot;b&quot;: [0.5, -1.0, 2.0, 0.0], &quot;s&quot;: [0.1, 0.2, 0.3, 0.4]}
+e_ref = run_eager(GRAPH, feeds)
+p_ref, trace, ledger = run_partitioned(GRAPH, feeds, regions)
+
+print(&quot;\n=== 3. 策略 B：区域编译 + 回退执行（默认行为）===&quot;)
+for out, kind, what in trace:
+    print(f&quot;  {out:&lt;4} ← {kind:&lt;8} {what}&quot;)
+print(f&quot;  结果对拍：最大绝对差 = {max(abs(a - b) for a, b in zip(e_ref[&#39;y&#39;], p_ref[&#39;y&#39;]))}&quot;)
+print(f&quot;  逐元素全等 = {e_ref[&#39;y&#39;] == p_ref[&#39;y&#39;]}（同一顺序同一精度下必须全等，不接受「差不多」）&quot;)
+print(&quot;  回退台账：&quot; + &quot;; &quot;.join(f&quot;{op}: {out} ← {why}&quot; for op, out, why in ledger))
+
+# ============ 4. 兜底红线：原地写与「把区域当纯函数」不能共存 ============
+MUT_GRAPH = [
+    (&quot;mul&quot;,  [&quot;x&quot;, &quot;w&quot;], &quot;t&quot;, {}),   # 读 x
+    (&quot;iadd&quot;, [&quot;x&quot;, &quot;k&quot;], &quot;u&quot;, {}),   # 原地写 x 的存储（没有 lowering → 回退）
+    (&quot;add&quot;,  [&quot;t&quot;, &quot;u&quot;], &quot;y&quot;, {}),   # 又用到修改后的 x
+]
+
+def run_mut(assume_pure):
+    env = {&quot;x&quot;: [1.0, 2.0, 3.0, 4.0]}
+    snapshot = {&quot;x&quot;: list(env[&quot;x&quot;])}       # 区域入口的寄存器快照
+    w, k = [2.0, 3.0, 4.0, 5.0], 10.0
+    # t = x * w（读 x）
+    src = snapshot[&quot;x&quot;] if assume_pure else env[&quot;x&quot;]
+    env[&quot;t&quot;] = [a * b for a, b in zip(src, w)]
+    # u = x + k（原地写 x）
+    for i in range(len(env[&quot;x&quot;])):
+        env[&quot;x&quot;][i] += k
+    env[&quot;u&quot;] = list(env[&quot;x&quot;])
+    # y = t + u：assume_pure 时第二个操作数复用入口快照 → 过期值
+    second = snapshot[&quot;x&quot;] if assume_pure else env[&quot;u&quot;]
+    env[&quot;y&quot;] = [a + b for a, b in zip(env[&quot;t&quot;], second)]
+    return env
+
+good, bad = run_mut(False), run_mut(True)
+print(&quot;\n=== 4. 兜底红线：原地写 vs 「区域入口快照输入」===&quot;)
+print(&quot;  x = [1,2,3,4]，w = [2,3,4,5]，iadd 把 x 每个元素 +10（原地写）&quot;)
+print(f&quot;  每次使用都读内存（正确）：y = {good[&#39;y&#39;]}&quot;)
+print(f&quot;  区域入口快照、之后复用寄存器（错误）：y = {bad[&#39;y&#39;]}&quot;)
+print(f&quot;  差 = {[a - b for a, b in zip(good[&#39;y&#39;], bad[&#39;y&#39;])]}  ← 不是精度问题，是读到了过期值&quot;)
+print(&quot;  两种合法收口：把原地写函数化成新张量；或在原地写处插屏障、把该区域降级&quot;)
+
+# ============ 5. 验收：容差、NaN、以及静默回退台账 ============
+print(&quot;\n=== 5. 验收三件事：容差 / NaN / 台账 ===&quot;)
+def seq_sum(v):
+    t = 0.0
+    for x in v:
+        t += x
+    return t
+
+for tag, vals in [(&quot;灾难性抵消：相对误差 100%，任何容差都不该放行&quot;, [1e16, 1.0, 1.0, -1e16]),
+                  (&quot;量级相当的重排：差 ~1e-16，容差应当放行&quot;, [0.1] * 10)]:
+    seq, pair = seq_sum(vals), math.fsum(vals)
+    print(f&quot;  {tag}&quot;)
+    print(f&quot;    顺序累加 = {seq!r}  精确累加 = {pair!r}&quot;)
+    print(f&quot;    逐位相等 = {seq == pair}；只给相对容差 = {math.isclose(seq, pair, rel_tol=1e-9)}；&quot;
+          f&quot;相对+绝对容差 = {math.isclose(seq, pair, rel_tol=1e-9, abs_tol=1e-6)}&quot;)
+print(&quot;  所以验收要先分类：量级相当的重排用容差放行；抵消型差异本身就说明数值路径变了，必须查&quot;)
+nan = float(&quot;nan&quot;)
+print(f&quot;  NaN 验收：nan == nan → {nan == nan}（不能这么写）；math.isnan(nan) → {math.isnan(nan)}&quot;)
+print(&quot;  验收脚本必须同时用：容差比较 + NaN/inf/-0.0 的显式清单&quot;)
+
+events = [(&quot;region0&quot;, &quot;compiled&quot;, &quot;mm,add,relu&quot;),
+          (&quot;rmsnorm&quot;, &quot;fallback&quot;, FALLBACK_REASON[&quot;rmsnorm&quot;]),
+          (&quot;region1&quot;, &quot;compiled&quot;, &quot;mul&quot;),
+          (&quot;整图降级&quot;, &quot;fallback&quot;, &quot;suppress_errors=True 吞掉了 lowering 异常&quot;)]
+print(&quot;\n  静默回退台账（suppress_errors 下唯一看得见的信号）：&quot;)
+counts = {}
+for name, kind, why in events:
+    counts[kind] = counts.get(kind, 0) + 1
+    print(f&quot;    - {name:&lt;9}{kind:&lt;10}{why}&quot;)
+print(f&quot;  汇总：compiled {counts.get(&#39;compiled&#39;, 0)} 段，fallback {counts.get(&#39;fallback&#39;, 0)} 段&quot;)
+print(&quot;  台账里 fallback 段数为 0，才能说这个模型被真正编译了；否则加速比会静默缩水&quot;)</code></pre>
+<p>实际运行结果：</p>
+<pre data-lang="text"><code class="language-text">=== 1. 分区结果：回退节点把图切成区域 ===
+  区域数 = 3（编译区域 2，回退区域 1）
+  区域边界（张量必须落到内存） = 2 处
+  kernel 启动次数 ≈ 3（回退区域就是一次框架算子调用）
+    region0: [compiled] const → mm → add → relu
+    region1: [fallback] rmsnorm
+    region2: [compiled] mul
+  回退原因台账：rmsnorm（没有 IR lowering（算子尚未接入））
+
+=== 2. 策略 A：fullgraph=True（等价于 error_on_graph_break）===
+  抛错：Unsupported: rmsnorm（输出 h3）—— fullgraph 下这是编译错误，不是警告
+  好处：性能不会静默丢失；代价：模型里只要有一个未支持算子就跑不起来
+
+=== 3. 策略 B：区域编译 + 回退执行（默认行为）===
+  h2   ← compiled const,mm,add,relu
+  h3   ← fallback rmsnorm
+  y    ← compiled mul
+  结果对拍：最大绝对差 = 0.0
+  逐元素全等 = True（同一顺序同一精度下必须全等，不接受「差不多」）
+  回退台账：rmsnorm: h3 ← 没有 IR lowering（算子尚未接入）
+
+=== 4. 兜底红线：原地写 vs 「区域入口快照输入」===
+  x = [1,2,3,4]，w = [2,3,4,5]，iadd 把 x 每个元素 +10（原地写）
+  每次使用都读内存（正确）：y = [13.0, 18.0, 25.0, 34.0]
+  区域入口快照、之后复用寄存器（错误）：y = [3.0, 8.0, 15.0, 24.0]
+  差 = [10.0, 10.0, 10.0, 10.0]  ← 不是精度问题，是读到了过期值
+  两种合法收口：把原地写函数化成新张量；或在原地写处插屏障、把该区域降级
+
+=== 5. 验收三件事：容差 / NaN / 台账 ===
+  灾难性抵消：相对误差 100%，任何容差都不该放行
+    顺序累加 = 0.0  精确累加 = 2.0
+    逐位相等 = False；只给相对容差 = False；相对+绝对容差 = False
+  量级相当的重排：差 ~1e-16，容差应当放行
+    顺序累加 = 0.9999999999999999  精确累加 = 1.0
+    逐位相等 = False；只给相对容差 = True；相对+绝对容差 = True
+  所以验收要先分类：量级相当的重排用容差放行；抵消型差异本身就说明数值路径变了，必须查
+  NaN 验收：nan == nan → False（不能这么写）；math.isnan(nan) → True
+  验收脚本必须同时用：容差比较 + NaN/inf/-0.0 的显式清单
+
+  静默回退台账（suppress_errors 下唯一看得见的信号）：
+    - region0  compiled  mm,add,relu
+    - rmsnorm  fallback  没有 IR lowering（算子尚未接入）
+    - region1  compiled  mul
+    - 整图降级     fallback  suppress_errors=True 吞掉了 lowering 异常
+  汇总：compiled 2 段，fallback 2 段
+  台账里 fallback 段数为 0，才能说这个模型被真正编译了；否则加速比会静默缩水</code></pre>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选，需自备或云上按需：在真实框架里观察同一条路径 ----
+# PyTorch（看哪些函数被跳过、有没有回退）：
+#   TORCH_LOGS=&quot;graph_breaks,recompiles&quot; python3 your_model.py
+#   python3 -c &quot;import torch; m=torch.compile(f, fullgraph=True) if False else None; print(torch.__version__)&quot;
+#   torch._dynamo.explain(fn)(*args)         # 会列出 graph break 的位置与原因
+# TVM（看 BYOC 分区把哪些片段交给外部库）：
+#   # 用 partition_for_cublas / partition_for_cudnn 之类的分区函数，再 print(IRModule)
+# 没有这些框架也不影响本课：上面的标准库版本已经把分区、成本、红线与验收跑通了。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：给 <code>partition</code> 加一条&quot;合并规则&quot;——当两个编译区域之间只隔一个回退算子、且回退算子的输入输出形状一致时，允许把它并进同一区域（用一次 extern 调用替代）。统计合并前后区域边界数与启动次数。</li>
+<li><strong>解释</strong>：为什么第 4 节的错误版本会把 <code>y</code> 算成 <code>[3, 8, 15, 24]</code>？如果把 <code>iadd</code> 换成&quot;返回新张量&quot;的函数式版本，即使生成器继续在区域入口做快照，结果还会错吗？</li>
+<li><strong>对比/验证</strong>：把第 5 节的验收改成&quot;逐位相等&quot;，在 <code>[0.1]*10</code> 这个例子上会发生什么？再改成&quot;只用相对容差&quot;，在 <code>[1e16, 1, 1, -1e16]</code> 上又会发生什么？据此写出一段可复用的验收断言。</li>
+<li><strong>思考</strong>：<code>suppress_errors=True</code> 把整图降级成 eager 之后，用户手里还剩什么信号可以判断&quot;这次编译其实没生效&quot;？如果让你给框架加一个指标，你会加哪一个，为什么？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>PyTorch 文档, <em>Skipped Functions</em>（programming model：被跳过的函数与 graph break 的语义，默认其余部分按 eager 执行）：<a href="https://docs.pytorch.org/docs/stable/user_guide/torch_compiler/compile/programming_model.skipped_functions.html" target="_blank" rel="noopener noreferrer">https://docs.pytorch.org/docs/stable/user_guide/torch_compiler/compile/programming_model.skipped_functions.html</a></li>
+<li>PyTorch 文档, <em>Toggling error_on_graph_break</em>（与 <code>fullgraph=True</code> 的交互：把 graph break 变成编译错误）：<a href="https://docs.pytorch.org/docs/main/user_guide/torch_compiler/compile/programming_model.error_on_graph_break.html" target="_blank" rel="noopener noreferrer">https://docs.pytorch.org/docs/main/user_guide/torch_compiler/compile/programming_model.error_on_graph_break.html</a></li>
+<li>PyTorch dev-discuss, <em>TorchInductor: a PyTorch-native Compiler with Define-by-Run IR and Symbolic Shapes</em>（未实现算子走 ATen 回退；mutation/scatter 与函数化的取舍）：<a href="https://dev-discuss.pytorch.org/t/torchinductor-a-pytorch-native-compiler-with-define-by-run-ir-and-symbolic-shapes/747" target="_blank" rel="noopener noreferrer">https://dev-discuss.pytorch.org/t/torchinductor-a-pytorch-native-compiler-with-define-by-run-ir-and-symbolic-shapes/747</a></li>
+<li>Apache TVM, <em>External Library Dispatch (BYOC)</em>（pattern 匹配 + check 函数（含 <code>has_leaking_intermediate_variables</code> 与 dtype/shape 约束）、分区与未匹配部分回落到 TVM 自身生成）：<a href="https://tvm.apache.org/docs/arch/external_library_dispatch.html" target="_blank" rel="noopener noreferrer">https://tvm.apache.org/docs/arch/external_library_dispatch.html</a></li>
+</ul>
+<p><a href="#/l/mlc-ch7-l4">下一课：量化 / 稀疏 / 低精度的编译支持与算子约束</a></p>

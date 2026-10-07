@@ -1,0 +1,93 @@
+<h2 id="h-nvlinknvswitch">NVLink/NVSwitch<a class="anchor" href="#h-nvlinknvswitch" aria-label="本节链接">#</a></h2>
+<p>上一课讲了 PCIe 这条&quot;窄路&quot;，这一课讲 NVIDIA 为绕过它而专门打造的&quot;高速立交&quot;——<strong>NVLink</strong> 与 <strong>NVSwitch</strong>。学完本课，你应当能说清 NVLink 比 PCIe 快多少、NVSwitch 解决了什么问题，以及为什么多卡集群离不开它们。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-nvlinkgpu-之间的专用高速互连">1. NVLink：GPU 之间的专用高速互连<a class="anchor" href="#h-1-nvlinkgpu-之间的专用高速互连" aria-label="本节链接">#</a></h4>
+<p><strong>NVLink</strong> 是 NVIDIA 的 GPU 到 GPU 点对点互连技术，用多条高带宽链路把两张 GPU 直接接起来，<strong>不经过 CPU、不走 PCIe</strong>。它的带宽远高于 PCIe，是数据中心多卡通信的主力。按代际看：</p>
+<table>
+<thead>
+<tr>
+<th>代际</th>
+<th>典型产品</th>
+<th>每 GPU 总带宽</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>NVLink 3.0</td>
+<td>A100</td>
+<td>约 600 GB/s（12 条链路）</td>
+</tr>
+<tr>
+<td>NVLink 4.0</td>
+<td>H100</td>
+<td>约 900 GB/s（18 条链路）</td>
+</tr>
+</tbody></table>
+<p>对比 PCIe 5.0 ×16 的约 63 GB/s，NVLink 4.0 快了 <strong>十几倍</strong>，这也是 H100 相比 PCIe 版更适合大规模训练与推理的根本原因之一。</p>
+<h4 id="h-2-nvswitch把两两相连升级成全互联">2. NVSwitch：把&quot;两两相连&quot;升级成&quot;全互联&quot;<a class="anchor" href="#h-2-nvswitch把两两相连升级成全互联" aria-label="本节链接">#</a></h4>
+<p>只靠 NVLink 做点对点连接，8 张 GPU 两两全连需要的链路数量会爆炸，而且任意两卡之间可能还要经中间卡转发。<strong>NVSwitch</strong> 是一颗高速交换芯片：把多张 GPU 的 NVLink 都接到 NVSwitch 上，任意两卡都能以满带宽<strong>无阻塞地通信</strong>，相当于一个&quot;全互联交换机&quot;。</p>
+<p><figure><img class="md-img" src="content/courses/inference-hardware/assets/chapter-6-figure-02.svg" alt="NVLink/NVSwitch 拓扑示意图：左侧画&quot;仅 PCIe&quot;——多张 GPU 各自通过细线连到 CPU，GPU 之间没有直连；右侧画&quot;NVSwitch 全互联&quot;——8 张 GPU 围绕一颗居中的 NVSwitch 芯片，用粗线两两接入，标注&quot;任意两卡满带宽直通、无阻塞&quot;，粗细对比突出 NVLink 与 PCIe 的带宽差距" loading="lazy" decoding="async"><figcaption>NVLink/NVSwitch 拓扑示意图：左侧画&quot;仅 PCIe&quot;——多张 GPU 各自通过细线连到 CPU，GPU 之间没有直连；右侧画&quot;NVSwitch 全互联&quot;——8 张 GPU 围绕一颗居中的 NVSwitch 芯片，用粗线两两接入，标注&quot;任意两卡满带宽直通、无阻塞&quot;，粗细对比突出 NVLink 与 PCIe 的带宽差距</figcaption></figure>
+</p>
+<h4 id="h-3-为什么多卡推理训练需要它">3. 为什么多卡推理/训练需要它<a class="anchor" href="#h-3-为什么多卡推理训练需要它" aria-label="本节链接">#</a></h4>
+<p>多卡做<strong>张量并行（tensor parallelism）</strong>时，一层矩阵乘被切到多张卡上，每算完一步都要在卡之间<strong>交换中间结果（all-reduce / all-gather）</strong>。这种通信极其频繁、数据量大，若走 PCIe 会立刻成为瓶颈；有了 NVLink/NVSwitch，通信开销被大幅压低，多卡才真正&quot;划算&quot;起来。</p>
+<h4 id="h-4-nvlink-也有限度">4. NVLink 也有限度<a class="anchor" href="#h-4-nvlink-也有限度" aria-label="本节链接">#</a></h4>
+<p>NVLink 再快，也<strong>跨不出单台服务器</strong>：它只连接同一机箱内的 GPU。跨机器的多卡通信仍要回到 <strong>InfiniBand / 以太网</strong>（RDMA）这类网络，带宽又降一个台阶。所以&quot;单机 8 卡 NVSwitch 全互联 + 跨机高速网络&quot;是大型集群的典型形态。</p>
+<h3 id="h-二可运行示例">二、可运行示例<a class="anchor" href="#h-二可运行示例" aria-label="本节链接">#</a></h3>
+<p>用纯 Python 对比&quot;同一批数据走 PCIe 还是走 NVLink 要多久&quot;，量化多卡通信的收益。</p>
+<pre data-lang="python"><code class="language-python"># -*- coding: utf-8 -*-
+# 对比 PCIe 与 NVLink 搬运同一批数据的耗时
+
+def transfer_time_ms(data_bytes, bw_bytes_per_sec):
+    return data_bytes / bw_bytes_per_sec * 1000   # 毫秒
+
+# 各互连的带宽（B/s）
+links = {
+    &quot;PCIe 4.0 x16&quot;: 31.5e9,
+    &quot;PCIe 5.0 x16&quot;: 63.0e9,
+    &quot;NVLink 3.0 (A100)&quot;: 600e9,
+    &quot;NVLink 4.0 (H100)&quot;: 900e9,
+}
+
+# 场景：张量并行时，单层需要 all-reduce 的数据量。
+#   以 70B 模型为例，一次通信交换的中间结果约等于一层权重的数据量。
+#   70B / 80 层 ≈ 每层 0.86B 参数，FP16 下约 1.7 GB（这里取整估 2 GB）。
+comm_bytes = 2.0e9
+
+print(&quot;单层 all-reduce 通信（约 2 GB）耗时：&quot;)
+for name, bw in links.items():
+    t = transfer_time_ms(comm_bytes, bw)
+    print(f&quot;  {name:&lt;22} {t:&gt;8.2f} 毫秒&quot;)
+
+# 速度倍数
+pcie5 = links[&quot;PCIe 5.0 x16&quot;]
+for name, bw in [(&quot;NVLink 3.0 (A100)&quot;, links[&quot;NVLink 3.0 (A100)&quot;]),
+                 (&quot;NVLink 4.0 (H100)&quot;, links[&quot;NVLink 4.0 (H100)&quot;])]:
+    print(f&quot;  {name} 带宽是 PCIe 5.0 x16 的 {bw/pcie5:.1f} 倍&quot;)
+
+# 换个视角：同样 10 毫秒内，各互连能搬多少 GB？
+print(&quot;\n10 毫秒内各互连可搬运数据量：&quot;)
+for name, bw in links.items():
+    gb = bw * 0.010 / 1e9
+    print(f&quot;  {name:&lt;22} {gb:&gt;7.1f} GB&quot;)
+
+# 通信是&quot;每层都要发生&quot;的：70B 共 80 层，估算整轮前向的通信总量耗时
+print(&quot;\n70B 模型 80 层各通信一次（每层 2 GB）的总耗时：&quot;)
+for name, bw in links.items():
+    total_s = 80 * transfer_time_ms(comm_bytes, bw) / 1000
+    print(f&quot;  {name:&lt;22} {total_s:&gt;7.2f} 秒&quot;)</code></pre>
+<p>运行后你会看到，同样 2 GB 的通信，PCIe 4.0 要 60 多毫秒，NVLink 4.0 只要 2 毫秒出头——一层看似差别不大，但 80 层叠加起来，PCIe 会吃掉数十倍的时间，直接决定多卡并行还有没有意义。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>手算</strong>：NVLink 4.0 每 GPU 约 900 GB/s，搬 18 GB 数据要多少毫秒？同样数据走 PCIe 4.0 ×16（约 31.5 GB/s）要多少毫秒？</li>
+<li><strong>换代</strong>：把 <code>links</code> 里的 NVLink 3.0 换成 600 GB/s 的 2 倍，模拟&quot;链路翻倍&quot;，观察总耗时如何变化，说明为什么 H100 比 A100 更适合大模型。</li>
+<li><strong>通信量</strong>：把 <code>comm_bytes</code> 改成 0.5e9 和 8e9，观察耗时变化，体会&quot;通信量由模型规模和并行切分方式决定&quot;。</li>
+<li><strong>跨机</strong>：假设跨机网络（InfiniBand）只有 400 GB/s，且多一跳交换，把它的带宽写进 <code>links</code>，对比与单机 NVSwitch 的差距。</li>
+<li><strong>思考</strong>：为什么说 NVLink 解决的是&quot;单机内&quot;的通信瓶颈？跨机器的通信瓶颈靠什么解决？这对&quot;单机 8 卡&quot;和&quot;多机 64 卡&quot;两种部署意味着什么？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>NVIDIA NVLink &amp; NVSwitch（互连带宽与拓扑）：<a href="https://www.nvidia.com/en-us/data-center/nvlink/" target="_blank" rel="noopener noreferrer">https://www.nvidia.com/en-us/data-center/nvlink/</a></li>
+<li>NVIDIA H100 Tensor Core GPU（NVLink 4.0 与 NVSwitch 规格）：<a href="https://www.nvidia.com/en-us/data-center/h100/" target="_blank" rel="noopener noreferrer">https://www.nvidia.com/en-us/data-center/h100/</a></li>
+<li>NVIDIA DGX H100（8 卡 NVSwitch 全互联系统）：<a href="https://www.nvidia.com/en-us/data-center/dgx-h100/" target="_blank" rel="noopener noreferrer">https://www.nvidia.com/en-us/data-center/dgx-h100/</a></li>
+<li>Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism（张量并行通信）：<a href="https://arxiv.org/abs/1909.08053" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1909.08053</a></li>
+</ul>
+<p><a href="#/l/hw-ch6-l3">下一课：多卡为何不是线性加速</a></p>

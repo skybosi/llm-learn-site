@@ -1,0 +1,98 @@
+<h2 id="h-swin-transformer-等分层架构">Swin Transformer 等分层架构<a class="anchor" href="#h-swin-transformer-等分层架构" aria-label="本节链接">#</a></h2>
+<p>前两课我们看到 ViT 的两个先天短板：一是自注意力的<strong>平方复杂度</strong>，分辨率一高就算不动；二是全程保持<strong>单一尺度</strong>的特征（从第一层到最后一层都是 196 个 token、同一个分辨率），而检测、分割这些你熟悉的密集预测任务，恰恰需要&quot;金字塔式&quot;的多尺度特征——大物体看高层粗特征，小物体看低层细特征。Swin Transformer 的贡献，就是给 Transformer 装回了 CNN 那套&quot;分层 + 多尺度&quot;的骨架，同时用一个巧妙的&quot;移位窗口&quot;把注意力复杂度从平方降到<strong>线性</strong>。这一课我们重点讲 Swin，再顺带认识几个同族的分层架构，看清这条演进路线。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-分层--多尺度把金字塔还给-transformer">1. 分层 + 多尺度：把&quot;金字塔&quot;还给 Transformer<a class="anchor" href="#h-1-分层--多尺度把金字塔还给-transformer" aria-label="本节链接">#</a></h4>
+<p>回顾 Mask R-CNN 里的 FPN：骨干网输出 C2/C3/C4/C5 多个尺度的特征图，供检测头在不同尺度上找目标。ViT 做不到这一点，它的输出从头到尾是同一分辨率。Swin 的做法是模仿 CNN 的&quot;特征金字塔&quot;：</p>
+<ol>
+<li><strong>Patch Partition + Linear Embedding</strong>：先把图切成 <code>4×4</code> 的小补丁，投影到 <code>C</code> 维。</li>
+<li><strong>分阶段下采样</strong>：整个网络分 4 个 Stage。每进入下一个 Stage，就用 <strong>Patch Merging</strong> 把相邻 <code>2×2</code> 的补丁合并成一个，通道数翻倍（<code>C → 2C → 4C → 8C</code>），token 数量变为原来的 1/4。这等价于 CNN 里的&quot;池化 + 通道翻倍&quot;。</li>
+</ol>
+<p>于是特征图从高分辨率小通道，逐步变成低分辨率大通道，形成四个尺度的金字塔。下游的检测/分割头（如 Mask R-CNN 的 RPN 与 FPN）可以直接挂在上面，几乎不改动就能复用——这正是 Swin 能迅速成为检测分割骨干网（Swin-T/S/B/L）的原因。</p>
+<p><figure><img class="md-img" src="content/courses/cv-advanced/assets/chapter-4-figure-06.svg" alt="Swin 的四阶段分层结构：Patch Merging 下采样 + 通道翻倍，形成多尺度特征金字塔" loading="lazy" decoding="async"><figcaption>Swin 的四阶段分层结构：Patch Merging 下采样 + 通道翻倍，形成多尺度特征金字塔</figcaption></figure>
+</p>
+<h4 id="h-2-窗口注意力把平方降成线性">2. 窗口注意力：把平方降成线性<a class="anchor" href="#h-2-窗口注意力把平方降成线性" aria-label="本节链接">#</a></h4>
+<p>全局注意力是 <code>O(N²)</code>。Swin 的解法是<strong>窗口（window）注意力</strong>：把特征图划分成不重叠的局部窗口（默认 <code>7×7</code>），注意力只在<strong>窗口内部</strong>计算。这样每个 token 只和同窗口的其余 token 交互，复杂度从 <code>O(N²)</code> 降为 <code>O(N·W²)</code>，<code>W</code> 是窗口边长，与全图尺寸无关，因此对分辨率是<strong>线性</strong>的。</p>
+<p>但纯窗口注意力带来一个新问题：<strong>窗口之间互不相通</strong>，长距离依赖被切断了。于是有了 Swin 的点睛之笔——<strong>移位窗口（Shifted Window）</strong>：</p>
+<ul>
+<li>第 1 个 block 用普通窗口划分（W-MSA）；</li>
+<li>第 2 个 block 把窗口整体沿对角线方向偏移 <code>(⌊W/2⌋, ⌊W/2⌋)</code> 再划分（SW-MSA）。</li>
+</ul>
+<p>两个 block 交替，上一层的窗口边界和下一层的错开，信息就能跨窗口流动。移位后窗口数量变多、大小不一，Swin 用<strong>循环移位（cyclic shift）+ 掩码注意力（masked attention）</strong>的工程技巧，在不真的拆散窗口的前提下完成高效计算。</p>
+<p><figure><img class="md-img" src="content/courses/cv-advanced/assets/chapter-4-figure-05.svg" alt="普通窗口注意力（W-MSA）与移位窗口注意力（SW-MSA）的对比示意" loading="lazy" decoding="async"><figcaption>普通窗口注意力（W-MSA）与移位窗口注意力（SW-MSA）的对比示意</figcaption></figure>
+</p>
+<h4 id="h-3-相对位置偏置比绝对位置编码更稳">3. 相对位置偏置：比绝对位置编码更稳<a class="anchor" href="#h-3-相对位置偏置比绝对位置编码更稳" aria-label="本节链接">#</a></h4>
+<p>第 1 课讲过，ViT 用<strong>绝对</strong>位置编码，一换分辨率就要插值，很脆弱。Swin 改用<strong>相对位置偏置</strong>：在注意力得分上，额外加一个只与&quot;两个 token 在窗口内的相对偏移 <code>(Δx, Δy)</code>&quot;有关的偏置项。因为相对位置的范围是有限的（窗口 <code>7×7</code> 内 <code>Δx, Δy ∈ [-6, 6]</code>），这张偏置表尺寸固定，与输入分辨率无关，天然支持任意分辨率输入。这个细节是 Swin 能在下游任务上平滑迁移的关键之一。</p>
+<h4 id="h-4-同族的分层架构一览">4. 同族的分层架构一览<a class="anchor" href="#h-4-同族的分层架构一览" aria-label="本节链接">#</a></h4>
+<p>Swin 不是孤例，它代表了一条&quot;给 Transformer 找回 CNN 结构&quot;的主线，值得一起放进你的工具箱：</p>
+<ul>
+<li><strong>PVT（Pyramid Vision Transformer）</strong>：用<strong>空间缩减注意力</strong>（先把 K、V 做空间下采样再算注意力）来降复杂度，同样形成金字塔特征，是更早的&quot;分层 ViT&quot;之一。</li>
+<li><strong>DeiT</strong>：本身不分层，但用<strong>蒸馏（distillation）</strong>把 CNN 老师（如 RegNet）的知识喂给 ViT，让 ViT 在 ImageNet-1k 这种小数据上也能训好，破解了&quot;ViT 必须海量数据&quot;的魔咒。</li>
+<li><strong>CvT / Twins / CrossFormer</strong>：各自在&quot;卷积 + 注意力混合&quot;&quot;分组/局部注意力&quot;上做文章，核心都是降低复杂度、引入多尺度。</li>
+<li><strong>ConvNeXt</strong>：反向的启示——按 Swin 的宏观设计（分层、窗口化、LayerNorm、GELU）反过来<strong>纯用卷积</strong>搭网络，发现也能追平 Swin。它提醒我们：很多时候提升来自<strong>结构设计</strong>，而不是&quot;卷积 vs 注意力&quot;的派别之争。</li>
+</ul>
+<p>理解这条主线后你会发现，现代骨干网的竞争早已不是&quot;卷积 vs Transformer&quot;的二元对立，而是&quot;如何用最合理的结构，拿到最强的多尺度表征&quot;。</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>先实现一个&quot;窗口划分&quot;函数，直观体会普通窗口和移位窗口的区别，再演示窗口注意力如何把复杂度降下来。</p>
+<pre data-lang="python"><code class="language-python">import torch
+import torch.nn.functional as F
+
+
+def window_partition(x, window_size):
+    &quot;&quot;&quot;把特征图划分成 window_size×window_size 的不重叠窗口。&quot;&quot;&quot;
+    B, H, W, C = x.shape
+    # 重塑成 (B, H//ws, ws, W//ws, ws, C)
+    x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
+    # 调换维度后合并：每个窗口变成一个独立的 token 序列
+    windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size * window_size, C)
+    return windows  # (B * num_windows, ws*ws, C)
+
+
+x = torch.randn(1, 8, 8, 4)          # 一个 8x8、4 通道的特征图
+w = window_partition(x, window_size=4)
+print(&quot;普通窗口划分后:&quot;, w.shape)      # (1*4, 16, 4) —— 4 个窗口，每个 4x4=16 个 token</code></pre>
+<p>接下来对比&quot;全局注意力 vs 窗口注意力&quot;的相似度矩阵尺寸，直观看到复杂度的下降：</p>
+<pre data-lang="python"><code class="language-python">def attention_scores(q, k):
+    return q @ k.transpose(-1, -2)
+
+N, C = 64, 16                        # 64 个 token，16 维
+q = k = torch.randn(1, N, C)
+
+# 全局注意力：每个 token 对全体 token 算相似度
+scores_global = attention_scores(q, k)
+print(&quot;全局注意力相似度矩阵:&quot;, scores_global.shape)   # (1, 64, 64)
+
+# 窗口注意力：分成 4 个窗口，每个窗口 4x4=16 个 token，窗口内互相关注
+windows = q.view(1, 4, 16, C)        # (1, 4 个窗口, 16 token, C)
+scores_win = windows @ windows.transpose(-1, -2)
+print(&quot;窗口注意力相似度矩阵:&quot;, scores_win.shape)     # (1, 4, 16, 16)
+
+# 直观比较总的&quot;注意力对&quot;数量
+print(&quot;全局注意力对:&quot;, N * N)                       # 64*64 = 4096
+print(&quot;窗口注意力对:&quot;, 4 * 16 * 16)                 # 4 个窗口 * 256 = 1024</code></pre>
+<p>当 token 数量从 64 涨到 4096（比如大图 + 小补丁），全局注意力的代价是 <code>4096²</code>，而窗口注意力只按 <code>窗口数 × 窗口大小²</code> 线性增长——这就是 Swin 敢在高分辨率上跑检测分割的根本原因。</p>
+<p>最后用 <code>timm</code> 一句话加载 Swin 骨干网，看看它作为下游骨干的接入方式：</p>
+<pre data-lang="python"><code class="language-python">import timm
+
+# 加载 Swin-Tiny；features_only=True 会返回 4 个 Stage 的多尺度特征
+model = timm.create_model(&quot;swin_tiny_patch4_window7_224&quot;, pretrained=False, features_only=True)
+feats = model(torch.randn(1, 3, 224, 224))
+print(&quot;Stage 数量:&quot;, len(feats))
+for i, f in enumerate(feats):
+    print(f&quot;Stage {i} 特征形状:&quot;, f.shape)</code></pre>
+<p>运行后你会看到四个 Stage 的特征从 <code>(1, 56, 56, 96)</code> 一路降到 <code>(1, 7, 7, 768)</code>，通道数翻倍、分辨率减半，正是&quot;特征金字塔&quot;的形状——和 FPN 需要的多尺度输入严丝合缝。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>修改上面的 <code>window_partition</code>，实现&quot;移位窗口&quot;：先把特征图用 <code>torch.roll</code> 循环移位 <code>(ws//2, ws//2)</code>，再调用 <code>window_partition</code>，观察窗口边界如何错开。说明为什么移位后需要&quot;掩码注意力&quot;防止跨窗口的错误交互。</li>
+<li>用 <code>timm</code> 分别加载 <code>vit_base_patch16_224</code> 与 <code>swin_tiny_patch4_window7_224</code>，比较两者第一层 token 数量与一个 Stage 结束后的 token 数量，解释为什么 Swin 更适合作为检测分割的骨干网。</li>
+<li>查 PVT 论文的&quot;空间缩减注意力&quot;，写出它把 K、V 下采样 <code>r</code> 倍后，复杂度相比全局注意力降低到多少（用 <code>N</code>、<code>r</code>、<code>d</code> 表示），并与 Swin 的窗口注意力复杂度作比较。</li>
+<li>思考：既然 ConvNeXt 用纯卷积也能追平 Swin，那&quot;分层 + 多尺度&quot;和&quot;注意力&quot;这两个因素里，哪一个对下游任务性能的贡献更大？请设计一个对照实验（保持其一、替换其二）来支持你的判断。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>论文《Swin Transformer: Hierarchical Vision Transformer using Shifted Windows》：<a href="https://arxiv.org/abs/2103.14030" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2103.14030</a></li>
+<li>论文《Pyramid Vision Transformer》（PVT）：<a href="https://arxiv.org/abs/2102.12122" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2102.12122</a></li>
+<li>论文《Training data-efficient image transformers &amp; distillation through attention》（DeiT）：<a href="https://arxiv.org/abs/2012.12877" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2012.12877</a></li>
+<li>论文《A ConvNet for the 2020s》（ConvNeXt）：<a href="https://arxiv.org/abs/2201.03545" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2201.03545</a></li>
+<li>timm 官方文档（Swin 系列模型）：<a href="https://huggingface.co/docs/timm/" target="_blank" rel="noopener noreferrer">https://huggingface.co/docs/timm/</a></li>
+</ul>
+<p><a href="#/l/cv-ch5-l1">下一课：对比学习（SimCLR/MoCo）</a></p>

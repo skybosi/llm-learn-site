@@ -1,0 +1,609 @@
+<h2 id="h-全景捕获--图-ir--优化--调度--代码生成--运行时">全景：捕获 → 图 IR → 优化 → 调度 → 代码生成 → 运行时<a class="anchor" href="#h-全景捕获--图-ir--优化--调度--代码生成--运行时" aria-label="本节链接">#</a></h2>
+<p>前两课讲清了&quot;贵在哪&quot;与&quot;三层各管什么&quot;。一段 Python 代码要变成能跑的目标代码，中间要经过<strong>六段流水线</strong>，每段回答一个问题，也各有失败方式。它最实用的价值是排障——&quot;编译后没变快&quot;时，你能判断是<strong>捕获不全</strong>、<strong>图 IR 表达力不够</strong>、<strong>优化太保守</strong>、<strong>调度没搜到好解</strong>、<strong>代码生成质量差</strong>，还是<strong>反复重编译</strong>。</p>
+<p><figure><img class="md-img" src="content/courses/ml-compilers/assets/chapter-1-figure-02.svg" alt="六段流水线：捕获、图 IR、优化、调度、代码生成、运行时" loading="lazy" decoding="async"><figcaption>六段流水线：捕获、图 IR、优化、调度、代码生成、运行时</figcaption></figure>
+</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-六段流水线一段一个问题">1. 六段流水线，一段一个问题<a class="anchor" href="#h-1-六段流水线一段一个问题" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>输入 → 输出</th>
+<th>关键决策</th>
+<th>失败会怎样</th>
+<th>后续</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>① 捕获 capture</td>
+<td>Python 程序 → 算子图</td>
+<td>记哪些算子、在哪停下</td>
+<td><strong>图断裂</strong>，片段退回 eager</td>
+<td>第 2 章</td>
+</tr>
+<tr>
+<td>② 图 IR</td>
+<td>算子图 → 中间表示</td>
+<td>表达力与可优化性</td>
+<td>信息丢失，后面无从下手</td>
+<td>第 3 章</td>
+</tr>
+<tr>
+<td>③ 优化 passes</td>
+<td>图 IR → 更小的图</td>
+<td>哪些变换是安全的</td>
+<td>保守则收益小，冒进则算错</td>
+<td>第 4 章</td>
+</tr>
+<tr>
+<td>④ 调度 scheduling</td>
+<td>算子/子图 → 循环结构</td>
+<td>分块、循环序、向量化、并行</td>
+<td>性能不达标</td>
+<td>第 6 章</td>
+</tr>
+<tr>
+<td>⑤ 代码生成 codegen</td>
+<td>循环结构 → 目标代码</td>
+<td>发射成什么（Triton/CUDA/LLVM）</td>
+<td>质量差或编不出来</td>
+<td>第 7 章</td>
+</tr>
+<tr>
+<td>⑥ 运行时 runtime</td>
+<td>目标代码 → 一次执行</td>
+<td>内存池、缓存键、执行顺序</td>
+<td>反复重编译、峰值爆</td>
+<td>第 8 章</td>
+</tr>
+</tbody></table>
+<p>记法：<strong>②③ 在&quot;算什么&quot;上做减法，④⑤ 在&quot;怎么算&quot;上做选择，①⑥ 是两道闸门</strong>；闸门关不严（捕获漏、缓存不命中），中间做得再好也只剩部分收益。</p>
+<h4 id="h-2-三条真实路线的逐段对照">2. 三条真实路线的逐段对照<a class="anchor" href="#h-2-三条真实路线的逐段对照" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>torch.compile / TorchInductor</th>
+<th>XLA</th>
+<th>TVM</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>① 捕获</td>
+<td>TorchDynamo 在字节码层拦截记录并生成<strong>守卫</strong>（guards）；AOTAutograd 把前向反向一起捕获</td>
+<td>JAX / TensorFlow 导出 HLO / StableHLO</td>
+<td>各前端导入图级 IR（OSDI&#39;18 论文里是 Relay）</td>
+</tr>
+<tr>
+<td>② 图 IR</td>
+<td>FX/ATen 图 → Inductor IR</td>
+<td>HLO / StableHLO</td>
+<td>Relay（图级）+ TE/TIR（算子级）</td>
+</tr>
+<tr>
+<td>③ 优化</td>
+<td>图级 pass：融合、布局、内存</td>
+<td>HLO pass（含 fusion）</td>
+<td>Relay pass</td>
+</tr>
+<tr>
+<td>④ 调度</td>
+<td>后端启发式自动决定</td>
+<td>后端内建</td>
+<td>显式 schedule + 自动调优（AutoTVM、Ansor）</td>
+</tr>
+<tr>
+<td>⑤ 代码生成</td>
+<td>GPU → Triton；CPU → C++/OpenMP</td>
+<td>降到 LLVM</td>
+<td>多后端（CUDA / LLVM / Metal）</td>
+</tr>
+<tr>
+<td>⑥ 运行时</td>
+<td>编译缓存、内存池、CUDA Graphs</td>
+<td>XLA runtime（PJRT 接口）</td>
+<td>TVM runtime</td>
+</tr>
+</tbody></table>
+<p>三条路线代表三种取向：<strong>TorchInductor</strong> 要&quot;零改动接管既有框架代码&quot;（力气全花在捕获与守卫）；<strong>XLA</strong> 要&quot;一套 HLO 打遍所有后端&quot;（图 IR 边界最严）；<strong>TVM</strong> 要&quot;调度可搜索&quot;（调度是一等公民，配代价模型与搜索器，第 6 章会展开 Ansor 的分层空间 + 演化搜索 + 代价模型）。MLIR 是正交的另一条路：多级 IR 做成可扩展框架，让高层张量方言与低层 LLVM 方言逐级下降。</p>
+<h4 id="h-3-什么时候编译jitaot-与缓存">3. 什么时候编译：JIT、AOT 与缓存<a class="anchor" href="#h-3-什么时候编译jitaot-与缓存" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>JIT（即时编译）</strong>：第一次遇到这张图才编译，好处是能看到真实 shape/dtype/设备，代价是首次延迟（<code>torch.compile</code> 属于这类）。</li>
+<li><strong>AOT（提前编译）</strong>：编译在部署前完成，无编译期抖动，代价是形状通常要预先固定。</li>
+<li><strong>编译缓存</strong>：键通常含&quot;图结构 + 形状 + dtype + 设备 + 调度参数&quot;，命中即跳过编译。</li>
+</ul>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">总</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">编译</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8778em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">执行</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord cjk_fallback">缓存命中时</span><span class="mord"> </span></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">编译</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">→</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0</span></span></span></span></span></p>
+<p>所以&quot;编译贵不贵&quot;的答案是&quot;看编译几次&quot;：只跑一次的脚本，编译是纯开销；跑一万次的推理服务，成本可忽略。<strong>动态形状</strong>会让形状进入缓存键，一变就重编译——这是第 2 章的主题。</p>
+<p><figure><img class="md-img" src="content/courses/ml-compilers/assets/chapter-1-figure-04.svg" alt="三种编译时机（JIT / AOT / 缓存）各自的代价：编译贵不贵取决于一共编译几次" loading="lazy" decoding="async"><figcaption>三种编译时机（JIT / AOT / 缓存）各自的代价：编译贵不贵取决于一共编译几次</figcaption></figure>
+</p>
+<h4 id="h-4-四个可检查的窗口">4. 四个&quot;可检查的窗口&quot;<a class="anchor" href="#h-4-四个可检查的窗口" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>看什么</th>
+<th>对应阶段</th>
+<th>典型手段（PyTorch 日志开关）</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>图在哪里断、为什么断</td>
+<td>① 捕获</td>
+<td><code>TORCH_LOGS=graph_breaks</code></td>
+</tr>
+<tr>
+<td>生成的代码长什么样</td>
+<td>⑤ 代码生成</td>
+<td><code>TORCH_LOGS=output_code</code></td>
+</tr>
+<tr>
+<td>pass 前后图变成什么样</td>
+<td>③ 优化</td>
+<td><code>TORCH_LOGS=post_grad_graphs</code></td>
+</tr>
+<tr>
+<td>有没有反复重编译、守卫为何失效</td>
+<td>⑥ 运行时</td>
+<td><code>TORCH_LOGS=recompiles</code>、<code>guards</code></td>
+</tr>
+</tbody></table>
+<p>排障顺序：<strong>先看捕获是否完整，再看优化有没有生效，最后才怀疑代码生成质量</strong>。顺序反了，就会在&quot;内核为什么慢&quot;上白花时间。</p>
+<h4 id="h-5-常见坑">5. 常见坑<a class="anchor" href="#h-5-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>图断裂吃掉收益</strong>：编译器只优化它看得见的部分，断成 5 段就是 5 个小编译器各自为战。</li>
+<li><strong>缓存永不命中</strong>：动态 shape、变化的分支、每步都变的常量会让键一直变，编译时间吃掉收益。</li>
+<li><strong>把&quot;能编译&quot;当&quot;会更快&quot;</strong>：算子链本就带宽受限时融合收益明显；单算子打满带宽时几乎无收益。</li>
+<li><strong>只看首次运行</strong>：首次运行含编译开销，测性能必须先预热。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>最后把六段装成一个能跑的迷你编译器（标准库 + numpy，本机 python 3.10.16 + numpy 1.26.2 实跑）：<strong>①</strong> 用符号张量代理把算子调用记成 IR；<strong>②</strong> 打印带 shape 的节点表；<strong>③</strong> 做常量折叠、CSE、死代码消除；<strong>④</strong> 为 GEMM 搜 block tile、为逐元素子图搜 TILE；<strong>⑤</strong> 生成源码并 <code>exec</code> 编译；<strong>⑥</strong> 运行时带编译缓存与内存池，跑 4 次推理（前三次同形状、第四次变形）并与 eager 参考对拍。</p>
+<pre data-lang="python"><code class="language-python"># ===== 第 3 课示例：一个六段式迷你 ML 编译器 =====
+# 捕获 → 图 IR → 优化 → 调度 → 代码生成 → 运行时（缓存 + 内存池 + 执行）
+# 只用标准库 + numpy（本机 python3.10 + numpy 1.26.2 验证），不需要 GPU / 不需要 torch。
+import math
+
+import numpy as np
+
+# ================= 阶段 1：捕获（capture）—— 只记录&quot;做什么&quot;，不立刻算 =================
+class GraphIR:
+    def __init__(self):
+        self.ins, self.n = [], 0
+
+    def emit(self, op, args, shape, kind, const=None):
+        self.n += 1
+        name = f&#39;%{self.n}&#39;
+        self.ins.append({&#39;name&#39;: name, &#39;op&#39;: op, &#39;args&#39;: list(args),
+                         &#39;shape&#39;: shape, &#39;kind&#39;: kind, &#39;const&#39;: const})
+        return name
+
+
+class Sym:
+    &quot;&quot;&quot;符号张量：算子重载只往 IR 追加一条记录，不做任何计算。&quot;&quot;&quot;
+    def __init__(self, g, name, shape, kind):
+        self.g, self.name, self.shape, self.kind = g, name, shape, kind
+
+    def _bin(self, other, op):
+        if isinstance(other, Sym):
+            arg, shape = other.name, (other.shape or self.shape)
+        else:                                        # Python 标量 → 捕获成 const 节点
+            arg = self.g.emit(&#39;const&#39;, [], (), &#39;const&#39;, const=float(other))
+            shape = self.shape
+        return Sym(self.g, self.g.emit(op, [self.name, arg], shape, &#39;elementwise&#39;), shape, &#39;elementwise&#39;)
+
+    __add__ = lambda self, o: self._bin(o, &#39;add&#39;)
+    __radd__ = lambda self, o: self._bin(o, &#39;add&#39;)
+    __mul__ = lambda self, o: self._bin(o, &#39;mul&#39;)
+    __rmul__ = lambda self, o: self._bin(o, &#39;mul&#39;)
+
+    def relu(self):
+        return Sym(self.g, self.g.emit(&#39;relu&#39;, [self.name], self.shape, &#39;elementwise&#39;),
+                   self.shape, &#39;elementwise&#39;)
+
+    def matmul(self, other):
+        shape = (self.shape[0], other.shape[1])
+        return Sym(self.g, self.g.emit(&#39;matmul&#39;, [self.name, other.name], shape, &#39;gemm&#39;),
+                   shape, &#39;gemm&#39;)
+
+
+def const_sym(g, v):
+    return Sym(g, g.emit(&#39;const&#39;, [], (), &#39;const&#39;, const=float(v)), (), &#39;const&#39;)
+
+
+def capture_model(B=32, K=64, N=48):
+    g = GraphIR()
+
+    def inp(shape):
+        return Sym(g, g.emit(&#39;input&#39;, [], shape, &#39;input&#39;), shape, &#39;input&#39;)
+
+    x, w, bias, res = inp((B, K)), inp((K, N)), inp((B, N)), inp((B, N))
+    alpha = const_sym(g, 1.5) * const_sym(g, 2.0)      # 常量×常量 → 折叠的原料
+    h = x.matmul(w)
+    y = (h + bias).relu() + res
+    z1, z2 = y * alpha, y * alpha                       # 完全相同的两次计算 → CSE 的原料
+    dead = y.relu()                                     # 结果没人用 → 死代码
+    out = z1 + z2
+    return g, {&#39;x&#39;: x.name, &#39;w&#39;: w.name, &#39;bias&#39;: bias.name, &#39;res&#39;: res.name}, out.name, dead.name
+
+
+def dump(g, ins=None):
+    lines = []
+    for i in (g.ins if ins is None else ins):
+        if i[&#39;op&#39;] == &#39;const&#39;:
+            lines.append(f&quot;  {i[&#39;name&#39;]} = const {i[&#39;const&#39;]}  : scalar&quot;)
+        elif i[&#39;op&#39;] == &#39;input&#39;:
+            lines.append(f&quot;  {i[&#39;name&#39;]} = input  : shape={i[&#39;shape&#39;]}&quot;)
+        else:
+            lines.append(f&quot;  {i[&#39;name&#39;]} = {i[&#39;op&#39;]} {&#39;, &#39;.join(i[&#39;args&#39;])}  : shape={i[&#39;shape&#39;]}&quot;)
+    return &#39;\n&#39;.join(lines)
+
+
+g, feeds, OUT, DEAD = capture_model()
+print(&#39;=== 阶段 1-2：捕获得到的图 IR ===&#39;)
+print(dump(g))
+print(f&#39;  （输入映射 {feeds}；{DEAD} 是死代码）&#39;)
+
+# ================= 阶段 3：图级优化 =================
+BINOP = {&#39;add&#39;: lambda a, b: a + b, &#39;mul&#39;: lambda a, b: a * b}
+
+
+def opt_const_fold(ins):
+    known, out, hits = {}, [], 0
+    for i in ins:
+        if i[&#39;op&#39;] == &#39;const&#39;:
+            known[i[&#39;name&#39;]] = i[&#39;const&#39;]
+            out.append(i)
+            continue
+        if i[&#39;op&#39;] in BINOP and all(a in known for a in i[&#39;args&#39;]):
+            v = BINOP[i[&#39;op&#39;]](*[known[a] for a in i[&#39;args&#39;]])
+            known[i[&#39;name&#39;]] = v
+            out.append(dict(i, op=&#39;const&#39;, args=[], kind=&#39;const&#39;, const=v))
+            hits += 1
+            continue
+        out.append(i)
+    return out, hits
+
+
+def opt_cse(ins):
+    seen, alias, out, hits = {}, {}, [], 0
+    for i in ins:
+        args = tuple(alias.get(a, a) for a in i[&#39;args&#39;])
+        key = (i[&#39;op&#39;], args)
+        if i[&#39;kind&#39;] == &#39;elementwise&#39;:
+            if key in seen:
+                alias[i[&#39;name&#39;]] = seen[key]
+                hits += 1
+                continue
+            seen[key] = i[&#39;name&#39;]
+        out.append(dict(i, args=list(args)))
+    return out, alias, hits
+
+
+def opt_dce(ins, outputs):
+    alive, keep = set(outputs), set()
+    for i in reversed(ins):
+        if i[&#39;name&#39;] in alive:
+            keep.add(i[&#39;name&#39;])
+            alive.update(i[&#39;args&#39;])
+    return [i for i in ins if i[&#39;name&#39;] in keep]
+
+
+def resolve(n, alias):
+    while n in alias:
+        n = alias[n]
+    return n
+
+
+ins1, n_fold = opt_const_fold(g.ins)
+ins2, alias, n_cse = opt_cse(ins1)
+ins3 = opt_dce(ins2, [OUT])
+print(&#39;\n=== 阶段 3：图级 pass 之后（常量折叠 → CSE → 死代码消除）===&#39;)
+print(dump(g, ins3))
+print(f&#39;  节点 {len(g.ins)} → {len(ins3)}：折叠 {n_fold}、CSE {n_cse}、&#39;
+      f&#39;死代码 {len(ins2) - len(ins3)}；输出别名链 {OUT} → {resolve(OUT, alias)}&#39;)
+scalars = {i[&#39;name&#39;]: i[&#39;const&#39;] for i in ins3 if i[&#39;op&#39;] == &#39;const&#39;}
+print(f&#39;  标量常量表（折叠结果）：{scalars}&#39;)
+
+# ================= 阶段 4：调度（schedule）=================
+def gemm_hbm(M, N, K, bm, bn, bk, itemsize=4):
+    return (math.ceil(M / bm) * math.ceil(N / bn) * math.ceil(K / bk)
+            * (bm * bk + bk * bn) * itemsize)
+
+
+B, K, N = 32, 64, 48
+print(&#39;\n=== 阶段 4a：GEMM 的 block tile 搜索（代价模型 = HBM 搬运量）===&#39;)
+best = None
+for t in ((16, 16, 16), (16, 24, 16), (32, 48, 16), (32, 48, 32), (32, 48, 64)):
+    cost = gemm_hbm(B, N, K, *t)
+    mark = &#39;&#39;
+    if best is None or cost &lt; best[1]:
+        best, mark = (t, cost), &#39;  ← 当前最优&#39;
+    print(f&#39;  (bm,bn,bk)={str(t):&lt;12} HBM {cost / 1024:&gt;6.1f} KB{mark}&#39;)
+tile = best[0]
+print(f&#39;  选定 tile = {tile}（代价模型只负责给候选排序，绝对值不可当真）&#39;)
+
+print(&#39;\n=== 阶段 4b：逐元素子图的 TILE 搜索（示例代价模型，参数是假设值）===&#39;)
+C_LOOP, ACTIVE_BUFS, BUDGET, C_SPILL = 2e-6, 6, 32 * 1024, 4e-9
+ELEMS = B * N
+print(f&quot;{&#39;TILE&#39;:&gt;6} {&#39;轮数&#39;:&gt;5} {&#39;循环开销(µs)&#39;:&gt;12} {&#39;工作集(KB)&#39;:&gt;10} {&#39;溢出罚项(µs)&#39;:&gt;13} {&#39;总代价(µs)&#39;:&gt;11}&quot;)
+best_tile, best_cost = None, None
+for TILE in (16, 64, 128, 256, 512, 1024, 2048):
+    rounds = math.ceil(ELEMS / TILE)
+    loop = rounds * C_LOOP
+    ws = TILE * ACTIVE_BUFS * 4
+    pen = C_SPILL * max(0, ws - BUDGET)
+    cost = loop + pen
+    mark = &#39;&#39;
+    if best_cost is None or cost &lt; best_cost:
+        best_tile, best_cost, mark = TILE, cost, &#39;  ← 当前最优&#39;
+    print(f&#39;{TILE:&gt;6} {rounds:&gt;5} {loop * 1e6:&gt;12.2f} {ws / 1024:&gt;10.1f} &#39;
+          f&#39;{pen * 1e6:&gt;13.2f} {cost * 1e6:&gt;11.2f}{mark}&#39;)
+print(f&#39;  选定 TILE = {best_tile}：循环开销随 TILE 单调下降，但工作集超过片上预算后溢出代价反超&#39;)
+print(&#39;  → 这就是&quot;融合不是越大越好&quot;的最小可打印版本（第 5 章会算这笔账）&#39;)
+
+# ================= 阶段 5：代码生成（codegen）=================
+def gen_gemm_source(bm, bn, bk):
+    return f&#39;&#39;&#39;def kernel_gemm(A, B, out):
+    M, K = A.shape
+    N = B.shape[1]
+    for i0 in range(0, M, {bm}):
+        for j0 in range(0, N, {bn}):
+            acc = out[i0:i0 + {bm}, j0:j0 + {bn}]
+            acc[...] = 0.0
+            for k0 in range(0, K, {bk}):
+                acc += A[i0:i0 + {bm}, k0:k0 + {bk}] @ B[k0:k0 + {bk}, j0:j0 + {bn}]
+    return out
+&#39;&#39;&#39;
+
+
+def gen_elementwise_source(nodes, out_name, bound, tile):
+    &quot;&quot;&quot;把逐元素子图生成成一段可 exec 的 Python 源码（块内一次遍历走完全链）。&quot;&quot;&quot;
+    params = list(bound) + [&#39;out&#39;]
+    lines = [f&#39;def kernel_fused({&quot;, &quot;.join(params)}, TILE={tile}):&#39;,
+             f&#39;    n = src.shape[0]&#39;,
+             &#39;    for i0 in range(0, n, TILE):&#39;]
+    tmpl = {node: f&#39;{param}[i0:i0 + TILE]&#39; for param, node in bound.items()}
+    assigned = False
+    for i in nodes:
+        if i[&#39;op&#39;] == &#39;const&#39;:
+            tmpl[i[&#39;name&#39;]] = repr(i[&#39;const&#39;])
+            continue
+        a = [tmpl[x] for x in i[&#39;args&#39;]]
+        if i[&#39;op&#39;] == &#39;add&#39;:                     # 每个子表达式都显式加括号：代码生成必须保证优先级
+            expr = f&#39;({a[0]} + {a[1]})&#39;
+        elif i[&#39;op&#39;] == &#39;mul&#39;:
+            expr = f&#39;({a[0]} * {a[1]})&#39;
+        elif i[&#39;op&#39;] == &#39;relu&#39;:
+            expr = f&#39;np.maximum({a[0]}, 0.0)&#39;
+        else:
+            raise ValueError(f&#39;逐元素子图里出现了无法生成的算子 {i[&quot;op&quot;]}&#39;)
+        if i[&#39;name&#39;] == out_name:
+            lines.append(f&#39;        out[i0:i0 + TILE] = {expr}&#39;)
+            assigned = True
+        else:
+            tmpl[i[&#39;name&#39;]] = expr
+    if not assigned:
+        lines.append(f&#39;        out[i0:i0 + TILE] = {tmpl[out_name]}&#39;)
+    return &#39;\n&#39;.join(lines) + &#39;\n&#39;
+
+
+gemm_src = gen_gemm_source(*tile)
+post = [i for i in ins3 if i[&#39;kind&#39;] in (&#39;elementwise&#39;, &#39;const&#39;)]   # 含子图用到的标量常量
+EW_OUT = resolve(OUT, alias)
+matmul_out = next(i[&#39;name&#39;] for i in ins3 if i[&#39;op&#39;] == &#39;matmul&#39;)
+ew_src = gen_elementwise_source(post, EW_OUT,
+                               {&#39;src&#39;: matmul_out, &#39;bias&#39;: feeds[&#39;bias&#39;], &#39;res&#39;: feeds[&#39;res&#39;]},
+                               best_tile)
+print(&#39;\n=== 阶段 5：生成的 kernel 源码 ===&#39;)
+print(&#39;--- kernel_gemm（块级累加；块内仍走 BLAS 内积，真实编译器在这一层发射 MMA）---&#39;)
+print(gemm_src)
+print(&#39;--- kernel_fused（由逐元素子图自动生成）---&#39;)
+print(ew_src)
+print(&#39;--- 同一段子图若目标是 CUDA，会被发射成（示意，不执行）---&#39;)
+print(&#39;&#39;&#39;__global__ void fused_kernel(const float* src, const float* bias, const float* res,
+                            float* out, int n, float alpha) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i &lt; n) out[i] = (fmaxf(src[i] + bias[i], 0.f) + res[i]) * alpha * 2.f;
+}&#39;&#39;&#39;)
+
+ns = {&#39;np&#39;: np}
+exec(gemm_src, ns)
+exec(ew_src, ns)
+kernel_gemm, kernel_fused = ns[&#39;kernel_gemm&#39;], ns[&#39;kernel_fused&#39;]
+
+# ================= 阶段 6：运行时（编译缓存 + 内存池 + 执行）=================
+class Runtime:
+    def __init__(self):
+        self.cache, self.compiles, self.hits = {}, 0, 0
+        self.pool, self.pool_hits, self.pool_new = {}, 0, 0
+        self.launches = 0
+
+    def get(self, key):
+        if key in self.cache:
+            self.hits += 1
+            return self.cache[key]
+        self.compiles += 1
+        self.cache[key] = (kernel_gemm, kernel_fused)
+        return self.cache[key]
+
+    def buffer(self, key, shape):
+        if key in self.pool:
+            self.pool_hits += 1
+        else:
+            self.pool[key] = np.zeros(shape, dtype=np.float32)
+            self.pool_new += 1
+        return self.pool[key]
+
+    def __call__(self, x, w, bias, res):
+        key = (&#39;f32&#39;, x.shape, w.shape, tile, best_tile)   # 形状与 schedule 进键 → 变形即重编译
+        kg, kf = self.get(key)
+        mat_shape = (x.shape[0], w.shape[1])
+        mat = self.buffer((&#39;mat&#39;,) + mat_shape, mat_shape)
+        out = self.buffer((&#39;out&#39;,) + mat_shape, mat_shape)
+        kf_input = mat
+        kg(x, w, mat)
+        self.launches += 1
+        kf(kf_input, bias, res, out)
+        self.launches += 1
+        return out
+
+
+def eager_reference(x, w, bias, res):
+    alpha = 1.5 * 2.0                       # 与图里 %7 折叠出来的常量一致
+    z = ((x @ w + bias).clip(min=0) + res) * alpha
+    return z + z                            # out = z1 + z2
+
+
+rng = np.random.default_rng(0)
+rt = Runtime()
+print(&#39;=== 阶段 6：跑起来（前三次同形状 → 1 次编译 + 2 次缓存命中；第四次变形 → 重编译）===&#39;)
+for Bx in (32, 32, 32, 64):
+    x = rng.standard_normal((Bx, K)).astype(np.float32)
+    w = rng.standard_normal((K, N)).astype(np.float32)
+    bias = rng.standard_normal((Bx, N)).astype(np.float32)
+    res = rng.standard_normal((Bx, N)).astype(np.float32)
+    got = rt(x, w, bias, res)
+    ref = eager_reference(x, w, bias, res)
+    d = float(np.abs(got - ref).max())
+    rel = d / float(np.abs(ref).max())
+    print(f&#39;  B={Bx:&gt;3}: vs eager 参考 最大绝对误差 {d:.2e}（相对 {rel:.1e}）&#39;
+          f&#39; | 编译次数={rt.compiles} 命中={rt.hits}&#39;)
+
+elem_ops = [i for i in g.ins if i[&#39;kind&#39;] == &#39;elementwise&#39;]
+eager_ew_bytes = sum(2 * B * N * 4 for _ in elem_ops)
+print(&#39;\n=== 六段流水线的产出对照 ===&#39;)
+print(f&#39;  捕获：{len(g.ins)} 个 IR 节点（含 {sum(1 for i in g.ins if i[&quot;op&quot;] == &quot;const&quot;)} 个 const）&#39;)
+print(f&#39;  优化：{len(ins3)} 个节点（折叠 {n_fold}、CSE {n_cse}、死代码 {len(ins2) - len(ins3)}）&#39;)
+print(f&#39;  调度：GEMM tile={tile}，逐元素 TILE={best_tile}&#39;)
+gen_lines = len([l for l in (gemm_src + ew_src).splitlines() if l.strip()])
+print(f&#39;  代码生成：{gen_lines} 行可执行的 Python kernel 源码 + 1 段 CUDA 示意&#39;)
+print(f&#39;  运行时：kernel 下发 {rt.launches} 次（4 次推理 × 2 个 kernel）；编译={rt.compiles}、&#39;
+      f&#39;缓存命中={rt.hits}；内存池新建 {rt.pool_new} 块 / 复用 {rt.pool_hits} 次&#39;)
+print(f&#39;  算子边界：捕获到 {len(elem_ops)} 个逐元素节点（其中 1 个是常量×常量，编译期直接消掉），&#39;
+      f&#39;eager 要逐次派发 + 1 次 GEMM；编译后 = 1 次 GEMM + 1 次融合 kernel&#39;)
+print(f&#39;  逐元素访存：eager 约 {eager_ew_bytes / 1024:.1f} KB（每步都读写中间结果）；&#39;
+      f&#39;融合后 {2 * B * N * 4 / 1024:.1f} KB&#39;)
+print(&#39;  形状从 32 变 64 → 缓存未命中又编译一次：这就是第 2 章 guard 与重编译的雏形&#39;)
+print(&#39;  误差 ~1e-5 不是算错：生成的块级 GEMM 把 K 维分 4 段累加，float32 的累加顺序与库函数不同&#39;)
+print(&#39;  （这正是 CUDA 课第 6 课&quot;算子正确性验收&quot;要对容差的原因）&#39;)</code></pre>
+<p>运行结果（本机实跑）：</p>
+<pre data-lang="text"><code class="language-text">=== 阶段 1-2：捕获得到的图 IR ===
+  %1 = input  : shape=(32, 64)
+  %2 = input  : shape=(64, 48)
+  %3 = input  : shape=(32, 48)
+  %4 = input  : shape=(32, 48)
+  %5 = const 1.5  : scalar
+  %6 = const 2.0  : scalar
+  %7 = mul %5, %6  : shape=()
+  %8 = matmul %1, %2  : shape=(32, 48)
+  %9 = add %8, %3  : shape=(32, 48)
+  %10 = relu %9  : shape=(32, 48)
+  %11 = add %10, %4  : shape=(32, 48)
+  %12 = mul %11, %7  : shape=(32, 48)
+  %13 = mul %11, %7  : shape=(32, 48)
+  %14 = relu %11  : shape=(32, 48)
+  %15 = add %12, %13  : shape=(32, 48)
+  （输入映射 {&#39;x&#39;: &#39;%1&#39;, &#39;w&#39;: &#39;%2&#39;, &#39;bias&#39;: &#39;%3&#39;, &#39;res&#39;: &#39;%4&#39;}；%14 是死代码）
+
+=== 阶段 3：图级 pass 之后（常量折叠 → CSE → 死代码消除）===
+  %1 = input  : shape=(32, 64)
+  %2 = input  : shape=(64, 48)
+  %3 = input  : shape=(32, 48)
+  %4 = input  : shape=(32, 48)
+  %7 = const 3.0  : scalar
+  %8 = matmul %1, %2  : shape=(32, 48)
+  %9 = add %8, %3  : shape=(32, 48)
+  %10 = relu %9  : shape=(32, 48)
+  %11 = add %10, %4  : shape=(32, 48)
+  %12 = mul %11, %7  : shape=(32, 48)
+  %15 = add %12, %12  : shape=(32, 48)
+  节点 15 → 11：折叠 1、CSE 1、死代码 3；输出别名链 %15 → %15
+  标量常量表（折叠结果）：{&#39;%7&#39;: 3.0}
+
+=== 阶段 4a：GEMM 的 block tile 搜索（代价模型 = HBM 搬运量）===
+  (bm,bn,bk)=(16, 16, 16) HBM   48.0 KB  ← 当前最优
+  (bm,bn,bk)=(16, 24, 16) HBM   40.0 KB  ← 当前最优
+  (bm,bn,bk)=(32, 48, 16) HBM   20.0 KB  ← 当前最优
+  (bm,bn,bk)=(32, 48, 32) HBM   20.0 KB
+  (bm,bn,bk)=(32, 48, 64) HBM   20.0 KB
+  选定 tile = (32, 48, 16)（代价模型只负责给候选排序，绝对值不可当真）
+
+=== 阶段 4b：逐元素子图的 TILE 搜索（示例代价模型，参数是假设值）===
+  TILE    轮数     循环开销(µs)    工作集(KB)      溢出罚项(µs)     总代价(µs)
+    16    96       192.00        0.4          0.00      192.00  ← 当前最优
+    64    24        48.00        1.5          0.00       48.00  ← 当前最优
+   128    12        24.00        3.0          0.00       24.00  ← 当前最优
+   256     6        12.00        6.0          0.00       12.00  ← 当前最优
+   512     3         6.00       12.0          0.00        6.00  ← 当前最优
+  1024     2         4.00       24.0          0.00        4.00  ← 当前最优
+  2048     1         2.00       48.0         65.54       67.54
+  选定 TILE = 1024：循环开销随 TILE 单调下降，但工作集超过片上预算后溢出代价反超
+  → 这就是&quot;融合不是越大越好&quot;的最小可打印版本（第 5 章会算这笔账）
+
+=== 阶段 5：生成的 kernel 源码 ===
+--- kernel_gemm（块级累加；块内仍走 BLAS 内积，真实编译器在这一层发射 MMA）---
+def kernel_gemm(A, B, out):
+    M, K = A.shape
+    N = B.shape[1]
+    for i0 in range(0, M, 32):
+        for j0 in range(0, N, 48):
+            acc = out[i0:i0 + 32, j0:j0 + 48]
+            acc[...] = 0.0
+            for k0 in range(0, K, 16):
+                acc += A[i0:i0 + 32, k0:k0 + 16] @ B[k0:k0 + 16, j0:j0 + 48]
+    return out
+
+--- kernel_fused（由逐元素子图自动生成）---
+def kernel_fused(src, bias, res, out, TILE=1024):
+    n = src.shape[0]
+    for i0 in range(0, n, TILE):
+        out[i0:i0 + TILE] = (((np.maximum((src[i0:i0 + TILE] + bias[i0:i0 + TILE]), 0.0) + res[i0:i0 + TILE]) * 3.0) + ((np.maximum((src[i0:i0 + TILE] + bias[i0:i0 + TILE]), 0.0) + res[i0:i0 + TILE]) * 3.0))
+
+--- 同一段子图若目标是 CUDA，会被发射成（示意，不执行）---
+__global__ void fused_kernel(const float* src, const float* bias, const float* res,
+                            float* out, int n, float alpha) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i &lt; n) out[i] = (fmaxf(src[i] + bias[i], 0.f) + res[i]) * alpha * 2.f;
+}
+=== 阶段 6：跑起来（前三次同形状 → 1 次编译 + 2 次缓存命中；第四次变形 → 重编译）===
+  B= 32: vs eager 参考 最大绝对误差 3.81e-05（相对 2.6e-07） | 编译次数=1 命中=0
+  B= 32: vs eager 参考 最大绝对误差 3.81e-05（相对 2.3e-07） | 编译次数=1 命中=1
+  B= 32: vs eager 参考 最大绝对误差 5.34e-05（相对 3.0e-07） | 编译次数=1 命中=2
+  B= 64: vs eager 参考 最大绝对误差 4.58e-05（相对 2.7e-07） | 编译次数=2 命中=2
+
+=== 六段流水线的产出对照 ===
+  捕获：15 个 IR 节点（含 2 个 const）
+  优化：11 个节点（折叠 1、CSE 1、死代码 3）
+  调度：GEMM tile=(32, 48, 16)，逐元素 TILE=1024
+  代码生成：14 行可执行的 Python kernel 源码 + 1 段 CUDA 示意
+  运行时：kernel 下发 8 次（4 次推理 × 2 个 kernel）；编译=2、缓存命中=2；内存池新建 4 块 / 复用 4 次
+  算子边界：捕获到 8 个逐元素节点（其中 1 个是常量×常量，编译期直接消掉），eager 要逐次派发 + 1 次 GEMM；编译后 = 1 次 GEMM + 1 次融合 kernel
+  逐元素访存：eager 约 96.0 KB（每步都读写中间结果）；融合后 12.0 KB
+  形状从 32 变 64 → 缓存未命中又编译一次：这就是第 2 章 guard 与重编译的雏形
+  误差 ~1e-5 不是算错：生成的块级 GEMM 把 K 维分 4 段累加，float32 的累加顺序与库函数不同
+  （这正是 CUDA 课第 6 课&quot;算子正确性验收&quot;要对容差的原因）</code></pre>
+<p>把输出与六段对上：<strong>①</strong> 捕获 15 个节点、4 个输入（<code>1.5×2.0</code> 也被记成 <code>mul</code> 节点）；<strong>②③</strong> 优化后剩 11 个节点；<strong>④</strong> GEMM 从 5 个候选里选出 <code>(32,48,16)</code>，逐元素 TILE 从 7 个候选里选出 1024——<code>TILE=2048</code> 的工作集 48 KB 超出片上预算，溢出罚项把总代价拉到 67.54 µs，<strong>这就是&quot;融合不是越大越好&quot;的可打印版本</strong>；<strong>⑤</strong> 生成的 <code>kernel_fused</code> 是 4 行真实 Python；<strong>⑥</strong> 编译 2 次（形状 32、64 各一次）、缓存命中 2 次，与参考的相对误差约 <code>2.6e-07</code>（块级 GEMM 分段累加的浮点顺序差异，CUDA 课第 6 课为此才要定容差）。</p>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选，需自备环境（torch CPU 版即可；XLA/TVM 需各自安装）：把六段逐段打开看 ----
+# ① 捕获：断点与守卫
+#    TORCH_LOGS=graph_breaks,guards python demo.py
+# ②③ 图 IR 与 pass 前后
+#    TORCH_LOGS=graph_code,post_grad_graphs python demo.py
+# ⑤ 代码生成（GPU 上生成 Triton，CPU 上生成 C++/OpenMP）
+#    TORCH_LOGS=output_code python demo.py
+# ⑥ 运行时重编译与内存规划
+#    TORCH_LOGS=recompiles,memory_planning python demo.py
+# 对照路线：XLA 侧用 jax.jit 观察稳定的 HLO 表示，TVM 侧用 Relay/TE 打印图与调度后再 codegen。
+# 六段都能在无 GPU 机器上观察到；只有&quot;生成的 kernel 到底多快&quot;需要 GPU 实测。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：给迷你编译器加<strong>代数化简</strong> pass（<code>mul(x,1)</code> → <code>x</code>），重跑对拍，误差仍应在 1e-7 量级。</li>
+<li><strong>解释</strong>：为什么缓存键必须含形状与 dtype？若只按&quot;图结构&quot;做键，<code>B=32 → 64</code> 那一行会怎样（先猜再验证）？</li>
+<li><strong>对比/验证</strong>：把第 4b 节的 <code>C_SPILL</code> 调大、调小 10 倍，看最优 TILE 如何移动；用&quot;工作集 = TILE × 活跃中间值个数 × 4 字节&quot;解释拐点。</li>
+<li><strong>思考</strong>：若捕获漏掉 30% 的算子，六段里哪些段收益打折、哪一段不受影响？为什么&quot;捕获质量&quot;常比&quot;优化算法先不先进&quot;更决定收益？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>MLIR 官方文档（多级 IR：既表达 dataflow 图并做图变换，也承载 fusion、tiling、布局变换并向 LLVM 下降）：<a href="https://mlir.llvm.org/" target="_blank" rel="noopener noreferrer">https://mlir.llvm.org/</a></li>
+<li>PyTorch 官方文档 <em>torch.compiler</em>（<code>torch.compile</code> 的默认后端、捕获与守卫、<code>TORCH_LOGS</code> 各阶段日志开关）：<a href="https://pytorch.org/docs/stable/torch.compiler.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/docs/stable/torch.compiler.html</a></li>
+<li>OpenXLA 项目文档 <em>XLA</em>（HLO/StableHLO 作为输入 IR、HLO 层优化、经 LLVM 生成目标代码）：<a href="https://openxla.org/xla" target="_blank" rel="noopener noreferrer">https://openxla.org/xla</a></li>
+<li>Chen et al., <em>TVM: An Automated End-to-End Optimizing Compiler for Deep Learning</em>（OSDI&#39;18：图级/算子级两层优化、算法-调度分离、多后端 codegen）：<a href="https://www.usenix.org/conference/osdi18/presentation/chen" target="_blank" rel="noopener noreferrer">https://www.usenix.org/conference/osdi18/presentation/chen</a></li>
+</ul>
+<p><a href="#/l/mlc-ch2-l1">下一章：图捕获三条路：TorchScript / TorchDynamo / FX</a></p>

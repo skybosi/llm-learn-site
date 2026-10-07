@@ -1,0 +1,106 @@
+<h2 id="h-sft">SFT<a class="anchor" href="#h-sft" aria-label="本节链接">#</a></h2>
+<p>上一课我们把指令数据整理成了&quot;对话 + 回答&quot;的形式。这一课进入正题：<strong>SFT（Supervised Fine-Tuning，监督微调）</strong>，也就是在成对的&quot;指令—回答&quot;数据上，用标准的监督学习目标去微调模型。SFT 是整个&quot;对齐&quot;管线（预训练 → SFT → RLHF/DPO）里的第一环，也是让一个&quot;只会续写&quot;的基座模型变成&quot;会听话&quot;的助手的关键一步。我们重点讲清它的损失函数到底怎么算，以及如何用 trl 的 SFTTrainer 把它压成几十行代码。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-sft-在做什么">1. SFT 在做什么<a class="anchor" href="#h-1-sft-在做什么" aria-label="本节链接">#</a></h4>
+<p>预训练模型学的是&quot;预测下一个 token&quot;，它擅长续写，但不擅长&quot;回答指令&quot;。SFT 给模型看大量 <code>&lt;指令, 期望回答&gt;</code> 样本，让模型学会：给定一段以指令开头的序列，去<strong>最大化期望回答的对数似然</strong>。本质仍是自回归语言模型目标，只是数据从&quot;网页文本&quot;换成了&quot;问答对&quot;。</p>
+<h4 id="h-2-核心细节损失只在回答部分计算">2. 核心细节：损失只在回答部分计算<a class="anchor" href="#h-2-核心细节损失只在回答部分计算" aria-label="本节链接">#</a></h4>
+<p>一条 SFT 样本 = <code>[system?] + user 指令 + assistant 回答</code>。如果对<strong>整段序列</strong>都算交叉熵损失，模型会同时去学&quot;预测用户会问什么&quot;，浪费容量、还可能学偏。正确做法是<strong>掩码</strong>：</p>
+<ul>
+<li><strong>prompt 部分</strong>（system + user）：labels 设为 <code>-100</code>，不贡献损失；</li>
+<li><strong>回答部分</strong>（assistant）：labels 保留真实 token id，贡献损失。</li>
+</ul>
+<p>这个&quot;只对回答算 loss&quot;的设计，是 SFT 与普通继续预训练最本质的区别，也是上一课练习里我们手动构造 <code>labels</code> 的原因。</p>
+<p><figure><img class="md-img" src="content/courses/llm-fine-tuning/assets/chapter-5-figure-02.svg" alt="SFT 的损失计算：只在 assistant 回答 token 上回传梯度" loading="lazy" decoding="async"><figcaption>SFT 的损失计算：只在 assistant 回答 token 上回传梯度</figcaption></figure>
+</p>
+<h4 id="h-3-训练目标与超参直觉">3. 训练目标与超参直觉<a class="anchor" href="#h-3-训练目标与超参直觉" aria-label="本节链接">#</a></h4>
+<p>SFT 的损失是回答部分的平均交叉熵。由于 LoRA 只动一小撮参数、数据又相对同质，几个直觉很重要：</p>
+<ul>
+<li><strong>学习率</strong>：比预训练高一些，LoRA 下常见 <code>1e-4 ~ 5e-4</code>；</li>
+<li><strong>轮数</strong>：指令数据通常 <strong>1~3 个 epoch</strong> 就够，多了容易过拟合、遗忘通用能力；</li>
+<li><strong>小批量 + 梯度累积</strong>：长序列吃显存，用梯度累积等效放大批量；</li>
+<li><strong>梯度裁剪</strong>：防止长文本导致梯度爆炸。</li>
+</ul>
+<h4 id="h-4-sft-在对齐管线中的位置">4. SFT 在&quot;对齐&quot;管线中的位置<a class="anchor" href="#h-4-sft-在对齐管线中的位置" aria-label="本节链接">#</a></h4>
+<p>SFT 之上还有 <strong>RLHF / DPO</strong> 等偏好对齐阶段：SFT 先让模型&quot;会回答&quot;，偏好对齐再让模型&quot;答得让人喜欢&quot;。近年也有 <strong>DPO（Direct Preference Optimization）</strong> 直接跳过显式奖励模型。但在学习路径上，先跑通 SFT、拿到一个&quot;能用的助手&quot;，再去碰偏好对齐，是最稳的路线。</p>
+<h4 id="h-5-sfttrainertrl-把流程封装好了">5. SFTTrainer：trl 把流程封装好了<a class="anchor" href="#h-5-sfttrainertrl-把流程封装好了" aria-label="本节链接">#</a></h4>
+<p>手写 SFT 循环要处理分词、掩码、打包（packing）、数据整理等一堆琐事。Hugging Face 的 <strong>trl</strong> 库提供 <code>SFTTrainer</code>，把&quot;格式化对话 → 掩码 → 训练&quot;全自动完成，是社区做 SFT 的主流工具。下面我们就用它。</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面用 trl 的 SFTTrainer 微调一个小模型，展示完整 SFT 流程。依赖 <code>transformers</code>、<code>peft</code>、<code>trl</code>、<code>datasets</code>。</p>
+<pre data-lang="python"><code class="language-python">from datasets import Dataset
+from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments
+from peft import LoraConfig
+from trl import SFTTrainer
+
+model_id = &quot;HuggingFaceH4/zephyr-7b-beta&quot;  # 示例：可换成任意可用模型
+
+# 1) 准备指令数据：OpenAI Chat 风格的 messages
+raw_data = [
+    {&quot;messages&quot;: [
+        {&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;什么是过拟合？&quot;},
+        {&quot;role&quot;: &quot;assistant&quot;, &quot;content&quot;: &quot;过拟合指模型在训练集上表现很好，但在新数据上泛化很差。&quot;}]},
+    {&quot;messages&quot;: [
+        {&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;怎么缓解过拟合？&quot;},
+        {&quot;role&quot;: &quot;assistant&quot;, &quot;content&quot;: &quot;可以增加数据、使用正则化、早停或 dropout。&quot;}]},
+]
+dataset = Dataset.from_list(raw_data)
+
+# 2) 分词器（带 chat_template），SFTTrainer 会自动用它渲染对话并掩码
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+tokenizer.pad_token = tokenizer.eos_token
+
+# 3) 可选：LoRA 配置，让 SFT 只训练低秩增量
+peft_config = LoraConfig(
+    r=16,
+    lora_alpha=32,
+    target_modules=[&quot;q_proj&quot;, &quot;k_proj&quot;, &quot;v_proj&quot;, &quot;o_proj&quot;],
+    lora_dropout=0.05,
+    bias=&quot;none&quot;,
+    task_type=&quot;CAUSAL_LM&quot;,
+)
+
+# 4) 训练参数
+training_args = TrainingArguments(
+    output_dir=&quot;./sft-output&quot;,
+    per_device_train_batch_size=2,
+    gradient_accumulation_steps=4,      # 等效 batch = 2 * 4 = 8
+    learning_rate=2e-4,
+    num_train_epochs=1,
+    logging_steps=1,
+    save_strategy=&quot;epoch&quot;,
+    bf16=True,                          # 有 GPU 时用 bf16 省显存
+    report_to=&quot;none&quot;,                   # 本地跑关闭 wandb 上报
+)
+
+# 5) SFTTrainer：把&quot;格式化 + 掩码 + 训练&quot;一步到位
+trainer = SFTTrainer(
+    model=model_id,
+    train_dataset=dataset,
+    tokenizer=tokenizer,
+    peft_config=peft_config,
+    args=training_args,
+    max_seq_length=512,
+)
+
+# 6) 开训，并保存适配器
+trainer.train()
+trainer.save_model(&quot;./sft-output&quot;)
+print(&quot;SFT 完成，适配器已保存到 ./sft-output&quot;)</code></pre>
+<p>运行后，SFTTrainer 会：用 <code>chat_template</code> 把每条 <code>messages</code> 渲染成文本 → 自动把 prompt 部分设为 <code>-100</code> → 打包成 batch → 用 LoRA 只训练增量矩阵。训练完成后 <code>./sft-output</code> 里就是可插拔的适配器权重。用一张 T4 就能跑通小型数据上的完整 SFT 流程。</p>
+<blockquote>
+<p>提示：若要手工确认&quot;损失只算回答&quot;，可以用 <code>DataCollatorForCompletionOnlyLM</code>，传入回答的起止标记（如 <code>response_template=&quot;&lt;|assistant|&gt;&quot;</code>），它会帮你生成掩码 labels，适合在自定义数据管线里使用。</p>
+</blockquote>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>把 <code>num_train_epochs</code> 分别设为 1、3、5，观察损失曲线和验证集表现，体会&quot;指令数据训几轮就过拟合&quot;的现象。</li>
+<li>用 <code>DataCollatorForCompletionOnlyLM</code> 手动构造一批 <code>labels</code>，打印出来核对：prompt 位置是否为 <code>-100</code>、assistant 位置是否为真实 token id。</li>
+<li>关闭 <code>peft_config</code>（即不做 LoRA，改为全量 SFT），对比训练耗时与显存占用，理解 LoRA 在 SFT 中的实际收益。</li>
+<li>查 trl 文档，找出 <code>SFTTrainer</code> 中 <code>packing=True</code> 的作用，用一句话说明它如何提升长序列样本的训练效率。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Hugging Face · TRL 文档（SFTTrainer）：<a href="https://huggingface.co/docs/trl/sft_trainer" target="_blank" rel="noopener noreferrer">https://huggingface.co/docs/trl/sft_trainer</a></li>
+<li>Hugging Face · TRL 仓库：<a href="https://github.com/huggingface/trl" target="_blank" rel="noopener noreferrer">https://github.com/huggingface/trl</a></li>
+<li>InstructGPT 论文（Ouyang 等，2022，SFT+RLHF 管线）：<a href="https://arxiv.org/abs/2203.02155" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2203.02155</a></li>
+<li>DPO 论文（Rafailov 等，2023）：<a href="https://arxiv.org/abs/2305.18290" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2305.18290</a></li>
+</ul>
+<p><a href="#/l/ft-ch5-l3">下一课：评估</a></p>

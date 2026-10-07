@@ -1,0 +1,100 @@
+<h2 id="h-时间特征工程">时间特征工程<a class="anchor" href="#h-时间特征工程" aria-label="本节链接">#</a></h2>
+<p>统计模型（ARIMA、指数平滑）把&quot;时间依赖&quot;内建在模型结构里；而机器学习的回归/树模型<strong>本身不认时间</strong>，它只看得懂一张 <code>(X, y)</code> 表格。要让梯度提升、随机森林这些利器做预测，唯一的办法是<strong>把时间信息手工变成特征</strong>。这一课讲怎么把一条序列&quot;摊平&quot;成监督学习表格，以及其中最容易踩的坑——特征泄漏。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-核心思想把预测转成监督学习">1. 核心思想：把预测转成监督学习<a class="anchor" href="#h-1-核心思想把预测转成监督学习" aria-label="本节链接">#</a></h4>
+<p>时间序列预测的监督学习表述是：<strong>用过去的信息，预测未来某期的值</strong>。给定序列 <code>y_1..y_T</code>，我们想预测 <code>y_{t+h}</code>，就把&quot;截至 t 期为止能看到的一切&quot;打包成一行特征 <code>X_t</code>，把 <code>y_{t+h}</code> 当作标签 <code>y</code>：</p>
+<pre><code>样本 i：X_i = 截至 t_i 期可用的特征，y_i = y_{t_i + h}</code></pre>
+<p>&quot;截至 t 期可用&quot;这半句是红线：<strong>任何要用到 <code>t+1</code> 期以后信息的特征，都是泄漏</strong>（第 3 课会严格讨论其危害）。特征工程的本质，就是诚实且充分地刻画&quot;在 t 时刻，我们到底知道什么&quot;。</p>
+<h4 id="h-2-三大类时间特征">2. 三大类时间特征<a class="anchor" href="#h-2-三大类时间特征" aria-label="本节链接">#</a></h4>
+<h5 id="h-1滞后特征-lag">（1）滞后特征 Lag<a class="anchor" href="#h-1滞后特征-lag" aria-label="本节链接">#</a></h5>
+<p>最直接：把过去若干期的观测值本身搬进表格。</p>
+<pre><code>lag_1 = y_{t-1},  lag_2 = y_{t-2},  ...,  lag_k = y_{t-k}</code></pre>
+<p>滞后特征回答&quot;最近几期是什么水平&quot;。它是最强的信号，尤其对短程依赖强的序列。滞后期数 <code>k</code> 是超参数：太小抓不住长记忆，太大则维度膨胀、噪声增多。</p>
+<h5 id="h-2滑动窗口统计-rolling">（2）滑动窗口统计 Rolling<a class="anchor" href="#h-2滑动窗口统计-rolling" aria-label="本节链接">#</a></h5>
+<p>对过去一个窗口做聚合，把&quot;局部形态&quot;总结成几个数：</p>
+<pre><code>roll_mean_7 = 最近 7 期均值
+roll_std_7  = 最近 7 期标准差
+roll_min/max/median = 最近 k 期的极值、中位数</code></pre>
+<p>滑动均值捕捉&quot;近期水平&quot;，滑动标准差捕捉&quot;近期波动&quot;。窗口要覆盖有意义的尺度（如 7 天、30 天），且只能统计<strong>过去</strong>的窗口，不能把未来也卷进来。</p>
+<h5 id="h-3日历特征-calendar">（3）日历特征 Calendar<a class="anchor" href="#h-3日历特征-calendar" aria-label="本节链接">#</a></h5>
+<p>时间戳本身携带大量规律，可以拆出：</p>
+<ul>
+<li>数值型：年、月、日、小时、星期几（<code>dayofweek</code>）、一年中的第几天（<code>dayofyear</code>）、季度；</li>
+<li>布尔型：是否周末、是否节假日、是否月末/季末；</li>
+<li>类别型：星期几、月份（常做 one-hot 或目标编码）。</li>
+</ul>
+<h5 id="h-4周期编码sincos-变换">（4）周期编码：sin/cos 变换<a class="anchor" href="#h-4周期编码sincos-变换" aria-label="本节链接">#</a></h5>
+<p>直接拿&quot;月份 = 12&quot;和&quot;月份 = 1&quot;当数值，会让 12 月和 1 月看起来相距 11，但它们在日历上其实是<strong>相邻</strong>的（周而复始）。这种&quot;循环变量&quot;的正确编码是映射到圆上，用一对 sin/cos：</p>
+<pre><code>x_sin = sin(2π · k / period)
+x_cos = cos(2π · k / period)</code></pre>
+<p>其中 <code>period</code> 是周期（月份=12、星期=7、小时=24），<code>k</code> 是周期内的序号。sin 和 cos 成对使用，才能唯一确定圆周上的位置——只用其中一个，会在圆上&quot;上下对称&quot;造成信息丢失。这样 1 月和 12 月在二维空间里就真正相邻了。</p>
+<h5 id="h-5变换特征">（5）变换特征<a class="anchor" href="#h-5变换特征" aria-label="本节链接">#</a></h5>
+<p>差分、变化率等，帮助模型看到&quot;变化&quot;而非&quot;绝对水平&quot;：</p>
+<pre><code>diff_1  = y_{t} − y_{t-1}         # 一阶差分
+pct_chg = (y_t − y_{t-1}) / y_{t-1}  # 环比变化率</code></pre>
+<p>这类特征更平稳，对树模型尤其友好。</p>
+<h4 id="h-3-泄漏时间特征工程的生死线">3. 泄漏：时间特征工程的生死线<a class="anchor" href="#h-3-泄漏时间特征工程的生死线" aria-label="本节链接">#</a></h4>
+<p>构造特征时最常见的错误，是<strong>不小心用到了未来信息</strong>，典型场景：</p>
+<ul>
+<li>用全序列的均值/标准差做标准化，再拿去训练——标准化统计量应只用训练段计算；</li>
+<li>滑动窗口把当前期之后的点也卷进去（窗口没有&quot;对齐到过去&quot;）；</li>
+<li>对整个序列做 one-hot 或目标编码时，编码用了全量标签。</li>
+</ul>
+<p>泄漏会让验证集的指标<strong>虚高</strong>，上线后却崩盘。守则只有一条：<strong>构造第 t 期的特征时，只允许使用第 t 期及之前的信息。</strong></p>
+<p><figure><img class="md-img" src="content/courses/time-series/assets/chapter-3-figure-01.svg" alt="时间序列转监督学习表格：滞后、滚动、日历特征的构造示意" loading="lazy" decoding="async"><figcaption>时间序列转监督学习表格：滞后、滚动、日历特征的构造示意</figcaption></figure>
+</p>
+<h3 id="h-二可运行示例">二、可运行示例<a class="anchor" href="#h-二可运行示例" aria-label="本节链接">#</a></h3>
+<p>用 pandas 把一条日度序列摊平成监督学习表格。</p>
+<pre data-lang="python"><code class="language-python">import numpy as np
+import pandas as pd
+
+# 构造 120 天的日度序列（带周周期和轻微趋势）
+idx = pd.date_range(&quot;2023-01-01&quot;, periods=120, freq=&quot;D&quot;)
+rng = np.random.default_rng(2)
+y = 30 + 0.1 * np.arange(120) + 5 * np.sin(2 * np.pi * np.arange(120) / 7) \
+    + rng.normal(0, 2, size=120)
+df = pd.DataFrame({&quot;y&quot;: y}, index=idx)
+
+# 1) 滞后特征：前 1/2/3 天
+for lag in [1, 2, 3]:
+    df[f&quot;lag_{lag}&quot;] = df[&quot;y&quot;].shift(lag)
+
+# 2) 滚动窗口统计：过去 7 天的均值与标准差
+df[&quot;roll_mean_7&quot;] = df[&quot;y&quot;].shift(1).rolling(7).mean()
+df[&quot;roll_std_7&quot;] = df[&quot;y&quot;].shift(1).rolling(7).std()
+
+# 3) 日历特征
+df[&quot;dayofweek&quot;] = df.index.dayofweek          # 0=周一 ... 6=周日
+df[&quot;is_weekend&quot;] = (df[&quot;dayofweek&quot;] &gt;= 5).astype(int)
+df[&quot;dayofyear&quot;] = df.index.dayofyear
+
+# 4) 星期几的 sin/cos 周期编码（period=7）
+df[&quot;dow_sin&quot;] = np.sin(2 * np.pi * df[&quot;dayofweek&quot;] / 7)
+df[&quot;dow_cos&quot;] = np.cos(2 * np.pi * df[&quot;dayofweek&quot;] / 7)
+
+# 5) 差分与变化率
+df[&quot;diff_1&quot;] = df[&quot;y&quot;].diff()
+df[&quot;pct_chg&quot;] = df[&quot;y&quot;].pct_change()
+
+# 目标：预测下一天，所以把 y 前移作为标签
+df[&quot;target&quot;] = df[&quot;y&quot;].shift(-1)
+
+# 丢掉无法构造完整特征/标签的前几行，看看表格长什么样
+print(df.dropna().head(8).round(2))
+print(&quot;\n特征列：&quot;, [c for c in df.columns if c not in (&quot;y&quot;,)])</code></pre>
+<p>注意两处关键：滚动窗口用了 <code>.shift(1)</code> 先错开一天，保证窗口只含<strong>过去</strong>；标签用 <code>.shift(-1)</code> 取<strong>下一天</strong>的值。丢掉 <code>NaN</code> 行后，每一行就是&quot;用截至 t 期的特征预测 t+1 期&quot;的一个干净样本。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>增加一个 <code>roll_max_14</code>（过去 14 天最大值）和 <code>lag_7</code>（前 7 天），观察表格的变化，并说明为什么这些特征都必须先 <code>shift</code> 再 <code>rolling</code>。</li>
+<li>把序列改成小时级（<code>freq=&quot;h&quot;</code>），为&quot;小时&quot;构造 sin/cos 编码（period=24），并解释为什么小时适合用周期编码而&quot;年份&quot;通常不适合。</li>
+<li>找出上面代码里哪些特征存在泄漏风险（如果有），并修复它们；用一句话说明泄漏为什么危险。</li>
+<li>思考：树模型（如梯度提升）能直接利用&quot;滞后 7 期 = 上上周&quot;这种线性外推吗？如果不能，它靠什么捕捉趋势？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Hyndman &amp; Athanasopoulos《Forecasting: Principles and Practice》(3rd ed)，第 10 章「时间序列回归模型」：<a href="https://otexts.com/fpp3/regression.html" target="_blank" rel="noopener noreferrer">https://otexts.com/fpp3/regression.html</a></li>
+<li>pandas 官方文档 · <code>shift</code> / <code>rolling</code>：<a href="https://pandas.pydata.org/docs/reference/api/pandas.Series.shift.html" target="_blank" rel="noopener noreferrer">https://pandas.pydata.org/docs/reference/api/pandas.Series.shift.html</a></li>
+<li>scikit-learn 官方文档 · 时间相关特征工程（SplineTransformer/日期特征）：<a href="https://scikit-learn.org/stable/auto_examples/applications/plot_cyclical_feature_engineering.html" target="_blank" rel="noopener noreferrer">https://scikit-learn.org/stable/auto_examples/applications/plot_cyclical_feature_engineering.html</a></li>
+<li>Kaggle · 时间序列特征工程教程（周期编码）：<a href="https://www.kaggle.com/code/ryanholbrook/seasonality" target="_blank" rel="noopener noreferrer">https://www.kaggle.com/code/ryanholbrook/seasonality</a></li>
+</ul>
+<p><a href="#/l/ts-ch3-l2">下一课：机器学习回归预测</a></p>

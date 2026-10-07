@@ -1,0 +1,84 @@
+<h2 id="h-prefix-caching">prefix caching<a class="anchor" href="#h-prefix-caching" aria-label="本节链接">#</a></h2>
+<p>投机解码靠&quot;猜&quot;来少算，这一课靠&quot;复用&quot;来少算。回想 KV Cache 的本质：对给定前缀，注意力计算出的 K、V 是<strong>确定性的</strong>，跟后面接什么完全无关。于是就有了一个朴素而强大的想法——<strong>如果两个请求共享同一段前缀（prefix），这段前缀的 KV Cache 只需要算一次，之后直接复用</strong>。这就是 <strong>prefix caching（前缀缓存）</strong>。在系统提示词、少样本示例、RAG 文档、多轮对话这类&quot;前缀高度重复&quot;的场景里，它能省下可观的预填充计算。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-前缀为什么能复用">1. 前缀为什么能复用<a class="anchor" href="#h-1-前缀为什么能复用" aria-label="本节链接">#</a></h4>
+<p>因果注意力里，第 <code>i</code> 个 token 只能看到 <code>0..i</code> 的 token，所以第 <code>i</code> 个位置的 K、V 只由 <code>token[0..i]</code> 决定，与 <code>i</code> 之后的内容无关。因此两段序列 <code>P + A</code> 和 <code>P + B</code>（<code>P</code> 是共同前缀），在 <code>P</code> 这一段产生的 KV Cache 完全一致。第一个请求算出 <code>P</code> 的 KV 后把它缓存下来，第二个请求就不用再算，直接跳过 <code>P</code> 的预填充，从 <code>A</code> 开始算。</p>
+<p>能省多少取决于<strong>前缀重复率</strong>。典型受益场景：</p>
+<ul>
+<li><strong>固定系统提示词</strong>：所有请求都带同一大段 system prompt，它的 KV 只需算一次；</li>
+<li><strong>少样本示例（few-shot）</strong>：每次请求前面都拼同样的几个示例；</li>
+<li><strong>RAG / 检索增强</strong>：同一批文档被反复塞进不同问题里；</li>
+<li><strong>多轮对话</strong>：新一轮 = 上一轮全部内容 + 新问题，前缀就是上一轮整段对话；</li>
+<li><strong>多采样 / 评测</strong>：同一 prompt 采样多个回答，前缀完全相同。</li>
+</ul>
+<h4 id="h-2-如何判定前缀相同基于块的哈希">2. 如何判定&quot;前缀相同&quot;：基于块的哈希<a class="anchor" href="#h-2-如何判定前缀相同基于块的哈希" aria-label="本节链接">#</a></h4>
+<p>前缀缓存不是逐 token 比较（那样本身就很慢），而是把 KV 按<strong>块（block/token 块）</strong>组织——这正好和 PagedAttention 的块式 KV 管理天然契合。给每个块的内容算一个<strong>哈希值</strong>，存进哈希表；新请求到来时，逐块计算哈希并查表，命中则复用，未命中则新建。命中的粒度是&quot;块&quot;，所以也叫 <strong>block-level prefix caching</strong>。</p>
+<p>vLLM 把这一整套做成<strong>自动前缀缓存（Automatic Prefix Caching，APC）</strong>：用户无需任何标注，引擎在调度时自动识别并复用相同的 token 块前缀。SGLang 则用 <strong>RadixAttention</strong>——把缓存的 KV 组织成一棵<strong>基数树（radix tree / trie）</strong>，树的每条路径对应一段 token 序列，公共前缀在树上自然共享，命中查找、插入、淘汰都更结构化，尤其擅长处理&quot;海量请求共享不同长度公共前缀&quot;的情况。</p>
+<h4 id="h-3-缓存的生命周期与淘汰">3. 缓存的生命周期与淘汰<a class="anchor" href="#h-3-缓存的生命周期与淘汰" aria-label="本节链接">#</a></h4>
+<p>缓存的 KV 放在显存里，而显存是稀缺资源，必须淘汰。常见策略是 <strong>LRU（最近最少使用）</strong>：久未命中的块被优先驱逐，腾出空间给新块。一个关键权衡是：<strong>缓存命中收益 vs 显存占用成本</strong>。缓存占用的显存越多，可同时服务的&quot;活跃 KV&quot;就越少，可能反而降低并发吞吐。所以引擎通常让前缀缓存与正常 KV 共享同一块池，由调度器统一管理，命中率与吞吐在动态中取得平衡。</p>
+<h4 id="h-4-什么时候收益最大">4. 什么时候收益最大<a class="anchor" href="#h-4-什么时候收益最大" aria-label="本节链接">#</a></h4>
+<p>前缀缓存的收益取决于两个因素：<strong>前缀重复率</strong>和<strong>前缀长度占比</strong>。前缀越长、重复越频繁，省的预填充就越多。反之，如果每个请求都是完全不同的长文（前缀几乎不重复），缓存不但没用还占显存。因此在设计服务时，<strong>把稳定不变的内容放在序列前面</strong>（system prompt、示例、文档在前，用户问题在后）能最大化命中；把每次都会变的内容放前面则会打散公共前缀，命中率骤降。</p>
+<p><figure><img class="md-img" src="content/courses/llm-inference-optimization/assets/chapter-6-figure-03.svg" alt="前缀缓存示意：两个共享前缀 P 的请求，P 的 KV 只算一次并复用；未命中部分各自计算" loading="lazy" decoding="async"><figcaption>前缀缓存示意：两个共享前缀 P 的请求，P 的 KV 只算一次并复用；未命中部分各自计算</figcaption></figure>
+</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<h4 id="h-示例-1用哈希表手写一个简化版前缀缓存">示例 1：用哈希表手写一个简化版前缀缓存<a class="anchor" href="#h-示例-1用哈希表手写一个简化版前缀缓存" aria-label="本节链接">#</a></h4>
+<p>下面用&quot;块 + 哈希&quot;的思路模拟前缀缓存：把输入序列切成块，用哈希判断两块是否相同，命中则复用（不重复&quot;计算&quot;），未命中则标记为需计算。用&quot;计算一次 KV&quot;抽象为计数，直观展示能省多少。</p>
+<pre data-lang="python"><code class="language-python">def block_hash(block):
+    &quot;&quot;&quot;模拟 KV 块的哈希：真实实现用内容摘要（如 xxHash）。&quot;&quot;&quot;
+    return hash(tuple(block))
+
+def simulate_prefix_cache(requests, block_size=2):
+    &quot;&quot;&quot;requests: 一串 token 序列列表。返回每个请求里&#39;需要新计算&#39;的块数。&quot;&quot;&quot;
+    cache = set()          # 已缓存块哈希
+    stats = []
+    for tokens in requests:
+        computed = 0
+        # 按块切分，逐块查哈希表
+        for i in range(0, len(tokens), block_size):
+            blk = tokens[i:i+block_size]
+            h = block_hash(blk)
+            if h in cache:
+                continue            # 命中：复用，不重复计算
+            cache.add(h)            # 未命中：计算并缓存
+            computed += 1
+        stats.append(computed)
+    return stats
+
+# 三个请求：前两个共享前缀 &quot;SYSTEM_PROMPT&quot;，第三个是全新内容
+requests = [
+    [&quot;SYS&quot;, &quot;PROMPT&quot;, &quot;what&quot;, &quot;is&quot;, &quot;AI&quot;],
+    [&quot;SYS&quot;, &quot;PROMPT&quot;, &quot;what&quot;, &quot;is&quot;, &quot;ML&quot;],
+    [&quot;SYS&quot;, &quot;PROMPT&quot;, &quot;tell&quot;, &quot;me&quot;, &quot;jokes&quot;],
+]
+blocksize = 2
+stats = simulate_prefix_cache(requests, blocksize)
+for i, s in enumerate(requests):
+    print(f&quot;请求{i}: {s} -&gt; 需计算块数 {stats[i]}&quot;)
+
+total_new = sum(stats)
+total_all = sum(len(r) // blocksize for r in requests)
+print(f&quot;总共 {total_all} 块中，实际只计算了 {total_new} 块，复用 {total_all - total_new} 块&quot;)</code></pre>
+<p>三个请求共享 <code>[&quot;SYS&quot;, &quot;PROMPT&quot;]</code> 这个前缀块，它只被计算一次，后两个请求直接复用——这就是 prefix caching 省算力的本质。把 <code>block_size</code> 改成 1，你会看到命中的粒度更细（但哈希查表次数更多），体现了&quot;块粒度&quot;的权衡。</p>
+<h4 id="h-示例-2vllm-与-sglang-开启前缀缓存">示例 2：vLLM 与 SGLang 开启前缀缓存<a class="anchor" href="#h-示例-2vllm-与-sglang-开启前缀缓存" aria-label="本节链接">#</a></h4>
+<p>vLLM 的 APC 默认对可用场景自动生效（也可显式开关）：</p>
+<pre data-lang="bash"><code class="language-bash"># vLLM：--enable-prefix-caching 显式开启自动前缀缓存
+vllm serve meta-llama/Llama-3.1-8B-Instruct --enable-prefix-caching</code></pre>
+<p>SGLang 的 RadixAttention 默认开启，且其调度器围绕前缀复用做了深度优化：</p>
+<pre data-lang="bash"><code class="language-bash"># SGLang：默认即启用 RadixAttention 前缀复用
+python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct</code></pre>
+<p>两者都不需要你改请求代码——只要把&quot;稳定的公共内容放前面&quot;，引擎就会自动命中复用。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>把示例 1 的请求改成&quot;每个请求前缀都不同&quot;，观察复用块数降为 0；再把公共前缀拆开放到序列中间，说明&quot;公共前缀被拆散&quot;为何会破坏命中。</li>
+<li>说明 prefix caching 与 PagedAttention 的&quot;块式 KV 管理&quot;为什么天然契合：为何按块而非按 token 缓存更高效？</li>
+<li>对比 LRU 与&quot;永不淘汰&quot;两种缓存策略在多轮长对话 + 高并发场景下的吞吐差异，说明显存占用与命中率之间的权衡。</li>
+<li>用 vLLM 起一个带 <code>--enable-prefix-caching</code> 的服务，构造一组共享长 system prompt 的请求，对比开/关缓存时的 TTFT 与预填充耗时变化。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>vLLM 文档 · Automatic Prefix Caching：<a href="https://docs.vllm.ai/en/latest/automatic_prefix_caching/apc.html" target="_blank" rel="noopener noreferrer">https://docs.vllm.ai/en/latest/automatic_prefix_caching/apc.html</a></li>
+<li>SGLang 项目与 RadixAttention 说明：<a href="https://github.com/sgl-project/sglang" target="_blank" rel="noopener noreferrer">https://github.com/sgl-project/sglang</a></li>
+<li>vLLM: Easy, Fast, and Cheap LLM Serving with PagedAttention：<a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2309.06180</a></li>
+<li>关于前缀共享与 KV Cache 复用：<a href="https://lmsys.org/blog/2024-01-17-sglang/" target="_blank" rel="noopener noreferrer">https://lmsys.org/blog/2024-01-17-sglang/</a></li>
+</ul>
+<p><a href="#/l/inf-ch7-l1">下一课：API 与流式</a></p>

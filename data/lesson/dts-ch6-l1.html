@@ -1,0 +1,284 @@
+<h2 id="h-zero-123-与-fsdp分片对象通信代价与适用场景">ZeRO-1/2/3 与 FSDP：分片对象、通信代价与适用场景<a class="anchor" href="#h-zero-123-与-fsdp分片对象通信代价与适用场景" aria-label="本节链接">#</a></h2>
+<p>上一章结尾你已经能给并行方案分工。可只要动手配一次真实模型，最先撞上的不是通信、而是显存：8.72B 参数的模型，即使用 bf16 存参数，混合精度 Adam 的<strong>模型状态</strong>也要 130 GiB——单卡装不下，而数据并行本来是要每张卡都存一份完整副本的。ZeRO 的全部内容只有一句话：<strong>把这份副本切开</strong>。这一课把&quot;切什么&quot;与&quot;切了要多付多少通信&quot;做成可打印的账本。</p>
+<p><figure><img class="md-img" src="content/courses/distributed-training-systems/assets/chapter-6-figure-01.svg" alt="把数据并行的副本切成三份：ZeRO 三档" loading="lazy" decoding="async"><figcaption>把数据并行的副本切成三份：ZeRO 三档</figcaption></figure>
+</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-数据并行的内存困境模型状态被复制了-p-份">1. 数据并行的内存困境：模型状态被复制了 P 份<a class="anchor" href="#h-1-数据并行的内存困境模型状态被复制了-p-份" aria-label="本节链接">#</a></h4>
+<p>数据并行（DP）的目标是让 P 张卡算不同的数据，但每张卡必须持有<strong>完整的模型状态</strong>才能做前向和反向。混合精度 Adam 的账本是固定的（单位：字节/参数）：</p>
+<table>
+<thead>
+<tr>
+<th>组成</th>
+<th>精度</th>
+<th>字节/参数</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>模型参数</td>
+<td>fp16 / bf16</td>
+<td>2</td>
+<td>前向反向用的那份</td>
+</tr>
+<tr>
+<td>梯度</td>
+<td>fp16 / bf16</td>
+<td>2</td>
+<td>反向产出、AllReduce 后同步</td>
+</tr>
+<tr>
+<td>主权重 master weight</td>
+<td>fp32</td>
+<td>4</td>
+<td>更新必须落在高精度副本上</td>
+</tr>
+<tr>
+<td>Adam 一阶动量 m</td>
+<td>fp32</td>
+<td>4</td>
+<td>优化器状态</td>
+</tr>
+<tr>
+<td>Adam 二阶动量 v</td>
+<td>fp32</td>
+<td>4</td>
+<td>优化器状态</td>
+</tr>
+<tr>
+<td><strong>合计</strong></td>
+<td></td>
+<td><strong>16</strong></td>
+<td>ZeRO 论文的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">16Ψ</span></span></span></span> 口径</td>
+</tr>
+</tbody></table>
+<p><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">Ψ</span></span></span></span> 表示参数量。这张表解释了两件事：第一，优化器状态（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">12Ψ</span></span></span></span>）占了 75%，但它<strong>只在参数更新那一步被用到</strong>；第二，参数与梯度（各 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">2Ψ</span></span></span></span>）在每一步的前向反向里都要用。切分谁，代价完全不同——这正是 ZeRO 分三档的原因。</p>
+<h4 id="h-2-三档切法math4-越大省得越多但收益有上限">2. 三档切法：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span></span></span></span> 越大，省得越多，但收益有上限<a class="anchor" href="#h-2-三档切法math4-越大省得越多但收益有上限" aria-label="本节链接">#</a></h4>
+<p>设数据并行组内有 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span></span></span></span> 张卡（ZeRO 论文用 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.109em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">d</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 表示），每卡每参数字节数如下：</p>
+<table>
+<thead>
+<tr>
+<th>档位</th>
+<th>切什么</th>
+<th>每卡每参数（B）</th>
+<th>大 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span></span></span></span> 极限</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>ZeRO-0 / 纯 DP</td>
+<td>不切</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">16</span></span></span></span></td>
+<td>16</td>
+</tr>
+<tr>
+<td>ZeRO-1</td>
+<td>优化器状态</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">4</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">12/</span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span></span></span></span></td>
+<td>4</td>
+</tr>
+<tr>
+<td>ZeRO-2</td>
+<td>优化器状态 + 梯度</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">2</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">14/</span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span></span></span></span></td>
+<td>2</td>
+</tr>
+<tr>
+<td>ZeRO-3</td>
+<td>优化器状态 + 梯度 + 参数</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">16/</span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span></span></span></span></td>
+<td>0</td>
+</tr>
+</tbody></table>
+<p>代进刚算的例子：8.72B 模型（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">16Ψ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">130</span></span></span></span> GiB），<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">8</span></span></span></span> 时从 130 GiB 降到 ZeRO-1 的 44.7 GiB、ZeRO-2 的 30.5 GiB、ZeRO-3 的 16.3 GiB；<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">64</span></span></span></span> 时 ZeRO-3 只剩 2.0 GiB。注意&quot;极限&quot;那一列：ZeRO-1/2 的收益<strong>很快饱和</strong>（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">64</span></span></span></span> 已经拿到大部分好处），而 ZeRO-3 可以随 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span></span></span></span> 线性下降——这也是它能训练万亿参数的唯一原因。</p>
+<h4 id="h-3-通信代价三档分别多付多少">3. 通信代价：三档分别多付多少<a class="anchor" href="#h-3-通信代价三档分别多付多少" aria-label="本节链接">#</a></h4>
+<p>切分不是免费的。反向必须先得到完整梯度才能更新，所以无论哪一档，每步都要做一次 <strong>reduce-scatter + all-gather</strong>（第 2 章讲过：这就是 ring AllReduce 的两个阶段，每卡搬迁量 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">2</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span><span class="mord">/</span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">Ψ</span></span></span></span>）。</p>
+<table>
+<thead>
+<tr>
+<th>档位</th>
+<th>每步的集合通信</th>
+<th>相对纯 DP</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>纯 DP / ZeRO-1</td>
+<td>reduce-scatter + all-gather</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1</span><span class="mord">×</span></span></span></span></td>
+</tr>
+<tr>
+<td>ZeRO-2</td>
+<td>同上，但分片梯度需要额外一次 all-gather 才能凑齐</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">2</span><span class="mord">×</span></span></span></span></td>
+</tr>
+<tr>
+<td>ZeRO-3</td>
+<td>前向 all-gather 参数、反向再 all-gather 参数、反向 reduce-scatter 梯度</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">3</span><span class="mord">×</span></span></span></span></td>
+</tr>
+</tbody></table>
+<p>关键点是这个比例与 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span></span></span></span> 无关：ZeRO-3 的通信量始终是纯 DP 的 3 倍。实际实现用两个手段打掉这堵墙：通信与计算重叠，以及<strong>只在需要时 all-gather 当前层的参数</strong>（用完立刻释放）。</p>
+<h4 id="h-4-fsdp-是什么把-zero-3-做成框架原语">4. FSDP 是什么：把 ZeRO-3 做成框架原语<a class="anchor" href="#h-4-fsdp-是什么把-zero-3-做成框架原语" aria-label="本节链接">#</a></h4>
+<p>FSDP（Fully Sharded Data Parallel，全分片数据并行）是 PyTorch 原生实现，思路与 ZeRO-3 同类但粒度不同：它把模型<strong>按单元</strong>拆开，每个单元的参数 flatten 成一个 flat parameter，单元计算前 all-gather、算完立刻释放，反向时再 all-gather，梯度用 reduce-scatter 回收。单元边界决定重叠质量——太小摊不掉启动延迟，太大压不住峰值显存。</p>
+<p>选型可以记成三条：</p>
+<ol>
+<li><strong>单卡装得下完整模型状态、只想省显存</strong> → ZeRO-1，零额外通信。</li>
+<li><strong>梯度本身是瓶颈</strong> → ZeRO-2。</li>
+<li><strong>参数都装不下</strong> → ZeRO-3 / FSDP，接受 3 倍通信与更多往返。</li>
+</ol>
+<h4 id="h-5-常见坑">5. 常见坑<a class="anchor" href="#h-5-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>把 ZeRO-3 当成&quot;无脑更快&quot;</strong>：它省显存，但通信 3 倍、每层多两次同步；小模型上 ZeRO-1 往往更快。</li>
+<li><strong>以为切了优化器状态就等于省下梯度</strong>：ZeRO-1 里梯度仍是每卡完整一份 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">2Ψ</span></span></span></span>。</li>
+<li><strong>在很小的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span></span></span></span> 上期待线性收益</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">12/</span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span></span></span></span> 在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">8</span></span></span></span> 时只把 12 压到 1.5。</li>
+<li><strong>忽略参数 all-gather 的往返次数</strong>：ZeRO-3 每层多一次同规模通信，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span> 按层数累加。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>纯 Python，不需要 GPU。第一段把账本算出来；第二段把三种并行/分片方案的通信量换成毫秒。</p>
+<pre data-lang="python"><code class="language-python"># ===== 示例 1：模型的显存账本 —— 固定部分与可切分部分 =====
+# 混合精度 Adam 的账本（单位 B/参数）：参数 2 + 梯度 2 + 优化器状态 12（主权重 4 + 一阶 4 + 二阶 4）
+BYTES = {&quot;params&quot;: 2, &quot;grads&quot;: 2, &quot;master&quot;: 4, &quot;m&quot;: 4, &quot;v&quot;: 4}
+WORLD = sum(BYTES.values())
+G = 1_000_000_000
+
+def n_params(vocab, hidden, layers, ffn=None):
+    &quot;&quot;&quot;Llama 式架构的参数量估算：每层 4 个注意力投影 + 3 个 MLP 矩阵，加嵌入与输出头。&quot;&quot;&quot;
+    ffn = ffn or 4 * hidden
+    return (4 * hidden * hidden + 3 * hidden * ffn) * layers + vocab * hidden + hidden
+
+def per_param(P, zero):
+    &quot;&quot;&quot;每卡每个参数字节数。P 为同一个数据并行组内的卡数。&quot;&quot;&quot;
+    if zero == 0: return WORLD                                  # 完全复制
+    if zero == 1: return BYTES[&quot;params&quot;] + BYTES[&quot;grads&quot;] + (BYTES[&quot;master&quot;] + BYTES[&quot;m&quot;] + BYTES[&quot;v&quot;]) / P
+    if zero == 2: return BYTES[&quot;params&quot;] + (BYTES[&quot;grads&quot;] + BYTES[&quot;master&quot;] + BYTES[&quot;m&quot;] + BYTES[&quot;v&quot;]) / P
+    return WORLD / P                                             # 参数、梯度、优化器状态全切
+
+print(&quot;混合精度 Adam 的固定账本：&quot;, BYTES, &quot;合计&quot;, WORLD, &quot;B/参数&quot;)
+print(&quot;\n参数量估算（示例配置，不对应任何具体发布的模型）：&quot;)
+cfgs = ((&quot;hidden 1024 / 24 层 / vocab 32k&quot;, (32768, 1024, 24)),
+        (&quot;hidden 4096 / 32 层 / vocab 32k&quot;, (32768, 4096, 32)),
+        (&quot;hidden 12288 / 96 层 / vocab 50k&quot;, (50257, 12288, 96)))
+for name, cfg in cfgs:
+    print(f&quot;  {name:&lt;34} {n_params(*cfg) / G:7.2f}B&quot;)
+
+print(&quot;\n每卡每参数字节数（P 是数据并行组内卡数，越小越省）：&quot;)
+for P in (1, 8, 64, 512, 4096):
+    print(f&quot;  P={P:&lt;5} &quot; + &quot;  &quot;.join(f&quot;ZeRO-{z}: {per_param(P, z):7.3f}&quot; for z in range(4)))
+
+print(&quot;\n把 8.72B 模型塞进各组：每卡模型状态（GiB）&quot;)
+N = n_params(32768, 4096, 32)
+for P in (1, 8, 64, 512):
+    row = &quot;  &quot;.join(f&quot;ZeRO-{z} {N * per_param(P, z) / 2**30:8.2f}&quot; for z in range(4))
+    print(f&quot;  P={P:&lt;4} {row}&quot;)
+
+print(&quot;\n把 232.55B 模型塞进各组：每卡模型状态（TiB）&quot;)
+N2 = n_params(50257, 12288, 96)
+for P in (64, 512, 2048):
+    row = &quot;  &quot;.join(f&quot;ZeRO-{z} {N2 * per_param(P, z) / 2**40:8.3f}&quot; for z in range(4))
+    print(f&quot;  P={P:&lt;4} {row}&quot;)
+
+print(&quot;\n渐进口径：P→∞ 时 ZeRO-1 每卡 4 B/参数、ZeRO-2 每卡 2 B/参数、ZeRO-3 趋近 0&quot;)
+for P in (8, 64, 512, 4096):
+    print(f&quot;  P={P:&lt;5} ZeRO-1 {per_param(P,1):6.3f}  ZeRO-2 {per_param(P,2):6.3f}  ZeRO-3 {per_param(P,3):7.4f}&quot;)</code></pre>
+<p>在 Python 3.14.5（仅标准库）下实际运行结果：</p>
+<pre data-lang="text"><code class="language-text">混合精度 Adam 的固定账本： {&#39;params&#39;: 2, &#39;grads&#39;: 2, &#39;master&#39;: 4, &#39;m&#39;: 4, &#39;v&#39;: 4} 合计 16 B/参数
+
+参数量估算（示例配置，不对应任何具体发布的模型）：
+  hidden 1024 / 24 层 / vocab 32k        0.44B
+  hidden 4096 / 32 层 / vocab 32k        8.72B
+  hidden 12288 / 96 层 / vocab 50k     232.55B
+
+每卡每参数字节数（P 是数据并行组内卡数，越小越省）：
+  P=1     ZeRO-0:  16.000  ZeRO-1:  16.000  ZeRO-2:  16.000  ZeRO-3:  16.000
+  P=8     ZeRO-0:  16.000  ZeRO-1:   5.500  ZeRO-2:   3.750  ZeRO-3:   2.000
+  P=64    ZeRO-0:  16.000  ZeRO-1:   4.188  ZeRO-2:   2.219  ZeRO-3:   0.250
+  P=512   ZeRO-0:  16.000  ZeRO-1:   4.023  ZeRO-2:   2.027  ZeRO-3:   0.031
+  P=4096  ZeRO-0:  16.000  ZeRO-1:   4.003  ZeRO-2:   2.003  ZeRO-3:   0.004
+
+把 8.72B 模型塞进各组：每卡模型状态（GiB）
+  P=1    ZeRO-0   130.00  ZeRO-1   130.00  ZeRO-2   130.00  ZeRO-3   130.00
+  P=8    ZeRO-0   130.00  ZeRO-1    44.69  ZeRO-2    30.47  ZeRO-3    16.25
+  P=64   ZeRO-0   130.00  ZeRO-1    34.02  ZeRO-2    18.03  ZeRO-3     2.03
+  P=512  ZeRO-0   130.00  ZeRO-1    32.69  ZeRO-2    16.47  ZeRO-3     0.25
+
+把 232.55B 模型塞进各组：每卡模型状态（TiB）
+  P=64   ZeRO-0    3.384  ZeRO-1    0.886  ZeRO-2    0.469  ZeRO-3    0.053
+  P=512  ZeRO-0    3.384  ZeRO-1    0.851  ZeRO-2    0.429  ZeRO-3    0.007
+  P=2048 ZeRO-0    3.384  ZeRO-1    0.847  ZeRO-2    0.424  ZeRO-3    0.002
+
+渐进口径：P→∞ 时 ZeRO-1 每卡 4 B/参数、ZeRO-2 每卡 2 B/参数、ZeRO-3 趋近 0
+  P=8     ZeRO-1  5.500  ZeRO-2  3.750  ZeRO-3  2.0000
+  P=64    ZeRO-1  4.188  ZeRO-2  2.219  ZeRO-3  0.2500
+  P=512   ZeRO-1  4.023  ZeRO-2  2.027  ZeRO-3  0.0312
+  P=4096  ZeRO-1  4.003  ZeRO-2  2.003  ZeRO-3  0.0039</code></pre>
+<p>三行结论：16 B/参数是基准；ZeRO-1 在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">8</span></span></span></span> 就砍掉三分之二；ZeRO-1/2 的收益随 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span></span></span></span> 迅速饱和（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">512</span></span></span></span> 时 4.02 与 2.03 已接近极限 4 与 2），只有 ZeRO-3 线性下降。</p>
+<pre data-lang="python"><code class="language-python"># ===== 示例 2：把 ZeRO 三档的通信代价换成毫秒（α-β 模型，无 GPU） =====
+ALPHA_US, BETA_GBPS = 5.0, 25.0          # 示例链路：跨机 25 GB/s 级 + 5 μs 单跳延迟
+def t_ms(nbytes, rounds, alpha=ALPHA_US, beta=BETA_GBPS):
+    &quot;&quot;&quot;T = rounds·α + V/β（α、β 用示例值，请换成本机实测）。&quot;&quot;&quot;
+    return (rounds * alpha + nbytes / (beta * 1e3)) / 1e3
+
+def ring_bytes(psi, P):
+    &quot;&quot;&quot;ring AllReduce 每卡的收发量：2(P-1)/P × Ψ。&quot;&quot;&quot;
+    return 2 * (P - 1) / P * psi
+
+psi = 8.72e9 * 2                          # 8.72B 参数的 fp16 梯度
+print(f&quot;Ψ = {psi/2**30:.2f} GiB；ring 每卡收发 2(P-1)/P·Ψ，大 P 时封顶在 2Ψ&quot;)
+plan = ((0, &quot;纯 DP / ZeRO-1：reduce-scatter + all-gather = 2Ψ&quot;, 2, 64),
+        (2, &quot;ZeRO-2：梯度也切，额外一次 all-gather = 4Ψ&quot;, 4, 128),
+        (3, &quot;ZeRO-3：参数也切，前向/反向各 all-gather + reduce-scatter = 6Ψ&quot;, 6, 192))
+for _, desc, mult, rounds in plan:
+    V = mult * psi
+    print(f&quot;  {desc}&quot;)
+    print(f&quot;      总量 {V/2**30:6.2f} GiB，{rounds} 次往返 → 下界 {t_ms(V, rounds):9.1f} ms/步&quot;)
+    print(f&quot;      换 β=5 GB/s 的悲观链路 → {t_ms(V, rounds, beta=5.0):9.1f} ms/步&quot;)
+
+print(&quot;\n对照：优化器状态放回 CPU（PCIe 单向 12 GB/s 示例值）&quot;)
+opt, grad = 12 * 8.72e9, 2 * 8.72e9
+print(f&quot;  优化器状态 {opt/2**30:6.2f} GiB + 梯度 {grad/2**30:6.2f} GiB → &quot;
+      f&quot;{t_ms(opt + grad, 4, beta=12.0):9.1f} ms/步（还要与计算抢这条链路）&quot;)
+
+print(&quot;\nZeRO-3 相对纯 DP 的通信倍数（只看带宽项，与 P 无关）：&quot;)
+for P in (8, 64, 512):
+    print(f&quot;  P={P:&lt;5} {ring_bytes(psi,P)*3/(ring_bytes(psi,P)):.2f}×  &quot;
+          f&quot;（{ring_bytes(psi,P)*3/2**30:.2f} GiB vs {ring_bytes(psi,P)/2**30:.2f} GiB）&quot;)</code></pre>
+<p>实测输出：</p>
+<pre data-lang="text"><code class="language-text">Ψ = 16.24 GiB；ring 每卡收发 2(P-1)/P·Ψ，大 P 时封顶在 2Ψ
+  纯 DP / ZeRO-1：reduce-scatter + all-gather = 2Ψ
+      总量  32.48 GiB，64 次往返 → 下界    1395.5 ms/步
+      换 β=5 GB/s 的悲观链路 →    6976.3 ms/步
+  ZeRO-2：梯度也切，额外一次 all-gather = 4Ψ
+      总量  64.97 GiB，128 次往返 → 下界    2791.0 ms/步
+      换 β=5 GB/s 的悲观链路 →   13952.6 ms/步
+  ZeRO-3：参数也切，前向/反向各 all-gather + reduce-scatter = 6Ψ
+      总量  97.45 GiB，192 次往返 → 下界    4186.6 ms/步
+      换 β=5 GB/s 的悲观链路 →   20929.0 ms/步
+
+对照：优化器状态放回 CPU（PCIe 单向 12 GB/s 示例值）
+  优化器状态  97.45 GiB + 梯度  16.24 GiB →   10173.4 ms/步（还要与计算抢这条链路）
+
+ZeRO-3 相对纯 DP 的通信倍数（只看带宽项，与 P 无关）：
+  P=8     3.00×  （85.27 GiB vs 28.42 GiB）
+  P=64    3.00×  （95.93 GiB vs 31.98 GiB）
+  P=512   3.00×  （97.26 GiB vs 32.42 GiB）</code></pre>
+<p><code>rounds</code> 只是把 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span> 次数显式写出来的教学参数：真实系统里 ZeRO-3 的往返次数等于&quot;参数 all-gather 次数&quot;，而带宽项 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.2222em;">V</span><span class="mord">/</span><span class="mord mathnormal" style="margin-right:0.0528em;">β</span></span></span></span> 与往返次数无关——所以&quot;省显存&quot;的价格可以精确归结为&quot;带宽项 ×3，另加按层数计的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span>&quot;。</p>
+<p><strong>可选，需要自备或云上按需 1<del>2 卡</strong>（没有卡也能完成本课，上面两段已经够用）：想验证真实 ZeRO 行为，用 <code>torchrun</code> 在 1</del>2 卡上跑一个玩具模型，并打印每卡显存：</p>
+<pre data-lang="bash"><code class="language-bash">nvidia-smi &amp;&amp; nvidia-smi topo -m        # 当前显存与拓扑（单卡也能跑）
+# 1~2 卡上用 FSDP2 的 fully_shard 包一层，观察显存变化（示例骨架，按本机版本调整）
+#    from torch.distributed.fsdp import fully_shard
+#    torchrun --standalone --nproc_per_node=2 train.py
+# 打开 NCCL 日志确认集合通信确实变多（ZeRO-3 应能看到 all_gather / reduce_scatter）
+NCCL_DEBUG=INFO torchrun --standalone --nproc_per_node=2 train.py 2&gt;&amp;1 | grep -E &quot;AllGather|ReduceScatter&quot;</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：把 <code>per_param</code> 改成支持&quot;梯度也用 fp32 累加&quot;的口径（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">16</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">→</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">20</span></span></span></span> B/参数），重算 8.72B 模型在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">8</span></span></span></span> 与 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">64</span></span></span></span> 下的每卡账本，并指出哪一档受影响最大。</li>
+<li><strong>解释</strong>：为什么 ZeRO-1 与 ZeRO-2 的收益随 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span></span></span></span> 迅速饱和，而 ZeRO-3 不会？用第 2 节的两个公式（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">4</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">12/</span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span></span></span></span> 与 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">16/</span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span></span></span></span>）分别求&quot;<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span></span></span></span> 再翻一倍还能省多少&quot;。</li>
+<li><strong>对比/验证</strong>：把示例 2 的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0528em;">β</span></span></span></span> 换成 300 GB/s（同机 NVLink 级），重算三档的通信下界；再算一遍 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">8</span></span></span></span> 与 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">512</span></span></span></span> 的差值，说明&quot;什么时候加卡不再有用&quot;。</li>
+<li><strong>思考</strong>：某任务用 ZeRO-3 后吞吐下降到原来的 60%，但显存从 70 GiB 降到 18 GiB。列出三种可能原因，并各给一个只靠日志/计时的验证方法。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>S. Rajbhandari, J. Rasley, O. Ruwase, Y. He, <em>ZeRO: Memory Optimizations Toward Training Trillion Parameter Models</em>, SC&#39;20（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">16Ψ</span></span></span></span> 模型状态账本、ZeRO 三档的分片对象与通信量 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">2Ψ/4Ψ/6Ψ</span></span></span></span> 口径，本课第 1~3 节）：<a href="https://arxiv.org/abs/1910.02054" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1910.02054</a></li>
+<li>Microsoft DeepSpeed, <em>ZeRO Tutorial</em>（DeepSpeed 侧 ZeRO-1/2/3 的配置项与启用方式，即&quot;哪一档切什么&quot;在框架里的落点）：<a href="https://www.deepspeed.ai/tutorials/zero/" target="_blank" rel="noopener noreferrer">https://www.deepspeed.ai/tutorials/zero/</a></li>
+<li>PyTorch, <em>FullyShardedDataParallel</em>（FSDP 的官方文档：按单元 shard、all-gather 参数与 reduce-scatter 梯度的接口语义；本课第 4 节）：<a href="https://pytorch.org/docs/stable/fsdp.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/docs/stable/fsdp.html</a></li>
+<li>P. Patarasuk, X. Yuan, <em>Bandwidth optimal all-reduce algorithms for clusters of workstations</em>, J. Parallel Distrib. Comput. 69(2)（ring AllReduce 的 reduce-scatter + allgather 结构与 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">2</span><span class="mopen">(</span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span><span class="mord">/</span><span class="mord mathnormal">p</span></span></span></span> 通信量，本课&quot;每步通信&quot;账的算法依据）：<a href="https://doi.org/10.1016/j.jpdc.2008.09.002" target="_blank" rel="noopener noreferrer">https://doi.org/10.1016/j.jpdc.2008.09.002</a></li>
+</ul>
+<p><a href="lesson-02.md">下一课：激活重计算：显存-算力权衡的定量分析</a></p>

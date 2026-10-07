@@ -1,0 +1,96 @@
+<h2 id="h-吞吐-vs-延迟与-continuous-batching">吞吐 vs 延迟与 continuous batching<a class="anchor" href="#h-吞吐-vs-延迟与-continuous-batching" aria-label="本节链接">#</a></h2>
+<p>前两课讲了延迟的两个指标，这一课把它们与<strong>吞吐</strong>放到天平两端，并引入现代推理引擎最核心的一项调度技术——<strong>continuous batching（连续批处理）</strong>。正是它，让 vLLM 等引擎能比朴素的静态批处理把吞吐提高数倍，同时控制住延迟。学完本课，你应当能解释&quot;静态批处理浪费在哪&quot;，以及&quot;连续批处理如何用分时复用把 GPU 喂饱&quot;。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-吞吐与延迟的跷跷板">1. 吞吐与延迟的跷跷板<a class="anchor" href="#h-1-吞吐与延迟的跷跷板" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>吞吐（throughput）</strong>：单位时间内系统产出的 token 数（tokens/s），衡量&quot;GPU 的产能&quot;。</li>
+<li><strong>延迟（latency）</strong>：单个请求从发出到完成的时间（或 TTFT/TPOT），衡量&quot;单个用户的体验&quot;。</li>
+</ul>
+<p>两者天然对立：把一个 GPU 同时喂给更多请求（batch 更大），它每秒能产出的总 token 数会上升（吞吐↑），但每个请求分到的算力/带宽变少，延迟也上升（延迟↑）。理想状态是<strong>在不明显牺牲延迟的前提下，把 GPU 的利用率拉满</strong>。</p>
+<h4 id="h-2-静态批处理static-batching的问题">2. 静态批处理（static batching）的问题<a class="anchor" href="#h-2-静态批处理static-batching的问题" aria-label="本节链接">#</a></h4>
+<p>早期推理服务用&quot;攒一批、跑一批&quot;的静态批处理：等若干请求到齐，把它们 pad（补齐）到同一长度，一次性 prefill + decode，全部结束后再处理下一批。它有两个致命浪费：</p>
+<ul>
+<li><strong>填充浪费</strong>：短请求被 pad 到与最长请求一样长，多算了大量无意义 token；</li>
+<li><strong>木桶效应</strong>：一个 batch 里只要有一个长请求没结束，整批的 GPU 都要陪它等，其他已结束的请求槽位空转。</li>
+</ul>
+<p>结果就是 GPU 大量时间在&quot;等&quot;，吞吐远低于理论峰值。</p>
+<h4 id="h-3-continuous-batching让-gpu-一刻不停地跑">3. continuous batching：让 GPU 一刻不停地跑<a class="anchor" href="#h-3-continuous-batching让-gpu-一刻不停地跑" aria-label="本节链接">#</a></h4>
+<p><strong>continuous batching</strong>（也叫 in-flight batching / dynamic batching / iteration-level scheduling）的核心思想：<strong>不再以&quot;整批请求&quot;为单位，而是以&quot;一次迭代（iteration）&quot;为单位调度</strong>。</p>
+<ul>
+<li>每个迭代，把所有<strong>活跃请求</strong>各推进一个 decode token（或对刚到的请求做一次 prefill）；</li>
+<li>有请求结束了，立刻从等待队列拉一个新请求顶上空位；</li>
+<li>新请求来了，可以在任意迭代<strong>插入</strong>，不必等下一批。</li>
+</ul>
+<p>这样 GPU 的每个迭代几乎都是满的，空闲槽位被实时填补，吞吐因此大幅提升——vLLM 论文报告相比传统方法吞吐提升可达 <strong>2–4 倍</strong>（在相同延迟约束下甚至更高）。</p>
+<h4 id="h-4-两个关键配套">4. 两个关键配套<a class="anchor" href="#h-4-两个关键配套" aria-label="本节链接">#</a></h4>
+<p>continuous batching 能落地，依赖两个配套能力：</p>
+<ul>
+<li><strong>KV Cache 按需分配与回收</strong>：请求动态进出，KV Cache 必须能随时为新请求分配、为结束请求释放（第 2 章会讲 PagedAttention 如何优雅地做这件事）；</li>
+<li><strong>prefill/decode 混排调度</strong>：既要快速响应新请求的 prefill，又不能饿死正在 decode 的老请求，调度器要在两者间平衡（比如对 prefill 分块 chunked prefill，避免一个超长 prompt 独占 GPU）。</li>
+</ul>
+<h3 id="h-二可运行示例">二、可运行示例<a class="anchor" href="#h-二可运行示例" aria-label="本节链接">#</a></h3>
+<p>下面的 Python 用离散事件模拟，对比&quot;静态批处理&quot;与&quot;连续批处理&quot;在同一批请求下的吞吐差距。</p>
+<pre data-lang="python"><code class="language-python"># -*- coding: utf-8 -*-
+# 对比 static batching 与 continuous batching 的吞吐
+import random
+
+def gen_requests(n):
+    &quot;&quot;&quot;生成 n 个请求，每个有 prompt 长度和生成长度。&quot;&quot;&quot;
+    return [{&quot;prompt&quot;: random.randint(32, 512),
+             &quot;gen&quot;: random.randint(50, 500)} for _ in range(n)]
+
+def static_batching(requests, batch_size=8, per_token_cost=1.0):
+    &quot;&quot;&quot;静态批处理：每批 pad 到最长，整批串行处理，长请求拖累整批。&quot;&quot;&quot;
+    total_tokens = 0
+    total_time = 0.0
+    for i in range(0, len(requests), batch_size):
+        batch = requests[i:i+batch_size]
+        max_len = max(r[&quot;prompt&quot;] + r[&quot;gen&quot;] for r in batch)
+        # 每个槽位都按 max_len 计算（pad 浪费），GPU 一次算完整批
+        total_tokens += sum(r[&quot;prompt&quot;] + r[&quot;gen&quot;] for r in batch)
+        total_time += max_len * per_token_cost   # 串行处理一批
+    return total_tokens / total_time
+
+def continuous_batching(requests, per_token_cost=1.0):
+    &quot;&quot;&quot;连续批处理：每个迭代只推进所有活跃请求 1 个 token，空位实时填补。&quot;&quot;&quot;
+    queue = list(requests)
+    active = []          # 活跃请求：[剩余生成 token 数]
+    total_tokens = 0
+    total_iters = 0
+    # 简化：每个迭代为所有活跃请求各算 1 个 token，不区分 prefill/decode 代价
+    while queue or active:
+        # 每个迭代拉满并发槽位（假设 GPU 上限 32 个活跃请求）
+        while queue and len(active) &lt; 32:
+            r = queue.pop(0)
+            active.append(r[&quot;prompt&quot;] + r[&quot;gen&quot;])  # 总剩余长度（含 prefill 部分）
+        # 本迭代推进 1 步
+        if active:
+            total_iters += 1
+            total_tokens += len(active)
+            active = [rem - 1 for rem in active if rem - 1 &gt; 0]
+    return total_tokens / (total_iters * per_token_cost)
+
+requests = gen_requests(200)
+tp_static = static_batching(requests)
+tp_cont = continuous_batching(requests)
+print(f&quot;静态批处理吞吐：{tp_static:.1f} tokens/单位时间&quot;)
+print(f&quot;连续批处理吞吐：{tp_cont:.1f} tokens/单位时间&quot;)
+print(f&quot;吞吐提升：{tp_cont/tp_static:.2f} 倍&quot;)</code></pre>
+<p>运行后你会发现，连续批处理的吞吐明显更高——因为它不让 GPU 停下来&quot;等长请求&quot;，空闲槽位被立即填补。真实引擎的差距来源更丰富（消除 padding、内存复用、调度优化），但&quot;不让 GPU 空转&quot;是共同的本质。</p>
+<p><figure><img class="md-img" src="content/courses/llm-inference-optimization/assets/chapter-1-figure-03.svg" alt="静态批处理 vs 连续批处理对比图：上半部分画&quot;静态批处理&quot;，用三行等高矩形表示一个 batch，每行由不同长度的彩条（代表请求）加灰色斜线块（代表 padding 填充）拼成，右侧标注&quot;长请求拖累整批，灰色是浪费&quot;；下半部分画&quot;连续批处理&quot;，一条连续的流水线，多个不同长度的请求彩条在时间轴上错落进出，旧的结束后新的立刻顶入，几乎无缝衔接，右侧标注&quot;每步推进 1 token，槽位实时填补&quot;；图底部一句话&quot;把 GPU 的空转时间变成产出&quot;" loading="lazy" decoding="async"><figcaption>静态批处理 vs 连续批处理对比图：上半部分画&quot;静态批处理&quot;，用三行等高矩形表示一个 batch，每行由不同长度的彩条（代表请求）加灰色斜线块（代表 padding 填充）拼成，右侧标注&quot;长请求拖累整批，灰色是浪费&quot;；下半部分画&quot;连续批处理&quot;，一条连续的流水线，多个不同长度的请求彩条在时间轴上错落进出，旧的结束后新的立刻顶入，几乎无缝衔接，右侧标注&quot;每步推进 1 token，槽位实时填补&quot;；图底部一句话&quot;把 GPU 的空转时间变成产出&quot;</figcaption></figure>
+</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>改 batch_size</strong>：把静态批处理的 <code>batch_size</code> 从 8 改成 16、4，吞吐怎么变？结合&quot;木桶效应&quot;解释。</li>
+<li><strong>改请求分布</strong>：把 <code>gen_requests</code> 里的生成长度改成固定值（如都生成 500），两种方法的吞吐差距是变大还是变小？为什么请求长度越均匀，静态批处理的浪费越小？</li>
+<li><strong>加槽位上限</strong>：把连续批处理的槽位上限从 32 改成 8，吞吐怎么变？说明 GPU 容量对连续批处理收益的影响。</li>
+<li><strong>思考</strong>：连续批处理本质上是&quot;用延迟换吞吐&quot;还是&quot;在不牺牲延迟下榨吞吐&quot;？结合上一课的 TTFT/TPOT 谈你的理解。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>vLLM 论文（continuous batching 与吞吐收益）：<a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2309.06180</a></li>
+<li>Orca 论文《Orca: A Distributed Serving System for Transformer-Based Generative Models》（iteration-level scheduling 思想）：<a href="https://arxiv.org/abs/2302.11824" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2302.11824</a></li>
+<li>NVIDIA TensorRT-LLM：In-flight batching 文档：<a href="https://docs.nvidia.com/tensorrt-llm/" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/tensorrt-llm/</a></li>
+<li>vLLM 文档：Scheduling 与 continuous batching：<a href="https://docs.vllm.ai/en/latest/design/arch_overview.html" target="_blank" rel="noopener noreferrer">https://docs.vllm.ai/en/latest/design/arch_overview.html</a></li>
+</ul>
+<p><a href="#/l/inf-ch2-l1">下一课：为什么需要 KV Cache</a></p>

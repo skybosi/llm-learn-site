@@ -1,0 +1,723 @@
+<h2 id="h-来源许可与合规把法律约束变成数据字段">来源、许可与合规：把法律约束变成数据字段<a class="anchor" href="#h-来源许可与合规把法律约束变成数据字段" aria-label="本节链接">#</a></h2>
+<h3 id="h-这一节要解决什么">这一节要解决什么<a class="anchor" href="#h-这一节要解决什么" aria-label="本节链接">#</a></h3>
+<p>技术团队处理合规问题的方式通常是：在项目启动时确认一次&quot;这些数据我们能拿到，应该没问题&quot;，然后把它写进文档的一句话里，此后再也不提。这种做法有三个结构性缺陷：</p>
+<ol>
+<li><strong>它不可计算</strong>。&quot;应该没问题&quot;不能回答&quot;如果用这批数据训出的模型对外提供 API，行不行？&quot;——而这恰恰是唯一重要的问题。</li>
+<li><strong>它不可追溯</strong>。三个月后有人问&quot;这批数据从哪来的&quot;，没人答得上来，因为来源信息只存在于某次群聊里。</li>
+<li><strong>它不可撤下</strong>。某个来源突然要求删除（法律投诉、许可变更、站长抗议）时，你无法回答&quot;这会影响多少样本&quot;，于是只能全量重跑 —— 或者更常见地，什么都不做，把风险留着。</li>
+</ol>
+<p>这一节要把这三件事变成工程产出：<strong>来源登记表</strong>（把许可变成可以 join 的字段）、<strong>溯源链</strong>（每个样本能追到 source_id）、<strong>撤下流程</strong>（从 source_id 回追到受影响样本，重跑管线）。加上 PII 的处理与采集系统的设计。</p>
+<h3 id="h-一来源的六种类型与它们的工程属性">一、来源的六种类型与它们的工程属性<a class="anchor" href="#h-一来源的六种类型与它们的工程属性" aria-label="本节链接">#</a></h3>
+<p>先把来源分类，因为每一类的法律地位、工程成本、失效模式都不同。</p>
+<table>
+<thead>
+<tr>
+<th>类型</th>
+<th>例子</th>
+<th>可得性</th>
+<th>许可清晰度</th>
+<th>PII 风险</th>
+<th>偏差特征</th>
+<th>可复现性</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>自有数据</strong></td>
+<td>自己的产品日志、客服对话</td>
+<td>高</td>
+<td><strong>最高</strong>（你拥有它，但可能含用户个人信息）</td>
+<td>最高（真实用户）</td>
+<td>与自己的业务强相关，域很窄</td>
+<td>高（但要防用户删号导致数据变动）</td>
+</tr>
+<tr>
+<td><strong>授权数据</strong></td>
+<td>采购的语料、合作方提供</td>
+<td>中（有合同）</td>
+<td>高（合同写清了范围）</td>
+<td>视合同</td>
+<td>视提供方</td>
+<td>中（对方可能不给版本）</td>
+</tr>
+<tr>
+<td><strong>公开网页爬取</strong></td>
+<td>Common Crawl 类</td>
+<td>高</td>
+<td><strong>最低</strong>（默认保留所有权利）</td>
+<td>中高（用户生成内容）</td>
+<td>与&quot;谁在网上写字&quot;强相关</td>
+<td>低（网页会变、会消失）</td>
+</tr>
+<tr>
+<td><strong>开放许可数据集</strong></td>
+<td>CC0/CC-BY 语料、维基</td>
+<td>高</td>
+<td>高（但要读清条款）</td>
+<td>中（维基含传记）</td>
+<td>偏正式、偏英文/主流语言</td>
+<td>高（有固定快照）</td>
+</tr>
+<tr>
+<td><strong>用户生成内容</strong></td>
+<td>评论、论坛、问答</td>
+<td>中</td>
+<td>低（平台 ToS 常禁止再分发）</td>
+<td>高</td>
+<td>口语化、噪声高</td>
+<td>低</td>
+</tr>
+<tr>
+<td><strong>合成数据</strong></td>
+<td>模型生成、规则生成</td>
+<td>最高（想要多少有多少）</td>
+<td>取决于基础模型与生成过程</td>
+<td>低（但可能复现训练数据里的 PII）</td>
+<td><strong>继承教师的偏差</strong>，尾部缺失</td>
+<td>高（有种子就完全可复现）</td>
+</tr>
+</tbody></table>
+<p><strong>三条从表里直接读出的推论：</strong></p>
+<ol>
+<li><strong>&quot;可得性高&quot;与&quot;许可清晰&quot;几乎负相关。</strong> 最容易拿到的数据（爬网页）许可最不清晰；许可最清晰的（自有）域最窄。所以真实管线必然是混合来源 —— 而混合正是麻烦所在（下一节）。</li>
+<li><strong>PII 风险与&quot;是不是真人写的&quot;正相关</strong>，与&quot;是不是合成&quot;负相关。但合成数据不是免责的：如果基础模型记住了训练数据里的 PII，合成数据会把它再吐出来。</li>
+<li><strong>可复现性最差的是爬取</strong>。网页会变、会 404、会 A/B 测试。所以爬取类采集的<strong>第一原则是保存原始快照</strong>（4.1）。</li>
+</ol>
+<p><figure><img class="md-img" src="content/courses/data-engineering/assets/chapter-2-figure-01.svg" alt="许可阶梯：每级授予的权利不同" loading="lazy" decoding="async"><figcaption>许可阶梯：每级授予的权利不同</figcaption></figure>
+</p>
+<h3 id="h-二许可从法律文本到可计算字段">二、许可：从法律文本到可计算字段<a class="anchor" href="#h-二许可从法律文本到可计算字段" aria-label="本节链接">#</a></h3>
+<h4 id="h-21-许可阶梯">2.1 许可阶梯<a class="anchor" href="#h-21-许可阶梯" aria-label="本节链接">#</a></h4>
+<p>把常见许可按&quot;授予的权利&quot;排序，而不是按名字记：</p>
+<pre><code>CC0 / 公有领域      → 放弃全部权利（无义务）
+MIT / Apache-2.0 / BSD → 宽松：可商用、可改、可再分发（需保留声明）
+CC-BY-4.0           → 可商用可改（需署名）
+CC-BY-SA-4.0        → 上面 + 传染性（衍生作品需同许可）
+CC-BY-ND-4.0        → 可商用但**禁止衍生**（对训练用途基本不可用）
+CC-BY-NC-*          → **禁止商用**（含 NC 的一律不能用）
+无许可 / 全版权保留  → 默认保留所有权利 —— 没有声明 ≠ 可以用</code></pre>
+<p><strong>两个最常见的误解</strong>：</p>
+<ol>
+<li><strong>&quot;没有版权声明就是公共领域&quot;</strong> —— 完全相反。版权在作品产生时自动生效，<strong>没有声明意味着作者保留全部权利</strong>。写&quot;版权所有&quot;不是获得版权的前提，只是提醒。</li>
+<li><strong>&quot;公开可访问 = 可以使用&quot;</strong> —— 公开可访问是事实状态，许可是法律状态，两者无关。你把一本书放在公园长椅上，不等于授权别人复印它。</li>
+</ol>
+<h4 id="h-22-权利取交集义务取并集">2.2 权利取交集，义务取并集<a class="anchor" href="#h-22-权利取交集义务取并集" aria-label="本节链接">#</a></h4>
+<p>混合来源时，一个自然的直觉是&quot;取交集&quot;：整份数据能做什么，等于所有来源都能做的事的交集。这个直觉<strong>对权利是对的，对义务是错的</strong>。本节代码的实测：</p>
+<pre><code>整份数据（含两个 all-rights-reserved 来源）：
+  权利交集 = []                                   义务并集 = [传染性, 署名]
+去掉两个 all-rights-reserved 来源后：
+  权利交集 = [commercial, derivatives, redistribute, train]
+  义务并集 = [传染性, 署名]   &lt;- 义务没有被取交集消掉</code></pre>
+<p>读法：权利交集从空集变成了四项，看起来&quot;只把 CC0 与 CC-BY-SA 混在一起，CC0 没义务，所以没义务了&quot;—— <strong>错<strong>。义务必须</strong>按来源分别记录并传播</strong>：只要语料里有任何一个 CC-BY-SA 的部分，署名与传染性义务就存在。</p>
+<p><strong>工程上的写法</strong>：登记表里对每个来源记 <code>rights</code>（它授予的）与 <code>duties</code>（它要求的）两个字段，然后：</p>
+<ul>
+<li>权利：对某个用途，<strong>所有</strong>来源都必须授予 → 交集；</li>
+<li>义务：<strong>任一</strong>来源要求的都要履行 → 并集。</li>
+</ul>
+<p>本节代码里的 <code>strictest()</code> 就是这么实现的，并且刻意在注释里标出这是&quot;取交集&quot;直觉唯一会出错的地方。</p>
+<h4 id="h-23-传播问题模型权重是不是衍生作品">2.3 传播问题：模型权重是不是&quot;衍生作品&quot;<a class="anchor" href="#h-23-传播问题模型权重是不是衍生作品" aria-label="本节链接">#</a></h4>
+<p>这是生成式 AI 时代最尖锐的未定问题：<strong>用 CC-BY-SA 的数据训练出的模型权重，是不是衍生作品？</strong> 如果是，那模型也要按 CC-BY-SA 分发（传染）；如果不是，那只需署名。</p>
+<p>现状是：<strong>法律上没有定论</strong>。各国判例与立法都在演进，不同司法辖区的答案可能不同。但工程上不能因为&quot;未定&quot;就不做决策，所以正确做法是<strong>按最保守的假设登记，并把不确定性显式写下来</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>假设</th>
+<th>后果</th>
+<th>什么时候选</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>权重是衍生作品</td>
+<td>必须署名 + 可能传染</td>
+<td>对外发布模型权重 / 高合规要求场景</td>
+</tr>
+<tr>
+<td>权重不是衍生作品</td>
+<td>只需署名（CC-BY 类）</td>
+<td>内部使用 / 明确的法律意见支持</td>
+</tr>
+</tbody></table>
+<p><strong>为什么这个选择必须写进登记表</strong>：因为它决定了&quot;能否换掉某个来源&quot;。如果一个 CC-BY-SA 来源被撤下，在保守假设下你需要重训（因为权重被&quot;污染&quot;了）；在宽松假设下你只需要更新数据卡。<strong>两种假设下的撤下成本差一个数量级</strong>，所以它不能是一个含糊的默认值。</p>
+<p>一个实用的折中：<strong>把许可分级（tier）</strong>，只把最严格的许可（CC-BY-SA、无许可）用于必须的内核数据，把宽松来源用于可替换的部分。这样撤下时影响面可控。</p>
+<h4 id="h-24-tos-与-robotstxt技术可达--法律许可">2.4 ToS 与 robots.txt：技术可达 ≠ 法律许可<a class="anchor" href="#h-24-tos-与-robotstxt技术可达--法律许可" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>robots.txt 是技术约定</strong>，不是法律授权文件。遵守它是<strong>必要不充分</strong>：遵守 robots 不代表 ToS 允许你把内容用于训练；反之，robots 允许抓取也不代表允许用于训练（很多网站的 ToS 明确禁止&quot;用于机器学习训练&quot;）。</li>
+<li><strong>反爬措施的存在本身</strong>是一个信号：站点表达了&quot;不希望被自动采集&quot;的意愿。绕过它（换 UA、代理池、破解验证码）在法律上会加重不利解释，在工程上还会引入下一节的&quot;静默降级&quot;风险。</li>
+<li><strong>Crawl-delay 与速率</strong>：除了合规，还有工程质量问题 —— 高频抓取会让站点返回错误页/限流页，而这些页面会作为&quot;内容&quot;进入语料（4.4）。</li>
+</ul>
+<p><strong>实践纪律</strong>：采集前把三件事写进登记表 —— ToS 的具体条款位置、是否允许训练用途、以及依据。<strong>&quot;我们查过了&quot;不是记录，&quot;ToS §3.2 禁止将内容用于训练&quot;才是记录。</strong></p>
+<h4 id="h-25-为什么许可必须是一个数据字段">2.5 为什么许可必须是一个数据字段<a class="anchor" href="#h-25-为什么许可必须是一个数据字段" aria-label="本节链接">#</a></h4>
+<p>抽象地讨论合规没有意义，落地只有一个动作：<strong>把许可变成可以 join 的字段</strong>。</p>
+<pre data-lang="python"><code class="language-python"># 不是这样：
+#   &quot;本数据集由公开网页和维基百科构成，许可情况已确认。&quot;   ← 无法回答任何问题
+
+# 而是这样：
+#   {&quot;doc_id&quot;: &quot;d0&quot;, &quot;source_id&quot;: &quot;web-crawl-01&quot;, &quot;license&quot;: &quot;all-rights-reserved&quot;, ...}</code></pre>
+<p>一旦它是字段，你就能：</p>
+<ul>
+<li><code>SELECT count(*) FROM docs WHERE license = &#39;CC-BY-NC-4.0&#39;</code> —— 找出必须清除的部分；</li>
+<li>回答&quot;这批数据的 <code>rights</code> 交集是什么&quot;（能不能商用）；</li>
+<li>回答&quot;撤下 <code>source_id=X</code> 影响多少样本&quot;（下一节）；</li>
+<li>在数据卡里自动生成许可段落，而不是手写一段会过期的文字。</li>
+</ul>
+<h3 id="h-三pii-与重识别为什么删掉姓名远远不够">三、PII 与重识别：为什么删掉姓名远远不够<a class="anchor" href="#h-三pii-与重识别为什么删掉姓名远远不够" aria-label="本节链接">#</a></h3>
+<h4 id="h-31-四类标识符">3.1 四类标识符<a class="anchor" href="#h-31-四类标识符" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>类别</th>
+<th>例子</th>
+<th>特点</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>直接标识符</strong></td>
+<td>姓名、邮箱、手机号、身份证号、护照号</td>
+<td>单独即可识别个人 —— 必须删/掩码</td>
+</tr>
+<tr>
+<td><strong>准标识符</strong></td>
+<td>邮编、出生年月、性别、职业、机构</td>
+<td><strong>组合起来可唯一识别</strong> —— 最容易被忽略</td>
+</tr>
+<tr>
+<td><strong>敏感属性</strong></td>
+<td>健康、性取向、宗教、政治立场、生物特征</td>
+<td>即使不可识别个人，泄露也构成伤害</td>
+</tr>
+<tr>
+<td><strong>行为/设备标识</strong></td>
+<td>IP、设备 id、Cookie、精确位置轨迹</td>
+<td>在&quot;关于自然人的信息&quot;这个定义下通常也算个人信息</td>
+</tr>
+</tbody></table>
+<p><strong>为什么删掉姓名不够</strong>：本节代码的最小演示（删掉姓名后，仅凭 <code>邮编 + 出生年 + 性别</code> 分组）：</p>
+<pre><code>准标识等价类大小 = [1, 1, 2, 3]</code></pre>
+<p>出现大小为 1 的等价类，意味着那条记录<strong>仍然可以被唯一识别</strong> —— 也就是这条记录关于某个具体的人。这说明&quot;删除直接标识符&quot;只是第一步，真正的目标是让每条记录<strong>不可区分</strong>（或不可信的区分）。</p>
+<h4 id="h-32-三个层次的保护以及各自的代价">3.2 三个层次的保护，以及各自的代价<a class="anchor" href="#h-32-三个层次的保护以及各自的代价" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>方法</th>
+<th>机制</th>
+<th>保证</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>k-匿名</strong></td>
+<td>泛化准标识符，使每个等价类至少 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 条</td>
+<td>不能把某人从 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 人中区分出来</td>
+<td>泛化越强信息损失越大；<strong>不防同质性攻击</strong>（等价类内敏感属性全相同）</td>
+</tr>
+<tr>
+<td><strong><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord">ℓ</span></span></span></span>-多样性</strong></td>
+<td>每个等价类内敏感属性至少 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord">ℓ</span></span></span></span> 种取值</td>
+<td>防同质性攻击</td>
+<td>更难满足；可能仍需大量泛化</td>
+</tr>
+<tr>
+<td><strong>差分隐私</strong></td>
+<td>对输出/统计加噪，保证相邻数据集输出分布接近</td>
+<td>数学可证的隐私界</td>
+<td>需要噪声预算 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">ϵ</span></span></span></span>，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">ϵ</span></span></span></span> 小则可用性差；对<strong>非结构化文本</strong>很难直接套用</td>
+</tr>
+</tbody></table>
+<p>⚠️ 一个必须说清的边界：<strong>上面这些是表格数据的工具。</strong> 对一段自然语言文本（客服对话、病历记录），&quot;泛化邮编&quot;这种操作没有对应物 —— 你得先把它结构化，或者做<strong>实体替换</strong>（把人名/地名换成占位符）。实体替换的问题是它可以被上下文反推（&quot;我们镇上唯一的那家三甲医院&quot;），也有研究表明替换后的文本仍可被重识别。</p>
+<h4 id="h-33-llm-特有的问题记忆化--提取攻击">3.3 LLM 特有的问题：记忆化 → 提取攻击<a class="anchor" href="#h-33-llm-特有的问题记忆化--提取攻击" aria-label="本节链接">#</a></h4>
+<p>前面都是&quot;数据处理&quot;层面的隐私。LLM 引入了一个新层面：<strong>模型会记住训练数据</strong>。</p>
+<p>链条是：训练数据里的个人信息 → 模型在参数里记住了它 → 通过成员推断（membership inference）可以判断&quot;某个人的数据是否在训练集里&quot; → 通过<strong>训练数据提取攻击</strong>（training data extraction）可以让模型<strong>逐字吐出</strong>训练样本里的 PII（这在多个大模型的公开研究里被实际演示过，包括邮箱、电话、住址）。</p>
+<p><strong>三个推论，都影响管线设计</strong>：</p>
+<ol>
+<li><strong>重复数据的隐私风险是超线性的</strong>。同一段含 PII 的文本出现 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span></span></span></span> 次，被记住的概率大幅上升 —— 这是&quot;去重也有隐私收益&quot;的机制（第 2 节）。</li>
+<li><strong>PII 检测必须在去重之前还是之后，是一个真问题</strong>。检测&quot;这个字符串是不是 PII&quot;需要上下文；但脱敏会改变文本表示。本节代码把脱敏做成<strong>确定性替换</strong>（同一实体一律换同一占位符），这样它和去重可以共存 —— 顺序问题在第 4 节展开。</li>
+<li><strong>&quot;删掉训练数据&quot;不等于&quot;模型忘记了&quot;</strong>。这直接引出下一小节。</li>
+</ol>
+<h4 id="h-34-被遗忘权与模型不会忘记的工程后果">3.4 被遗忘权与&quot;模型不会忘记&quot;的工程后果<a class="anchor" href="#h-34-被遗忘权与模型不会忘记的工程后果" aria-label="本节链接">#</a></h4>
+<p>GDPR 的被遗忘权（right to erasure）/ 个人信息保护法里的删除权，要求数据主体可以要求删除其个人信息。而对一个已训练好的模型，<strong>没有&quot;删除某个人的数据&quot;这个操作</strong> —— 梯度已经融进参数，你无法定位它。</p>
+<p>工程上只有四条路，各有代价：</p>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>做法</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>重训</strong></td>
+<td>从数据集中删除该主体数据，从头训</td>
+<td>最彻底、最贵</td>
+</tr>
+<tr>
+<td><strong>近似遗忘</strong>（unlearning）</td>
+<td>用专门的算法&quot;抹掉&quot;特定影响</td>
+<td>研究阶段；效果难以验证（&quot;忘了多少&quot;很难测）</td>
+</tr>
+<tr>
+<td><strong>抑制/过滤</strong></td>
+<td>在推理时过滤输出</td>
+<td>只能挡已知形态；不改变模型内部状态</td>
+</tr>
+<tr>
+<td><strong>前置避免</strong></td>
+<td>训练前就把 PII 清干净，不留需要删的东西</td>
+<td>需要高质量 PII 检测；会损失一部分数据</td>
+</tr>
+</tbody></table>
+<p><strong>这四条路的共同结论是：隐私工作的重心必须前移到数据管线。</strong> 一旦 PII 进了模型，唯一可靠的选择就是重训 —— 这就是为什么&quot;3.3 的检测&quot;不是可选的合规装饰。</p>
+<h3 id="h-四采集工程系统设计与失败模式">四、采集工程：系统设计与失败模式<a class="anchor" href="#h-四采集工程系统设计与失败模式" aria-label="本节链接">#</a></h3>
+<h4 id="h-41-原始层不可变">4.1 原始层不可变<a class="anchor" href="#h-41-原始层不可变" aria-label="本节链接">#</a></h4>
+<p>数据湖的经典分层对训练数据同样适用：</p>
+<pre><code>raw（原始快照，只追加、永不修改）
+  → bronze（解析后的文本 + 元数据，可重跑）
+  → silver（规范化 + 去重 + 过滤后）
+  → gold（配比好的最终训练集）</code></pre>
+<p><strong>为什么 raw 必须不可变</strong>：</p>
+<ul>
+<li><strong>可复现</strong>：规范化/过滤/去重的代码会改（一定会改），只有保留原始字节才能重跑出&quot;当时那份数据&quot;；</li>
+<li><strong>可复核许可</strong>：许可争议时，你需要证明&quot;我们抓到的确实只有这些&quot;；</li>
+<li><strong>可修复</strong>：发现解析器有 bug 时可以只重跑 bronze，不用重新爬。</li>
+</ul>
+<p><strong>代价</strong>：存储成本（raw 通常比 silver 大 3~10 倍，因为含 HTML/PDF 原始字节与重复内容）与访问管理。这个成本几乎总是值得的 —— 唯二的例外是&quot;来源有明确的保留期限要求&quot;（此时要按期限删除，并行记录删除动作）与&quot;原始数据本身是敏感的&quot;（此时要考虑加密与访问审计）。</p>
+<h4 id="h-42-礼貌与稳定">4.2 礼貌与稳定<a class="anchor" href="#h-42-礼貌与稳定" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>robots.txt</strong>：解析 <code>User-agent</code> / <code>Disallow</code> / <code>Crawl-delay</code>（本节代码实现了最小解析与虚拟时钟限速）。</li>
+<li><strong>User-Agent 标识</strong>：给出可联系的身份，而不是伪装成浏览器。伪装会让站点无法区分你和恶意爬虫，于是它会对所有流量一起降级。</li>
+<li><strong>缓存与条件请求</strong>：用 <code>ETag</code>/<code>If-Modified-Since</code> 避免重复下载，也避免给站点造成无谓压力。</li>
+<li><strong>失败重试要有界</strong>：指数退避 + 上限；无界重试会在站点故障时产生请求风暴。</li>
+</ul>
+<h4 id="h-43-内容去重采集期的第一道去重">4.3 内容去重（采集期的第一道去重）<a class="anchor" href="#h-43-内容去重采集期的第一道去重" aria-label="本节链接">#</a></h4>
+<p>同一个 URL 会被抓多次（更新、重定向），同一个内容会出现在多个 URL（镜像、转载、参数化 URL）。采集期要做：</p>
+<ol>
+<li><strong>URL 规范化</strong>：去掉跟踪参数（<code>?utm_*</code>、<code>?ref=</code>）、统一大小写与结尾斜杠、解析重定向到最终 URL、把 <code>http://</code> 与 <code>https://</code> 视为同一资源（当内容相同时）；</li>
+<li><strong>内容指纹</strong>：对原始字节做 hash，重复的直接跳过（<strong>注意：这一步是精确去重，近似去重在第 2 节</strong>）；</li>
+<li><strong>快照版本</strong>：内容变了要保留新快照（而不是覆盖），并记录抓取时间 —— 否则时间泄漏审计（第 1 章 E13）无法做。</li>
+</ol>
+<h4 id="h-44-五类失败模式都会静默污染语料">4.4 五类失败模式（都会静默污染语料）<a class="anchor" href="#h-44-五类失败模式都会静默污染语料" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>失败</th>
+<th>表现</th>
+<th>后果</th>
+<th>检测</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>软 404</strong></td>
+<td>HTTP 200，但内容是&quot;该页面不存在&quot;</td>
+<td>大量无信息的短文本涌入</td>
+<td>响应体长度 + 关键词模板检测</td>
+</tr>
+<tr>
+<td><strong>反爬静默降级</strong></td>
+<td>HTTP 200，但返回登录页/验证页</td>
+<td>登录提示被当成正文</td>
+<td>登录/验证关键词检测（代码演示）</td>
+</tr>
+<tr>
+<td><strong>动态渲染</strong></td>
+<td>HTTP 200，但正文由 JS 生成，拿到空壳</td>
+<td>有效内容丢失，只剩导航</td>
+<td>正文提取后的长度比检查</td>
+</tr>
+<tr>
+<td><strong>编码错误</strong></td>
+<td>出现大量 <code>U+FFFD</code> 或乱码</td>
+<td>语料被污染，且影响 tokenizer</td>
+<td><code>U+FFFD</code> 比例、语言识别置信度</td>
+</tr>
+<tr>
+<td><strong>日历/分页陷阱</strong></td>
+<td>无限翻页或&quot;上一世纪&quot;的日期</td>
+<td>采集量爆炸、陈旧数据混入</td>
+<td>采集上限 + 日期分布监控</td>
+</tr>
+</tbody></table>
+<p><strong>它们的共同点是全部返回 200。</strong> 任何&quot;只看状态码&quot;的采集器都会把它们全部当成成功。本节代码把前两类做成了显式检查：</p>
+<pre><code>保留 https://x.test/a  hash=c598fc92d6c8  虚拟时刻 t=1.0s（Crawl-delay=1s）
+跳过 https://x.test/b                 原因: 内容重复
+跳过 https://x.test/c                 原因: 反爬静默降级：返回登录页
+跳过 https://x.test/private/x         原因: robots 禁止
+跳过 https://x.test/missing           原因: 空响应（软 404）</code></pre>
+<p>注意&quot;空响应&quot;与&quot;登录页&quot;这两条：<strong>如果它们不被显式识别，就会作为低质语料进入训练集</strong> —— 而它们的量往往很大（一个反爬策略变更就能让整个批次的采集全部降级），所以这是一次典型的&quot;静默的大规模污染&quot;。</p>
+<h3 id="h-五两个可交付产物">五、两个可交付产物<a class="anchor" href="#h-五两个可交付产物" aria-label="本节链接">#</a></h3>
+<h4 id="h-51-来源登记表">5.1 来源登记表<a class="anchor" href="#h-51-来源登记表" aria-label="本节链接">#</a></h4>
+<p>字段设计（每一项都有下游用途，不是装饰）：</p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>类型</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>source_id</code></td>
+<td>稳定标识</td>
+<td>溯源的主键；撤下时用它回追</td>
+</tr>
+<tr>
+<td><code>kind</code></td>
+<td>六类之一</td>
+<td>决定默认风险等级</td>
+</tr>
+<tr>
+<td><code>url_or_path</code></td>
+<td>定位</td>
+<td>复核与重抓</td>
+</tr>
+<tr>
+<td><code>license</code></td>
+<td>枚举</td>
+<td>权利/义务计算</td>
+</tr>
+<tr>
+<td><code>license_evidence</code></td>
+<td>文本（ToS 条款位置）</td>
+<td>合规审计</td>
+</tr>
+<tr>
+<td><code>acquired_at</code></td>
+<td>时间戳</td>
+<td>时效性评估、快照定位</td>
+</tr>
+<tr>
+<td><code>method</code></td>
+<td>采集方式（爬取/API/采购）</td>
+<td>复现</td>
+</tr>
+<tr>
+<td><code>pii_categories</code></td>
+<td>列表</td>
+<td>决定脱敏策略</td>
+</tr>
+<tr>
+<td><code>scale</code></td>
+<td>样本数/字节数</td>
+<td>影响面估算</td>
+</tr>
+<tr>
+<td><code>pipeline_version</code></td>
+<td>处理它的管线版本</td>
+<td>数据版本三元组的一部分</td>
+</tr>
+<tr>
+<td><code>notes</code></td>
+<td>自由文本</td>
+<td>已知问题（例如&quot;某月起 ToS 变更&quot;）</td>
+</tr>
+</tbody></table>
+<p><strong>一个常见的设计错误</strong>：把 <code>license</code> 记成自由文本（&quot;CC-BY 或类似&quot;）。枚举化是让它可计算的前提；遇到未知许可就用 <code>unknown</code>，而 <code>unknown</code> 在权利集合里是空集 —— 于是它会自动被拦下，这正是我们想要的默认行为。</p>
+<h4 id="h-52-溯源链与撤下流程">5.2 溯源链与撤下流程<a class="anchor" href="#h-52-溯源链与撤下流程" aria-label="本节链接">#</a></h4>
+<p>溯源链 = 从 <code>doc_id</code> 到 <code>source_id</code> 的映射（在管线里逐层保留，而不是最后才 join）：</p>
+<pre data-lang="python"><code class="language-python">lineage = defaultdict(list)
+for d in docs:
+    lineage[d[&quot;source_id&quot;]].append(d[&quot;doc_id&quot;])
+
+# 撤下 source_id = &quot;web-crawl-01&quot;
+affected = lineage.get(&quot;web-crawl-01&quot;, [])     # [&#39;d0&#39;, &#39;d4&#39;, &#39;d8&#39;]</code></pre>
+<p>本节代码的实测输出：</p>
+<pre><code>撤下 web-crawl-01：受影响 3/12 条，溯源可定位 = True</code></pre>
+<p>撤下流程（可执行版）：</p>
+<ol>
+<li><strong>定位</strong>：从登记表拿 <code>source_id</code> → 从 lineage 拿全部 <code>doc_id</code>；</li>
+<li><strong>评估影响面</strong>：这些样本覆盖了哪些域、占配比多少；是否在测试集里（如果在 → 评测集也要重建，第 1 章 E34）；</li>
+<li><strong>决定动作</strong>：删除后重跑管线；如果许可假设是&quot;权重是衍生作品&quot;，还要重训；</li>
+<li><strong>验证</strong>：新数据集的指纹、规模、以及<strong>受影响的评测指标</strong>（重跑同一套评测，报告变化）；</li>
+<li><strong>记录</strong>：变更记录（第 1 章 E55）。</li>
+</ol>
+<p><strong>没有溯源链时，第 1 步就无法完成</strong>，整个流程退化成&quot;重训一遍&quot;或者&quot;什么都不做&quot;。</p>
+<h4 id="h-53-数据卡datasheet">5.3 数据卡（datasheet）<a class="anchor" href="#h-53-数据卡datasheet" aria-label="本节链接">#</a></h4>
+<p>数据卡是给下游使用者的说明书，最少要包含：动机（为什么收集）、构成（来源与配比）、采集过程（时间、方式、是否含用户生成内容）、预处理（清洗/去重/过滤的具体步骤与参数）、用途限制（许可、禁止用途）、分发方式、维护计划（多久更新、谁来更新）。</p>
+<p><strong>它最有价值的部分是&quot;用途限制&quot;与&quot;已知缺陷&quot;</strong>，因为这两块正是下游最容易踩坑的地方。数据卡不是文档工作，它是<strong>把撤下成本前移</strong>的手段：写清用途限制，才能让下游在选它之前就知道自己不能用。</p>
+<h3 id="h-六取舍清单">六、取舍清单<a class="anchor" href="#h-六取舍清单" aria-label="本节链接">#</a></h3>
+<table>
+<thead>
+<tr>
+<th>取舍</th>
+<th>一端</th>
+<th>另一端</th>
+<th>怎么选</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>许可假设</strong></td>
+<td>权重是衍生作品（保守）</td>
+<td>权重不是（宽松）</td>
+<td>对外发布/高合规场景取保守；把选择写进登记表</td>
+</tr>
+<tr>
+<td><strong>raw 留存</strong></td>
+<td>全存（可复现）</td>
+<td>不存（省存储）</td>
+<td>除非有法定保留期限或原始数据极敏感，一律全存</td>
+</tr>
+<tr>
+<td><strong>PII 处理强度</strong></td>
+<td>只删直接标识（省事）</td>
+<td>泛化+加噪（隐私强）</td>
+<td>按敏感属性和部署场景定；训练语料一律至少做到&quot;直接标识 + 已知准标识&quot;</td>
+</tr>
+<tr>
+<td><strong>PII 召回 vs 精度</strong></td>
+<td>高召回（宁删错）</td>
+<td>高精度（宁漏）</td>
+<td>合规风险场景取高召回 —— 漏一条 PII 的代价远大于误删一条文本</td>
+</tr>
+<tr>
+<td><strong>采集覆盖 vs 礼貌</strong></td>
+<td>抓得多</td>
+<td>抓得慢但稳定</td>
+<td>长期管线一律取礼貌：被站点封禁的代价远大于多花的时间</td>
+</tr>
+<tr>
+<td><strong>来源数量</strong></td>
+<td>少（许可清晰、易审计）</td>
+<td>多（覆盖广）</td>
+<td>每加一个来源都要问&quot;撤下它的成本是多少&quot;</td>
+</tr>
+<tr>
+<td><strong>合成数据比例</strong></td>
+<td>高（无限供应）</td>
+<td>低（保真）</td>
+<td>与第 1 章 E43 同一条纪律：真实数据占比必须显式记录</td>
+</tr>
+</tbody></table>
+<h3 id="h-代码许可审计溯源礼貌采集与-pii-的最小实现">代码：许可审计、溯源、礼貌采集与 PII 的最小实现<a class="anchor" href="#h-代码许可审计溯源礼貌采集与-pii-的最小实现" aria-label="本节链接">#</a></h3>
+<p>四段代码对应四个可交付产物。刻意不依赖任何第三方库（<code>re</code>/<code>json</code>/<code>hashlib</code> 都是标准库），因为这一段应该能嵌进任何管线。</p>
+<pre data-lang="python"><code class="language-python"># -*- coding: utf-8 -*-
+&quot;&quot;&quot;来源、许可与合规：四个环节的最小实现（登记表 / 溯源 / 采集 / PII）。&quot;&quot;&quot;
+import hashlib
+import re
+from collections import Counter, defaultdict
+
+# ============ 1. 许可阶梯：把法律约束变成可计算的字段 ============
+# 每个许可声明的不是&quot;能不能用&quot;，而是**一组被授予的权利**。
+RIGHTS = (&quot;train&quot;, &quot;commercial&quot;, &quot;redistribute&quot;, &quot;derivatives&quot;, &quot;attribution&quot;, &quot;share_alike&quot;)
+LICENSES = {
+    &quot;CC0-1.0&quot;:        {&quot;train&quot;, &quot;commercial&quot;, &quot;redistribute&quot;, &quot;derivatives&quot;},
+    &quot;MIT&quot;:            {&quot;train&quot;, &quot;commercial&quot;, &quot;redistribute&quot;, &quot;derivatives&quot;, &quot;attribution&quot;},
+    &quot;Apache-2.0&quot;:     {&quot;train&quot;, &quot;commercial&quot;, &quot;redistribute&quot;, &quot;derivatives&quot;, &quot;attribution&quot;},
+    &quot;CC-BY-4.0&quot;:      {&quot;train&quot;, &quot;commercial&quot;, &quot;redistribute&quot;, &quot;derivatives&quot;, &quot;attribution&quot;},
+    &quot;CC-BY-SA-4.0&quot;:   {&quot;train&quot;, &quot;commercial&quot;, &quot;redistribute&quot;, &quot;derivatives&quot;, &quot;attribution&quot;, &quot;share_alike&quot;},
+    &quot;CC-BY-NC-4.0&quot;:   {&quot;train&quot;, &quot;redistribute&quot;, &quot;derivatives&quot;, &quot;attribution&quot;},   # 无 commercial
+    &quot;all-rights-reserved&quot;: set(),                                               # 默认保留所有权利
+    &quot;unknown&quot;:        set(),
+}
+
+def audit_use(sources, use=&quot;commercial&quot;):
+    &quot;&quot;&quot;给定来源清单与用途，返回 (是否全部允许, 阻塞来源, 需履行的义务)。&quot;&quot;&quot;
+    blocked = [s[&quot;source_id&quot;] for s in sources if use not in LICENSES[s[&quot;license&quot;]]]
+    duties = set()
+    for s in sources:
+        r = LICENSES[s[&quot;license&quot;]]
+        if &quot;attribution&quot; in r:
+            duties.add(&quot;署名（保留来源与许可声明）&quot;)
+        if &quot;share_alike&quot; in r:
+            duties.add(&quot;传染性：衍生作品需同许可（模型权重的法律地位未定）&quot;)
+    return (not blocked), blocked, sorted(duties)
+
+def strictest(sources):
+    &quot;&quot;&quot;混合来源的约束：**权利取交集，义务取并集**。
+
+    这是&quot;取交集&quot;这个直觉唯一会出错的地方：把 CC0 与 CC-BY-SA 混合时，
+    权利交集等于 CC0，看起来&quot;没有额外要求&quot; —— 但署名与传染性义务不会因为
+    另一个来源权利更宽就消失。义务必须独立记录并按来源传播。
+    &quot;&quot;&quot;
+    rights, duties = set(RIGHTS), set()
+    for s in sources:
+        r = LICENSES[s[&quot;license&quot;]]
+        rights &amp;= r
+        if &quot;attribution&quot; in r:
+            duties.add(&quot;署名&quot;)
+        if &quot;share_alike&quot; in r:
+            duties.add(&quot;传染性（share-alike）&quot;)
+    return rights, duties
+
+if __name__ == &quot;__main__&quot;:
+    print(&quot;=== 1. 许可：一组来源，不同用途能不能用 ===&quot;)
+    REG = [
+        {&quot;source_id&quot;: &quot;web-crawl-01&quot;, &quot;license&quot;: &quot;all-rights-reserved&quot;, &quot;kind&quot;: &quot;公开网页爬取&quot;},
+        {&quot;source_id&quot;: &quot;wiki-dump&quot;,    &quot;license&quot;: &quot;CC-BY-SA-4.0&quot;,        &quot;kind&quot;: &quot;开放数据集&quot;},
+        {&quot;source_id&quot;: &quot;internal-cs&quot;,  &quot;license&quot;: &quot;all-rights-reserved&quot;, &quot;kind&quot;: &quot;自有数据&quot;},
+        {&quot;source_id&quot;: &quot;cc0-corpus&quot;,   &quot;license&quot;: &quot;CC0-1.0&quot;,             &quot;kind&quot;: &quot;开放数据集&quot;},
+    ]
+    for use in (&quot;train&quot;, &quot;commercial&quot;, &quot;redistribute&quot;):
+        ok, blocked, duties = audit_use(REG, use)
+        print(f&quot;   用途 {use:13s} 全部允许 = {ok}   阻塞来源 = {blocked}&quot;)
+    r_all, d_all = strictest(REG)
+    print(f&quot;   整份数据：权利交集 = {sorted(r_all)}   义务并集 = {sorted(d_all)}&quot;)
+    REG2 = [s for s in REG if s[&quot;license&quot;] != &quot;all-rights-reserved&quot;]
+    r2, d2 = strictest(REG2)
+    print(f&quot;   去掉两个 all-rights-reserved 来源后：权利交集 = {sorted(r2)}&quot;)
+    print(f&quot;                                        义务并集 = {sorted(d2)}   &lt;- 义务没有被取交集消掉&quot;)
+    print(&quot;   注：&#39;train&#39; 在 all-rights-reserved 下为空集 —— 最保守假设下即不可用&quot;)
+
+    # ============ 2. 来源登记 + 溯源 + 撤下 ============
+    print(&quot;\n=== 2. 溯源：从 source_id 回追受影响的样本 ===&quot;)
+    docs = [{&quot;doc_id&quot;: f&quot;d{i}&quot;,
+             &quot;source_id&quot;: [&quot;web-crawl-01&quot;, &quot;wiki-dump&quot;, &quot;internal-cs&quot;, &quot;cc0-corpus&quot;][i % 4]}
+            for i in range(12)]
+    lineage = defaultdict(list)
+    for d in docs:
+        lineage[d[&quot;source_id&quot;]].append(d[&quot;doc_id&quot;])
+    for k in sorted(lineage):
+        print(f&quot;   {k:16s} -&gt; {len(lineage[k])} 条 {lineage[k]}&quot;)
+    takedown = &quot;web-crawl-01&quot;
+    affected = lineage.get(takedown, [])
+    print(f&quot;   撤下 {takedown}：受影响 {len(affected)}/{len(docs)} 条，&quot;
+          f&quot;溯源可定位 = {all(d[&#39;doc_id&#39;] in affected for d in docs if d[&#39;source_id&#39;] == takedown)}&quot;)
+
+    # ============ 3. 礼貌采集 + 静默降级的检测 ============
+    print(&quot;\n=== 3. 采集：robots + 限速 + 内容去重 + 软 404 检测 ===&quot;)
+    ROBOTS = &quot;User-agent: *\nDisallow: /private\nCrawl-delay: 1\n&quot;
+    def robots_allows(path, rule=ROBOTS):
+        dis = [l.split(&quot;:&quot;, 1)[1].strip() for l in rule.splitlines()
+               if l.lower().startswith(&quot;disallow&quot;)]
+        return not any(path.startswith(d) for d in dis if d)
+    PAGES = {
+        &quot;https://x.test/a&quot;: &quot;深度学习模型的训练需要大量高质量数据。&quot;,
+        &quot;https://x.test/b&quot;: &quot;深度学习模型的训练需要大量高质量数据。&quot;,     # 重复内容
+        &quot;https://x.test/c&quot;: &quot;&lt;html&gt;请登录后查看&lt;/html&gt;&quot;,                  # 反爬：静默降级
+        &quot;https://x.test/private/x&quot;: &quot;机密内容&quot;,
+    }
+    LOGIN_MARKERS = (&quot;请登录&quot;, &quot;登录后查看&quot;, &quot;Sign in&quot;)
+    def fetch(url):
+        return PAGES.get(url, &quot;&quot;)
+    seen_hash, kept, skipped = set(), [], []
+    delay = float([l.split(&quot;:&quot;, 1)[1] for l in ROBOTS.splitlines()
+                   if l.lower().startswith(&quot;crawl-delay&quot;)][0])
+    clock = {&quot;t&quot;: 0.0}
+    def schedule(url):
+        &quot;&quot;&quot;虚拟时钟：同一站的两次请求至少间隔 crawl-delay 秒。&quot;&quot;&quot;
+        clock[&quot;t&quot;] += delay
+        return clock[&quot;t&quot;]
+    for url in [&quot;https://x.test/a&quot;, &quot;https://x.test/b&quot;, &quot;https://x.test/c&quot;,
+                &quot;https://x.test/private/x&quot;, &quot;https://x.test/missing&quot;]:
+        path = &quot;/&quot; + url.split(&quot;/&quot;, 3)[3]
+        if not robots_allows(path):
+            skipped.append((url, &quot;robots 禁止&quot;)); continue
+        html = fetch(url)
+        if not html:
+            skipped.append((url, &quot;空响应（软 404）&quot;)); continue
+        if any(m in html for m in LOGIN_MARKERS):
+            skipped.append((url, &quot;反爬静默降级：返回登录页&quot;)); continue
+        h = hashlib.sha256(html.encode()).hexdigest()[:12]
+        if h in seen_hash:
+            skipped.append((url, &quot;内容重复&quot;)); continue
+        seen_hash.add(h); kept.append((url, h, schedule(url)))
+    for u, h, t in kept:
+        print(f&quot;   保留 {u}  hash={h}  虚拟时刻 t={t:.1f}s（Crawl-delay={delay:g}s）&quot;)
+    for u, why in skipped:
+        print(f&quot;   跳过 {u:32s} 原因: {why}&quot;)
+    print(&quot;   关键：&#39;登录页&#39;与&#39;空响应&#39;都必须被显式识别 —— 否则它们会作为低质语料进入训练集&quot;)
+
+    # ============ 4. PII：删掉姓名远远不够（准标识重识别） ============
+    print(&quot;\n=== 4. PII 与准标识：k-匿名的最小演示 ===&quot;)
+    PII = [(&quot;邮箱&quot;, re.compile(r&quot;[\w.+-]+@[\w-]+\.[\w.]+&quot;)),
+           (&quot;手机&quot;, re.compile(r&quot;(?&lt;!\d)1[3-9]\d{9}(?!\d)&quot;)),
+           (&quot;身份证&quot;, re.compile(r&quot;(?&lt;!\d)\d{17}[\dXx](?!\d)&quot;))]
+    text = &quot;联系 zhang@example.com 或 13812345678，身份证 11010119900307123X。&quot;
+    masked, hits = text, []
+    for name, pat in PII:
+        for m in pat.finditer(masked):
+            hits.append((name, m.group()))
+        masked = pat.sub(f&quot;[{name}]&quot;, masked)        # 确定性替换：同一实体 -&gt; 同一占位符
+    print(&quot;   原始:&quot;, text)
+    print(&quot;   脱敏:&quot;, masked)
+    print(&quot;   命中:&quot;, hits)
+    # 准标识（邮编+出生年+性别）—— 即使删掉姓名，仍可唯一化
+    rows = [(100084, 1990, &quot;男&quot;), (100084, 1990, &quot;男&quot;), (100084, 1990, &quot;女&quot;),
+            (200000, 1985, &quot;男&quot;), (200000, 1985, &quot;男&quot;), (200000, 1985, &quot;男&quot;),
+            (518000, 1978, &quot;女&quot;)]
+    cls = Counter(rows)
+    print(f&quot;   删掉姓名后，准标识等价类大小 = {sorted(cls.values())}&quot;)
+    print(&quot;   上面出现大小为 1 的等价类 —— 该记录仍可被唯一识别；&quot;
+          &quot;泛化（邮编 -&gt; 城市、年份 -&gt; 年代）或加噪才能提高 k&quot;)</code></pre>
+<p>实际输出：</p>
+<pre><code>=== 1. 许可：一组来源，不同用途能不能用 ===
+   用途 train         全部允许 = False   阻塞来源 = [&#39;web-crawl-01&#39;, &#39;internal-cs&#39;]
+   用途 commercial    全部允许 = False   阻塞来源 = [&#39;web-crawl-01&#39;, &#39;internal-cs&#39;]
+   用途 redistribute  全部允许 = False   阻塞来源 = [&#39;web-crawl-01&#39;, &#39;internal-cs&#39;]
+   整份数据：权利交集 = []   义务并集 = [&#39;传染性（share-alike）&#39;, &#39;署名&#39;]
+   去掉两个 all-rights-reserved 来源后：权利交集 = [&#39;commercial&#39;, &#39;derivatives&#39;, &#39;redistribute&#39;, &#39;train&#39;]
+                                        义务并集 = [&#39;传染性（share-alike）&#39;, &#39;署名&#39;]   &lt;- 义务没有被取交集消掉
+   注：&#39;train&#39; 在 all-rights-reserved 下为空集 —— 最保守假设下即不可用
+
+=== 2. 溯源：从 source_id 回追受影响的样本 ===
+   cc0-corpus       -&gt; 3 条 [&#39;d3&#39;, &#39;d7&#39;, &#39;d11&#39;]
+   internal-cs      -&gt; 3 条 [&#39;d2&#39;, &#39;d6&#39;, &#39;d10&#39;]
+   web-crawl-01     -&gt; 3 条 [&#39;d0&#39;, &#39;d4&#39;, &#39;d8&#39;]
+   wiki-dump        -&gt; 3 条 [&#39;d1&#39;, &#39;d5&#39;, &#39;d9&#39;]
+   撤下 web-crawl-01：受影响 3/12 条，溯源可定位 = True
+
+=== 3. 采集：robots + 限速 + 内容去重 + 软 404 检测 ===
+   保留 https://x.test/a  hash=c598fc92d6c8  虚拟时刻 t=1.0s（Crawl-delay=1s）
+   跳过 https://x.test/b                 原因: 内容重复
+   跳过 https://x.test/c                 原因: 反爬静默降级：返回登录页
+   跳过 https://x.test/private/x         原因: robots 禁止
+   跳过 https://x.test/missing           原因: 空响应（软 404）
+   关键：&#39;登录页&#39;与&#39;空响应&#39;都必须被显式识别 —— 否则它们会作为低质语料进入训练集
+
+=== 4. PII 与准标识：k-匿名的最小演示 ===
+   原始: 联系 zhang@example.com 或 13812345678，身份证 11010119900307123X。
+   脱敏: 联系 [邮箱] 或 [手机]，身份证 [身份证]。
+   命中: [(&#39;邮箱&#39;, &#39;zhang@example.com&#39;), (&#39;手机&#39;, &#39;13812345678&#39;), (&#39;身份证&#39;, &#39;11010119900307123X&#39;)]
+   删掉姓名后，准标识等价类大小 = [1, 1, 2, 3]
+   上面出现大小为 1 的等价类 —— 该记录仍可被唯一识别；泛化（邮编 -&gt; 城市、年份 -&gt; 年代）或加噪才能提高 k</code></pre>
+<p><strong>每个实现决策背后的理由：</strong></p>
+<ul>
+<li><strong>许可用&quot;权利集合&quot;而不是&quot;能否使用&quot;的布尔值</strong>：因为用途是多维的（训练/商用/再分发/衍生），布尔值会在遇到&quot;能训练但不能再分发&quot;这种许可时立刻失效。集合模型天然支持&quot;取交集&quot;与&quot;逐用途查询&quot;。</li>
+<li><strong><code>unknown</code> 与 <code>all-rights-reserved</code> 都映射到空集</strong>：这是<strong>fail-closed</strong>（默认拒绝）的设计。如果未知许可被当成允许，那么任何一个字段缺失都会变成一次无意的侵权；反过来，字段缺失只会让一部分数据被拦下，人工复核后放行。<strong>在合规问题上，默认值必须是拒绝。</strong></li>
+<li><strong><code>strictest()</code> 同时返回权利与义务</strong>，并且在注释里点名这是&quot;取交集&quot;直觉的出错点。代码实测证明了这一点：去掉两个全版权来源后权利交集从 <code>[]</code> 变成了四项，但义务并集一个字都没少。</li>
+<li><strong>溯源用 <code>defaultdict(list)</code> 在管线内逐层保留</strong>，而不是最后才 join。原因是&quot;最后 join&quot;在真实管线里几乎做不到 —— 中间步骤（过滤、去重）会丢字段。<strong>溯源链必须在每一步都显式传递</strong>，这是管线设计的一部分，不是查询技巧。</li>
+<li><strong>采集器把&quot;空响应&quot;和&quot;登录页&quot;当成显式跳过原因</strong>，而不是靠状态码。这两条检查是本节最有工程价值的两行代码：它们的量可能占整个批次，而危害（低质语料 + 隐私风险）完全静默。</li>
+<li><strong>PII 脱敏是确定性替换</strong>（<code>[邮箱]</code>、<code>[手机]</code>），不是随机加噪。这一点决定了它能否与去重共存（第 4 节展开）：确定性替换后同一内容的指纹稳定，去重仍然有效；随机化则会破坏去重。</li>
+<li><strong>k-匿名的演示只用了三个准标识</strong>，就产生了大小为 1 的等价类。<strong>这说明&quot;已删除姓名&quot;这种合规声明几乎没有保护作用</strong> —— 有效的做法是先定义&quot;什么是可接受的不可识别性&quot;，再决定泛化到什么粒度。</li>
+<li>⚠️ 本段代码是<strong>教学实现</strong>：正则 PII 检测的召回率很低（姓名、地址、机构名、以及&quot;我们镇上唯一的三甲医院&quot;这类可反推表述全都抓不到）。生产环境要用 NER 模型 + 人工抽检，并明确记录<strong>已知的漏检类别</strong>。</li>
+</ul>
+<h3 id="h-练习">练习<a class="anchor" href="#h-练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><p><strong>许可计算</strong>：设五个来源的许可分别是 <code>CC0-1.0</code>、<code>CC-BY-4.0</code>、<code>CC-BY-NC-4.0</code>、<code>CC-BY-SA-4.0</code>、<code>all-rights-reserved</code>。
+（a）分别写出&quot;训练&quot;&quot;商用&quot;&quot;对外发布模型权重&quot;三种用途下被阻塞的来源；
+（b）写出权利交集与义务并集；
+（c）如果要让整份数据<strong>可以商用</strong>，最少需要剔除哪些来源？如果要求还要<strong>可以对外发布权重且不传染</strong>，又要剔除哪些？说明每一步的法律依据与不确定性。</p>
+</li>
+<li><p><strong>撤下演练</strong>：你有一个 2T token 的训练集，来自 40 个来源，已经训过一个模型并对外提供服务。
+（a）写出&quot;某个来源被要求撤下&quot;的完整流程（从收到通知到上线新模型），标出每一步的产物与责任人；
+（b）如果溯源链只在最终数据集上记录，而不在中间层记录，这个流程会在哪一步断掉？
+（c）如果许可假设是&quot;权重是衍生作品&quot;，成本如何变化？给出一个量级估计（用你的假设说明）。</p>
+</li>
+<li><p><strong>PII 检测的取舍</strong>：你的语料是 500 万条客服对话，预算只够人工核 1000 条。
+（a）设计一个抽样方案估计 PII 漏检率（提示：不能只抽检测器命中的）。
+（b）若你的正则召回是 0.6、精度是 0.95，写出&quot;漏检 PII 条数&quot;的估计式；
+（c）说明为什么&quot;提高召回&quot;在合规场景下几乎总是正确的方向，以及它的代价具体落在哪里。</p>
+</li>
+<li><p><strong>k-匿名动手</strong>：给定一张 10 条记录的表（自选字段），
+（a）用代码算出原始准标识等价类的大小分布；
+（b）通过泛化（邮编后两位置零、出生年改为年代）使 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8304em;vertical-align:-0.136em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≥</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2</span></span></span></span>，报告泛化后的数据损失（用&quot;每组记录数&quot;与&quot;泛化前后的字段区分度&quot;度量）；
+（c）构造一个 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8304em;vertical-align:-0.136em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≥</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2</span></span></span></span> 但仍有隐私泄漏的例子（提示：等价类内敏感属性相同 → 同质性攻击），并说明 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord">ℓ</span></span></span></span>-多样性如何修它。</p>
+</li>
+<li><p><strong>采集失败模式</strong>：为一个真实站点设计采集器。
+（a）列出你会显式检测的五类&quot;200 但无效&quot;的响应，并为每一类写出一个可执行的检测规则；
+（b）设计一个&quot;批次级&quot;的监控：如果某天 80% 的响应都是登录页，你要在什么信号上发现它，而不是等到训练完才发现？
+（c）说明&quot;保存原始快照&quot;在这个场景里如何降低损失。</p>
+</li>
+<li><p><strong>来源数量与撤下成本</strong>：你的配比里有一个来源占 15% 的权重，它提供了某项独特能力。
+（a）如果它突然不可用，你的四个选项分别是什么（重训/替换/放弃该能力/继续用）？
+（b）为每个选项估算&quot;能力损失&quot;与&quot;合规风险&quot;两个维度上的代价；
+（c）据此说明为什么&quot;来源多样性&quot;本身是一种合规资产 —— 但同时它也让许可审计变难。这个张力怎么处理？</p>
+</li>
+</ol>
+<h3 id="h-小结">小结<a class="anchor" href="#h-小结" aria-label="本节链接">#</a></h3>
+<ul>
+<li><strong>来源分六类，工程属性（许可清晰度、PII 风险、可复现性）差异极大</strong>，而且&quot;可得性高&quot;与&quot;许可清晰&quot;几乎负相关 —— 所以真实管线必然是混合来源，混合就是麻烦的来源。</li>
+<li><strong>许可阶梯按&quot;授予的权利&quot;记，而不是按名字记</strong>。两个最常见的误解：没有声明 ≠ 可以用（版权自动生效）；公开可访问 ≠ 可以使用。</li>
+<li><strong>混合来源时：权利取交集，义务取并集。</strong> 代码实测证明&quot;取交集&quot;的直觉会在义务上出错（去掉全版权来源后权利交集从空集变成四项，义务一个字都没少）。<code>unknown</code> 与 <code>all-rights-reserved</code> 都映射到空集 —— 合规问题的默认值必须是<strong>拒绝</strong>。</li>
+<li><strong>传播问题（模型权重是否衍生作品）法律未定</strong>，工程上必须<strong>按最保守假设登记并把选择写下来</strong>，因为它决定了撤下成本差一个数量级。</li>
+<li><strong>删掉姓名远远不够</strong>：代码里仅用&quot;邮编+出生年+性别&quot;三个准标识就产生了大小为 1 的等价类。k-匿名/ℓ-多样性/差分隐私各有代价，且<strong>对非结构化文本很难直接套用</strong>（要先结构化或做实体替换）。</li>
+<li><strong>LLM 引入了新层面</strong>：模型会记住训练数据 → 成员推断与训练数据提取攻击。重复数据的隐私风险是<strong>超线性的</strong>，所以去重也有隐私收益。&quot;删除训练数据&quot;≠&quot;模型忘记&quot;，唯一可靠的隐私手段是<strong>前移到数据管线</strong>。</li>
+<li><strong>采集的五类失败模式（软 404、反爬静默降级、动态渲染、编码错误、分页陷阱）全部返回 200</strong>，只看状态码的采集器会把它们全部当成成功。代码把前两类做成了显式检查。</li>
+<li><strong>两个可交付产物</strong>：来源登记表（许可枚举化、fail-closed）与溯源链（逐层传递，不在最后 join）。有它们，撤下是一条命令；没有它们，撤下是一场灾难。</li>
+<li><strong>raw 层不可变</strong>是所有可复现性与许可复核的基础，代价是 3~10 倍存储 —— 除非法定保留期限或原始数据极敏感，这个代价几乎总是值得的。</li>
+</ul>

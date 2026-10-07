@@ -1,0 +1,113 @@
+<h2 id="h-图文理解llava-等">图文理解（LLaVA 等）<a class="anchor" href="#h-图文理解llava-等" aria-label="本节链接">#</a></h2>
+<p>第四章的 CLIP 解决了&quot;图文对齐&quot;，但它有一个天生短板：双塔把图片和文本<strong>分开编码</strong>，只在最后算一次相似度，图文之间没有逐 token 的深度交互。所以 CLIP 做检索、做零样本分类很拿手，却回答不了&quot;图里这位先生在做什么？&quot;&quot;招牌上写的电话是多少？&quot;这类需要<strong>逐字生成、需要推理</strong>的问题。本课时进入多模态大模型（Multimodal Large Language Model，MLLM）的世界，主角是 LLaVA——它把视觉接进了大语言模型，让模型第一次能&quot;看懂并描述&quot;图片。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-双塔为什么看得懂却说不出口">1. 双塔为什么&quot;看得懂却说不出口&quot;<a class="anchor" href="#h-1-双塔为什么看得懂却说不出口" aria-label="本节链接">#</a></h4>
+<p>回顾 CLIP：图像向量和文本向量各算各的，最后做点积。这带来两个限制：</p>
+<ul>
+<li><strong>无细粒度交互</strong>：图像里的每个区域无法和文本里的每个词逐一对照，所以数数、读字、定位&quot;谁在左边&quot;都很吃力（这正是第四章结尾列的短板）。</li>
+<li><strong>只能打分，不能生成</strong>：CLIP 输出的是相似度分数，而不是一句自然语言回答。而人类看图的最终形式往往是&quot;说一句话&quot;。</li>
+</ul>
+<p>MLLM 的思路很直接：<strong>把视觉信号转成&quot;伪语言 token&quot;，喂给一个已经会说话的大语言模型（LLM）</strong>，让它像生成文本一样生成回答。LLaVA（Large Language and Vision Assistant）是这条路线最经典的开创者之一。</p>
+<h4 id="h-2-llava-的架构视觉编码器--投影层--大语言模型">2. LLaVA 的架构：视觉编码器 + 投影层 + 大语言模型<a class="anchor" href="#h-2-llava-的架构视觉编码器--投影层--大语言模型" aria-label="本节链接">#</a></h4>
+<p>LLaVA 由三个模块组成：</p>
+<ol>
+<li><strong>视觉编码器</strong>：直接复用 CLIP 的 ViT-L/14（预训练好的图像塔，冻结）。它把一张图切成 patch 并编码成一串向量，例如 224×224 的图在 patch=14 下得到 16×16=256 个 patch token。</li>
+<li><strong>投影层（projection）</strong>：一个可训练的线性层（LLaVA-v1）或两层 MLP（LLaVA-1.5）。它的任务是把视觉 token 的维度<strong>映射到语言模型的词嵌入维度</strong>，让&quot;视觉 token&quot;在 LLM 眼里长得和&quot;文字 token&quot;一样。这一步是视觉与语言&quot;接轨&quot;的关键。</li>
+<li><strong>大语言模型</strong>：用 Vicuna（基于 LLaMA 微调的对话模型）。它接收&quot;视觉 token + 文本 token&quot;拼成的序列，自回归地逐 token 生成回答。</li>
+</ol>
+<p><figure><img class="md-img" src="content/courses/multimodal-diffusion/assets/chapter-5-figure-01.svg" alt="LLaVA 架构：视觉编码器 → 投影层 → 大语言模型" loading="lazy" decoding="async"><figcaption>LLaVA 架构：视觉编码器 → 投影层 → 大语言模型</figcaption></figure>
+</p>
+<p>前向流程可以概括为：把图片变成一串&quot;视觉 token&quot;，前面拼上用户的问题（文本 token），整串塞进 LLM，LLM 输出对问题的回答。视觉 token 在这里扮演的角色，和&quot;一句系统提示的前缀&quot;没有本质区别——<strong>图像被翻译成了一种语言模型能读的&quot;外语&quot;</strong>。</p>
+<p><figure><img class="md-img" src="content/courses/multimodal-diffusion/assets/chapter-5-figure-02.svg" alt="视觉 token 投影并拼接到语言 token 序列" loading="lazy" decoding="async"><figcaption>视觉 token 投影并拼接到语言 token 序列</figcaption></figure>
+</p>
+<h4 id="h-3-视觉指令微调两阶段训练">3. 视觉指令微调：两阶段训练<a class="anchor" href="#h-3-视觉指令微调两阶段训练" aria-label="本节链接">#</a></h4>
+<p>LLaVA 的另一个关键贡献是训练方法——<strong>视觉指令微调（visual instruction tuning）</strong>，分两阶段：</p>
+<ul>
+<li><strong>第一阶段：特征对齐（pretraining for feature alignment）</strong>。用约 60 万对图文数据（来自 CC3M 的一个子集），<strong>冻结视觉编码器和 LLM，只训练投影层</strong>。目标是让投影后的视觉 token 尽快落入 LLM 的语义空间，为后续训练铺路。这阶段的数据只要&quot;图 + 一句话描述&quot;，不需要复杂问答。</li>
+<li><strong>第二阶段：端到端微调（end-to-end fine-tuning）</strong>。用约 15.8 万条<strong>多模态指令数据</strong>，冻结视觉编码器，同时训练投影层和 LLM。数据有三种：对话（5.8 万）、详细描述（2.3 万）、复杂推理（7.7 万）——这些数据是论文作者用 GPT-4 对 COCO 图片&quot;自我指令&quot;（self-instruct）生成的：给 GPT-4 看图，让它写出问答对和详细描述，再拿这些数据来训练 LLaVA。</li>
+</ul>
+<p>训练损失是标准的<strong>自回归下一 token 预测</strong>，但有一个细节：<strong>只对&quot;回答部分&quot;的 token 计算损失，把&quot;问题 + 图像&quot;部分 mask 掉</strong>。否则模型会浪费容量去学着&quot;复述问题&quot;，而不是&quot;回答问题&quot;。</p>
+<h4 id="h-4-自回归生成图像当作前缀">4. 自回归生成：图像当作前缀<a class="anchor" href="#h-4-自回归生成图像当作前缀" aria-label="本节链接">#</a></h4>
+<p>在推理时，LLaVA 把输入拼成：</p>
+<pre><code>&lt;图像 token&gt; ... &lt;图像 token&gt; USER: &lt;问题&gt; ASSISTANT:</code></pre>
+<p>然后 LLM 从 <code>ASSISTANT:</code> 之后开始自回归生成，一个 token 一个 token 地吐出答案。因为视觉 token 就是序列的开头，注意力机制可以让后面生成的每个文字 token <strong>回头看到整张图</strong>——这解决了 CLIP 双塔&quot;图文无交互&quot;的问题。</p>
+<h4 id="h-5-其他代表性模型">5. 其他代表性模型<a class="anchor" href="#h-5-其他代表性模型" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>Flamingo</strong>：不把视觉 token 拼进文本，而是在 LLM 的每一层插入<strong>交叉注意力</strong>，让文本 token 直接&quot;查询&quot;视觉特征。这种&quot;交叉注意力&quot;路线保真度更高，但结构改动大。</li>
+<li><strong>BLIP-2</strong>：在冻结的视觉编码器和冻结的 LLM 之间加一个可训练的 <strong>Q-Former</strong>（一组可学习的 query token 通过交叉注意力从视觉特征里抽取信息），用更少的视觉 token 桥接两个模态。</li>
+<li><strong>LLaVA-1.5</strong>：把分辨率提升到 336px、投影层换成两层 MLP、训练数据与指令格式做了系统化改进，效果大幅提升，成为后来很多工作的基座。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<h4 id="h-示例-1用-llava-做图文对话">示例 1：用 LLaVA 做图文对话<a class="anchor" href="#h-示例-1用-llava-做图文对话" aria-label="本节链接">#</a></h4>
+<p>下面用 Hugging Face <code>transformers</code> 加载 LLaVA-1.5 做一次真实的图文问答。（模型较大，需要 GPU 与首次下载；此处以官方 API 演示标准流程。）</p>
+<pre data-lang="python"><code class="language-python">from transformers import LlavaForConditionalGeneration, AutoProcessor
+import torch
+from PIL import Image
+
+model_id = &quot;llava-hf/llava-1.5-7b-hf&quot;
+# 用 float16 与 device_map 让大模型在单卡上跑起来
+model = LlavaForConditionalGeneration.from_pretrained(
+    model_id, torch_dtype=torch.float16, device_map=&quot;auto&quot;
+)
+processor = AutoProcessor.from_pretrained(model_id)
+
+# 准备图片与问题（提示词模板是 LLaVA 对话格式的一部分）
+image = Image.open(&quot;your_image.jpg&quot;).convert(&quot;RGB&quot;)
+prompt = &quot;USER: &lt;image&gt;\n这张图里有什么？请描述一下。 ASSISTANT:&quot;
+
+inputs = processor(text=prompt, images=image, return_tensors=&quot;pt&quot;).to(model.device)
+
+with torch.no_grad():
+    output = model.generate(
+        **inputs,
+        max_new_tokens=128,       # 限制生成长度
+        do_sample=False,          # 贪心解码，结果确定
+    )
+
+answer = processor.decode(output[0], skip_special_tokens=True)
+print(answer.split(&quot;ASSISTANT:&quot;)[-1].strip())</code></pre>
+<p><code>&lt;image&gt;</code> 这个特殊占位符会被 processor 替换成投影后的视觉 token，其余流程与普通文本生成完全一致。</p>
+<h4 id="h-示例-2从零理解视觉-token-拼接机制">示例 2：从零理解&quot;视觉 token 拼接&quot;机制<a class="anchor" href="#h-示例-2从零理解视觉-token-拼接机制" aria-label="本节链接">#</a></h4>
+<p>下面的纯 PyTorch 小实验不加载大模型，但完整演示了 MLLM 的核心机制：patch 编码 → 投影 → 与文本嵌入拼接。</p>
+<pre data-lang="python"><code class="language-python">import torch
+import torch.nn as nn
+
+torch.manual_seed(0)
+batch, n_patches, v_dim, t_dim, seq_len = 1, 256, 1024, 512, 8
+
+# 1. 视觉编码器输出: 256 个 patch token, 每个维度 1024 (模拟 CLIP ViT 的 grid 特征)
+vision_tokens = torch.randn(batch, n_patches, v_dim)
+
+# 2. 投影层: 把 1024 维视觉特征映射到 LLM 的 512 维词嵌入空间
+projection = nn.Linear(v_dim, t_dim)
+projected = projection(vision_tokens)          # (1, 256, 512)
+
+# 3. 文本侧: 把问题 tokenize 后的 token id 查嵌入表
+vocab = 1000
+embedding = nn.Embedding(vocab, t_dim)
+text_ids = torch.randint(0, vocab, (batch, seq_len))   # 模拟问题 token
+text_emb = embedding(text_ids)                         # (1, 8, 512)
+
+# 4. 关键一步: 视觉 token 在前, 文本 token 在后, 拼成一条序列
+combined = torch.cat([projected, text_emb], dim=1)     # (1, 256+8, 512)
+print(&quot;拼接后的序列长度:&quot;, combined.shape[1], &quot;= 视觉 256 + 文本 8&quot;)
+
+# 之后这条序列会进入 LLM 的自注意力层, 让文本 token 也能&quot;看到&quot;视觉 token</code></pre>
+<p>第 4 行的 <code>torch.cat</code> 就是 MLLM 与 CLIP 最本质的分野：<strong>CLIP 里图文永不交叉，这里图文在进入自注意力之前就已经是同一条序列了</strong>。理解了这一点，就理解了 LLaVA 类模型的骨架。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>架构对比</strong>：用一张表对比 CLIP 与 LLaVA 在&quot;图文交互方式&quot;&quot;输出形式&quot;&quot;能否逐 token 生成&quot;三个维度上的差异。</li>
+<li><strong>动手实验</strong>：在示例 2 中，把拼接顺序改成&quot;文本在前、视觉在后&quot;，思考这对自回归生成有什么影响？为什么实际模型通常把视觉 token 放在最前面？</li>
+<li><strong>训练理解</strong>：解释 LLaVA 两阶段训练各自的冻结/训练对象，以及为什么要先做&quot;特征对齐&quot;再&quot;端到端微调&quot;，而不是一步到位。</li>
+<li><strong>思考题</strong>：为什么第二阶段微调要 mask 掉问题部分的 loss，只对回答部分计算损失？如果不对问题部分 mask，模型可能会学到什么坏习惯？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>LLaVA 原论文（Visual Instruction Tuning）：<a href="https://arxiv.org/abs/2304.08485" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2304.08485</a></li>
+<li>LLaVA 项目主页：<a href="https://llava-vl.github.io/" target="_blank" rel="noopener noreferrer">https://llava-vl.github.io/</a></li>
+<li>LLaVA-1.5 论文（Improved Baselines with Visual Instruction Tuning）：<a href="https://arxiv.org/abs/2310.03744" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2310.03744</a></li>
+<li>Hugging Face LLaVA 文档：<a href="https://huggingface.co/docs/transformers/model_doc/llava" target="_blank" rel="noopener noreferrer">https://huggingface.co/docs/transformers/model_doc/llava</a></li>
+<li>BLIP-2 论文：<a href="https://arxiv.org/abs/2301.12597" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2301.12597</a></li>
+<li>Flamingo 论文：<a href="https://arxiv.org/abs/2204.14198" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2204.14198</a></li>
+</ul>
+<p><a href="#/l/mm-ch5-l2">下一课：图文生成统一</a></p>

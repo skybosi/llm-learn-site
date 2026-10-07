@@ -1,0 +1,368 @@
+<h2 id="h-内联循环识别与不变量外提">内联、循环识别与不变量外提<a class="anchor" href="#h-内联循环识别与不变量外提" aria-label="本节链接">#</a></h2>
+<p>上一课的三个改写都在单个函数内部。可真实程序由函数组成，而<strong>函数边界对优化器是一堵墙</strong>：被调函数的体对调用者不可见，常量、类型、别名信息过不去。这一课先讲怎么把墙拆掉（内联），再讲优化收益最集中的地方——循环：怎么用支配关系<strong>认出</strong>一个自然循环，怎么把循环里&quot;每轮都算但结果不变&quot;的指令搬到循环外，以及为什么&quot;值不变&quot;并不等于&quot;可以随便搬&quot;。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-内联的价值主要不在省一次调用">1. 内联的价值主要不在&quot;省一次调用&quot;<a class="anchor" href="#h-1-内联的价值主要不在省一次调用" aria-label="本节链接">#</a></h4>
+<p>内联（inlining）的第一收益是<strong>打开跨过程优化的门</strong>：调用点消失后，实参常量、返回值、别名信息都暴露在同一个函数体里，上一课的折叠/CSE/DCE 才有活干；省下的那次 <code>call</code>/<code>ret</code> 反而是次要的。</p>
+<p>本课代码第一段就是最小演示：<code>main</code> 原本只有 2 条指令（<code>r = call g(10)</code> 和 <code>return r</code>）。递归内联 <code>g</code> 与 <code>f</code> 后变成 6 条；再跑折叠 + DCE，只剩 2 条，<code>r</code> 直接是 24。<strong>没有内联，<code>10 * 2 + 3 + 1</code> 只能陪跑到运行期</strong>。</p>
+<p>代价同样真实：每个调用点复制一份函数体（代码体积与指令缓存压力）、编译时间、递归需要深度上限。真实编译器因此用<strong>代价模型</strong>（调用点开销对比体大小、是否只被调用一次、是否有 <code>inline</code> 提示）决定，而不是一个固定阈值。</p>
+<h4 id="h-2-先要能认出循环支配关系--回边--自然循环">2. 先要能&quot;认出&quot;循环：支配关系 → 回边 → 自然循环<a class="anchor" href="#h-2-先要能认出循环支配关系--回边--自然循环" aria-label="本节链接">#</a></h4>
+<p>LLVM <em>Loop Terminology</em> 的定义很精确：循环是 CFG 节点的一个子集，满足</p>
+<ol>
+<li>子集的<strong>诱导子图强连通</strong>（里面任意两点互相可达）；</li>
+<li>从子集外进入子集的边<strong>全部指向同一个节点</strong>，称为 header；</li>
+<li>它是满足前两条的最大子集。</li>
+</ol>
+<p>第 2 条的直接推论就是&quot;header 支配循环内所有节点&quot;。识别流程因此非常工程化：先算<strong>支配关系</strong>（<code>Dom(B) = {B} ∪ ⋂ over P ∈ pred(B) : Dom(P)</code>，从 <code>Dom(entry) = {entry}</code> 迭代到不动点），再找<strong>回边</strong>（back edge）<code>latch → header</code>（要求 header 支配 latch），最后从 latch 沿前驱反向走、遇 header 即停，走到的节点加 header 就是<strong>自然循环</strong>。</p>
+<p>本课程序实测：<code>B3 → B2</code> 是回边，循环 = <code>{B2, B3}</code>，header = B2。</p>
+<h4 id="h-3-preheader不变量外提需要循环外只执行一次的落点">3. preheader：不变量外提需要&quot;循环外只执行一次&quot;的落点<a class="anchor" href="#h-3-preheader不变量外提需要循环外只执行一次的落点" aria-label="本节链接">#</a></h4>
+<p>外提不能把指令丢进 header（那还是每轮执行一次），也不能丢进某个分支（可能根本不执行）。需要的是 <strong>preheader</strong>：唯一一个从循环外进入 header、且自己只跳到 header 的前驱块。LLVM 的 <code>LoopSimplify</code> 保证每个循环都有 preheader、单回边、专用出口——这种&quot;规范形态&quot;（canonical form）的意义在于：pass 只需处理一种形状，不必为任意写法各写一套逻辑。本课程序里 <code>B1</code> 就是天然的 preheader。</p>
+<h4 id="h-4-不变量外提的三个条件">4. 不变量外提的三个条件<a class="anchor" href="#h-4-不变量外提的三个条件" aria-label="本节链接">#</a></h4>
+<p>把一条指令从循环体搬到 preheader，必须同时满足：</p>
+<ol>
+<li><strong>操作数在循环内不变</strong>：每个名字要么在循环外定义，要么是已被外提指令的结果。</li>
+<li><strong>无条件执行是安全的</strong>（safe to speculate）：搬到&quot;必然执行&quot;的位置后不能引入原来没有的陷阱。除法、可能越界的 load 都是典型反例；LLVM 的 LICM 用 <code>isSafeToSpeculativelyExecute</code> 判这一类。</li>
+<li><strong>结果在循环内只有一个定值，且定义支配所有出口</strong>：否则某些出口上这个值还没算出来。在&quot;自然循环 + 单回边 + 无中途退出&quot;的形状下这条自动成立。</li>
+</ol>
+<p>本课代码实测：<code>t2 = a * b</code> 被外提；<code>t3 = 100 / c</code> 被<strong>拒绝</strong>，理由正是第 2 条（循环体一次都不执行时原程序不会出错，搬出去就必然出错）；<code>t4 = s * 2</code> 被拒绝，因为 <code>s</code> 在循环内被改写。</p>
+<p>顺带一个组合效应：外提之后 preheader 里的 <code>c = a * b</code> 与新外提的 <code>t2 = a * b</code> 右值相同，上一课的 CSE 可以把它们合成一条。<strong>优化的收益经常是组合出来的</strong>。</p>
+<h4 id="h-5-常见坑">5. 常见坑<a class="anchor" href="#h-5-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>内联递归函数不设界</strong>：直接死循环；真实编译器对递归调用点通常直接放弃内联。</li>
+<li><strong>把&quot;节点在环里&quot;当成自然循环</strong>：不可约控制流里存在没有支配 header 的环，此时不能用自然循环的性质；LLVM 用更一般的 cycle 概念描述，并提供 <code>FixIrreducible</code> 处理。</li>
+<li><strong>没有 preheader 就外提</strong>：把指令塞进 header 会改变&quot;进入循环的次数&quot;的语义。</li>
+<li><strong>把可能陷阱的运算当纯计算搬走</strong>：见上面 <code>100 / c</code> 的反例。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面的纯 Python 代码分两部分。第一部分是递归内联器（形参与局部临时名全部换新），演示&quot;内联把跨过程的常量计算暴露给折叠&quot;。第二部分先算支配关系、用回边找自然循环与 preheader，再按上述三个条件做不变量外提，并把每条被拒绝的指令连同理由打印出来——<strong>&quot;为什么没外提&quot;和&quot;外提了什么&quot;同样重要</strong>。</p>
+<pre data-lang="python"><code class="language-python"># ---- 内联 + 自然循环识别 + 循环不变量外提（纯 Python，无第三方依赖）----
+BIN = {&#39;add&#39;, &#39;sub&#39;, &#39;mul&#39;, &#39;div&#39;}
+OPS = {&#39;add&#39;: lambda x, y: x + y, &#39;sub&#39;: lambda x, y: x - y,
+       &#39;mul&#39;: lambda x, y: x * y, &#39;div&#39;: lambda x, y: x // y}
+SAFE_TO_HOIST = {&#39;add&#39;, &#39;sub&#39;, &#39;mul&#39;, &#39;copy&#39;, &#39;cmp&#39;}      # div 可能陷阱 → 不敢无条件执行
+
+
+def nm(x):
+    return (&#39;name&#39;, x)
+
+
+def ct(k):
+    return (&#39;const&#39;, k)
+
+
+def op_str(x):
+    return str(x[1]) if x else &#39;-&#39;
+
+
+def fmt(ins):
+    op = ins[0]
+    if op == &#39;copy&#39;:
+        return f&#39;{ins[3]} = {op_str(ins[1])}&#39;
+    if op in BIN:
+        return f&#39;{ins[3]} = {op_str(ins[1])} {op} {op_str(ins[2])}&#39;
+    if op == &#39;cmp&#39;:
+        return f&#39;{ins[4]} = {op_str(ins[2])} {ins[1]} {op_str(ins[3])}&#39;
+    if op == &#39;ifgoto&#39;:
+        return f&#39;if {op_str(ins[1])} goto {ins[2]} else {ins[3]}&#39;
+    if op == &#39;goto&#39;:
+        return f&#39;goto {ins[1]}&#39;
+    if op == &#39;call&#39;:
+        return f&#39;{ins[3]} = call {ins[1]}({&quot;, &quot;.join(op_str(a) for a in ins[2])})&#39;
+    if op == &#39;return&#39;:
+        return f&#39;return {op_str(ins[1])}&#39;
+    return str(ins)
+
+
+def def_use(ins):
+    op = ins[0]
+    if op == &#39;copy&#39;:
+        return ins[3], [ins[1]]
+    if op in BIN:
+        return ins[3], [ins[1], ins[2]]
+    if op == &#39;cmp&#39;:
+        return ins[4], [ins[2], ins[3]]
+    if op == &#39;call&#39;:
+        return ins[3], list(ins[2])
+    if op in (&#39;ifgoto&#39;, &#39;return&#39;):
+        return None, [ins[1]]
+    return None, []
+
+
+# ==================== 第一部分：内联（把跨过程优化变成过程内优化）====================
+FUNCS = {                                    # 名字 → (形参, 指令体, 返回值变量)
+    &#39;f&#39;: ([&#39;x&#39;], [(&#39;mul&#39;, nm(&#39;x&#39;), ct(2), &#39;fx&#39;), (&#39;add&#39;, nm(&#39;fx&#39;), ct(3), &#39;fr&#39;)], &#39;fr&#39;),
+    &#39;g&#39;: ([&#39;y&#39;], [(&#39;call&#39;, &#39;f&#39;, [nm(&#39;y&#39;)], &#39;cy&#39;), (&#39;add&#39;, nm(&#39;cy&#39;), ct(1), &#39;gr&#39;)], &#39;gr&#39;),
+}
+MAIN = [(&#39;call&#39;, &#39;g&#39;, [ct(10)], &#39;r&#39;), (&#39;return&#39;, nm(&#39;r&#39;))]
+counter = [0]
+
+
+def fresh(v):
+    counter[0] += 1
+    return f&#39;{v}.{counter[0]}&#39;
+
+
+def instantiate(fname, args):
+    &quot;&quot;&quot;把 fname(args) 的体展开成指令序列（形参与局部临时名全部换成新名字）&quot;&quot;&quot;
+    params, body, ret = FUNCS[fname]
+    sub = dict(zip(params, args))
+    local, out = {}, []
+
+    def ren(x):
+        if x is None or x[0] != &#39;name&#39;:
+            return x
+        return sub.get(x[1], nm(local[x[1]]) if x[1] in local else x)
+    for ins in body:
+        op = ins[0]
+        if op == &#39;return&#39;:
+            continue
+        if op == &#39;call&#39;:
+            callee, cret = instantiate(ins[1], [ren(a) for a in ins[2]])
+            out += callee
+            local[ins[3]] = fresh(ins[3])
+            out.append((&#39;copy&#39;, nm(cret), None, local[ins[3]]))
+            continue
+        d, _ = def_use(ins)
+        local[d] = fresh(d)
+        if op == &#39;copy&#39;:
+            out.append((&#39;copy&#39;, ren(ins[1]), None, local[d]))
+        elif op in BIN:
+            out.append((op, ren(ins[1]), ren(ins[2]), local[d]))
+        else:
+            out.append((&#39;cmp&#39;, ins[1], ren(ins[2]), ren(ins[3]), local[d]))
+    return out, local[ret]
+
+
+def inline_top(instrs):
+    out = []
+    for ins in instrs:
+        if ins[0] == &#39;call&#39;:
+            body, ret = instantiate(ins[1], ins[2])
+            out += body + [(&#39;copy&#39;, nm(ret), None, ins[3])]
+        else:
+            out.append(ins)
+    return out
+
+
+def fold_and_dce(instrs):
+    &quot;&quot;&quot;过程内常量折叠 + 死代码消除（内联之后才有机会做的事）&quot;&quot;&quot;
+    state, out, folds = {}, [], 0
+    for ins in instrs:
+        op = ins[0]
+        if op in (&#39;return&#39;, &#39;goto&#39;, &#39;ifgoto&#39;):
+            out.append(ins)
+            continue
+        d, ops = def_use(ins)
+        vals = [state.get(x[1]) if x[0] == &#39;name&#39; else (&#39;C&#39;, x[1]) for x in ops]
+        if all(v and v[0] == &#39;C&#39; for v in vals):
+            val = vals[0][1] if op == &#39;copy&#39; else OPS[op](*[v[1] for v in vals])
+            state[d] = (&#39;C&#39;, val)
+            out.append((&#39;copy&#39;, ct(val), None, d))
+            folds += op != &#39;copy&#39;
+        else:
+            state[d] = (&#39;NAC&#39;,)
+            out.append(ins)
+    changed = True
+    while changed:                                   # 简单的死代码消除
+        used = {x[1] for ins in out for x in def_use(ins)[1] if x and x[0] == &#39;name&#39;}
+        keep = [ins for ins in out if def_use(ins)[0] is None or def_use(ins)[0] in used]
+        changed = len(keep) != len(out)
+        out = keep
+    return out, folds
+
+
+print(&#39;=== 内联：把跨过程的常量计算变成过程内的常量计算 ===&#39;)
+print(&#39;main 原始：&#39;)
+for ins in MAIN:
+    print(&#39;   &#39;, fmt(ins))
+inlined = inline_top(MAIN)
+print(f&#39;main 内联后（{len(inlined)} 条指令，递归展开了 g→f）：&#39;)
+for ins in inlined:
+    print(&#39;   &#39;, fmt(ins))
+folded, nfold = fold_and_dce(inlined)
+print(f&#39;内联 + 折叠 + 死代码消除后（{len(folded)} 条指令，折叠 {nfold} 次）：&#39;)
+for ins in folded:
+    print(&#39;   &#39;, fmt(ins))
+print(&#39;   → 没有内联，这两次乘法加法只能&quot;陪跑&quot;到运行期；内联把它们暴露给了折叠。\n&#39;)
+
+# ==================== 第二部分：自然循环识别 + 不变量外提 ====================
+LOOP_PROG = {
+    &#39;B1&#39;: [(&#39;mul&#39;, nm(&#39;a&#39;), nm(&#39;b&#39;), &#39;c&#39;),
+           (&#39;copy&#39;, ct(0), None, &#39;i&#39;),
+           (&#39;goto&#39;, &#39;B2&#39;)],
+    &#39;B2&#39;: [(&#39;cmp&#39;, &#39;&lt;&#39;, nm(&#39;i&#39;), nm(&#39;n&#39;), &#39;t1&#39;),
+           (&#39;ifgoto&#39;, nm(&#39;t1&#39;), &#39;B3&#39;, &#39;B5&#39;)],
+    &#39;B3&#39;: [(&#39;mul&#39;, nm(&#39;a&#39;), nm(&#39;b&#39;), &#39;t2&#39;),
+           (&#39;div&#39;, ct(100), nm(&#39;c&#39;), &#39;t3&#39;),
+           (&#39;mul&#39;, nm(&#39;s&#39;), ct(2), &#39;t4&#39;),
+           (&#39;add&#39;, nm(&#39;s&#39;), nm(&#39;t2&#39;), &#39;s&#39;),
+           (&#39;add&#39;, nm(&#39;i&#39;), ct(1), &#39;i&#39;),
+           (&#39;goto&#39;, &#39;B2&#39;)],
+    &#39;B5&#39;: [(&#39;return&#39;, nm(&#39;s&#39;))],
+}
+
+
+def succ_of(prog):
+    s = {}
+    for b, body in prog.items():
+        last = body[-1] if body else None
+        if last and last[0] == &#39;goto&#39;:
+            s[b] = [last[1]]
+        elif last and last[0] == &#39;ifgoto&#39;:
+            s[b] = [last[2], last[3]]
+        else:
+            s[b] = []
+    return s
+
+
+def dominators(prog, succ):
+    order, entry = list(prog), list(prog)[0]
+    pred = {b: [p for p in order if b in succ[p]] for b in order}
+    dom = {b: set(order) for b in order}
+    dom[entry] = {entry}
+    for _ in range(len(order) + 1):
+        new = {}
+        for b in order:
+            if b == entry:
+                new[b] = {entry}
+            else:
+                new[b] = {b} | set.intersection(*[dom[p] for p in pred[b]]) if pred[b] else {b}
+        if new == dom:
+            break
+        dom = new
+    return dom, pred
+
+
+prog, succ = LOOP_PROG, None
+succ = succ_of(prog)
+dom, pred = dominators(prog, succ)
+print(&#39;=== 自然循环识别（支配关系 → 回边 → 循环 + preheader）===&#39;)
+for b in prog:
+    print(f&#39;  dom({b}) = {sorted(dom[b])}&#39;)
+backedges = [(p, b) for b in prog for p in pred[b] if b in dom[p] and p != b or
+             (b in dom[p] and b == p)]
+backedges = [(p, b) for b in prog for p in pred[b] if b in dom[p]]
+print(&#39;  回边 back edge：&#39;, backedges)
+header = backedges[0][1]
+loop = {header}
+work = [backedges[0][0]]
+while work:                                          # 从锁存块反向走，遇到 header 停
+    b = work.pop()
+    if b in loop:
+        continue
+    loop.add(b)
+    work += [p for p in pred[b] if p != header]
+print(f&#39;  自然循环（header={header}）：{sorted(loop)}&#39;)
+pre = [p for p in pred[header] if p not in loop]
+preheader = pre[0] if len(pre) == 1 and succ[pre[0]] == [header] else None
+print(f&#39;  preheader：{preheader}&#39;
+      f&#39;{&quot;（唯一入口且只跳 header → 可直接外提）&quot; if preheader else &quot;（需先补 preheader）&quot;}&#39;)
+
+# ---------- LICM：把循环不变量搬到 preheader 末尾 ----------
+in_loop_defs = {def_use(i)[0] for b in loop for i in prog[b] if def_use(i)[0]}
+hoisted, refused, moved = set(), [], []
+new_pre_body = prog[preheader][:-1]                  # 插在 preheader 的 goto 之前
+for b in sorted(loop):
+    keep = []
+    for ins in prog[b]:
+        op, d, ops = ins[0], def_use(ins)[0], def_use(ins)[1]
+        if d is None or d in moved:
+            keep.append(ins)
+            continue
+        names = [x[1] for x in ops if x[0] == &#39;name&#39;]
+        invariant = all(n not in in_loop_defs or n in hoisted for n in names)
+        defs_here = [def_use(i)[0] for i in prog[b] if def_use(i)[0] == d]
+        if not invariant:
+            refused.append((fmt(ins), &#39;操作数在循环内有定义（非不变量）&#39;))
+        elif op not in SAFE_TO_HOIST:
+            refused.append((fmt(ins), f&#39;{op} 可能陷阱，不能无条件执行（不能猜测执行）&#39;))
+        elif len(defs_here) != 1:
+            refused.append((fmt(ins), &#39;循环内该结果有多个定值&#39;))
+        else:
+            new_pre_body.append(ins)
+            hoisted.add(d)
+            moved.append(ins)
+            continue
+        keep.append(ins)
+    prog[b] = keep
+prog[preheader] = new_pre_body + [prog[preheader][-1]]
+print(&#39;\n=== LICM 决策 ===&#39;)
+print(f&#39;  外提到 {preheader} 的指令：&#39;)
+for ins in moved:
+    print(&#39;   &#39;, fmt(ins))
+print(&#39;  拒绝外提的指令与理由：&#39;)
+for text, why in refused:
+    print(f&#39;    {text:&lt;22} ← {why}&#39;)
+print(&#39;\n=== 外提后的程序 ===&#39;)
+for b in prog:
+    for ins in prog[b]:
+        print(f&#39;  {b}: {fmt(ins)}&#39;)</code></pre>
+<p>运行结果：</p>
+<pre><code>=== 内联：把跨过程的常量计算变成过程内的常量计算 ===
+main 原始：
+    r = call g(10)
+    return r
+main 内联后（6 条指令，递归展开了 g→f）：
+    fx.1 = 10 mul 2
+    fr.2 = fx.1 add 3
+    cy.3 = fr.2
+    gr.4 = cy.3 add 1
+    r = gr.4
+    return r
+内联 + 折叠 + 死代码消除后（2 条指令，折叠 3 次）：
+    r = 24
+    return r
+   → 没有内联，这两次乘法加法只能&quot;陪跑&quot;到运行期；内联把它们暴露给了折叠。
+
+=== 自然循环识别（支配关系 → 回边 → 循环 + preheader）===
+  dom(B1) = [&#39;B1&#39;]
+  dom(B2) = [&#39;B1&#39;, &#39;B2&#39;]
+  dom(B3) = [&#39;B1&#39;, &#39;B2&#39;, &#39;B3&#39;]
+  dom(B5) = [&#39;B1&#39;, &#39;B2&#39;, &#39;B5&#39;]
+  回边 back edge： [(&#39;B3&#39;, &#39;B2&#39;)]
+  自然循环（header=B2）：[&#39;B2&#39;, &#39;B3&#39;]
+  preheader：B1（唯一入口且只跳 header → 可直接外提）
+
+=== LICM 决策 ===
+  外提到 B1 的指令：
+    t2 = a mul b
+  拒绝外提的指令与理由：
+    t1 = i &lt; n             ← 操作数在循环内有定义（非不变量）
+    t3 = 100 div c         ← div 可能陷阱，不能无条件执行（不能猜测执行）
+    t4 = s mul 2           ← 操作数在循环内有定义（非不变量）
+    s = s add t2           ← 操作数在循环内有定义（非不变量）
+    i = i add 1            ← 操作数在循环内有定义（非不变量）
+
+=== 外提后的程序 ===
+  B1: c = a mul b
+  B1: i = 0
+  B1: t2 = a mul b
+  B1: goto B2
+  B2: t1 = i &lt; n
+  B2: if t1 goto B3 else B5
+  B3: t3 = 100 div c
+  B3: t4 = s mul 2
+  B3: s = s add t2
+  B3: i = i add 1
+  B3: goto B2
+  B5: return s</code></pre>
+<p>对照输出读三件事：内联 + 折叠把 <code>main</code> 从 6 条压到 2 条（<code>r = 24</code>）；<code>t2 = a * b</code> 落在 <code>B1</code> 末尾（preheader 的 <code>goto</code> 之前）；被拒绝的 5 条里，<code>t3 = 100 div c</code> 的理由是&quot;可能陷阱&quot;，其余 4 条是&quot;操作数在循环内变&quot;。</p>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选（需本机有 clang / opt）：亲眼看见循环的结构与 LICM ----
+#   clang -O0 -S -emit-llvm loop.c -o loop_O0.ll   # 循环里写一条与循环无关的 a*b 和一条 100/c
+#   opt -passes=&#39;print&lt;loops&gt;&#39; -S loop_O0.ll       # LoopInfo：header / latch / exiting 块
+#   opt -passes=&#39;loop(licm)&#39; -S loop_O0.ll         # 看 a*b 是否被提到 preheader，100/c 是否留下
+# 没有 clang/opt 不影响本课：上面的 Python 版把支配关系、回边、循环、preheader 与外提决策都打印了。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：给外提加&quot;守卫版&quot;支持——当一条可能陷阱的指令（如 <code>100 / c</code>）也想外提时，不无条件执行，而是生成&quot;提前判断安全性&quot;的守卫，失败则走原循环体（提示：这是 LLVM 处理 speculation 的常见折中）。</li>
+<li><strong>解释</strong>：为什么 LLVM 要让 <code>LoopSimplify</code> 先把循环整理成&quot;有 preheader、单回边、专用出口&quot;的规范形态，而不是让每个优化 pass 自己处理任意形状的循环？</li>
+<li><strong>对比/验证</strong>：把 <code>t2 = a * b</code> 改成 <code>t2 = a * b * c</code>（<code>c</code> 在 preheader 定义）再跑，确认它仍被外提；然后把 <code>c</code> 改成循环体内定义的变量，观察拒绝理由从&quot;可能陷阱&quot;变成&quot;操作数在循环内变&quot;。</li>
+<li><strong>思考</strong>：内联让代码变大、让优化机会变多，平衡该由谁拍板？为什么真实编译器用代价模型而不是&quot;函数体不超过 N 条指令&quot;的硬阈值？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Aho, Lam, Sethi, Ullman, <em>Compilers: Principles, Techniques, and Tools</em>（龙书）第 9 章 §9.1「The Principal Sources of Optimization」（代码外提 code motion 与其安全性前提）：<a href="https://suif.stanford.edu/dragonbook/" target="_blank" rel="noopener noreferrer">https://suif.stanford.edu/dragonbook/</a></li>
+<li>同上，§9.6「Loops in Flow Graphs」（支配关系、回边、自然循环与 preheader）</li>
+<li>LLVM <em>Loop Terminology (and Canonical Forms)</em>（自然循环的三条定义、preheader 与 LoopSimplify 规范形态、<code>opt -passes=&#39;print&lt;loops&gt;&#39;</code>）：<a href="https://llvm.org/docs/LoopTerminology.html" target="_blank" rel="noopener noreferrer">https://llvm.org/docs/LoopTerminology.html</a></li>
+<li>LLVM <em>Analysis and Transform Passes</em> 文档（<code>licm</code>、<code>inline</code>、<code>loop-simplify</code> 等 pass 的职责）：<a href="https://llvm.org/docs/Passes.html" target="_blank" rel="noopener noreferrer">https://llvm.org/docs/Passes.html</a></li>
+</ul>
+<p><a href="#/l/cf-ch5-l4">下一课：强度削减、循环展开与向量化预备（与 GPU tiling 呼应）</a></p>

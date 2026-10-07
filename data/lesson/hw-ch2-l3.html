@@ -1,0 +1,117 @@
+<h2 id="h-显存层次hbml2寄存器">显存层次（HBM/L2/寄存器）<a class="anchor" href="#h-显存层次hbml2寄存器" aria-label="本节链接">#</a></h2>
+<p>前面两课都在讲&quot;算&quot;，这一课讲&quot;存&quot;。硬件里有一条残酷的规律：<strong>存储越快，离计算越近，容量就越小</strong>。GPU 用一层层的存储堆出一个&quot;金字塔&quot;，用容量换速度、用局部性换带宽。理解这个金字塔，是后面判断&quot;推理为什么卡在带宽上&quot;的前提。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-存储金字塔">1. 存储金字塔<a class="anchor" href="#h-1-存储金字塔" aria-label="本节链接">#</a></h4>
+<p>从快到慢、从小到大，GPU 的存储层次大致是：</p>
+<ol>
+<li><strong>寄存器（Register）</strong>：每个线程私有，速度最快、容量最小；</li>
+<li><strong>共享内存 / L1 缓存（Shared Memory / L1）</strong>：SM 内共享，片上 SRAM；</li>
+<li><strong>L2 缓存</strong>：整块芯片所有 SM 共享；</li>
+<li><strong>HBM 显存</strong>：片外，容量大、带宽高但仍远慢于片上；</li>
+<li><strong>主机内存</strong>：通过 PCIe / NVLink 连接，最慢。</li>
+</ol>
+<p><figure><img class="md-img" src="content/courses/inference-hardware/assets/chapter-2-figure-03.svg" alt="GPU 存储金字塔：寄存器/共享内存/L2/HBM/主机内存的分层示意" loading="lazy" decoding="async"><figcaption>GPU 存储金字塔：寄存器/共享内存/L2/HBM/主机内存的分层示意</figcaption></figure>
+</p>
+<h4 id="h-2-各层容量与带宽的量级以-h100-为例">2. 各层容量与带宽的量级（以 H100 为例）<a class="anchor" href="#h-2-各层容量与带宽的量级以-h100-为例" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>层级</th>
+<th>容量（量级）</th>
+<th>速度/带宽（量级）</th>
+<th>谁在用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>寄存器</td>
+<td>256 KB / SM</td>
+<td>极快（纳秒级、片上）</td>
+<td>单个线程的临时变量</td>
+</tr>
+<tr>
+<td>共享内存 / L1</td>
+<td>约 228 KB / SM</td>
+<td>极快（片上，TB/s 级）</td>
+<td>SM 内线程共享、数据复用</td>
+</tr>
+<tr>
+<td>L2 缓存</td>
+<td>50 MB</td>
+<td>快（数 TB/s）</td>
+<td>全芯片共享、跨 SM 复用</td>
+</tr>
+<tr>
+<td>HBM</td>
+<td>80 GB</td>
+<td>3.35 TB/s</td>
+<td>权重、激活、KV cache</td>
+</tr>
+</tbody></table>
+<p>规律一目了然：<strong>离 SM 越近越快越小，离得越远越慢越大</strong>。寄存器、共享内存、L2 加起来也就几十 MB 量级，而权重动不动就是几十上百 GB——这就是矛盾所在。</p>
+<h4 id="h-3-为什么要分层局部性与复用">3. 为什么要分层：局部性与复用<a class="anchor" href="#h-3-为什么要分层局部性与复用" aria-label="本节链接">#</a></h4>
+<p>存储分层的依据是程序的两种局部性：</p>
+<ul>
+<li><strong>时间局部性</strong>：刚用过的数据很快会再用（分块里的矩阵小块）；</li>
+<li><strong>空间局部性</strong>：相邻的数据会被一起访问（数组顺序读取）。</li>
+</ul>
+<p>把热点数据放进片上小存储反复复用，就能大幅减少对慢速 HBM 的访问。上一课讲的 GEMM 分块，正是靠共享内存实现这种复用。</p>
+<h4 id="h-4-推理的残酷现实权重放不进片上">4. 推理的残酷现实：权重放不进片上<a class="anchor" href="#h-4-推理的残酷现实权重放不进片上" aria-label="本节链接">#</a></h4>
+<p>问题来了：大模型的<strong>权重是几十上百 GB</strong>，任何片上存储都装不下。于是每生成一个 token，权重都要<strong>从 HBM 完整读一遍</strong>。HBM 的 3.35 TB/s 看起来很大，但除以 140 GB 的权重，也不过每秒 20 多次——<strong>这就是大模型推理吞吐的天花板</strong>（第 4 章会严格推导）。存储金字塔直接解释了&quot;推理为什么是访存密集&quot;。</p>
+<h4 id="h-5-容量-vs-带宽两个不同的瓶颈">5. 容量 vs 带宽：两个不同的瓶颈<a class="anchor" href="#h-5-容量-vs-带宽两个不同的瓶颈" aria-label="本节链接">#</a></h4>
+<p>最后务必分清两个概念：</p>
+<ul>
+<li><strong>容量</strong>决定&quot;能不能装下&quot;：80 GB 的 H100 装不下 175B 的 FP16 模型（350 GB）；</li>
+<li><strong>带宽</strong>决定&quot;装下后跑多快&quot;：装得下 70B（140 GB），但每秒也只能读 20 多遍。</li>
+</ul>
+<p>两者都会卡人，但卡的方式不同。选卡、选精度、做优化，都是在和这两个数打交道。</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>把存储金字塔量化，并亲手算出&quot;读一遍权重要多久&quot;。</p>
+<pre data-lang="python"><code class="language-python"># ---- 例 1：H100 存储层次速查表 ----
+h100_memory = {
+    &quot;寄存器(每SM)&quot;:       {&quot;容量&quot;: 256e3,    &quot;带宽 TB/s&quot;: None,  &quot;位置&quot;: &quot;片上/最快&quot;},
+    &quot;共享内存+L1(每SM)&quot;:  {&quot;容量&quot;: 228e3,    &quot;带宽 TB/s&quot;: None,  &quot;位置&quot;: &quot;片上&quot;},
+    &quot;L2 缓存&quot;:            {&quot;容量&quot;: 50e6,     &quot;带宽 TB/s&quot;: 5.5,   &quot;位置&quot;: &quot;片上/全芯片共享&quot;},
+    &quot;HBM 显存&quot;:           {&quot;容量&quot;: 80e9,     &quot;带宽 TB/s&quot;: 3.35,  &quot;位置&quot;: &quot;片外&quot;},
+}
+for name, spec in h100_memory.items():
+    print(f&quot;{name}: 容量 {spec[&#39;容量&#39;]/1e6:.0f} MB, 带宽 {spec[&#39;带宽 TB/s&#39;]} TB/s&quot;)
+
+# ---- 例 2：读一遍不同大小的模型，要多久 ----
+def read_time(bytes_needed, bw_tb_s):
+    return bytes_needed / (bw_tb_s * 1e12)
+
+for name, params in {&quot;7B&quot;: 7e9, &quot;8B&quot;: 8e9, &quot;70B&quot;: 70e9}.items():
+    weight_bytes = params * 2   # FP16，每参数 2 字节
+    t = read_time(weight_bytes, 3.35)
+    print(f&quot;模型 {name}（FP16 {weight_bytes/1e9:.0f} GB）在 H100 读完一遍 ≈ {t*1e3:.1f} ms&quot;)
+
+# ---- 例 3：容量瓶颈 vs 带宽瓶颈 ----
+def capacity_bound(params, bytes_per_param, capacity_gb):
+    return params * bytes_per_param &lt;= capacity_gb * 1e9
+
+for name, params in {&quot;70B&quot;: 70e9, &quot;175B&quot;: 175e9}.items():
+    fits = capacity_bound(params, 2, capacity_gb=80)
+    print(f&quot;H100 80GB 能否装下 {name} FP16 模型? {&#39;能&#39; if fits else &#39;不能&#39;}&quot;)
+
+# ---- 例 4：片上复用 vs 片外访问的差距 ----
+# 共享内存/L1 的片上带宽可达 TB/s 级，远快于 HBM。
+# 假设片上带宽约 10 TB/s，HBM 3.35 TB/s，做一次&quot;读 1KB&quot;的对比：
+def latency_proxy(bw_tb_s):
+    return 1024 / (bw_tb_s * 1e12)   # 理想化：读 1KB 的时间下限
+
+print(f&quot;\n读 1KB 的理想下限：片上(10TB/s) ≈ {latency_proxy(10)*1e9:.1f} ns，HBM(3.35TB/s) ≈ {latency_proxy(3.35)*1e9:.1f} ns&quot;)</code></pre>
+<p><strong>要点</strong>：例 2 是本课最重要的一行输出——<strong>70B 模型读一遍约 42 毫秒</strong>，意味着即便算力无穷大，H100 每秒最多也只能为它服务约 24 次。例 4 强调片上与片外的巨大差距，说明&quot;把数据留在片上复用&quot;是优化的核心手段。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>排序</strong>：把寄存器、L2、HBM、主机内存按&quot;带宽从大到小&quot;排序，并说明每层分别解决什么问题。</li>
+<li><strong>计算</strong>：H200 的 HBM 带宽是 4.8 TB/s、容量 141 GB。用 <code>read_time</code> 算它读完一个 70B FP16 模型（140 GB）要多久，对比 H100 快了多少。</li>
+<li><strong>判断</strong>：一块 24 GB 的显卡能装下 13B 的 FP16 模型吗？装下 13B 的 INT8（每参数 1 字节）模型吗？分别说明是&quot;容量卡住&quot;还是&quot;能装下但带宽受限&quot;。</li>
+<li><strong>思考</strong>：为什么权重明明读一遍还要读第二遍（每生成一个 token 都要重读）？如果能把权重常驻在片上，推理速度会怎样变化？结合片上与 HBM 的带宽差说明。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>NVIDIA Hopper H100 架构深入（L2、HBM3、SM 存储层次）：<a href="https://developer.nvidia.com/blog/nvidia-hopper-architecture-in-depth/" target="_blank" rel="noopener noreferrer">https://developer.nvidia.com/blog/nvidia-hopper-architecture-in-depth/</a></li>
+<li>NVIDIA H100 Tensor Core GPU 产品规格：<a href="https://www.nvidia.com/en-us/data-center/h100/" target="_blank" rel="noopener noreferrer">https://www.nvidia.com/en-us/data-center/h100/</a></li>
+<li>Micron HBM3 技术说明（高带宽内存）：<a href="https://www.micron.com/products/memory/high-bandwidth-memory" target="_blank" rel="noopener noreferrer">https://www.micron.com/products/memory/high-bandwidth-memory</a></li>
+</ul>
+<p><a href="#/l/hw-ch3-l1">下一课：FP32/FP16/BF16</a></p>

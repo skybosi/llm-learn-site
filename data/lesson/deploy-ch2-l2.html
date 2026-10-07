@@ -1,0 +1,132 @@
+<h2 id="h-vllm-启动与压测">vLLM 启动与压测<a class="anchor" href="#h-vllm-启动与压测" aria-label="本节链接">#</a></h2>
+<p>环境搭好、模型量化完，下一步是把它&quot;serve 起来&quot;并测出真实性能。本课聚焦两个动作：<strong>用 vLLM 拉起一个 OpenAI 兼容的推理服务</strong>，以及<strong>用压测脚本测出吞吐与延迟分位数</strong>。压测不是&quot;跑一下看个数字&quot;，而是要在<strong>控制并发/请求速率</strong>的前提下，找到&quot;满足 P99 延迟前提下的最大吞吐&quot;——这正是上一章容量规划需要的那个关键输入。学完本课，你应当能启动服务、用 curl 验证、用脚本压测并读懂 TTFT/TPOT/吞吐三组指标。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-vllm-启动一个命令拉起服务">1. vLLM 启动：一个命令拉起服务<a class="anchor" href="#h-1-vllm-启动一个命令拉起服务" aria-label="本节链接">#</a></h4>
+<p>现代 vLLM 用 <code>vllm serve</code> 直接启动 OpenAI 兼容服务：</p>
+<pre data-lang="bash"><code class="language-bash">vllm serve Qwen/Qwen2.5-7B-Instruct \
+    --host 0.0.0.0 --port 8000 \
+    --gpu-memory-utilization 0.9 \
+    --max-model-len 8192 \
+    --max-num-seqs 256</code></pre>
+<p>关键参数（下一课深入调优）：</p>
+<ul>
+<li><code>--gpu-memory-utilization 0.9</code>：模型 + KV Cache 最多用 90% 显存；</li>
+<li><code>--max-model-len 8192</code>：允许的最大序列长度（决定 KV Cache 上限）；</li>
+<li><code>--max-num-seqs 256</code>：同时处理的序列数上限（并发批）；</li>
+<li><code>--quantization awq</code>：加载量化模型时加这个参数。</li>
+</ul>
+<p>启动后可用 curl 验证（OpenAI 兼容协议）：</p>
+<pre data-lang="bash"><code class="language-bash">curl http://localhost:8000/v1/chat/completions \
+  -H &quot;Content-Type: application/json&quot; \
+  -d &#39;{&quot;model&quot;:&quot;Qwen/Qwen2.5-7B-Instruct&quot;,&quot;messages&quot;:[{&quot;role&quot;:&quot;user&quot;,&quot;content&quot;:&quot;你好&quot;}]}&#39;</code></pre>
+<h4 id="h-2-压测测什么">2. 压测测什么<a class="anchor" href="#h-2-压测测什么" aria-label="本节链接">#</a></h4>
+<p>压测核心三指标（上一门课的定义，这里落到测量）：</p>
+<ul>
+<li><strong>吞吐（token/s）</strong>：单位时间产出的 token，衡量&quot;能接多少活&quot;；</li>
+<li><strong>TTFT（首 token 延迟）</strong>：请求发出到收到第一个 token，衡量&quot;反应快不快&quot;；</li>
+<li><strong>TPOT（每 token 延迟）</strong>：生成阶段每个 token 的平均间隔，衡量&quot;读起来顺不顺&quot;。</li>
+</ul>
+<p>压测的关键是<strong>扫请求速率（QPS）</strong>：从低到高逐步加压，画出&quot;吞吐上升、延迟在某个点后陡增&quot;的曲线，<strong>拐点之前就是&quot;达标吞吐&quot;</strong>。只测一个并发点是看不出拐点的。</p>
+<h4 id="h-3-自编压测脚本-vs-现成工具">3. 自编压测脚本 vs 现成工具<a class="anchor" href="#h-3-自编压测脚本-vs-现成工具" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>vLLM 自带 <code>bench serve</code></strong>：一条命令出吞吐/延迟，适合快速摸底；</li>
+<li><strong>自编脚本</strong>：能精确控制并发、采集每个请求的 TTFT/TPOT、算 P99，适合验证 SLO。</li>
+</ul>
+<p>本课用自编脚本，因为它把&quot;延迟分位数&quot;和&quot;吞吐&quot;一起算出来，更贴近需求分析的验收标准。</p>
+<h4 id="h-4-压测的坑">4. 压测的坑<a class="anchor" href="#h-4-压测的坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>预热</strong>：首几个请求含模型加载/内核编译，数据要丢弃；</li>
+<li><strong>限流</strong>：短时间狂发会被限流或 OOM，要按速率逐步加压；</li>
+<li><strong>长尾</strong>：只报平均值会漏掉 P99 尖峰，必须算分位数；</li>
+<li><strong>输出长度</strong>：TTFT 受 prompt 长度影响，TPOT 受输出长度影响，压测要固定代表性长度。</li>
+</ul>
+<p><figure><img class="md-img" src="content/courses/llm-deployment-practice/assets/chapter-2-figure-02.svg" alt="vLLM 启动与压测链路：左侧&quot;vllm serve 命令&quot;拉起带 GPU 的服务（OpenAI 兼容端口 8000），中间压测脚本以可调 QPS 发送并发请求，右侧输出三张曲线——吞吐随 QPS 先升后平、P99 TTFT/TPOT 在拐点后陡增" loading="lazy" decoding="async"><figcaption>vLLM 启动与压测链路：左侧&quot;vllm serve 命令&quot;拉起带 GPU 的服务（OpenAI 兼容端口 8000），中间压测脚本以可调 QPS 发送并发请求，右侧输出三张曲线——吞吐随 QPS 先升后平、P99 TTFT/TPOT 在拐点后陡增</figcaption></figure>
+</p>
+<h3 id="h-二可运行示例">二、可运行示例<a class="anchor" href="#h-二可运行示例" aria-label="本节链接">#</a></h3>
+<h4 id="h-示例-1启动服务--curl-冒烟">示例 1：启动服务 + curl 冒烟<a class="anchor" href="#h-示例-1启动服务--curl-冒烟" aria-label="本节链接">#</a></h4>
+<pre data-lang="bash"><code class="language-bash"># 启动（量化模型加 --quantization awq；原始权重则省略）
+vllm serve Qwen/Qwen2.5-7B-Instruct \
+    --host 0.0.0.0 --port 8000 \
+    --gpu-memory-utilization 0.9 \
+    --max-model-len 8192 \
+    --max-num-seqs 128
+
+# 另开终端冒烟验证
+curl -s http://localhost:8000/v1/chat/completions \
+  -H &quot;Content-Type: application/json&quot; \
+  -d &#39;{&quot;model&quot;:&quot;Qwen/Qwen2.5-7B-Instruct&quot;,&quot;messages&quot;:[{&quot;role&quot;:&quot;user&quot;,&quot;content&quot;:&quot;用一句话介绍 GPU&quot;}],&quot;max_tokens&quot;:32}&#39;</code></pre>
+<h4 id="h-示例-2自编压测脚本扫-qps算-ttfttpot吞吐">示例 2：自编压测脚本（扫 QPS，算 TTFT/TPOT/吞吐）<a class="anchor" href="#h-示例-2自编压测脚本扫-qps算-ttfttpot吞吐" aria-label="本节链接">#</a></h4>
+<pre data-lang="python"><code class="language-python"># -*- coding: utf-8 -*-
+# 压测脚本：以固定 QPS 打 OpenAI 兼容接口，统计吞吐 + 延迟分位数
+# 运行前先 pip install openai aiohttp，并确保服务已启动在 8000 端口
+import asyncio, time, random
+from openai import AsyncOpenAI
+
+client = AsyncOpenAI(base_url=&quot;http://localhost:8000/v1&quot;, api_key=&quot;EMPTY&quot;)
+MODEL = &quot;Qwen/Qwen2.5-7B-Instruct&quot;
+
+async def one_request(ttft_list, tpot_list, out_tok_list, in_tok=200, out_tok=128):
+    prompt = &quot;请用中文详细解释&quot; + &quot;量子计算&quot; * 10   # 构造约 200 token 的输入
+    t0 = time.perf_counter()
+    ttft = tpot_sum = None
+    n_out = 0
+    stream = await client.chat.completions.create(
+        model=MODEL,
+        messages=[{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: prompt}],
+        max_tokens=out_tok, temperature=0.0, stream=True)
+    async for chunk in stream:
+        if chunk.choices and chunk.choices[0].delta.content:
+            now = time.perf_counter()
+            if ttft is None:
+                ttft = now - t0            # 首个 token -&gt; TTFT
+                tpot_sum = 0.0
+            else:
+                tpot_sum += now - t0       # 累计 token 时间戳
+            n_out += 1
+            t0 = now
+    if n_out &gt; 0:
+        ttft_list.append(ttft)
+        tpot_list.append(tpot_sum / max(n_out - 1, 1))   # 平均每 token 间隔
+        out_tok_list.append(n_out)
+
+async def run(qps: float, seconds: float = 30):
+    &quot;&quot;&quot;按 qps 的速率持续发请求 seconds 秒，返回(吞吐, P50/P99 TTFT, P50/P99 TPOT)。&quot;&quot;&quot;
+    ttft, tpot, ntok = [], [], []
+    interval = 1.0 / qps
+    tasks, start = [], time.perf_counter()
+    while time.perf_counter() - start &lt; seconds:
+        tasks.append(asyncio.create_task(one_request(ttft, tpot, ntok)))
+        await asyncio.sleep(interval)                    # 限速：控制请求速率
+    await asyncio.gather(*tasks)
+    ttft.sort(); tpot.sort()
+    def pct(xs, p): return xs[int(len(xs) * p)] if xs else 0
+    total_tok = sum(ntok)
+    dur = time.perf_counter() - start
+    return dict(qps=qps, throughput=total_tok / dur,
+                p50_ttft=pct(ttft, .5), p99_ttft=pct(ttft, .99),
+                p50_tpot=pct(tpot, .5), p99_tpot=pct(tpot, .99))
+
+async def main():
+    for qps in [2, 4, 8, 16, 32]:          # 从低到高扫速率，找&quot;拐点&quot;
+        r = await run(qps)
+        print(f&quot;QPS={r[&#39;qps&#39;]:&gt;2} | 吞吐={r[&#39;throughput&#39;]:6.0f} tok/s | &quot;
+              f&quot;P50/P99 TTFT={r[&#39;p50_ttft&#39;]:.2f}/{r[&#39;p99_ttft&#39;]:.2f}s | &quot;
+              f&quot;P50/P99 TPOT={r[&#39;p50_tpot&#39;]*1000:4.0f}/{r[&#39;p99_tpot&#39;]*1000:4.0f}ms&quot;)
+
+asyncio.run(main())</code></pre>
+<p>跑完你会看到典型曲线：<strong>QPS 低时延迟很小、吞吐随 QPS 线性上升；超过某个点后吞吐不再涨、P99 延迟陡增</strong>——那个拐点对应的吞吐，就是&quot;守住延迟 SLO 的最大吞吐&quot;，正是容量规划要填的数字。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>找拐点</strong>：把示例 2 的 QPS 列表加密（如 [2,4,8,16,24,32,48,64]），定位你机器上&quot;P99 TTFT 开始超过 2s&quot;的 QPS，并记录该点的吞吐。</li>
+<li><strong>改输出长度</strong>：把 <code>out_tok</code> 从 128 改成 512，重跑一个 QPS 点，观察 TPOT 和吞吐怎么变，说明为什么长输出场景吞吐会下降。</li>
+<li><strong>加预热</strong>：给脚本加&quot;正式压测前先发 3 个请求丢弃&quot;的预热逻辑，并解释预热为什么能避免把模型加载时间算进延迟。</li>
+<li><strong>对比现成工具</strong>：用 <code>vllm bench serve --help</code> 查看官方压测工具的用法，与自编脚本对比，说明各自适合什么场景。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>vLLM 文档 · OpenAI 兼容服务器与 CLI：<a href="https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html" target="_blank" rel="noopener noreferrer">https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html</a></li>
+<li>vLLM 文档 · 性能压测工具：<a href="https://docs.vllm.ai/en/latest/contributing/benchmarks.html" target="_blank" rel="noopener noreferrer">https://docs.vllm.ai/en/latest/contributing/benchmarks.html</a></li>
+<li>OpenAI API · Chat Completions 流式协议：<a href="https://platform.openai.com/docs/api-reference/chat" target="_blank" rel="noopener noreferrer">https://platform.openai.com/docs/api-reference/chat</a></li>
+<li>vLLM 论文（PagedAttention）：<a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2309.06180</a></li>
+</ul>
+<p><a href="#/l/deploy-ch2-l3">下一课：显存与吞吐调优</a></p>

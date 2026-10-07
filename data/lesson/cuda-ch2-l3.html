@@ -1,0 +1,250 @@
+<h2 id="h-同步与协作__syncthreadswarp-shuffle协作组">同步与协作：__syncthreads、warp shuffle、协作组<a class="anchor" href="#h-同步与协作__syncthreadswarp-shuffle协作组" aria-label="本节链接">#</a></h2>
+<p>上一课说清了 warp 之间是&quot;各自为战&quot;的：调度器挑谁发射是自由的，所以你不能假设别的 warp 走到哪了。但 shared memory 恰恰是<strong>整个 block 共用</strong>的——A 线程写、B 线程读，读到的到底是新值还是旧值？这一课讲三种把顺序&quot;钉死&quot;的手段：block 级屏障 <code>__syncthreads()</code>、warp 内的 shuffle 原语，以及把它们包装成类型的 cooperative groups（协作组）。同一份归约，用屏障写要 8 轮同步，用 shuffle 写只要 1 轮——这个差距就是本课的全部意义。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-__syncthreads屏障--可见性不只是等一等">1. <code>__syncthreads()</code>：屏障 + 可见性，不只是&quot;等一等&quot;<a class="anchor" href="#h-1-__syncthreads屏障--可见性不只是等一等" aria-label="本节链接">#</a></h4>
+<p>官方文档对 <code>__syncthreads()</code> 的定义包含两件事：<strong>等到 block 内所有线程都到达这个点</strong>，并且<strong>这些线程在此点之前对 global 与 shared memory 的写，对 block 内所有线程可见</strong>。第二条常被忽略：没有它，即使所有线程都&quot;到了&quot;，编译器与硬件也没有义务让你看到同伴刚写的 shared 值。</p>
+<p>两条硬规则：</p>
+<ol>
+<li><strong>所有线程必须到达同一个屏障</strong>。把 <code>__syncthreads()</code> 放在&quot;只有一部分线程会进&quot;的分支里，是未定义行为——实际表现通常是整个 block 挂死（其余 warp 永远等不到）。边界判断要写在屏障<strong>之外</strong>，或者改成所有线程都到达的等价写法。</li>
+<li><strong>屏障不是免费的</strong>。它把 block 内所有 warp 卡在同一个点上，前面第 2 课讲过的&quot;用别的 warp 填空&quot;在屏障处失效。所以归约这类算法要尽量<strong>减少屏障轮数</strong>，而不是只在循环里加同步。</li>
+</ol>
+<h4 id="h-2-数一数屏障两种归约写法的差距">2. 数一数屏障：两种归约写法的差距<a class="anchor" href="#h-2-数一数屏障两种归约写法的差距" aria-label="本节链接">#</a></h4>
+<p>以 256 个元素求和为例：</p>
+<table>
+<thead>
+<tr>
+<th>写法</th>
+<th>同步结构</th>
+<th><code>__syncthreads()</code> 次数</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>朴素 shared 树形归约</td>
+<td>每轮 stride 减半，每轮都要同步</td>
+<td><code>log2(256) = 8</code></td>
+</tr>
+<tr>
+<td>两级归约</td>
+<td>每 warp 用 shuffle 出部分和（0 屏障）→ 写 shared → 1 次屏障 → warp 0 归约</td>
+<td>1</td>
+</tr>
+</tbody></table>
+<p>两级写法的结构是：① 每个 warp 内部用 5 步 shuffle（<code>32 = 2^5</code>）算出 32 个 lane 的和；② 8 个 warp 各把自己 lane 0 的部分和写进 <code>shared[8]</code>；③ <strong>一次</strong> <code>__syncthreads()</code>；④ 让 warp 0 读这 8 个数，再用 3 步 shuffle 求和。屏障从 8 次降到 1 次，这个改进与&quot;共享内存银行冲突&quot;（第 3 章）是两件事，别混着算。</p>
+<p><figure><img class="md-img" src="content/courses/gpu-cuda-kernels/assets/chapter-2-figure-03.svg" alt="两种归约的屏障账：朴素树形 8 次，两级归约 1 次" loading="lazy" decoding="async"><figcaption>两种归约的屏障账：朴素树形 8 次，两级归约 1 次</figcaption></figure>
+</p>
+<h4 id="h-3-warp-级协作__syncwarp-与-shuffle">3. warp 级协作：<code>__syncwarp</code> 与 shuffle<a class="anchor" href="#h-3-warp-级协作__syncwarp-与-shuffle" aria-label="本节链接">#</a></h4>
+<p>Volta 及之后，warp 内线程拥有独立调度——<strong>不能再用&quot;warp 天然锁步&quot;来当同步</strong>。官方语言扩展文档给出的要求是：warp 级原语都要带一个 mask 参数，明确声明哪些 lane 参与。</p>
+<ul>
+<li><code>__syncwarp(mask)</code>：参与 lane 的 warp 级屏障（只保证这些 lane 到达同一处，不涉及 shared 可见性语义）；</li>
+<li><code>__shfl_sync(mask, v, srcLane)</code>、<code>__shfl_down_sync(mask, v, offset)</code>、<code>__shfl_up_sync</code>、<code>__shfl_xor_sync</code>：让 lane 直接<strong>读</strong>同伴的寄存器值；</li>
+<li><code>__ballot_sync(mask, pred)</code>、<code>__any_sync</code>、<code>__all_sync</code>：把 32 个 lane 的谓词汇总成 mask/布尔。</li>
+</ul>
+<p>关键性质：<strong>shuffle 是寄存器到寄存器的交换，不经过 shared memory，也不需要屏障</strong>。<code>__shfl_down_sync(mask, v, k)</code> 的语义是&quot;lane <code>i</code> 取 lane <code>i+k</code> 的值，越界的 lane 保持自己的值不变&quot;。所以 warp 内归约可以写成 5 步：<code>offset = 16, 8, 4, 2, 1</code>，每步 <code>v += shfl_down(v, offset)</code>，最后 lane 0 就是 32 个 lane 的和。</p>
+<p>坑也集中在这里：mask 必须覆盖所有真正参与的 lane（漏掉就是未定义行为）；只能用 <code>_sync</code> 版本（老的 <code>__shfl</code> 已被弃用）；shuffle 只在本 warp 内有效，不能跨 warp；<code>__shfl_up_sync</code> 在 lane 0 处没有&quot;上一个 lane&quot;，越界语义同样是保持原值。</p>
+<h4 id="h-4-协作组把范围变成类型">4. 协作组：把&quot;范围&quot;变成类型<a class="anchor" href="#h-4-协作组把范围变成类型" aria-label="本节链接">#</a></h4>
+<p>cooperative groups（协作组，头文件 <code>cooperative_groups.h</code>，命名空间 <code>cg</code>）做的事是：把&quot;我在哪个范围内同步&quot;从约定变成类型。</p>
+<table>
+<thead>
+<tr>
+<th>对象</th>
+<th>范围</th>
+<th>典型用法</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>cg::thread_block</code></td>
+<td>整个 block</td>
+<td><code>cg::sync(block)</code> 等价于 <code>__syncthreads()</code>；<code>block.thread_rank()</code> 给块内线性号</td>
+</tr>
+<tr>
+<td><code>cg::tiled_partition&lt;32&gt;(block)</code></td>
+<td>一个 warp</td>
+<td>给 warp 级原语加上静态范围与类型安全</td>
+</tr>
+<tr>
+<td><code>cg::coalesced_threads()</code></td>
+<td>当前能一起走的那些 lane</td>
+<td>收敛后立刻组队，减少显式 mask 出错</td>
+</tr>
+<tr>
+<td><code>cg::grid_group</code></td>
+<td>整个 grid</td>
+<td>需要 <code>cudaLaunchCooperativeKernel</code> 启动，能做 grid 级同步</td>
+</tr>
+</tbody></table>
+<p>grid 级同步的代价要算清楚：<strong>只有能被同时驻留的 block 才可能全到齐</strong>，所以 grid 的规模必须不超过&quot;每 SM 可驻留 block 数 × SM 数&quot;。这个上限正是上一课 occupancy 的产出——occupancy 算不清，协作组 grid 同步就启动不起来（官方文档专门有一节 &quot;When to use cudaLaunchCooperativeKernel&quot;）。device 是否支持，也要用 <code>cudaDevAttrCooperativeLaunch</code> 之类的属性查询确认。</p>
+<h4 id="h-5-常见坑">5. 常见坑<a class="anchor" href="#h-5-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>在分叉分支里调用 <code>__syncthreads()</code></strong>：只要有一个 warp 到不了，就是 UB/挂死。</li>
+<li><strong>用 <code>volatile</code> 代替屏障</strong>：<code>volatile</code> 只影响编译器优化的可见性，不建立线程之间的执行顺序。</li>
+<li><strong>把 <code>__syncthreads()</code> 当 warp 内同步用</strong>：明明 5 步 shuffle 能解决，却让整个 block 停 8 次。</li>
+<li><strong>以为 grid 同步免费</strong>：它要求&quot;整个 grid 同时驻留&quot;，规模一超就启动失败。</li>
+<li><strong>mask 写 <code>0xffffffff</code> 却只让 16 个 lane 参与</strong>：多出来的 lane 在等待，属于 UB；mask 要如实反映参与集合。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面用纯 Python/numpy 把上面两种归约各跑一遍：路线 A 模拟&quot;shared memory + 每轮 <code>__syncthreads()</code>&quot;，路线 B 模拟&quot;warp 内 shuffle + 唯一一次屏障&quot;。<code>shfl_down_sync</code> 按官方语义实现（越界 lane 保持不变），屏障次数也真的数出来。</p>
+<pre data-lang="python"><code class="language-python"># ---- 无 GPU 模拟 __syncthreads 屏障归约 与 warp shuffle 归约（纯 Python/numpy）----
+import numpy as np
+
+WARP = 32
+
+
+class Block:
+    &quot;&quot;&quot;模拟一个线程块：shared 是块内共享内存，barrier() 当一次 __syncthreads。&quot;&quot;&quot;
+
+    def __init__(self, threads, data):
+        self.t = threads                      # 块内线程数
+        self.shared = np.zeros(threads, dtype=np.int64)
+        self.shared[:threads] = data          # 每个线程先把自己那份写进 shared
+        self.barriers = 0
+
+    def barrier(self, all_threads_arrive=True):
+        self.barriers += 1
+        if not all_threads_arrive:            # 只有部分线程到达 → 未定义行为
+            raise RuntimeError(&#39;__syncthreads 只被部分线程到达：CUDA 里是未定义行为&#39;)
+
+
+def tree_reduce_shared(block):
+    &quot;&quot;&quot;朴素 shared-memory 树形归约：每轮&quot;活着的一半线程&quot;读另一半、写回、再屏障。&quot;&quot;&quot;
+    stride = block.t // 2
+    round_no = 0
+    while stride &gt;= 1:
+        for i in range(stride):
+            block.shared[i] += block.shared[i + stride]
+        block.barrier()                        # 每轮都必须同步，否则读到脏数据
+        round_no += 1
+        print(f&#39;  shared 归约第 {round_no} 轮后（stride={stride}）：&#39;
+              f&#39;前 8 项 = {block.shared[:8].tolist()}&#39;)
+        stride //= 2
+    return int(block.shared[0])
+
+
+def shfl_down_sync(val, offset):
+    &quot;&quot;&quot;__shfl_down_sync(0xffffffff, val, offset)：lane 取 lane+offset 的值，越界则保持不变。&quot;&quot;&quot;
+    out = val.copy()
+    for lane in range(WARP):
+        src = lane + offset
+        if src &lt; WARP:
+            out[lane] = val[src]
+    return out
+
+
+def warp_reduce(v, verbose=True):
+    &quot;&quot;&quot;warp 内归约：5 步 shuffle、零屏障。要求 v 是长度 32 的数组。&quot;&quot;&quot;
+    v = v.copy()
+    offset, step = WARP // 2, 0
+    while offset &gt;= 1:
+        v = v + shfl_down_sync(v, offset)
+        step += 1
+        if verbose:
+            print(f&#39;  shuffle 第 {step} 步（offset={offset:&gt;2}）：&#39;
+                  f&#39;lane 0..7 = {v[:8].tolist()}&#39;)
+        offset //= 2
+    return int(v[0])
+
+
+rng = np.random.default_rng(1)
+T = 256
+data = rng.integers(0, 10, T).astype(np.int64)
+golden = int(data.sum())
+print(f&#39;输入 {T} 个整数，参考和 = {golden}\n&#39;)
+
+print(&#39;=== 路线 A：shared memory 树形归约（每轮一次 __syncthreads）===&#39;)
+blk = Block(T, data)
+got_a = tree_reduce_shared(blk)
+print(f&#39;结果 = {got_a}，正确 = {got_a == golden}，__syncthreads 次数 = {blk.barriers}\n&#39;)
+
+print(&#39;=== 路线 B：两级归约 = warp 内 shuffle（0 屏障）+ warp 间 1 次屏障 ===&#39;)
+n_warps = T // WARP
+partials = np.zeros(n_warps, dtype=np.int64)
+for w in range(n_warps):
+    print(f&#39;warp {w}：&#39; if w == 0 else f&#39;warp {w}：（步骤同上，只列部分和）&#39;)
+    partials[w] = warp_reduce(data[w * WARP:(w + 1) * WARP], verbose=(w == 0))
+print(f&#39;  各 warp 的部分和 = {partials.tolist()}&#39;)
+barriers = 1                                  # 只有&quot;写 shared + 读 shared&quot;之间需要一次
+print(f&#39;  把 {n_warps} 个部分和写进 shared → __syncthreads（第 1 次，也是唯一一次）&#39;)
+padded = np.zeros(WARP, dtype=np.int64)
+padded[:n_warps] = partials                   # 补 0 到 32，让 shuffle 能在整 warp 上跑
+print(f&#39;  补齐到 32 个 lane = {padded.tolist()}&#39;)
+print(&#39;  warp 0 再对自己归约（offset=16/8 落在补 0 的 lane 上，等于空转）：&#39;)
+warp0_sum = warp_reduce(padded)
+print(f&#39;结果 = {warp0_sum}，正确 = {warp0_sum == golden}，__syncthreads 次数 = {barriers}&#39;)
+print(f&#39;\n两种路线的屏障数：{blk.barriers} vs {barriers}（{blk.barriers / barriers:.0f}x）\n&#39;)
+
+print(&#39;=== 反面例子：屏障放进&quot;只有一半线程会进&quot;的分支 ===&#39;)
+try:
+    Block(64, data[:64]).barrier(all_threads_arrive=False)
+except RuntimeError as e:
+    print(&#39;  抛出：&#39;, e)</code></pre>
+<p>运行结果（CPU 实测，数据种子固定）：</p>
+<pre><code>输入 256 个整数，参考和 = 1169
+
+=== 路线 A：shared memory 树形归约（每轮一次 __syncthreads）===
+  shared 归约第 1 轮后（stride=128）：前 8 项 = [8, 13, 16, 11, 4, 3, 14, 15]
+  shared 归约第 2 轮后（stride=64）：前 8 项 = [18, 20, 23, 24, 14, 12, 21, 31]
+  shared 归约第 3 轮后（stride=32）：前 8 项 = [35, 30, 42, 45, 30, 33, 48, 43]
+  shared 归约第 4 轮后（stride=16）：前 8 项 = [60, 82, 75, 86, 70, 81, 104, 61]
+  shared 归约第 5 轮后（stride=8）：前 8 项 = [138, 154, 143, 157, 150, 153, 152, 122]
+  shared 归约第 6 轮后（stride=4）：前 8 项 = [288, 307, 295, 279, 150, 153, 152, 122]
+  shared 归约第 7 轮后（stride=2）：前 8 项 = [583, 586, 295, 279, 150, 153, 152, 122]
+  shared 归约第 8 轮后（stride=1）：前 8 项 = [1169, 586, 295, 279, 150, 153, 152, 122]
+结果 = 1169，正确 = True，__syncthreads 次数 = 8
+
+=== 路线 B：两级归约 = warp 内 shuffle（0 屏障）+ warp 间 1 次屏障 ===
+warp 0：
+  shuffle 第 1 步（offset=16）：lane 0..7 = [10, 10, 7, 9, 8, 8, 16, 14]
+  shuffle 第 2 步（offset= 8）：lane 0..7 = [20, 16, 19, 20, 11, 19, 19, 22]
+  shuffle 第 3 步（offset= 4）：lane 0..7 = [31, 35, 38, 42, 33, 35, 31, 33]
+  shuffle 第 4 步（offset= 2）：lane 0..7 = [69, 77, 71, 77, 64, 68, 72, 74]
+  shuffle 第 5 步（offset= 1）：lane 0..7 = [146, 148, 148, 141, 132, 140, 146, 146]
+warp 1：（步骤同上，只列部分和）
+warp 2：（步骤同上，只列部分和）
+warp 3：（步骤同上，只列部分和）
+warp 4：（步骤同上，只列部分和）
+warp 5：（步骤同上，只列部分和）
+warp 6：（步骤同上，只列部分和）
+warp 7：（步骤同上，只列部分和）
+  各 warp 的部分和 = [146, 135, 167, 151, 180, 130, 134, 126]
+  把 8 个部分和写进 shared → __syncthreads（第 1 次，也是唯一一次）
+  补齐到 32 个 lane = [146, 135, 167, 151, 180, 130, 134, 126, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  warp 0 再对自己归约（offset=16/8 落在补 0 的 lane 上，等于空转）：
+  shuffle 第 1 步（offset=16）：lane 0..7 = [146, 135, 167, 151, 180, 130, 134, 126]
+  shuffle 第 2 步（offset= 8）：lane 0..7 = [146, 135, 167, 151, 180, 130, 134, 126]
+  shuffle 第 3 步（offset= 4）：lane 0..7 = [326, 265, 301, 277, 180, 130, 134, 126]
+  shuffle 第 4 步（offset= 2）：lane 0..7 = [627, 542, 481, 407, 314, 256, 134, 126]
+  shuffle 第 5 步（offset= 1）：lane 0..7 = [1169, 1023, 888, 721, 570, 390, 260, 126]
+结果 = 1169，正确 = True，__syncthreads 次数 = 1
+
+两种路线的屏障数：8 vs 1（8x）
+
+=== 反面例子：屏障放进&quot;只有一半线程会进&quot;的分支 ===
+  抛出： __syncthreads 只被部分线程到达：CUDA 里是未定义行为</code></pre>
+<p>两个细节值得对照：路线 B 里 <code>offset=16/8</code> 两步在补 0 之后确实是空转（lane 0..7 的值没变），所以&quot;补齐到 32 再归约&quot;并不浪费计算；而屏障从 8 次降到 1 次，意味着 block 内所有 warp 少停了 7 次。</p>
+<pre data-lang="cuda"><code class="language-cuda">// ---- 可选（需自备 GPU 或云上按需）：上面路线 B 的 CUDA C++ 样子 ----
+// 每个 block 256 线程（8 个 warp）做一次 256 元素归约：
+//   float v = data[threadIdx.x];
+//   for (int off = 16; off &gt; 0; off &gt;&gt;= 1) v += __shfl_down_sync(0xffffffff, v, off);
+//   if ((threadIdx.x &amp; 31) == 0) shared[threadIdx.x &gt;&gt; 5] = v;   // 每 warp 一个部分和
+//   __syncthreads();                                             // 唯一一次 block 级同步
+//   if (threadIdx.x &lt; 32) {
+//       v = (threadIdx.x &lt; 8) ? shared[threadIdx.x] : 0.0f;
+//       for (int off = 4; off &gt; 0; off &gt;&gt;= 1) v += __shfl_down_sync(0xffffffff, v, off);
+//       if (threadIdx.x == 0) out[blockIdx.x] = v;
+//   }
+// 注意：mask 里的 lane 必须真的参与；把 __syncthreads() 挪进上面任意一个 if 里就变成 UB。
+// 与第 6 课（归约）的差别只是这里不做多级/多 block 合并。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：把 <code>shfl_down_sync</code> 换成 <code>shfl_xor_sync</code> 的语义（lane <code>i</code> 与 lane <code>i ^ offset</code> 交换），重写 <code>warp_reduce</code>，验证 5 步之后<strong>每个 lane 都得到同一个总和</strong>（蝶形归约），并解释为什么 <code>xor</code> 版本不需要 <code>if (lane + offset &lt; 32)</code> 这种越界保护。</li>
+<li><strong>解释</strong>：为什么 <code>__syncthreads()</code> 的定义里要包含&quot;此点之前对 shared/global 的写对块内所有线程可见&quot;？如果只有&quot;等所有线程到达&quot;这一句，会出现什么样的错误程序？</li>
+<li><strong>对比/验证</strong>：把 <code>T</code> 从 256 改成 512、1024，分别记录两条路线的屏障次数与总 shuffle 步数，画一张小表，说明&quot;两级归约&quot;的屏障次数为什么与 <code>T</code> 无关（提示：只与&quot;warps 数是否超过一个 warp 能一次归约的规模&quot;有关），而朴素树形归约是 <code>log2(T)</code>。</li>
+<li><strong>思考</strong>：<code>cg::grid_group</code> 的 grid 同步要求&quot;整个 grid 同时驻留&quot;。请用第 2 课的 occupancy 公式估算：某架构每 SM 可驻留 2 个 512 线程的 block、共 100 个 SM，那么协作组 grid 最多能放多少个 block？如果模型要求 8 万个 block 才能算完，这条路走不走得通？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>NVIDIA, <em>CUDA C++ Programming Guide</em> §5 附录「C++ Language Extensions」— Warp Shuffle Functions、Warp Synchronization Function、Thread Block Synchronization Functions（shuffle 与 <code>__syncthreads</code> 的权威定义）：<a href="https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/cpp-language-extensions.html#warp-shuffle-functions" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/cpp-language-extensions.html#warp-shuffle-functions</a></li>
+<li>同上 — Cooperative Groups（<code>cg::sync</code>、<code>tiled_partition</code>、<code>grid_group</code> 与 <code>cudaLaunchCooperativeKernel</code> 的适用条件）：<a href="https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/cooperative-groups.html#cooperative-groups-synchronization" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/cooperative-groups.html#cooperative-groups-synchronization</a></li>
+<li>同上 §1.2「Programming Model」— Warps and SIMT（warp 内线程与独立调度的关系）：<a href="https://docs.nvidia.com/cuda/cuda-programming-guide/01-introduction/programming-model.html#warps-and-simt" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/cuda-programming-guide/01-introduction/programming-model.html#warps-and-simt</a></li>
+<li>NVIDIA, <em>CUDA C++ Best Practices Guide</em> — Synchronization Instruction（屏障为何应尽量少用）：<a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#synchronization-instruction" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#synchronization-instruction</a></li>
+</ul>
+<p><a href="#/l/cuda-ch2-l4">下一课：多流与异步：stream、事件与并发执行</a></p>

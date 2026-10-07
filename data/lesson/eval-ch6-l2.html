@@ -1,0 +1,479 @@
+<h3 id="h-这一节要解决什么">这一节要解决什么<a class="anchor" href="#h-这一节要解决什么" aria-label="本节链接">#</a></h3>
+<p>第 1 节产出了指标树。指标树要落地，必须落在<strong>一份具体的评测集</strong>上。而评测集是<strong>长期资产</strong>：它会被使用几个月到几年，会经历模型更替、标注规则修订、题目饱和与污染。<strong>没有治理的评测集会在半年内变成&quot;一组没人敢改、也没人敢信的数字&quot;。</strong></p>
+<p>这一节把第 2 章第 4 节（自建评测集）与第 5 章的对抗视角合起来，专门讲<strong>治理</strong>：让评测集像软件一样被版本化、被测试、被审计、被淘汰。</p>
+<p>内容分五块：</p>
+<ol>
+<li><strong>数据契约</strong>：一条样本里到底有哪些字段、哪些是不可变的、哪些可以被修订。</li>
+<li><strong>版本策略</strong>：什么改动是补丁、什么是不兼容变更；语义化版本对评测集怎么定义。</li>
+<li><strong>三集方案与开箱纪律</strong>：dev / test-frozen / test-live 的规模、更新频率、锚题比例。</li>
+<li><strong>权限与防污染</strong>：谁能读、谁能改、怎么检测&quot;评测集被用于训练&quot;。</li>
+<li><strong>生命周期</strong>：饱和检测、退役规则、以及&quot;评测集换掉了怎么保证可比&quot;。</li>
+</ol>
+<h3 id="h-一数据契约样本的字段与不可变性">一、数据契约：样本的字段与不可变性<a class="anchor" href="#h-一数据契约样本的字段与不可变性" aria-label="本节链接">#</a></h3>
+<p>一条评测样本不只是&quot;输入 + 答案&quot;。把它的字段定清楚，是治理的第一步：</p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>是否可变</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>id</code></td>
+<td><strong>不可变</strong></td>
+<td>全局唯一，跨版本稳定；退役也不复用</td>
+</tr>
+<tr>
+<td><code>input</code></td>
+<td>不可变（修订=新 id）</td>
+<td>改动输入等于换了一道题，必须新 id</td>
+</tr>
+<tr>
+<td><code>reference</code> / <code>rubric</code></td>
+<td>可修订（记版本）</td>
+<td>标准答案会随业务规则变化</td>
+</tr>
+<tr>
+<td><code>layer</code> / <code>tags</code></td>
+<td>可修订</td>
+<td>分层标签（任务类型、难度、风险等级）</td>
+</tr>
+<tr>
+<td><code>provenance</code></td>
+<td>不可变</td>
+<td>来源（真实流量 / 专家构造 / 合成）、采集时间、脱敏方式</td>
+</tr>
+<tr>
+<td><code>license</code> / <code>consent</code></td>
+<td>不可变</td>
+<td>数据可用范围与合规依据</td>
+</tr>
+<tr>
+<td><code>added_in</code></td>
+<td>不可变</td>
+<td>加入的评测集版本</td>
+</tr>
+<tr>
+<td><code>retired_in</code></td>
+<td>不可变</td>
+<td>退役的版本（空=在用）</td>
+</tr>
+<tr>
+<td><code>gold</code></td>
+<td>可修订</td>
+<td>是否金题（用于质检，不影响计分）</td>
+</tr>
+<tr>
+<td><code>weight</code></td>
+<td>可修订（记版本）</td>
+<td>若做加权评分，权重必须版本化</td>
+</tr>
+</tbody></table>
+<p><strong>三条不可变性铁律</strong>：</p>
+<ol>
+<li><strong><code>id</code> 永不复用。</strong> 退役的题目的 id 不能给新题目用——否则历史报告无法解读。</li>
+<li><strong>改动 <code>input</code> 必须新 id。</strong> 否则&quot;同一道题&quot;在不同版本上不可比。</li>
+<li><strong><code>reference</code>/<code>rubric</code> 可以改，但必须记版本并触发基线重跑。</strong> 因为改了评分标准，之前的分数不再可比。</li>
+</ol>
+<p><strong>为什么这样设计</strong>：因为评测集的<strong>可比性</strong>来自&quot;同一批 id 上的分数&quot;。任何让 id 与内容脱钩的操作（复用 id、就地改输入）都会破坏这个基础，而且破坏是延迟发现的——通常在你需要拿一年前的数字做趋势分析时才发现。</p>
+<h3 id="h-二版本策略什么算不兼容变更">二、版本策略：什么算不兼容变更<a class="anchor" href="#h-二版本策略什么算不兼容变更" aria-label="本节链接">#</a></h3>
+<p>对评测集采用语义化版本 <code>MAJOR.MINOR.PATCH</code>，但定义要贴合评测场景：</p>
+<table>
+<thead>
+<tr>
+<th>版本位</th>
+<th>触发条件</th>
+<th>后果</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>PATCH</strong></td>
+<td>修 typo、补 rubric 措辞（不改判定边界）、补 tags</td>
+<td>无需重跑基线；分数应几乎不变（可抽检证明）</td>
+</tr>
+<tr>
+<td><strong>MINOR</strong></td>
+<td>新增题目、新增分层、退役明确失效的题目</td>
+<td><strong>必须重跑全部基线</strong>；新旧分数不可直接比较，需锚题等值</td>
+</tr>
+<tr>
+<td><strong>MAJOR</strong></td>
+<td>改评分函数、改判定协议、大规模替换题目、改标签体系</td>
+<td><strong>历史分数作废</strong>；只能在同一 MAJOR 内比较</td>
+</tr>
+</tbody></table>
+<p><strong>判断 MINOR 与 MAJOR 的分界线</strong>：问一个问题——<strong>&quot;分数变了，是模型变了还是评测集变了？&quot;</strong> 如果无法用锚题等值把两者分开，那就是 MAJOR。</p>
+<p><strong>锚题（anchor items）的作用在这里变得具体</strong>：跨 MINOR 版本保留一批<strong>未被修改</strong>的题目（通常 15%~25%），用它们在两个版本上的分数差估计&quot;版本难度差&quot;，从而对总分做等值校正。<strong>没有锚题的版本升级，等于把趋势线砍断。</strong></p>
+<p><strong>怎么做（升级流程）</strong>：</p>
+<ol>
+<li>新版本在一个分支上构建，<strong>冻结旧版本</strong>（不再修改）。</li>
+<li>候选改动先过<strong>影响评估</strong>：抽 30~50 题跑新旧两个版本，估分数偏移与方差。</li>
+<li>若偏移超出阈值（比如 &gt;1 个点）→ 判定为 MINOR 或 MAJOR，而非 PATCH。</li>
+<li>更新 <code>CHANGELOG</code>（含每题的增删改），打 tag。</li>
+<li>用新版本重跑全部在用模型，把结果写进基线表。</li>
+<li><strong>在报告里同时给出新旧对齐关系</strong>（锚题校正系数）。</li>
+</ol>
+<p><strong>取舍</strong>：不兼容变更越少越好（减少重跑成本），但把该升级的改动当 PATCH 发布，会让趋势线悄悄失真。<strong>默认从严</strong>：拿不准就按 MINOR 处理。</p>
+<h3 id="h-三三集方案与开箱纪律">三、三集方案与开箱纪律<a class="anchor" href="#h-三三集方案与开箱纪律" aria-label="本节链接">#</a></h3>
+<p>第 2 章给过三集方案，这里给出<strong>治理视角</strong>的版本：</p>
+<table>
+<thead>
+<tr>
+<th>集</th>
+<th>规模占比</th>
+<th>用途</th>
+<th>可见性</th>
+<th>更新频率</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>dev</strong></td>
+<td>50%~60%</td>
+<td>日常迭代、调参、快速反馈</td>
+<td>对开发者完全可见</td>
+<td>随时（可过拟合）</td>
+</tr>
+<tr>
+<td><strong>test-frozen</strong></td>
+<td>20%~30%</td>
+<td>发布门禁、对外报告</td>
+<td>只有评测负责人可见；题目内容限制访问</td>
+<td>按版本（MINOR 级别）</td>
+</tr>
+<tr>
+<td><strong>test-live</strong></td>
+<td>20%~30%</td>
+<td>监控漂移、发现新失败模式</td>
+<td>定期轮换</td>
+<td>持续（月度轮换）</td>
+</tr>
+</tbody></table>
+<p><strong>开箱纪律（四条，必须写进流程）</strong>：</p>
+<ol>
+<li><strong>test-frozen 的题目内容不对模型开发团队全员开放</strong>（至少不开放答案与 rubric 细节）。实践做法：只开放聚合结果与失败聚类，题目正文按需申请、留痕。</li>
+<li><strong>每个模型对 test-frozen 的开箱次数有限</strong>（比如每季度 3 次）。每次开箱记录：时间、模型版本、结果、决策。<strong>这是防止&quot;反复选择&quot;（第 3 章的选择增益）的唯一有效手段。</strong></li>
+<li><strong>一旦某集被用于调参或训练，立即降级为 dev 集</strong>（永久，不可逆）。</li>
+<li><strong>test-live 只用于监控，不用于发布决策</strong>（因为它在轮换，跨期不可比）。</li>
+</ol>
+<p><strong>锚题比例怎么定</strong>：取决于两个因素——<strong>版本升级的频率</strong>与<strong>分数波动的量级</strong>。经验规则：如果每次 MINOR 升级的难度漂移预期在 1~2 个点，而你要检测的效应也是 2 个点，那么锚题比例要让难度差的估计标准误（约 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0647em;vertical-align:-0.3147em;"></span><span class="mord">1/</span><span class="mord sqrt"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.7253em;"><span class="svg-align" style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord" style="padding-left:0.833em;"><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">anchor</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span><span style="top:-2.6853em;"><span class="pstrut" style="height:3em;"></span><span class="hide-tail" style="min-width:0.853em;height:1.08em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="1.08em" viewBox="0 0 400000 1080" preserveAspectRatio="xMinYMin slice"><path d="M95,702
+c-2.7,0,-7.17,-2.7,-13.5,-8c-5.8,-5.3,-9.5,-10,-9.5,-14
+c0,-2,0.3,-3.3,1,-4c1.3,-2.7,23.83,-20.7,67.5,-54
+c44.2,-33.3,65.8,-50.3,66.5,-51c1.3,-1.3,3,-2,5,-2c4.7,0,8.7,3.3,12,10
+s173,378,173,378c0.7,0,35.3,-71,104,-213c68.7,-142,137.5,-285,206.5,-429
+c69,-144,104.5,-217.7,106.5,-221
+l0 -0
+c5.3,-9.3,12,-14,20,-14
+H400000v40H845.2724
+s-225.272,467,-225.272,467s-235,486,-235,486c-2.7,4.7,-9,7,-19,7
+c-6,0,-10,-1,-12,-3s-194,-422,-194,-422s-65,47,-65,47z
+M834 80h400000v40h-400000z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.3147em;"><span></span></span></span></span></span></span></span></span> 量级）显著小于 1 个点 → <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">anchor</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 通常需要占总量的 15% 以上。<strong>比例过低时，等值校正本身引入的噪声会大于要校正的偏差。</strong></p>
+<h3 id="h-四权限与防污染">四、权限与防污染<a class="anchor" href="#h-四权限与防污染" aria-label="本节链接">#</a></h3>
+<p><strong>污染（contamination）</strong> 在治理层面有两个来源：<strong>外部</strong>（模型训练数据里包含公开基准）与<strong>内部</strong>（团队把评测集内容用于训练/调参）。</p>
+<p><strong>内部防污染的四道闸</strong>：</p>
+<ol>
+<li><strong>访问控制</strong>：test-frozen 单独仓库或目录，读写权限最小化；<strong>读操作也留痕</strong>（否则无法追责）。</li>
+<li><strong>水印/诱饵（canary strings）</strong>：在题目文本里嵌入不影响语义的唯一字符串；定期用<strong>成员推断</strong>或<strong>生成式探测</strong>检查模型是否&quot;见过&quot;这些串。这是第 2 章污染检测方法在内部治理上的应用。</li>
+<li><strong>数据血缘</strong>：训练/微调数据集的构建流程中，加一道<strong>黑名单过滤</strong>（把评测集指纹纳入拦截列表），并保留过滤日志。</li>
+<li><strong>流程隔离</strong>：评测集维护者与训练数据维护者不应当是同一人（组织性措施，比技术措施更可靠）。</li>
+</ol>
+<p><strong>外部污染的检测</strong>（第 2 章讲过方法，这里只补治理动作）：对每个公开基准，记录<strong>首次使用时间</strong>与<strong>模型训练截止时间</strong>的关系；对时间窗可疑的基准，改用<strong>私有变体</strong>（同构但内容不同的题）做交叉验证。</p>
+<p><strong>取舍</strong>：防污染的每一道闸都增加摩擦（申请、留痕、隔离）。<strong>摩擦必须花在 test-frozen 上，不要花在 dev 上</strong>——dev 集的设计目的就是被榨干。</p>
+<p><figure><img class="md-img" src="content/courses/llm-evaluation/assets/chapter-6-figure-03.svg" alt="评测集治理的五个动作" loading="lazy" decoding="async"><figcaption>评测集治理的五个动作</figcaption></figure>
+</p>
+<h3 id="h-五生命周期饱和退役与换代">五、生命周期：饱和、退役与换代<a class="anchor" href="#h-五生命周期饱和退役与换代" aria-label="本节链接">#</a></h3>
+<p><strong>饱和检测</strong>：如果某套题的通过率长期高于 90%（或低于 10%），它对区分模型的贡献接近于零（第 2 章的项目分析）。两个可用信号：</p>
+<ul>
+<li><strong>区分度 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">D</span></span></span></span></strong>：高分组与低分组的通过率差；<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">D</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0</span></span></span></span> 的题目在选型场景中没有价值。</li>
+<li><strong>方差的来源</strong>：如果题目间方差占总方差的比例持续下降（第 4 章的方差分解），说明题目不再能区分模型。</li>
+</ul>
+<p><strong>退役规则（写进文档）</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>条件</th>
+<th>动作</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>通过率 &gt; 0.95 且 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7224em;vertical-align:-0.0391em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">D</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&lt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.1</span></span></span></span>（连续两个版本）</td>
+<td>标记为&quot;饱和&quot;，从选型集移除；<strong>保留在回归门禁集</strong>（防退化仍有用）</td>
+</tr>
+<tr>
+<td>题目被证明有歧义/无可判定标准</td>
+<td>退役（记 <code>retired_in</code>），并在 CHANGELOG 说明</td>
+</tr>
+<tr>
+<td>题目被用于训练（确认污染）</td>
+<td><strong>立即退役 + 重估历史报告</strong>（哪些结论受了影响）</td>
+</tr>
+<tr>
+<td>通过率 &lt; 0.05（对所有在用模型）</td>
+<td>复核是否题面错误；若是，退役；若否，保留为&quot;能力边界&quot;题</td>
+</tr>
+</tbody></table>
+<p><strong>换代（把评测集整体替换）</strong>：这是最贵的动作，因为历史趋势会断。做法：</p>
+<ol>
+<li><strong>重叠期</strong>：新旧两套同时跑至少一个季度，用重叠部分的题目做等值。</li>
+<li><strong>双报告期</strong>：报告同时给新旧分数与对齐说明。</li>
+<li><strong>切换点明确记录</strong>：在时间序列图上标注断点，禁止跨断点直接比较。</li>
+</ol>
+<p><strong>一条纪律</strong>：<strong>评测集的&quot;变好&quot;从来不是目标。</strong> 目标是&quot;它能改变正确的决策&quot;。一套一直不涨的分数也可能是健康的（说明模型没变、题目没饱和、流程稳定）。</p>
+<p><figure><img class="md-img" src="content/courses/llm-evaluation/assets/chapter-6-figure-04.svg" alt="开箱次数越多分越虚高（示意）" loading="lazy" decoding="async"><figcaption>开箱次数越多分越虚高（示意）</figcaption></figure>
+</p>
+<h3 id="h-六把治理变成常规动作">六、把治理变成常规动作<a class="anchor" href="#h-六把治理变成常规动作" aria-label="本节链接">#</a></h3>
+<p>治理不是一次性文件，是四条周期性动作：</p>
+<table>
+<thead>
+<tr>
+<th>频率</th>
+<th>动作</th>
+<th>产物</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>每次改动</td>
+<td>影响评估（抽 30~50 题跑新旧）</td>
+<td>版本归类（PATCH/MINOR/MAJOR）</td>
+</tr>
+<tr>
+<td>每月</td>
+<td>项目分析（难度/区分度）、污染抽检</td>
+<td>饱和清单、污染告警</td>
+</tr>
+<tr>
+<td>每季度</td>
+<td>test-live 轮换、锚题复核、开箱配额结算</td>
+<td>轮换记录、配额使用情况</td>
+</tr>
+<tr>
+<td>每半年</td>
+<td>评测集健康报告（覆盖度、一致性、成本、决策贡献）</td>
+<td>是否换代/补题的决策</td>
+</tr>
+</tbody></table>
+<p><strong>&quot;决策贡献&quot;这一项最容易被忽略，也最重要</strong>：统计过去半年里，这套评测集<strong>实际改变了多少次决策</strong>。如果答案是 0，那么问题不在评测集的质量，而在它没有连着一个决策（回到第 1 节）。</p>
+<h3 id="h-代码">代码<a class="anchor" href="#h-代码" aria-label="本节链接">#</a></h3>
+<p>⚠️ 以下为<strong>合成数据</strong>，仅用于展示治理机制；代码只用标准库，可直接运行。</p>
+<pre data-lang="python"><code class="language-python">import hashlib
+import json
+import math
+import random
+
+rng = random.Random(907)
+
+
+# ============================================================
+# 1. 数据集指纹：规范化哈希（顺序无关 + 内容敏感）
+# ============================================================
+def canonical_item(item):
+    # 只把&quot;影响分数&quot;的字段纳入指纹；元数据（备注、创建时间）不纳入
+    return json.dumps(
+        {k: item[k] for k in (&quot;id&quot;, &quot;input&quot;, &quot;reference&quot;, &quot;rubric_version&quot;)},
+        ensure_ascii=False, sort_keys=True)
+
+
+def dataset_fingerprint(items):
+    h = hashlib.sha256()
+    for line in sorted(canonical_item(it) for it in items):
+        h.update(line.encode(&quot;utf-8&quot;))
+        h.update(b&quot;\n&quot;)
+    return h.hexdigest()[:16]
+
+
+base_items = [
+    {&quot;id&quot;: &quot;q001&quot;, &quot;input&quot;: &quot;退货政策是什么&quot;, &quot;reference&quot;: &quot;7 天无理由&quot;,
+     &quot;rubric_version&quot;: &quot;r1&quot;, &quot;layer&quot;: &quot;简单&quot;, &quot;note&quot;: &quot;初版&quot;},
+    {&quot;id&quot;: &quot;q002&quot;, &quot;input&quot;: &quot;如何修改发票抬头&quot;, &quot;reference&quot;: &quot;在订单页修改&quot;,
+     &quot;rubric_version&quot;: &quot;r1&quot;, &quot;layer&quot;: &quot;中等&quot;, &quot;note&quot;: &quot;&quot;},
+    {&quot;id&quot;: &quot;q003&quot;, &quot;input&quot;: &quot;跨境订单多久到&quot;, &quot;reference&quot;: &quot;7-15 个工作日&quot;,
+     &quot;rubric_version&quot;: &quot;r1&quot;, &quot;layer&quot;: &quot;中等&quot;, &quot;note&quot;: &quot;&quot;},
+]
+fp1 = dataset_fingerprint(base_items)
+
+# 改动 1：只改备注（不应改变指纹）
+mod_meta = [dict(it, note=&quot;补了说明&quot;) for it in base_items]
+# 改动 2：改参考答案（应改变指纹）
+mod_ref = [dict(base_items[0], reference=&quot;15 天无理由&quot;)] + base_items[1:]
+# 改动 3：调换顺序（不应改变指纹）
+mod_order = list(reversed(base_items))
+
+print(&quot;== 1. 数据集指纹（规范化哈希） ==&quot;)
+print(f&quot;原始指纹            : {fp1}&quot;)
+print(f&quot;只改备注（元数据）  : {dataset_fingerprint(mod_meta)}  &quot;
+      f&quot;{&#39;不变 ✓&#39; if dataset_fingerprint(mod_meta) == fp1 else &#39;变了 ✗&#39;}&quot;)
+print(f&quot;调换顺序            : {dataset_fingerprint(mod_order)}  &quot;
+      f&quot;{&#39;不变 ✓&#39; if dataset_fingerprint(mod_order) == fp1 else &#39;变了 ✗&#39;}&quot;)
+print(f&quot;改参考答案          : {dataset_fingerprint(mod_ref)}  &quot;
+      f&quot;{&#39;变了 ✓&#39; if dataset_fingerprint(mod_ref) != fp1 else &#39;不变 ✗&#39;}&quot;)
+print(&quot;  &lt;- 指纹要满足两个性质：顺序无关、内容敏感；&quot;)
+print(&quot;     只把影响分数的字段纳入哈希，否则每次补备注都要重跑基线&quot;)
+
+
+# ============================================================
+# 2. 版本归类：用抽样影响评估决定 PATCH / MINOR / MAJOR
+# ============================================================
+def version_bump(score_shift, mdd=0.01):
+    # score_shift：抽 30~50 题上新旧版本的分数差（绝对值）
+    if score_shift &gt; 2 * mdd:
+        return &quot;MAJOR（评分标准或题目体系变了）&quot;
+    if score_shift &gt; 0.3 * mdd:
+        return &quot;MINOR（需要重跑基线 + 锚题等值）&quot;
+    return &quot;PATCH（无需重跑；仍应抽检证明）&quot;
+
+
+print(&quot;\n== 2. 版本归类：抽样影响评估 ==&quot;)
+for shift, desc in ((0.001, &quot;修 typo&quot;), (0.004, &quot;补 rubric 措辞&quot;),
+                    (0.012, &quot;新增 20 题 + 退役 5 题&quot;),
+                    (0.035, &quot;把评分从二分类改为三分制&quot;)):
+    print(f&quot;  分数偏移 {shift:.3f} ({desc:18s}) -&gt; {version_bump(shift)}&quot;)
+print(&quot;  &lt;- 阈值要写成明文规则（本例 MDD=1pt）；拿不准就从严重一侧处理&quot;)
+
+
+# ============================================================
+# 3. 锚题等值：跨 MINOR 版本对齐趋势
+# ============================================================
+def equate(score_new_full, anchor_new, anchor_old):
+    # 一维等值：用锚题上的差校正新版本全集分数
+    drift = anchor_new - anchor_old          # 锚题上的难度漂移
+    return score_new_full - drift, drift
+
+
+print(&quot;\n== 3. 锚题等值：让新旧版本可比（合成） ==&quot;)
+print(&quot;  场景：v1.2 -&gt; v1.3，新版本削弱了部分简单题（整体变难）&quot;)
+for s_full, a_new, a_old in [(0.712, 0.640, 0.700), (0.712, 0.700, 0.700),
+                             (0.688, 0.700, 0.700)]:
+    adj, drift = equate(s_full, a_new, a_old)
+    tag = (&quot;新版本更难，原始分数被低估&quot; if drift &lt; -0.005 else
+           &quot;难度相当&quot; if abs(drift) &lt;= 0.005 else
+           &quot;新版本更容易，原始分数被高估&quot;)
+    print(f&quot;  全集 {s_full:.3f} | 锚题 新 {a_new:.3f} / 旧 {a_old:.3f} &quot;
+          f&quot;-&gt; 漂移 {drift:+.3f} 校正后 {adj:.3f}   ({tag})&quot;)
+print(&quot;  &lt;- 没有锚题等值，&#39;v1.3 分数掉了 2 个点&#39;无法区分模型退化与题目变难&quot;)
+
+
+# ============================================================
+# 4. 开箱配额：选择增益随开箱次数增长
+# ============================================================
+def selection_gain(n_candidates_per_open, n_opens, n_items=300,
+                   true_p=0.70, seed=5):
+    # 每次开箱从 n_candidates_per_open 个模型里挑最好的；返回累计最大分
+    r = random.Random(seed)
+    best_all = 0.0
+    history = []
+    for _ in range(n_opens):
+        scores = []
+        for _ in range(n_candidates_per_open):
+            hits = sum(1 for _ in range(n_items) if r.random() &lt; true_p)
+            scores.append(hits / n_items)
+        best_all = max(best_all, max(scores))
+        history.append(best_all)
+    return history
+
+
+print(&quot;\n== 4. 开箱配额：反复开箱会累积选择增益（合成，真实能力都是 0.70） ==&quot;)
+h = selection_gain(5, 10)
+for i, v in enumerate(h, 1):
+    print(f&quot;  第 {i:2d} 次开箱后，历史最高分 = {v:.4f}  (真实 {0.70})&quot;)
+print(&quot;  &lt;- 10 次开箱后&#39;最高分&#39;比真实能力高 3 个点以上，全部来自噪声；&quot;)
+print(&quot;     这就是为什么 test-frozen 必须限制开箱次数并留痕&quot;)
+
+
+# ============================================================
+# 5. 饱和检测：区分度 D 与方差占比
+# ============================================================
+def item_stats(n_high, n_low, p_high, p_low, seed):
+    # 按上下 27% 分组计算区分度 D
+    r = random.Random(seed)
+    hh = sum(1 for _ in range(n_high) if r.random() &lt; p_high) / n_high
+    ll = sum(1 for _ in range(n_low) if r.random() &lt; p_low) / n_low
+    return hh, ll, hh - ll
+
+
+print(&quot;\n== 5. 饱和检测：难度 p 与区分度 D（合成） ==&quot;)
+items = [
+    (&quot;q011&quot;, 0.97, 0.96), (&quot;q012&quot;, 0.95, 0.94), (&quot;q013&quot;, 0.55, 0.20),
+    (&quot;q014&quot;, 0.60, 0.25), (&quot;q015&quot;, 0.28, 0.38),
+]
+print(f&quot;{&#39;题&#39;:&gt;6}{&#39;高分组&#39;:&gt;8}{&#39;低分组&#39;:&gt;8}{&#39;难度p&#39;:&gt;8}{&#39;区分度D&#39;:&gt;9}  处置&quot;)
+for qid, ph, pl in items:
+    hh, ll, D = item_stats(60, 60, ph, pl, seed=hash(qid) % 1000)
+    p = (hh + ll) / 2
+    if p &gt; 0.95 and D &lt; 0.10:
+        act = &quot;饱和：移出选型集，留在门禁集&quot;
+    elif D &lt; 0.05:
+        act = &quot;区分度极低：复核题面是否歧义&quot;
+    elif p &lt; 0.10:
+        act = &quot;过难：复核是否题面错误&quot;
+    else:
+        act = &quot;保留&quot;
+    print(f&quot;{qid:&gt;6}{hh:&gt;8.2f}{ll:&gt;8.2f}{p:&gt;8.2f}{D:&gt;9.2f}  {act}&quot;)
+print(&quot;  &lt;- 饱和题对&#39;选型&#39;无用，但对&#39;回归门禁&#39;仍然有价值（防退化）；&quot;)
+print(&quot;     区分度接近 0 或为负的题（q015 这类）几乎总意味着题面/rubric 有歧义&quot;)
+
+
+# ============================================================
+# 6. 污染探针：诱饵串检测（合成）
+# ============================================================
+print(&quot;\n== 6. 内部污染探针（合成） ==&quot;)
+CANARIES = [&quot;zq7f3k9x&quot;, &quot;m4b8w2pt&quot;, &quot;r6y1n5vd&quot;]
+print(&quot;  在 test-frozen 的 30 道题里嵌入不影响语义的诱饵串&quot;)
+print(&quot;  探针方式：直接询问 / 补全 / 生成变体，检查是否复现诱饵串&quot;)
+probe_results = {&quot;直接询问&quot;: 0, &quot;补全前置词&quot;: 0, &quot;生成变体&quot;: 1}
+for k, v in probe_results.items():
+    print(f&quot;    {k:10s} 命中 {v}/3 个诱饵串 -&gt; &quot;
+          f&quot;{&#39;疑似见过（需人工确认）&#39; if v else &#39;未命中&#39;}&quot;)
+print(&quot;  &lt;- 诱饵串命中不等于确认污染（可能来自巧合/泛化），&quot;)
+print(&quot;     但它是启动人工调查的最便宜触发器&quot;)</code></pre>
+<p><strong>代码里六个值得注意的点</strong>：</p>
+<ul>
+<li><strong>第 1 段给出指纹的两个必备性质</strong>：<strong>顺序无关</strong>（同一批样本换个顺序指纹不变）与<strong>内容敏感</strong>（改参考答案就变）。关键设计是<strong>只把影响分数的字段纳入哈希</strong>——如果把备注、创建时间也纳入，那么每次补个说明都要重跑基线。这是&quot;评测集治理&quot;和&quot;普通数据管理&quot;的分界线。</li>
+<li><strong>第 2 段把版本归类变成可执行规则</strong>：偏移 &lt; 0.3×MDD 算 PATCH，0.3~2×MDD 算 MINOR，超过 2×MDD 算 MAJOR。<strong>规则要事先写成数字</strong>，否则每次升级都会变成&quot;这次就算 PATCH 吧&quot;的政治协商。</li>
+<li><strong>第 3 段是锚题等值的最小实现</strong>：锚题上的漂移 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">−</span><span class="mord">0.060</span></span></span></span> 说明新版本更难，于是全集的 0.712 校正到 0.772。<strong>没有这一步，&quot;v1.3 掉了 2 个点&quot;无法区分模型退化与题目变难</strong>——而这两种情况的应对完全相反。</li>
+<li><strong>第 4 段量化了开箱配额的必需性</strong>：5 个候选、真实能力全为 0.70，反复开箱 10 次后&quot;历史最高分&quot;比真实能力高 3 个点以上。<strong>这 3 个点会全部进入发布决策的收益叙事。</strong> 限制开箱次数 + 留痕是唯一有效的对抗手段。</li>
+<li><strong>第 5 段把饱和检测落到具体动作</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7335em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&gt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.95</span></span></span></span> 且 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7224em;vertical-align:-0.0391em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">D</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&lt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.10</span></span></span></span> 的题从<strong>选型集</strong>移除但保留在<strong>门禁集</strong>；<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">D</span></span></span></span> 接近 0 或为负的题必须复核题面（负区分度几乎总意味着歧义）。<strong>注意这里是&quot;移出某个集&quot;而不是&quot;退役&quot;</strong>——同一道题对不同决策的价值不同。</li>
+<li><strong>第 6 段给出内部污染探针的最简形式</strong>：诱饵串命中是&quot;启动调查&quot;的触发器，不是结论。<strong>它便宜、可自动化，适合每月跑一次</strong>；确认污染还需要人工判断与更大的检测组合（第 2 章的成员推断方法）。</li>
+</ul>
+<h3 id="h-练习">练习<a class="anchor" href="#h-练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><p><strong>数据契约</strong>：为&quot;用户问客服机器人&quot;的评测样本写一份字段表。
+（a）区分可变/不可变字段，并说明每个字段的作用；
+（b）如果你的 <code>reference</code> 需要随业务政策变化（退货期从 7 天改为 15 天），写出修订流程（哪些记录要改、哪些基线要重跑）；
+（c）设计一个能自动发现&quot;id 被复用&quot;的校验。</p>
+</li>
+<li><p><strong>版本归类</strong>：你做了四处改动：（a）修正 3 道题的错别字；（b）新增 25 道题；（c）把评分从&quot;对/错&quot;改为&quot;对/部分对/错&quot;；（d）给 10 道题补了分层标签。
+（a）为每处改动判定 PATCH/MINOR/MAJOR，并说明理由；
+（b）如果这四处一起发布，整体应归为哪一版？
+（c）写出发布检查清单（至少 6 项）。</p>
+</li>
+<li><p><strong>锚题等值</strong>：v2.0 与 v2.1 之间有 60 道锚题。v2.1 上模型 A 全集 0.681、锚题 0.650；v2.0 上锚题 0.700。
+（a）算漂移与校正后分数；
+（b）判断模型是进步还是退步；
+（c）如果锚题本身的难度也变了（因为业务规则更新，部分锚题的参考答案改了），这个校正会偏哪个方向？你会怎么防护？</p>
+</li>
+<li><p><strong>开箱纪律</strong>：你的团队每两周做一次模型选型，候选 6~10 个，每次都跑 test-frozen。
+（a）用第 4 段的模型估算一年（26 次）后的累计选择增益；
+（b）设计一个替代方案，让&quot;频繁选型&quot;不污染发布决策（提示：分层使用 dev 与 frozen）；
+（c）写出开箱记录必须包含的字段。</p>
+</li>
+<li><p><strong>污染响应</strong>：诱饵串探针在三个方式中有两个命中。
+（a）列出至少四种&quot;非污染&quot;的可能解释；
+（b）设计一个能区分&quot;见过&quot;与&quot;泛化&quot;的验证实验；
+（c）如果确认污染，写出处置流程（评测集、历史报告、训练流程分别怎么改）。</p>
+</li>
+<li><p><strong>生命周期决策</strong>（开放题）：你的评测集用了 9 个月，指标：题目间方差占比从 0.65 降到 0.38，40% 的题目通过率 &gt; 0.95，两名维护者都换过人。
+（a）列出一份健康检查清单（至少 8 项）；
+（b）给出你的处置建议（补题/退役/换代）与成本估算；
+（c）写出给管理层的汇报要点（必须包含&quot;这次治理的收益如何度量&quot;）。</p>
+</li>
+</ol>
+<h3 id="h-小结">小结<a class="anchor" href="#h-小结" aria-label="本节链接">#</a></h3>
+<ul>
+<li><strong>评测样本是带契约的数据对象</strong>：<code>id</code>/<code>input</code>/<code>provenance</code> 不可变，<code>reference</code>/<code>rubric</code>/<code>weight</code> 可修订但要记版本。<strong>三条铁律：id 永不复用、改 input 必须新 id、改评分标准必须重跑基线。</strong></li>
+<li><strong>版本策略要写成明文规则</strong>：PATCH（修 typo，无需重跑）、MINOR（增删题目，需重跑 + 锚题等值）、MAJOR（改评分/判定/体系，历史分数作废）。分界线的判据是&quot;能否用锚题把模型变化与评测集变化分开&quot;。</li>
+<li><strong>锚题是趋势线的接续件</strong>：比例通常 ≥15%，低了会让等值校正自身引入的噪声大于要校正的偏差；没有锚题的版本升级等于砍断趋势线。</li>
+<li><strong>三集 + 四条开箱纪律</strong>：dev（可过拟合）/ test-frozen（门禁，限次开箱 + 留痕）/ test-live（监控，定期轮换，不用于发布决策）。<strong>一旦某集被用于训练或调参，永久降级为 dev。</strong></li>
+<li><strong>防污染要四道闸</strong>：访问控制与读留痕、诱饵串探针、训练数据黑名单过滤、人员/流程隔离。<strong>摩擦花在 test-frozen 上，不要花在 dev 上。</strong></li>
+<li><strong>饱和题&quot;移出某个集&quot;而不是&quot;退役&quot;</strong>：同一道题对选型无用、对回归门禁仍有用；负区分度几乎总是题面歧义。</li>
+<li><strong>治理是周期性动作</strong>：每次改动做影响评估、每月做项目分析与污染抽检、每季度轮换与配额结算、每半年做健康报告（含<strong>&quot;这套评测集实际改变了多少次决策&quot;</strong>——如果答案是 0，问题不在评测集质量，而在它没有连着决策）。</li>
+</ul>

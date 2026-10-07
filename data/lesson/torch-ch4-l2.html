@@ -1,0 +1,132 @@
+<h2 id="h-dataloader">DataLoader<a class="anchor" href="#h-dataloader" aria-label="本节链接">#</a></h2>
+<p>上一课的 <code>Dataset</code> 回答了&quot;有多少样本、怎么取一个样本&quot;。但训练时我们不会一个样本一个样本地喂，而是<strong>一次喂一小批（batch）</strong>，还要打乱顺序、用多线程并行读取。<code>DataLoader</code> 就是干这些活儿的：它把 <code>Dataset</code> 包装成一台&quot;持续产出批次&quot;的机器。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-为什么需要-batch-和多线程">1. 为什么需要 batch 和多线程<a class="anchor" href="#h-1-为什么需要-batch-和多线程" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>batch（小批量）</strong>：一次梯度更新用一小批样本（例如 32 张图），而不是全部数据，也不是单条。这样既保证梯度方向比较稳定，又不需要把整个数据集塞进显存。</li>
+<li><strong>shuffle（打乱）</strong>：每个 epoch 开始前把样本顺序洗牌，避免模型&quot;记住顺序&quot;而学偏。</li>
+<li><strong>多线程预取</strong>：读图、解压这些 I/O 操作很慢，用多个 worker 在后台并行加载，让 GPU 不至于&quot;等数据&quot;。</li>
+</ul>
+<p>这些能力都由 <code>torch.utils.data.DataLoader</code> 提供。</p>
+<h4 id="h-2-核心参数">2. 核心参数<a class="anchor" href="#h-2-核心参数" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>参数</th>
+<th>含义</th>
+<th>常用取值</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>dataset</code></td>
+<td>要包装的 <code>Dataset</code></td>
+<td>上一课的实例</td>
+</tr>
+<tr>
+<td><code>batch_size</code></td>
+<td>每个 batch 的样本数</td>
+<td>16 / 32 / 64</td>
+</tr>
+<tr>
+<td><code>shuffle</code></td>
+<td>是否打乱顺序</td>
+<td>训练 <code>True</code>，验证/测试 <code>False</code></td>
+</tr>
+<tr>
+<td><code>num_workers</code></td>
+<td>后台加载线程数</td>
+<td>大于 0，如 2 或 4</td>
+</tr>
+<tr>
+<td><code>drop_last</code></td>
+<td>最后不足一个 batch 时是否丢弃</td>
+<td>训练常 <code>True</code></td>
+</tr>
+</tbody></table>
+<p>一个关键的形状问题：如果样本是形状 <code>(3, 28, 28)</code> 的图像，<code>batch_size=16</code> 时，<code>DataLoader</code> 会把 16 个样本<strong>堆叠</strong>成 <code>(16, 3, 28, 28)</code> 的张量。标签也一样被堆成 <code>(16,)</code>。</p>
+<h4 id="h-3-如何遍历">3. 如何遍历<a class="anchor" href="#h-3-如何遍历" aria-label="本节链接">#</a></h4>
+<p><code>DataLoader</code> 是一个可迭代对象，每个 epoch 都可以用 <code>for</code> 重新遍历一遍：</p>
+<pre data-lang="python"><code class="language-python">for epoch in range(2):
+    for x_batch, y_batch in train_loader:
+        # x_batch: (batch_size, ...)
+        pass</code></pre>
+<p>每遍历完一遍，就是一个 <strong>epoch</strong>（把整个数据集看过一轮）。<code>shuffle=True</code> 会让每个 epoch 的顺序都不同。</p>
+<p><figure><img class="md-img" src="content/courses/pytorch-fundamentals/assets/chapter-4-figure-02.svg" alt="DataLoader 从 Dataset 到 batch 的流水线" loading="lazy" decoding="async"><figcaption>DataLoader 从 Dataset 到 batch 的流水线</figcaption></figure>
+</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>沿用上一课的 <code>ParabolaDataset</code>，完整演示 <code>DataLoader</code> 的 batch 堆叠、shuffle、drop_last，以及&quot;训练集/验证集&quot;的常见拆分方式。</p>
+<pre data-lang="python"><code class="language-python">import torch
+from torch.utils.data import Dataset, DataLoader, random_split
+
+
+# 1) 复用一个简单的数值 Dataset
+class ParabolaDataset(Dataset):
+    &quot;&quot;&quot;y = 2x^2 - 3x + 1 的带噪声样本。&quot;&quot;&quot;
+
+    def __init__(self, n=200, noise=0.2):
+        super().__init__()
+        self.x = torch.linspace(-3, 3, steps=n).unsqueeze(1)
+        self.y = 2 * self.x ** 2 - 3 * self.x + 1
+        self.y = self.y + noise * torch.randn_like(self.y)
+
+    def __len__(self):
+        return len(self.x)
+
+    def __getitem__(self, index):
+        return self.x[index], self.y[index]
+
+
+ds = ParabolaDataset(n=200)
+
+# 2) 用 random_split 把数据按比例切成训练集和验证集
+train_ds, val_ds = random_split(ds, [160, 40])   # 160 + 40 = 200
+
+# 3) 训练集：打乱 + 成批；验证集：不打乱
+train_loader = DataLoader(train_ds, batch_size=32, shuffle=True)
+val_loader = DataLoader(val_ds, batch_size=32, shuffle=False)
+
+print(&quot;训练集 batch 数：&quot;, len(train_loader))   # 160 / 32 = 5
+print(&quot;验证集 batch 数：&quot;, len(val_loader))     # 40 / 32 = 2（最后不足 32 也保留）
+
+# 4) 观察一个 batch 的形状：自动在第 0 维堆叠成 batch
+for x_batch, y_batch in train_loader:
+    print(&quot;\n训练 batch 输入形状：&quot;, x_batch.shape)   # torch.Size([32, 1])
+    print(&quot;训练 batch 标签形状：&quot;, y_batch.shape)     # torch.Size([32, 1])
+    break   # 只看第一个 batch
+
+# 5) drop_last 的作用：丢弃最后不足一个 batch 的&quot;零头&quot;
+loader_drop = DataLoader(val_ds, batch_size=32, shuffle=False, drop_last=True)
+print(&quot;\n开启 drop_last 后验证集 batch 数：&quot;, len(loader_drop))  # 32 个样本凑不满，只剩 1 个 batch
+
+# 6) 每个 epoch 的顺序不同（shuffle 的效果）
+print(&quot;\n两个 epoch 前 3 个样本的输入值对比：&quot;)
+for epoch in range(2):
+    first_three = []
+    for x_batch, _ in train_loader:
+        first_three = [round(v, 2) for v in x_batch[:3, 0].tolist()]
+        break
+    print(f&quot;epoch {epoch + 1}: {first_three}&quot;)</code></pre>
+<p>运行后你会看到类似：</p>
+<pre data-lang="text"><code class="language-text">训练集 batch 数： 5
+验证集 batch 数： 2
+训练 batch 输入形状： torch.Size([32, 1])
+训练 batch 标签形状： torch.Size([32, 1])
+开启 drop_last 后验证集 batch 数： 1
+两个 epoch 前 3 个样本的输入值对比：
+epoch 1: [0.09, 2.61, -1.85]
+epoch 2: [-2.79, 0.94, 1.73]</code></pre>
+<p>要点都在输出里：batch 在第 0 维堆叠；<code>drop_last=True</code> 丢掉了不足 32 的最后一批；<code>shuffle=True</code> 让每个 epoch 的前几个样本顺序都不一样。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>把 <code>batch_size</code> 改成 25（200 个样本），观察 <code>drop_last=True</code> 和 <code>drop_last=False</code> 时 <code>len(train_loader)</code> 分别是多少，并解释差异。</li>
+<li>给 <code>DataLoader</code> 设置 <code>num_workers=2</code>，重新跑上面的遍历，确认结果一致（多线程只影响速度，不影响数据内容）。</li>
+<li>写一个循环，用 <code>enumerate(train_loader)</code> 打印出每个 batch 的下标、输入形状，统计&quot;一个 epoch 里样本总数是不是等于训练集样本数&quot;。</li>
+<li>想一想：为什么验证集/测试集的 <code>shuffle</code> 通常设为 <code>False</code>？如果设成 <code>True</code> 会带来什么麻烦？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>PyTorch 官方文档 · <code>torch.utils.data.DataLoader</code>：<a href="https://pytorch.org/docs/stable/data.html#torch.utils.data.DataLoader" target="_blank" rel="noopener noreferrer">https://pytorch.org/docs/stable/data.html#torch.utils.data.DataLoader</a></li>
+<li>PyTorch 官方文档 · <code>torch.utils.data.random_split</code>：<a href="https://pytorch.org/docs/stable/data.html#torch.utils.data.random_split" target="_blank" rel="noopener noreferrer">https://pytorch.org/docs/stable/data.html#torch.utils.data.random_split</a></li>
+<li>PyTorch 官方教程 · Datasets &amp; DataLoaders：<a href="https://pytorch.org/tutorials/beginner/basics/data_tutorial.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/tutorials/beginner/basics/data_tutorial.html</a></li>
+</ul>
+<p><a href="#/l/torch-ch4-l3">下一课：数据增强</a></p>

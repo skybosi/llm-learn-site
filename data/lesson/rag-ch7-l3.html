@@ -1,0 +1,936 @@
+<h2 id="h-完整案例一个可运行的最小-rag-系统评测脚本与决策记录">完整案例：一个可运行的最小 RAG 系统、评测脚本与决策记录<a class="anchor" href="#h-完整案例一个可运行的最小-rag-系统评测脚本与决策记录" aria-label="本节链接">#</a></h2>
+<h3 id="h-这一节要解决什么">这一节要解决什么<a class="anchor" href="#h-这一节要解决什么" aria-label="本节链接">#</a></h3>
+<p>前两节分别给出了&quot;从 SLO 反推架构&quot;与&quot;用评测驱动迭代&quot;的方法。这一节把方法落到代码上：<strong>一个能跑、能被评测、能被诊断、能被改进的最小 RAG 系统。</strong></p>
+<p>它必须满足四个要求，缺一个就不算&quot;完整案例&quot;：</p>
+<ol>
+<li><strong>端到端可运行</strong>：只用 Python 标准库 + numpy，不依赖任何向量库或框架；</li>
+<li><strong>每个模块都能被单独消融</strong>：稀疏 / 稠密 / 混合 / 重排 可以逐个开关；</li>
+<li><strong>带工程底线</strong>：ACL 前置过滤 + canary 断言、带租户键的缓存、段式索引与回滚；</li>
+<li><strong>必须包含一次真实的&quot;诊断 → 修复&quot;</strong>：不是所有数字都好看，而是从评测结果里<strong>读出病根并改对</strong>。</li>
+</ol>
+<p>这个案例最有价值的部分不是&quot;它跑通了&quot;，而是它的评测表第一次跑出来是这样的：</p>
+<pre><code>sparse                0.300   0.250     0.200     0.200
+dense                 0.050   0.042     0.033     0.033
+hybrid                0.250   0.068     0.033     0.033
+hybrid+rerank         1.000   0.742     0.483     0.483     &lt;- 召回 1.000，答案只有 0.483</code></pre>
+<p><strong>召回@10 = 1.000，答案正确率只有 0.483。</strong> 这个 gap 就是全课反复讲的那句话的实证：<strong>&quot;找回来了&quot;和&quot;用上了&quot;是两件事</strong>。而本节的后半部分会给出这个案例的病根与修复 —— 修复后答案正确率从 <strong>0.483 抬到 0.983</strong>。</p>
+<p>要回答四个问题：</p>
+<ol>
+<li>一个最小但完整的 RAG 系统由哪些模块组成？每个模块的&quot;为什么&quot;与失效条件是什么？</li>
+<li>消融实验怎么设计才能<strong>一次看到全链路</strong>的贡献？</li>
+<li>当&quot;召回好、答案差&quot;时，怎么定位到具体模块？</li>
+<li>这个案例里的四个架构决策，各自的依据与&quot;何时重审&quot;是什么？</li>
+</ol>
+<blockquote>
+<p><strong>结论先放在这里</strong>：本案例的评测表给出了一个可复用的<strong>诊断判据</strong> —— 若 <code>recall@k</code> 高而 <code>答案正确率</code> 低，瓶颈一定在<strong>排序/装配/生成</strong>，不在召回；反之才修召回。⚠️ 实测：v1 重排后的 recall@10 = 1.000、答案正确率 0.483（gap +0.517）；病根是<strong>重排特征只在 chunk 文本里查找实体键，而切分把键切到了另一个 chunk</strong>，导致该交互信号丢失。把键匹配提升为<strong>文档级特征</strong>（v2）后，MRR 0.742→0.992、答案正确率 0.483→<strong>0.983</strong>。</p>
+</blockquote>
+<h3 id="h-一案例设定与需求量化">一、案例设定与需求量化<a class="anchor" href="#h-一案例设定与需求量化" aria-label="本节链接">#</a></h3>
+<h4 id="h-11-场景">1.1 场景<a class="anchor" href="#h-11-场景" aria-label="本节链接">#</a></h4>
+<p>一个<strong>多租户内部知识库问答</strong>。按第 7 章第 1 节的问卷量化：</p>
+<table>
+<thead>
+<tr>
+<th>需求项</th>
+<th>取值</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>语料</td>
+<td>⚠️ 合成：60 个黄金实体 + 180 篇竞争文档 + 200 篇同主题噪声 + 6 篇 canary</td>
+<td>规模小到单机秒级，但足以暴露每条机制</td>
+</tr>
+<tr>
+<td>租户</td>
+<td>3 个（<code>t0</code>/<code>t1</code>/<code>t2</code>）</td>
+<td>每租户 2 篇 canary 诱饵</td>
+</tr>
+<tr>
+<td>查询类型</td>
+<td>单跳事实（&quot;某领域的某属性最新值是多少&quot;）</td>
+<td>全课的主线任务</td>
+</tr>
+<tr>
+<td>延迟</td>
+<td>P95 &lt; 2s（本地 stub）</td>
+<td>案例里的 ms 数字是单机相对值，不可外推</td>
+</tr>
+<tr>
+<td>质量目标</td>
+<td>recall@10 ≥ 0.9、引用一致率 ≥ 0.8</td>
+<td>对应第 7 章第 2 节的指标树</td>
+</tr>
+<tr>
+<td>成本约束</td>
+<td>示例：成本 ∝ 上下文块数</td>
+<td>用于演示&quot;质量-成本&quot;对照</td>
+</tr>
+</tbody></table>
+<p><strong>为什么选这个规模</strong>：它能在<strong>秒级</strong>跑完全部消融 + canary 测试 + 回滚断言，因此可以作为 CI 的一部分。<strong>能进 CI 的案例，才是能持续的案例。</strong></p>
+<h4 id="h-12-语料为什么这样构造">1.2 语料为什么这样构造<a class="anchor" href="#h-12-语料为什么这样构造" aria-label="本节链接">#</a></h4>
+<p>⚠️ <strong>合成数据</strong>。每个查询 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6595em;"></span><span class="mord mathnormal">i</span></span></span></span> 对应：</p>
+<ul>
+<li><strong>1 篇黄金文档</strong>：使用属性的<strong>同义词</strong>（&quot;营收&quot;→&quot;收入&quot;），带&quot;最新/现行&quot;标记，含正确答案 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6595em;"></span><span class="mord mathnormal">i</span></span></span></span>；</li>
+<li><strong>3 篇竞争文档</strong>：使用属性的<strong>精确词</strong>（&quot;营收&quot;），带&quot;历史/废止&quot;标记，含旧值 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">900</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.854em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0572em;">j</span></span></span></span>；其中 <strong>1 篇属于同一租户</strong>，另 2 篇属于其他租户；</li>
+<li><strong>200 篇同主题噪声</strong>：稀释候选池，让&quot;检索回全量&quot;变得不平凡。</li>
+</ul>
+<p>这个构造精确地制造了三种真实困境：</p>
+<table>
+<thead>
+<tr>
+<th>构造</th>
+<th>制造的困境</th>
+<th>全课对应</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>黄金用同义词</td>
+<td>词汇不匹配（稀疏的强项失效）</td>
+<td>ch1-l2</td>
+</tr>
+<tr>
+<td>竞争文档用精确词 + 旧值</td>
+<td>词法匹配对，事实错</td>
+<td>ch3-l1（相似度≠相关性）</td>
+</tr>
+<tr>
+<td>2/3 竞争文档属于他租户</td>
+<td>不做 ACL 前置就会污染结果</td>
+<td>ch6-l3</td>
+</tr>
+</tbody></table>
+<p><strong>关键设计</strong>：黄金文档的键（<code>K{i}</code>）与值（<code>i</code>）在文本里相隔较远，<strong>会被切分切到不同 chunk</strong>。这不是疏忽，而是刻意复现一个真实病根 —— 本节的 v1 → v2 修复正来自它。</p>
+<h3 id="h-二系统组成逐模块的为什么">二、系统组成：逐模块的&quot;为什么&quot;<a class="anchor" href="#h-二系统组成逐模块的为什么" aria-label="本节链接">#</a></h3>
+<p>案例共 10 个模块。每个模块给出<strong>设计理由</strong>与<strong>失效条件</strong>。</p>
+<h4 id="h-21-切分与内容寻址-id">2.1 切分与内容寻址 id<a class="anchor" href="#h-21-切分与内容寻址-id" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>做法</strong>：滑窗切分（窗口 14 token、重叠 4），<code>chunk_id = sha1(doc_id | version | span | chunker_ver | embedder_ver)</code>。</li>
+<li><strong>为什么</strong>：内容寻址让&quot;重跑流水线&quot;幂等（ch6-l1）；把 <code>chunker_ver</code> 与 <code>embedder_ver</code> 写进 id，使版本变更时<strong>全量失效自动发生</strong>。</li>
+<li><strong>失效条件</strong>：窗口过大 → 键与值落在同一 chunk 的概率上升（本例中反而更好）但噪声增加；重叠过大 → 重复证据挤占预算（ch5-l2）。</li>
+</ul>
+<h4 id="h-22-稀疏检索-bm25">2.2 稀疏检索 BM25<a class="anchor" href="#h-22-稀疏检索-bm25" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>做法</strong>：标准 BM25，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.0315em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1.2</span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">b</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.75</span></span></span></span>（ch1-l2 的默认值）。</li>
+<li><strong>为什么</strong>：精确词匹配是稀疏的强项，&quot;营收&quot;这种属性词命中就能带来高 idf 分。</li>
+<li><strong>失效条件</strong>：黄金用同义词 → 词法不匹配；竞争文档用精确词 → <strong>稀疏会系统性地偏爱旧值文档</strong>。⚠️ 实测 sparse 答案正确率只有 0.200，<strong>低于随机猜测的 1/2 量级</strong> —— 它不是&quot;召回不到&quot;，而是&quot;稳定地选错&quot;。</li>
+</ul>
+<h4 id="h-23-稠密检索代理">2.3 稠密检索（代理）<a class="anchor" href="#h-23-稠密检索代理" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>做法</strong>：hashing-trick 随机投影 + <strong>主题向量</strong>（权重 1.8），余弦相似度。</li>
+<li><strong>为什么这样写</strong>：真实双塔的价值是<strong>语义泛化</strong>（同义词映射到相近区域）。随机投影本身没有这个能力，所以我显式加入&quot;主题向量&quot;来模拟&quot;主题级泛化&quot;。<strong>这是一个代理，不是双塔。</strong></li>
+<li><strong>诚实的局限</strong>：主题向量让同一主题的所有 chunk 相似度几乎相同（⚠️ 实测同一主题的多个 chunk 得分都是 0.8848），因此它在<strong>主题内几乎没有区分能力</strong>；且黄金用同义词反而使它的词法分量更低。⚠️ 结果：dense 的 recall@10 = 0.050、答案正确率 0.033。</li>
+<li><strong>失效条件</strong>：<strong>不要把本案例的 dense 数字当成真实双塔的表现。</strong> 真实双塔在本任务上 recall@10 通常远高于此；本节保留这个弱代理的原因见 §2.4。</li>
+</ul>
+<h4 id="h-24-rrf-融合--一个必须如实报告的负结果">2.4 RRF 融合 —— 一个必须如实报告的负结果<a class="anchor" href="#h-24-rrf-融合--一个必须如实报告的负结果" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>做法</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1/</span><span class="mopen">(</span><span class="mord">60</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord">rank</span></span><span class="mclose">)</span></span></span></span> 的倒数排名融合（ch3-l3）。</li>
+<li><strong>预期</strong>：融合应优于任一单路。</li>
+<li><strong>实际</strong>：⚠️ hybrid 的 recall@10 = 0.250、答案正确率 0.033 —— <strong>低于 sparse 的 0.300 / 0.200</strong>。</li>
+<li><strong>为什么</strong>：RRF 给每一路<strong>同等的信任</strong>。当其中一路（本案例的稠密代理）的排序接近随机时，它注入的不是互补信息而是<strong>噪声</strong>；RRF 无法识别&quot;这一路不可信&quot;。</li>
+<li><strong>这正好验证了 ch3-l3 的判据</strong>：融合的收益取决于<strong>互补度</strong>，而互补度必须在真实数据上<strong>测<strong>出来，不能假设。</strong>&quot;我们上了混合检索&quot;不等于&quot;效果更好&quot;。</strong></li>
+<li><strong>工程处置</strong>：见 §4 的 ADR-001 —— 在稠密路未达标前，<strong>不单独依赖混合</strong>，把它作为候选而非默认。</li>
+</ul>
+<h4 id="h-25-交互式重排">2.5 交互式重排<a class="anchor" href="#h-25-交互式重排" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>做法</strong>：对 RRF 融合后的池（默认 50）逐候选打分：</li>
+</ul>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord text"><span class="mord">score</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord text"><span class="mord">base</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">RRF</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.9</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord text"><span class="mord">overlap</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.35</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mopen">[</span><span class="mord text"><span class="mord cjk_fallback">非陈旧</span></span><span class="mclose">]</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.25</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mopen">[</span><span class="mord text"><span class="mord cjk_fallback">键在</span><span class="mord"> chunk </span><span class="mord cjk_fallback">文本中</span></span><span class="mclose">]</span></span></span></span></span></p>
+<ul>
+<li><strong>为什么</strong>：这是 cross-encoder 的<strong>代理</strong> —— 它引入了 query×chunk 的交互特征（overlap）与文档级元数据（新鲜度）。真实 cross-encoder 用完整注意力替代这些手工特征，但&quot;引入交互&quot;这个机制是同一个。</li>
+<li><strong>失效条件</strong>：特征必须是<strong>模型能看到的</strong>。⚠️ v1 的 <code>adjacency</code> 特征在 chunk 文本里找键，而切分把键切到了另一个 chunk —— 于是这个特征在黄金文档上<strong>从不触发</strong>。这就是本案例的病根（§3.3）。</li>
+</ul>
+<h4 id="h-26-acl-前置过滤">2.6 ACL 前置过滤<a class="anchor" href="#h-26-acl-前置过滤" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>做法</strong>：<code>allow = ACL[tenant]</code> 传入检索器，在打分阶段就跳过无权文档（ch6-l3 的实现 C）。</li>
+<li><strong>为什么</strong>：post-filter 的可用条数 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.3669em;"></span><span class="mrel">∼</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord">Binomial</span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">s</span><span class="mclose">)</span></span></span></span>，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span></span></span></span> 小时功能不可用。</li>
+<li><strong>失效条件</strong>：ACL 的更新必须走墓碑 + manifest 切换（ch6-l1），否则撤权不生效。</li>
+</ul>
+<h4 id="h-27-预算装配">2.7 预算装配<a class="anchor" href="#h-27-预算装配" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>做法</strong>：按重排分从高到低贪心，跳过&quot;没有新增 token&quot;的 chunk，直到 120 token 预算用尽（ch5-l2）。</li>
+<li><strong>为什么</strong>：覆盖度贪婪能避免&quot;多个 chunk 讲同一件事&quot;。</li>
+<li><strong>失效条件</strong>：预算过小 → 证据不足；<code>per_chunk=14</code> 是估算值，真实系统应用真实 tokenizer 统计。</li>
+</ul>
+<h4 id="h-28-抽取式生成-stub">2.8 抽取式生成 stub<a class="anchor" href="#h-28-抽取式生成-stub" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>做法</strong>：从入选证据里取<strong>分数最高</strong>的那一块，返回它的值 + 引用 id。</li>
+<li><strong>为什么</strong>：完全可复现、<strong>不调用 LLM</strong>，因此评测不受生成随机性污染。这让&quot;检索/排序&quot;的问题能被干净地暴露出来。</li>
+<li><strong>失效条件（重要）</strong>：它<strong>测不出</strong>第 5 章第 3 节那些生成层问题（位置折扣、干扰、先验冲突、引用装饰）。<strong>这是本案例最大的局限</strong>：它把 RAG 简化成了&quot;检索+排序&quot;，生成层被替换成了一个确定性函数。</li>
+</ul>
+<h4 id="h-29-带租户键的缓存">2.9 带租户键的缓存<a class="anchor" href="#h-29-带租户键的缓存" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>做法</strong>：<code>key = sha1(tenant | manifest | acl_fingerprint | query)</code>。</li>
+<li><strong>为什么</strong>：缺任一维度都会造成隐蔽 bug（ch6-l2 §4）：缺 tenant → 跨租户泄漏；缺 manifest → 索引更新后返回旧内容；缺 acl_fingerprint → 权限变更后越权。</li>
+<li><strong>失效条件</strong>：查询归一化不足会降低命中率；TTL 无法处理&quot;文档更新&quot;（需要 doc→key 反向失效）。</li>
+</ul>
+<h4 id="h-210-段式索引与回滚">2.10 段式索引与回滚<a class="anchor" href="#h-210-段式索引与回滚" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>做法</strong>：<code>SegmentIndex</code>（append-only 段 + 墓碑 + manifest），<code>snapshot()</code> / <code>rollback()</code>。</li>
+<li><strong>为什么</strong>：可回滚是可上线的底线（ch6-l1）。</li>
+<li><strong>失效条件</strong>：段数与墓碑比例需要压实阈值，否则查询放大。</li>
+</ul>
+<h3 id="h-三评测脚本与消融实验">三、评测脚本与消融实验<a class="anchor" href="#h-三评测脚本与消融实验" aria-label="本节链接">#</a></h3>
+<h4 id="h-31-指标">3.1 指标<a class="anchor" href="#h-31-指标" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>定义</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>recall@k</code></td>
+<td>黄金文档是否出现在最终 top-<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span></td>
+<td>召回能力（含排序在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 内的名次）</td>
+</tr>
+<tr>
+<td><code>MRR</code></td>
+<td>黄金文档名次的倒数均值</td>
+<td>排序精细度</td>
+</tr>
+<tr>
+<td><code>答案正确</code></td>
+<td>抽取值是否等于期望值</td>
+<td>端到端（stub 下等于&quot;top-1 是黄金&quot;）</td>
+</tr>
+<tr>
+<td><code>引用一致</code></td>
+<td>引用 chunk 是否属于黄金文档</td>
+<td>引用可信度</td>
+</tr>
+<tr>
+<td><code>P50(ms)</code></td>
+<td>单机耗时中位数</td>
+<td><strong>仅相对比较</strong>，不可外推</td>
+</tr>
+<tr>
+<td><code>成本</code></td>
+<td>∝ 上下文块数</td>
+<td>质量-成本对照</td>
+</tr>
+<tr>
+<td><code>上下文块</code></td>
+<td>平均入选块数</td>
+<td>预算装配的实际效果</td>
+</tr>
+</tbody></table>
+<h4 id="h-32-消融表">3.2 消融表<a class="anchor" href="#h-32-消融表" aria-label="本节链接">#</a></h4>
+<p>⚠️ 合成数据，N=60 查询，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">10</span></span></span></span>，预算 120 token：</p>
+<table>
+<thead>
+<tr>
+<th>配置</th>
+<th>recall@10</th>
+<th>MRR</th>
+<th>答案正确</th>
+<th>引用一致</th>
+<th>上下文块</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>sparse</td>
+<td>0.300</td>
+<td>0.250</td>
+<td>0.200</td>
+<td>0.200</td>
+<td>2.0</td>
+</tr>
+<tr>
+<td>dense</td>
+<td>0.050</td>
+<td>0.042</td>
+<td>0.033</td>
+<td>0.033</td>
+<td>1.1</td>
+</tr>
+<tr>
+<td>hybrid</td>
+<td>0.250</td>
+<td>0.068</td>
+<td>0.033</td>
+<td>0.033</td>
+<td>2.0</td>
+</tr>
+<tr>
+<td>hybrid+rerank (v1)</td>
+<td><strong>1.000</strong></td>
+<td>0.742</td>
+<td><strong>0.483</strong></td>
+<td>0.483</td>
+<td>8.0</td>
+</tr>
+<tr>
+<td>hybrid+rerank-v2</td>
+<td><strong>1.000</strong></td>
+<td><strong>0.992</strong></td>
+<td><strong>0.983</strong></td>
+<td>0.983</td>
+<td>6.8</td>
+</tr>
+</tbody></table>
+<p>三个读数：</p>
+<ol>
+<li><strong>重排带来最大的一次跃迁</strong>（recall 0.250→1.000）。因为在 RRF 池（50）里已经包含了黄金文档，而重排的特征把它提到了前面。</li>
+<li><strong>v1 的 recall 已满分，答案却只有 0.483</strong> —— 这是本节的核心诊断信号。</li>
+<li><strong>v2 只改了一个特征</strong>，答案正确率 +0.500，而且<strong>上下文块数还下降了</strong>（8.0→6.8）—— 更好的排序让更少的证据就够用，<strong>质量与成本同向改善</strong>（不是权衡）。</li>
+</ol>
+<h4 id="h-33-诊断为什么召回满分答案只有一半">3.3 诊断：为什么&quot;召回满分、答案只有一半&quot;<a class="anchor" href="#h-33-诊断为什么召回满分答案只有一半" aria-label="本节链接">#</a></h4>
+<p>判定链条（第 7 章第 2 节的失败分类 + 第 5 章第 3 节的反事实）：</p>
+<pre data-lang="text"><code class="language-text">recall@10 = 1.000  -&gt; 黄金证据确实进了 top-10          （不是召回失败）
+MRR = 0.742        -&gt; 黄金证据的平均名次约 1.35        （排序不够靠前）
+答案 = 0.483       -&gt; 生成取的是&quot;分数最高的入选块&quot;      （top-1 常常不是黄金）</code></pre>
+<p>于是问题定位在<strong>重排的特征</strong>上。检查 v1 的三个特征：</p>
+<table>
+<thead>
+<tr>
+<th>特征</th>
+<th>作用对象</th>
+<th>在黄金文档上的实际取值</th>
+<th>问题</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>overlap</code></td>
+<td>chunk 文本 × 查询</td>
+<td>较低（黄金用<strong>同义词</strong>，与查询词不重叠）</td>
+<td>反而有利于竞争文档</td>
+</tr>
+<tr>
+<td><code>freshness</code></td>
+<td>文档元数据（非陈旧）</td>
+<td>+0.35（正常触发）</td>
+<td>无</td>
+</tr>
+<tr>
+<td><code>adjacency</code></td>
+<td><strong>chunk 文本</strong>里是否含键</td>
+<td><strong>0</strong>（键被切到另一个 chunk）</td>
+<td><strong>特征从未触发</strong></td>
+</tr>
+</tbody></table>
+<p><strong>病根确定</strong>：v1 想用&quot;实体键是否匹配&quot;来区分&quot;同一属性的新旧值文档&quot;，但这个信号<strong>只在 chunk 文本里找</strong>，而切分把键切走了。因此 v1 手里<strong>没有任何区分新旧值的有效特征</strong>，只能靠 <code>freshness</code> 的 0.35 与噪声竞争 —— 于是 top-1 常常落在陈旧文档上。</p>
+<p><strong>这是一个&quot;特征可见性&quot;问题，不是&quot;模型能力&quot;问题。</strong> 它和真实系统里的 cross-encoder 失效同源：特征工程假设了&quot;模型能看到的输入&quot;，而输入被上游（切分）改变了。</p>
+<h4 id="h-34-修复v2与验证">3.4 修复（v2）与验证<a class="anchor" href="#h-34-修复v2与验证" aria-label="本节链接">#</a></h4>
+<p>v2 只加一项：<strong>把键匹配提升为文档级交互特征</strong> ——</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0044em;vertical-align:-0.31em;"></span><span class="mord text"><span class="mord">key_match</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.60</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="minner"><span class="mopen delimcenter" style="top:0em;">[</span><span class="mord text"><span class="mord">doc.key</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∈</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mord text"><span class="mord">query</span></span><span class="mclose delimcenter" style="top:0em;">]</span></span></span></span></span></span></p>
+<p>⚠️ 实测：MRR 0.742→0.992、答案正确率 0.483→<strong>0.983</strong>、上下文块 8.0→6.8。</p>
+<p><strong>注意 v2 的实现选择</strong>：它<strong>没有</strong>改切分（把键和值切到同一 chunk），而是把信号提升到文档级。理由见 ADR-005：改切分会触发全量重嵌入（ch6-l1 的代价表），而改重排特征只影响在线打分。<strong>&quot;先用最便宜的杠杆验证假设&quot;是调优顺序的原则。</strong></p>
+<h4 id="h-35-math13-与重排池的扫描">3.5 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 与重排池的扫描<a class="anchor" href="#h-35-math13-与重排池的扫描" aria-label="本节链接">#</a></h4>
+<p><strong><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 扫描</strong>（v2）：</p>
+<table>
+<thead>
+<tr>
+<th><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span></th>
+<th>recall@k</th>
+<th>MRR</th>
+<th>答案正确</th>
+<th>上下文块</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1</td>
+<td>0.983</td>
+<td>0.983</td>
+<td>0.983</td>
+<td>1.0</td>
+</tr>
+<tr>
+<td>3</td>
+<td>1.000</td>
+<td>0.992</td>
+<td>0.983</td>
+<td>3.0</td>
+</tr>
+<tr>
+<td>5</td>
+<td>1.000</td>
+<td>0.992</td>
+<td>0.983</td>
+<td>4.6</td>
+</tr>
+<tr>
+<td>10</td>
+<td>1.000</td>
+<td>0.992</td>
+<td>0.983</td>
+<td>6.8</td>
+</tr>
+<tr>
+<td>20</td>
+<td>1.000</td>
+<td>0.992</td>
+<td>0.983</td>
+<td>8.0</td>
+</tr>
+<tr>
+<td>50</td>
+<td>1.000</td>
+<td>0.992</td>
+<td>0.983</td>
+<td>8.0</td>
+</tr>
+</tbody></table>
+<p><strong>读数</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8304em;vertical-align:-0.136em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≥</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">3</span></span></span></span> 之后指标完全饱和，而上下文块数继续涨（预算被更多低分块填满）。<strong>这与第 5 章第 2 节的结论一致</strong>：证据的边际收益在覆盖饱和后为零（甚至为负，因为干扰）。<strong>所以本案例的合理工作点是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">3</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∼</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">5</span></span></span></span></strong>，不是 10。</p>
+<p><strong>重排池扫描</strong>（v2）：</p>
+<table>
+<thead>
+<tr>
+<th>pool</th>
+<th>recall@10</th>
+<th>MRR</th>
+<th>答案正确</th>
+<th>成本（元）</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>0（= hybrid）</td>
+<td>0.250</td>
+<td>0.068</td>
+<td>0.033</td>
+<td>0.00497</td>
+</tr>
+<tr>
+<td>10</td>
+<td>0.250</td>
+<td>0.250</td>
+<td>0.250</td>
+<td>0.00490</td>
+</tr>
+<tr>
+<td>50</td>
+<td>1.000</td>
+<td>0.992</td>
+<td>0.983</td>
+<td>0.01540</td>
+</tr>
+<tr>
+<td>200</td>
+<td>1.000</td>
+<td>0.992</td>
+<td>0.983</td>
+<td>0.01560</td>
+</tr>
+</tbody></table>
+<p><strong>读数</strong>：池从 10 到 50 是关键跃迁（黄金文档在 11~50 名之间），50 之后完全饱和而成本继续微升 → <strong>重排池 = 50 是拐点</strong>（对应第 5 章第 4 节的 MC 判据：右侧的边际质量增益为 0）。</p>
+<p><figure><img class="md-img" src="content/courses/rag-systems/assets/chapter-7-figure-03.svg" alt="召回满分、答案只有一半" loading="lazy" decoding="async"><figcaption>召回满分、答案只有一半</figcaption></figure>
+</p>
+<h3 id="h-四决策记录adr与下一步">四、决策记录（ADR）与下一步<a class="anchor" href="#h-四决策记录adr与下一步" aria-label="本节链接">#</a></h3>
+<h4 id="h-adr-001暂不单独依赖混合检索以稀疏为基线">ADR-001：暂不单独依赖混合检索，以稀疏为基线<a class="anchor" href="#h-adr-001暂不单独依赖混合检索以稀疏为基线" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>背景</strong>：稀疏 recall@10 = 0.300、稠密代理 0.050、混合 0.250。混合<strong>低于</strong>稀疏。</li>
+<li><strong>决策</strong>：保留 <code>hybrid</code> 作为可选模式，<strong>默认配置使用&quot;混合 + 重排&quot;</strong>；但<strong>不把&quot;混合本身&quot;写进收益承诺</strong>。</li>
+<li><strong>替代方案</strong>：① 直接上混合并宣称收益（被否：本地数据不支持）；② 放弃稠密路（被否：真实双塔的语义泛化能力尚未被本代理代表）。</li>
+<li><strong>理由</strong>：RRF 假设两路都可信；本案例的稠密代理排序接近随机，融合注入的是噪声（ch3-l3 的互补度判据）。</li>
+<li><strong>后果</strong>：需要为&quot;稠密路是否可信&quot;建一个可测判据（单路 recall@10 与互补度），并在换真实模型后重测。</li>
+<li><strong>何时重审</strong>：接入真实双塔且其单路 recall@10 ≥ 0.6 时；或互补度（两路结果集的 Jaccard 逆指标）显著上升时。</li>
+</ul>
+<h4 id="h-adr-002acl-必须前置过滤">ADR-002：ACL 必须前置过滤<a class="anchor" href="#h-adr-002acl-必须前置过滤" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>背景</strong>：语料中 2/3 的竞争文档属于其他租户。</li>
+<li><strong>决策</strong>：<code>allow = ACL[tenant]</code> 在打分阶段生效；canary 对抗测试进 CI。</li>
+<li><strong>理由</strong>：post-filter 的可用条数 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.3669em;"></span><span class="mrel">∼</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord">Binomial</span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">s</span><span class="mclose">)</span></span></span></span>（ch6-l3），权限与本任务相关性无关，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span></span></span></span> 小时效用崩塌。⚠️ 实测：canary 交叉断言 12 条、泄漏 <strong>0</strong> → PASS。</li>
+<li><strong>后果</strong>：检索器必须接受 <code>allow</code> 参数；所有旁路（导出、评测、调试）都必须走同一入口。</li>
+<li><strong>何时重审</strong>：租户数超过数百、或出现&quot;大租户独占索引&quot;的合规要求时，改为分区索引。</li>
+</ul>
+<h4 id="h-adr-003重排池--50">ADR-003：重排池 = 50<a class="anchor" href="#h-adr-003重排池--50" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>背景</strong>：池 0/10/50/200 的实测如上。</li>
+<li><strong>决策</strong>：池 = 50。</li>
+<li><strong>理由</strong>：10→50 是 recall 0.250→1.000 的关键区间；50→200 的边际质量增益为 0，成本仍上升。</li>
+<li><strong>后果</strong>：每查询多约 50 次候选打分；需要重排模型的版本管理。</li>
+<li><strong>何时重审</strong>：语料规模或查询分布变化导致&quot;黄金文档名次分布&quot;右移时（应重新扫池）。</li>
+</ul>
+<h4 id="h-adr-004缓存键必须带-tenantacl-指纹与-manifest">ADR-004：缓存键必须带 tenant、acl 指纹与 manifest<a class="anchor" href="#h-adr-004缓存键必须带-tenantacl-指纹与-manifest" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>背景</strong>：多租户共享缓存。</li>
+<li><strong>决策</strong>：<code>key = sha1(tenant | manifest | acl_fp | query)</code>。</li>
+<li><strong>理由</strong>：⚠️ 实测：同租户第 2 次查询命中（命中 1 次）；<strong>他租户同问不命中</strong>（未命中），因为 key 含 tenant 与权限指纹。缺任一项都会造成越权或陈旧内容（ch6-l2 §4）。</li>
+<li><strong>后果</strong>：跨租户命中率下降（失去了&quot;全局热门问题&quot;的复用），但这是隔离的必要代价。</li>
+<li><strong>何时重审</strong>：引入公共/共享语料分层时（公共部分可以跨租户共享，但必须与私有部分分键）。</li>
+</ul>
+<h4 id="h-adr-005先用文档级键匹配特征修复排序而不是改切分">ADR-005：先用文档级键匹配特征修复排序，而不是改切分<a class="anchor" href="#h-adr-005先用文档级键匹配特征修复排序而不是改切分" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>背景</strong>：v1 的 <code>adjacency</code> 特征因切分而失效（§3.3）。</li>
+<li><strong>决策</strong>：在重排中加入文档级 <code>key_match</code> 特征（v2），<strong>暂不改切分参数</strong>。</li>
+<li><strong>替代方案</strong>：① 缩小窗口让键与值同 chunk（成本：全量重嵌入 + 重建索引，ch6-l1）；② 增大重叠（成本：token 预算上升，ch5-l2）；③ 不修（质量不达标）。</li>
+<li><strong>理由</strong>：v2 在<strong>零索引成本</strong>下把答案正确率从 0.483 抬到 0.983；①的预期收益不明确而代价确定。</li>
+<li><strong>后果</strong>：重排器依赖文档级键的可得性；若未来把&quot;键&quot;改成多字段实体，需要同步更新该特征。</li>
+<li><strong>何时重审</strong>：当切分本身被证明是其他失败的主因时；或当 <code>key_match</code> 对多实体查询失效时。</li>
+</ul>
+<h4 id="h-下一步由评测结果推出">下一步（由评测结果推出）<a class="anchor" href="#h-下一步由评测结果推出" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>观察</th>
+<th>结论</th>
+<th>下一步</th>
+<th>预期收益</th>
+<th>成本</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>dense 单路 0.050</td>
+<td>稠密代理不可用</td>
+<td>接入真实双塔并重测互补度</td>
+<td>可能把 recall 从 0.30 提到 0.6+</td>
+<td>中（需模型与重嵌入）</td>
+</tr>
+<tr>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8304em;vertical-align:-0.136em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≥</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">3</span></span></span></span> 饱和</td>
+<td>预算有浪费</td>
+<td>默认 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 从 10 降到 5</td>
+<td>上下文块 6.8→4.6，成本下降</td>
+<td>极低</td>
+</tr>
+<tr>
+<td>答案 0.983、引用 0.983</td>
+<td>抽取式 stub 已到顶</td>
+<td>换真实生成模型并重跑评测</td>
+<td>需要重新评估&quot;生成未用&quot;类失败</td>
+<td>高</td>
+</tr>
+<tr>
+<td>canary PASS</td>
+<td>权限路径健康</td>
+<td>把该测试加入 CI 门禁</td>
+<td>防回归</td>
+<td>极低</td>
+</tr>
+<tr>
+<td>回滚 PASS</td>
+<td>索引可回滚</td>
+<td>加上&quot;撤权传播 SLA&quot;测试</td>
+<td>防撤权延迟泄漏</td>
+<td>低</td>
+</tr>
+</tbody></table>
+<h3 id="h-代码">代码<a class="anchor" href="#h-代码" aria-label="本节链接">#</a></h3>
+<p>下面四段代码<strong>按顺序拼接</strong>即为一个完整可运行脚本（单文件，无第三方依赖，仅用标准库 + numpy）。运行环境：Python 3.10+。</p>
+<p><strong>（第 1 段 / 共 4 段 —— 按顺序拼接为一个文件）</strong></p>
+<pre data-lang="python"><code class="language-python"># -*- coding: utf-8 -*-
+&quot;&quot;&quot;⚠️ 合成数据：最小可运行 RAG 系统 + 评测脚本。
+   包含：切分/内容寻址 id、BM25、稠密代理（hashing-trick 随机投影）、RRF 融合、
+   交互式重排、ACL 前置过滤、预算装配、抽取式生成 stub、带租户键的缓存、
+   段式索引与回滚、消融评测、canary 对抗测试。
+   ⚠️ 稠密表示是随机投影代理（不具备真实双塔的语义泛化）；生成是抽取式 stub（不调用 LLM）；
+      语料为构造数据 —— 因此本文件的绝对数值不代表任何真实系统水平，只用于演示方法与结构。&quot;&quot;&quot;
+import hashlib, math, re, time
+from collections import Counter
+from dataclasses import dataclass, field
+import numpy as np
+
+# ============ 0. 合成语料 ============
+TOPICS = [f&quot;领域{t}&quot; for t in range(10)]
+ATTRS = [&quot;营收&quot;, &quot;延迟&quot;, &quot;成本&quot;, &quot;召回率&quot;, &quot;吞吐&quot;]
+ATTR_SYN = {&quot;营收&quot;: &quot;收入&quot;, &quot;延迟&quot;: &quot;响应时间&quot;, &quot;成本&quot;: &quot;开销&quot;, &quot;召回率&quot;: &quot;查全率&quot;, &quot;吞吐&quot;: &quot;处理能力&quot;}
+rng = np.random.default_rng(2026)
+
+@dataclass
+class Doc:
+    doc_id: str; tenant: str; topic: str; key: str; attr: str; value: str; stale: bool
+
+def make_corpus(n_gold=60, n_decoy=200):
+    docs = []
+    for i in range(n_gold):
+        t, a = TOPICS[i % len(TOPICS)], ATTRS[i % len(ATTRS)]
+        # 黄金文档：用同义词（词汇不匹配）+ &quot;最新&quot;标记 + 现行值
+        gold = (f&quot;{t} {t} 季度 报告 {ATTR_SYN[a]} 指标 说明 现行 版本 生效 最新 {i} &quot;
+                f&quot;{t} 摘要 补充 参考 附录 K{i}&quot;)
+        docs.append(Doc(f&quot;doc_g{i}&quot;, f&quot;t{i%3}&quot;, t, f&quot;K{i}&quot;, a, f&quot;{i}&quot;, False))
+        # 竞争文档：精确属性词（词法匹配强）+ &quot;历史&quot;标记 + 旧值；分布在不同租户
+        for j in range(3):
+            other = f&quot;t{i%3}&quot; if j == 0 else f&quot;t{(i+1+j)%3}&quot;
+            stale = (f&quot;{t} {t} 季度 报告 {a} 指标 说明 历史 版本 废止 旧 {900+j} &quot;
+                     f&quot;{t} 摘要 补充 参考 附录 K{i}&quot;)
+            docs.append(Doc(f&quot;doc_s{i}_{j}&quot;, other, t, f&quot;K{i}&quot;, a, f&quot;{900+j}&quot;, True))
+    for d in range(n_decoy):                      # 同主题噪声文档，稀释候选池
+        t = TOPICS[d % len(TOPICS)]
+        docs.append(Doc(f&quot;decoy{d}&quot;, f&quot;t{d%3}&quot;, t, f&quot;D{d}&quot;, ATTRS[d % 5], f&quot;{5000+d}&quot;, True))
+    return docs
+
+CORPUS = make_corpus()
+TENANTS = [&quot;t0&quot;, &quot;t1&quot;, &quot;t2&quot;]
+ACL = {t: {d.doc_id for d in CORPUS if d.tenant == t} for t in TENANTS}
+CANARY = {}
+for t in TENANTS:                                 # 每租户 2 篇 canary 诱饵（仅本租户可见）
+    CANARY[t] = []
+    for j in range(2):
+        did = f&quot;canary_{t}_{j}&quot;
+        CORPUS.append(Doc(did, t, TOPICS[(j + 3) % 10], f&quot;CK{t}{j}&quot;, ATTRS[j % 5],
+                          f&quot;SECRET-{t}-{j}&quot;, True))     # canary 标为陈旧，避免污染正常排序
+        CANARY[t].append(did)
+    ACL[t] |= set(CANARY[t])
+
+# ============ 1. 切分 + 内容寻址 id ============
+CHUNKER_VER, EMBEDDER_VER = &quot;chk-v1&quot;, &quot;emb-v1&quot;
+def chunk_id(doc_id, version, span):
+    raw = f&quot;{doc_id}|{version}|{span}|{CHUNKER_VER}|{EMBEDDER_VER}&quot;
+    return &quot;c&quot; + hashlib.sha1(raw.encode()).hexdigest()[:14]
+
+def tokenize(s): return re.findall(r&quot;[A-Za-z0-9]+|[\u4e00-\u9fff]&quot;, s.lower())
+
+@dataclass
+class Chunk:
+    cid: str; doc_id: str; tenant: str; text: str; tokens: list
+    topic: str; key: str; value: str; stale: bool
+
+def split_doc(d: Doc, version=1, size=14, overlap=4):
+    toks = tokenize(d.text) if hasattr(d, &quot;text&quot;) else tokenize(
+        f&quot;{d.topic} {d.topic} 季度 报告 {ATTR_SYN[d.attr] if not d.stale else d.attr} 指标 说明 &quot;
+        f&quot;{&#39;现行 版本 生效 最新&#39; if not d.stale else &#39;历史 版本 废止 旧&#39;} {d.value} &quot;
+        f&quot;{d.topic} 摘要 补充 参考 附录 {d.key}&quot;)
+    out, i = [], 0
+    while i &lt; len(toks):
+        span = (i, min(i + size, len(toks)))
+        out.append(Chunk(cid=chunk_id(d.doc_id, version, span), doc_id=d.doc_id,
+                         tenant=d.tenant, text=&quot; &quot;.join(toks[span[0]:span[1]]),
+                         tokens=toks[span[0]:span[1]], topic=d.topic, key=d.key,
+                         value=d.value, stale=d.stale))
+        if span[1] == len(toks): break
+        i += size - overlap
+    return out
+
+# ============ 2. 稀疏检索 BM25 ============
+class BM25:
+    def __init__(self, chunks, k1=1.2, b=0.75):
+        self.chunks, self.k1, self.b = chunks, k1, b
+        self.df = Counter()
+        for c in chunks: self.df.update(set(c.tokens))
+        self.N = len(chunks)
+        self.tf = [Counter(c.tokens) for c in chunks]
+        self.avgdl = sum(len(c.tokens) for c in chunks) / max(1, self.N)
+    def score(self, q, allow):
+        out = []
+        for i, c in enumerate(self.chunks):
+            if c.doc_id not in allow: continue
+            s = 0.0
+            for t in set(tokenize(q)):
+                f = self.tf[i].get(t, 0)
+                if not f: continue
+                idf = math.log(1 + (self.N - self.df[t] + 0.5) / (self.df[t] + 0.5))
+                s += idf * f * (self.k1 + 1) / (f + self.k1 * (1 - self.b + self.b * len(c.tokens) / self.avgdl))
+            out.append((s, c))
+        return sorted(out, key=lambda x: -x[0])
+
+# ============ 3. 稠密检索（hashing-trick 随机投影代理）============
+class Dense:
+    &quot;&quot;&quot;hashing-trick 随机投影 + 主题向量：模拟双塔的&#39;主题级语义泛化&#39;。
+    ⚠️ 这只是代理：它没有真实的同义词/蕴含能力，不能替代真实双塔。&quot;&quot;&quot;
+    def __init__(self, chunks, dim=64, seed=0, topic_w=1.8):
+        self.chunks, self.dim, self.topic_w = chunks, dim, topic_w
+        r = np.random.default_rng(seed)
+        self.P = r.normal(0, 1, (4096, dim))
+        self.TOPIC_VEC = {t: self._unit(r.normal(0, 1, dim))
+                          for t in sorted(set(c.topic for c in chunks))}  # 排序保证可复现
+        self.vecs = [self._enc(c.tokens, c.topic) for c in chunks]
+    @staticmethod
+    def _unit(v):
+        n = np.linalg.norm(v); return v / n if n else v
+    def _enc(self, toks, topic=None):
+        v = np.zeros(self.dim)
+        for t in toks:
+            v += self.P[int(hashlib.md5(t.encode()).hexdigest()[:6], 16) % 4096]
+        v = self._unit(v)
+        if topic in self.TOPIC_VEC: v = self._unit(v + self.topic_w * self.TOPIC_VEC[topic])
+        return v
+    def score(self, q, allow):
+        m = re.search(r&quot;领域(\d+)&quot;, q)
+        q_topic = f&quot;领域{m.group(1)}&quot; if m else None
+        qv = self._enc(tokenize(q), q_topic); out = []
+        for i, c in enumerate(self.chunks):
+            if c.doc_id not in allow: continue
+            out.append((float(np.dot(qv, self.vecs[i])), c))
+        return sorted(out, key=lambda x: -x[0])</code></pre>
+<p><strong>（第 2 段 / 共 4 段 —— 按顺序拼接为一个文件）</strong></p>
+<pre data-lang="python"><code class="language-python"># ============ 4. RRF 融合 + 5. 交互式重排 ============
+def rrf(rank_lists, k=60):
+    agg = {}
+    for lst in rank_lists:
+        for rank, (_, c) in enumerate(lst):
+            agg[c.cid] = agg.get(c.cid, 0.0) + 1.0 / (k + rank + 1)
+    return sorted(agg.items(), key=lambda x: -x[1])
+
+def rerank(query, fused, by_cid, pool=50):
+    qt = set(tokenize(query)); out = []
+    for cid, base in fused[:pool]:
+        c = by_cid[cid]
+        overlap = len(qt &amp; set(c.tokens)) / max(1, len(qt))
+        freshness = 0.35 if not c.stale else 0.0        # 版本新鲜度（文档元数据）
+        adjacency = 0.25 if c.key.lower() in c.text.replace(&quot; &quot;, &quot;&quot;) else 0.0
+        out.append((base + 0.9 * overlap + freshness + adjacency, c))
+    return sorted(out, key=lambda x: -x[0])
+
+def rerank_v2(query, fused, by_cid, pool=50):
+    &quot;&quot;&quot;v2：在 v1 基础上加入&#39;查询里的实体键是否命中该 chunk 所属文档&#39;这个交互特征。
+    v1 只在 chunk 文本里找 key，而切分把 key 切到了另一个 chunk，导致该信号丢失 —— 这就是 v1 的病根。&quot;&quot;&quot;
+    qn = query.lower().replace(&quot; &quot;, &quot;&quot;)
+    qt = set(tokenize(query)); out = []
+    for cid, base in fused[:pool]:
+        c = by_cid[cid]
+        overlap = len(qt &amp; set(c.tokens)) / max(1, len(qt))
+        freshness = 0.35 if not c.stale else 0.0
+        adjacency = 0.25 if c.key.lower() in c.text.replace(&quot; &quot;, &quot;&quot;) else 0.0
+        key_match = 0.60 if c.key.lower() in qn else 0.0     # 文档级键匹配（v2 新增）
+        out.append((base + 0.9 * overlap + freshness + adjacency + key_match, c))
+    return sorted(out, key=lambda x: -x[0])
+
+# ============ 6. 预算装配（贪心覆盖）============
+def assemble(ranked, budget_tokens=120, per_chunk=14):
+    sel, used, covered = [], 0, set()
+    for s, c in ranked:
+        if used + per_chunk &gt; budget_tokens: break
+        if covered and not (set(c.tokens) - covered): continue
+        sel.append((s, c)); used += per_chunk; covered |= set(c.tokens)
+    return sel
+
+# ============ 7. 抽取式生成 stub ============
+def generate(query, ctx):
+    if not ctx: return &quot;UNKNOWN&quot;, &quot;&quot;
+    best = max(ctx, key=lambda x: x[0])[1]
+    return best.value, best.cid</code></pre>
+<p><strong>（第 3 段 / 共 4 段 —— 按顺序拼接为一个文件）</strong></p>
+<pre data-lang="python"><code class="language-python"># ============ 8. 缓存（键含 tenant / 权限指纹 / manifest）============
+class Cache:
+    def __init__(self): self.d = {}; self.hits = 0; self.miss = 0
+    def key(self, tenant, manifest, q, acl_fp):
+        return hashlib.sha1(f&quot;{tenant}|{manifest}|{acl_fp}|{q}&quot;.encode()).hexdigest()[:16]
+    def get(self, k):
+        if k in self.d: self.hits += 1; return self.d[k]
+        self.miss += 1; return None
+    def put(self, k, v): self.d[k] = v
+
+# ============ 9. 段式索引 + manifest + 回滚 ============
+@dataclass
+class Segment:
+    sid: int; chunks: list = field(default_factory=list); tomb: set = field(default_factory=set)
+
+class SegmentIndex:
+    _seq = 0
+    def __init__(self):
+        self.segments = []; self.by_cid = {}; self.manifest_id = &quot;man-0&quot;; self._v = 0
+    def add(self, chunks):
+        SegmentIndex._seq += 1
+        s = Segment(SegmentIndex._seq, list(chunks)); self.segments.append(s)
+        for c in chunks: self.by_cid[c.cid] = c
+        self._v += 1; self.manifest_id = f&quot;man-{self._v}&quot;; return s
+    def delete_doc(self, doc_id):
+        for s in self.segments:
+            for c in s.chunks:
+                if c.doc_id == doc_id: s.tomb.add(c.cid)
+    def live(self): return [c for s in self.segments for c in s.chunks if c.cid not in s.tomb]
+    def stats(self):
+        total = sum(len(s.chunks) for s in self.segments); live = len(self.live())
+        return dict(segments=len(self.segments), live=live, total=total,
+                    tomb=round((total - live) / total, 3) if total else 0,
+                    manifest=self.manifest_id)
+    def snapshot(self):
+        return (self.manifest_id, [(s.sid, list(s.chunks), set(s.tomb)) for s in self.segments])
+    def rollback(self, snap):
+        mid, data = snap
+        self.segments = [Segment(sid, list(ch), set(tb)) for sid, ch, tb in data]
+        self.manifest_id = mid
+
+# ============ 10. 流水线 ============
+idx = SegmentIndex()
+DEFAULT_VER = 1
+idx.add([c for d in CORPUS for c in split_doc(d, version=DEFAULT_VER)])
+LIVE = idx.live(); bm25 = BM25(LIVE); dense = Dense(LIVE)
+
+def pipeline(query, tenant, mode=&quot;hybrid+rerank&quot;, k=10, pool=50, budget=120):
+    allow = ACL[tenant]
+    r1, r2 = bm25.score(query, allow), dense.score(query, allow)
+    if mode == &quot;sparse&quot;:   ranked = r1[:k]
+    elif mode == &quot;dense&quot;:  ranked = r2[:k]
+    elif mode == &quot;hybrid&quot;: ranked = [(v, idx.by_cid[cid]) for cid, v in rrf([r1, r2])[:k]]
+    elif mode == &quot;hybrid+rerank&quot;:
+        ranked = rerank(query, rrf([r1, r2]), idx.by_cid, pool=pool)[:k]
+    elif mode == &quot;hybrid+rerank-v2&quot;:
+        ranked = rerank_v2(query, rrf([r1, r2]), idx.by_cid, pool=pool)[:k]
+    else: raise ValueError(mode)
+    ctx = assemble(ranked, budget_tokens=budget)
+    ans, cite = generate(query, ctx)
+    return dict(ranked=ranked, ctx=ctx, ans=ans, cite=cite)</code></pre>
+<p><strong>（第 4 段 / 共 4 段 —— 按顺序拼接为一个文件）</strong></p>
+<pre data-lang="python"><code class="language-python"># ============ 11. 评测脚本 ============
+def eval_set(n=60):
+    return [dict(qid=i, tenant=f&quot;t{i%3}&quot;, golden=f&quot;doc_g{i}&quot;,
+                 query=f&quot;{TOPICS[i%len(TOPICS)]} 最新 {ATTRS[i%len(ATTRS)]} K{i} 是多少&quot;,
+                 expect=str(i)) for i in range(n)]
+EVAL = eval_set()
+
+def evaluate(mode=&quot;hybrid+rerank&quot;, k=10, pool=50, budget=120, cache=None):
+    rec = mrr = acc = cite = cost = 0.0; lat = []
+    for e in EVAL:
+        t0 = time.perf_counter()
+        key = (cache.key(e[&quot;tenant&quot;], idx.manifest_id, e[&quot;query&quot;], len(ACL[e[&quot;tenant&quot;]]))
+               if cache else None)
+        r = cache.get(key) if cache else None
+        if r is None:
+            r = pipeline(e[&quot;query&quot;], e[&quot;tenant&quot;], mode, k, pool, budget)
+            if cache: cache.put(key, r)
+        lat.append((time.perf_counter() - t0) * 1000)
+        docs = [c.doc_id for _, c in r[&quot;ranked&quot;][:k]]
+        if e[&quot;golden&quot;] in docs:
+            rec += 1.0; mrr += 1.0 / (docs.index(e[&quot;golden&quot;]) + 1)
+        acc += 1.0 if r[&quot;ans&quot;] == e[&quot;expect&quot;] else 0.0
+        if r[&quot;cite&quot;]:
+            cite += 1.0 if idx.by_cid[r[&quot;cite&quot;]].doc_id == e[&quot;golden&quot;] else 0.0
+        cost += 0.002 * (1 + len(r[&quot;ctx&quot;]))
+    n = len(EVAL)
+    return dict(mode=mode, recall=rec / n, mrr=mrr / n, answer=acc / n, citation=cite / n,
+                p50_ms=float(np.percentile(lat, 50)), cost=cost / n,
+                ctx_chunks=float(np.mean([len(pipeline(e[&quot;query&quot;], e[&quot;tenant&quot;], mode, k, pool, budget)[&quot;ctx&quot;]) for e in EVAL[:10]])))
+
+print(&quot;== ⚠️ 合成数据：消融实验（N=60 查询，k=10，预算 120 token）==&quot;)
+print(f&quot;{&#39;配置&#39;:&lt;16} {&#39;recall@10&#39;:&gt;10} {&#39;MRR&#39;:&gt;7} {&#39;答案正确&#39;:&gt;9} {&#39;引用一致&#39;:&gt;9} {&#39;P50(ms)&#39;:&gt;9} {&#39;成本(元)&#39;:&gt;9} {&#39;上下文块&#39;:&gt;9}&quot;)
+res = {}
+for mode in (&quot;sparse&quot;, &quot;dense&quot;, &quot;hybrid&quot;, &quot;hybrid+rerank&quot;, &quot;hybrid+rerank-v2&quot;):
+    r = evaluate(mode); res[mode] = r
+    print(f&quot;{mode:&lt;16} {r[&#39;recall&#39;]:&gt;10.3f} {r[&#39;mrr&#39;]:&gt;7.3f} {r[&#39;answer&#39;]:&gt;9.3f} &quot;
+          f&quot;{r[&#39;citation&#39;]:&gt;9.3f} {r[&#39;p50_ms&#39;]:&gt;9.2f} {r[&#39;cost&#39;]:&gt;9.5f} {r[&#39;ctx_chunks&#39;]:&gt;9.1f}&quot;)
+
+print(&quot;\n== k 扫描（hybrid+rerank-v2）==&quot;)
+print(f&quot;{&#39;k&#39;:&gt;4} {&#39;recall@k&#39;:&gt;9} {&#39;MRR&#39;:&gt;7} {&#39;答案正确&#39;:&gt;9} {&#39;上下文块&#39;:&gt;9}&quot;)
+for k in (1, 3, 5, 10, 20, 50):
+    r = evaluate(&quot;hybrid+rerank-v2&quot;, k=k)
+    print(f&quot;{k:&gt;4} {r[&#39;recall&#39;]:&gt;9.3f} {r[&#39;mrr&#39;]:&gt;7.3f} {r[&#39;answer&#39;]:&gt;9.3f} {r[&#39;ctx_chunks&#39;]:&gt;9.1f}&quot;)
+
+print(&quot;\n== 重排池扫描（收益-成本）==&quot;)
+print(f&quot;{&#39;pool&#39;:&gt;5} {&#39;recall@10&#39;:&gt;10} {&#39;MRR&#39;:&gt;7} {&#39;答案正确&#39;:&gt;9} {&#39;成本(元)&#39;:&gt;9}&quot;)
+for pool in (0, 10, 50, 200):
+    mode = &quot;hybrid+rerank-v2&quot; if pool else &quot;hybrid&quot;
+    r = evaluate(mode, pool=pool or 50)
+    print(f&quot;{pool:&gt;5} {r[&#39;recall&#39;]:&gt;10.3f} {r[&#39;mrr&#39;]:&gt;7.3f} {r[&#39;answer&#39;]:&gt;9.3f} {r[&#39;cost&#39;]:&gt;9.5f}&quot;)
+
+# ============ 12. ACL canary 对抗测试 ============
+print(&quot;\n== ACL canary 对抗测试（全租户交叉，断言命中数 == 0）==&quot;)
+by_doc = {}
+for c in LIVE: by_doc.setdefault(c.doc_id, c)
+leak = checks = 0
+for t in TENANTS:
+    for u in TENANTS:
+        if u == t: continue
+        for cd in CANARY[u]:
+            c = by_doc[cd]
+            r = pipeline(f&quot;{c.text} {c.key}&quot;, t, &quot;hybrid+rerank&quot;, k=50)
+            checks += 1
+            if cd in {cc.doc_id for _, cc in r[&quot;ranked&quot;]}: leak += 1
+print(f&quot;  交叉断言数 = {checks}  泄漏 = {leak}  -&gt; {&#39;PASS&#39; if leak == 0 else &#39;FAIL&#39;}&quot;)
+
+# ============ 13. 缓存：同租户命中 / 跨租户隔离 ============
+print(&quot;\n== 缓存的租户隔离（键含 tenant + 权限指纹 + manifest）==&quot;)
+cache = Cache(); q = &quot;领域0 最新 营收 K0 是多少&quot;
+for tenant, tag in ((&quot;t0&quot;, &quot;第1次&quot;), (&quot;t0&quot;, &quot;第2次&quot;), (&quot;t1&quot;, &quot;他租户同问&quot;)):
+    key = cache.key(tenant, idx.manifest_id, q, len(ACL[tenant]))
+    got = cache.get(key); hit = got is not None
+    if got is None:
+        got = pipeline(q, tenant, &quot;hybrid+rerank&quot;); cache.put(key, got)
+    print(f&quot;  {tag:&lt;10} tenant={tenant} 命中={hit} 答案={got[&#39;ans&#39;]}&quot;)
+print(f&quot;  命中={cache.hits} 未命中={cache.miss}；跨租户不会命中（key 含 tenant 与权限指纹）&quot;)
+
+# ============ 14. 段式索引：删除 -&gt; 回滚 ============
+print(&quot;\n== 段式索引：删除 -&gt; 回滚（断言状态完全恢复）==&quot;)
+snap = idx.snapshot()
+before = len([c for c in idx.live() if c.doc_id == &quot;doc_g5&quot;])
+idx.delete_doc(&quot;doc_g5&quot;)
+after = len([c for c in idx.live() if c.doc_id == &quot;doc_g5&quot;])
+idx.rollback(snap)
+restored = len([c for c in idx.live() if c.doc_id == &quot;doc_g5&quot;])
+print(f&quot;  删除前={before} 删除后={after} 回滚后={restored} -&gt; &quot;
+      f&quot;{&#39;PASS&#39; if (before &gt; 0 and after == 0 and restored == before) else &#39;FAIL&#39;}&quot;)
+print(f&quot;  索引状态：{idx.stats()}&quot;)
+
+# ============ 15. 从评测结果读下一步 ============
+b = res[&quot;hybrid+rerank-v2&quot;]
+v1 = res[&quot;hybrid+rerank&quot;]
+print(&quot;\n== 结论 ==&quot;)
+print(f&quot;  最佳配置 recall@10={b[&#39;recall&#39;]:.3f} MRR={b[&#39;mrr&#39;]:.3f} 答案正确={b[&#39;answer&#39;]:.3f} &quot;
+      f&quot;引用一致={b[&#39;citation&#39;]:.3f}&quot;)
+print(f&quot;  v1 对照：recall@10={v1[&#39;recall&#39;]:.3f} 答案正确={v1[&#39;answer&#39;]:.3f} &quot;
+      f&quot;MRR={v1[&#39;mrr&#39;]:.3f}  -&gt; v2 把答案正确率提升了 {b[&#39;answer&#39;]-v1[&#39;answer&#39;]:+.3f}&quot;)
+gap = b[&quot;recall&quot;] - b[&quot;answer&quot;] if False else v1[&quot;recall&quot;] - v1[&quot;answer&quot;]
+print(f&quot;  v1 的 recall@10 - 答案正确 = {gap:+.3f}（召回够、排序不够的典型信号）&quot;)
+print(&quot;  -&gt; &quot; + (&quot;召回够但排序/装配没把正确证据排到首位：优先修重排与装配。&quot;
+                 if gap &gt; 0.05 else &quot;召回本身是短板：优先修切分/索引/查询改写。&quot;))</code></pre>
+<p>运行输出：</p>
+<pre data-lang="text"><code class="language-text">== ⚠️ 合成数据：消融实验（N=60 查询，k=10，预算 120 token）==
+配置                recall@10     MRR      答案正确      引用一致   P50(ms)     成本(元)      上下文块
+sparse                0.300   0.250     0.200     0.200      2.09   0.00520       2.0
+dense                 0.050   0.042     0.033     0.033      1.92   0.00420       1.1
+hybrid                0.250   0.068     0.033     0.033      2.07   0.00497       2.0
+hybrid+rerank         1.000   0.742     0.483     0.483      2.13   0.01787       8.0
+hybrid+rerank-v2      1.000   0.992     0.983     0.983      2.12   0.01540       6.8
+
+== k 扫描（hybrid+rerank-v2）==
+   k  recall@k     MRR      答案正确      上下文块
+   1     0.983   0.983     0.983       1.0
+   3     1.000   0.992     0.983       3.0
+   5     1.000   0.992     0.983       4.6
+  10     1.000   0.992     0.983       6.8
+  20     1.000   0.992     0.983       8.0
+  50     1.000   0.992     0.983       8.0
+
+== 重排池扫描（收益-成本）==
+ pool  recall@10     MRR      答案正确     成本(元)
+    0      0.250   0.068     0.033   0.00497
+   10      0.250   0.250     0.250   0.00490
+   50      1.000   0.992     0.983   0.01540
+  200      1.000   0.992     0.983   0.01560
+
+== ACL canary 对抗测试（全租户交叉，断言命中数 == 0）==
+  交叉断言数 = 12  泄漏 = 0  -&gt; PASS
+
+== 缓存的租户隔离（键含 tenant + 权限指纹 + manifest）==
+  第1次        tenant=t0 命中=False 答案=0
+  第2次        tenant=t0 命中=True 答案=0
+  他租户同问      tenant=t1 命中=False 答案=10
+  命中=1 未命中=2；跨租户不会命中（key 含 tenant 与权限指纹）
+
+== 段式索引：删除 -&gt; 回滚（断言状态完全恢复）==
+  删除前=4 删除后=0 回滚后=4 -&gt; PASS
+  索引状态：{&#39;segments&#39;: 1, &#39;live&#39;: 1784, &#39;total&#39;: 1784, &#39;tomb&#39;: 0.0, &#39;manifest&#39;: &#39;man-1&#39;}
+
+== 结论 ==
+  最佳配置 recall@10=1.000 MRR=0.992 答案正确=0.983 引用一致=0.983
+  v1 对照：recall@10=1.000 答案正确=0.483 MRR=0.742  -&gt; v2 把答案正确率提升了 +0.500
+  v1 的 recall@10 - 答案正确 = +0.517（召回够、排序不够的典型信号）
+  -&gt; 召回够但排序/装配没把正确证据排到首位：优先修重排与装配。</code></pre>
+<p><strong>关键设计决策</strong>：整个案例最值得学习的一处，是<strong>评测表把&quot;召回满分、答案一半&quot;这个矛盾直接暴露出来</strong>。如果只统计一个端到端分数（比如 0.483），你会得出&quot;这个系统还差一半&quot;的模糊结论；而把 <code>recall@10</code>、<code>MRR</code>、<code>答案正确</code> 三个指标放在一起，诊断就是确定性的：<strong>召回没问题，是排序</strong>。这正是第 7 章第 2 节&quot;指标树 + 失败分类&quot;存在的意义 —— <strong>它不是为了报告分数，而是为了让下一步行动没有歧义。</strong></p>
+<p>第二处值得学习的是 <strong>v2 的修复选择</strong>：发现问题在&quot;键匹配信号不可见&quot;之后，有两条路 —— 改切分（贵、影响全链路）或把信号提升到文档级（便宜、只影响在线打分）。<strong>选择后者不是因为后者更彻底，而是因为它用最小的代价验证了假设</strong>；如果 v2 之后仍然不达标，再动切分也不迟。这个顺序（先改在线、后改离线）是 ch6-l1 的&quot;重建代价&quot;与 ch5-l4 的&quot;边际成本&quot;共同推出的。</p>
+<h3 id="h-练习">练习<a class="anchor" href="#h-练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><p><strong>跑通并复现基线</strong>。把四段代码拼接成一个文件运行，确认得到与本案例一致的消融表（注意 P50 列会因机器不同而变化，其余指标应当一致）。然后回答：如果把 <code>Dense</code> 的 <code>topic_w</code> 从 1.8 调到 0.2，哪些指标会变化、方向如何？解释原因。</p>
+</li>
+<li><p><strong>实现第 6 个消融配置</strong>。加入 <code>sparse+rerank</code>（只用稀疏路 + 重排）。测它的 recall@10、答案正确率与成本，并与 <code>hybrid+rerank-v2</code> 比较。回答：如果两者接近，那&quot;混合&quot;在这个语料上还有必要吗？给出你的判据。</p>
+</li>
+<li><p><strong>修复另一种病根</strong>。把语料构造成&quot;黄金文档的键与值被切到同一 chunk&quot;（缩小窗口），重跑 v1。回答：(a) v1 的答案正确率是否自己就好转？(b) 这验证了 §3.3 的结论吗？(c) 如果 v1 因此变好，那 ADR-005 的选择是否仍然正确？</p>
+</li>
+<li><p><strong>给评测加一个&quot;生成层&quot;指标</strong>。当前的抽取式 stub 掩盖了生成层问题。设计一个最小可复现的生成层代理（例如&quot;必须引用 ≥1 条证据且引用必须支持答案&quot;的规则），并加入两个会破坏它的配置：(a) 强制引用但允许引用不相关块；(b) 允许无引用回答。测这两个配置的&quot;引用一致率&quot;，说明为什么它们能暴露 v1 看不到的问题。</p>
+</li>
+<li><p><strong>把 canary 测试做成参数化</strong>。修改 ACL 对抗测试，使其：(a) 同时测试&quot;无权文档不出现在候选&quot;与&quot;无权文档不出现在最终上下文&quot;；(b) 加入&quot;缺 ACL 字段的文档必须不可见&quot;的断言。给出修改后的 PASS/FAIL 输出。</p>
+</li>
+<li><p><strong>索引更新的端到端演练</strong>。扩展 <code>SegmentIndex</code>：(a) 新增一篇文档 → 查询能召回；(b) 删除一篇文档 → 查询不再召回（墓碑生效）；(c) 回滚 → 恢复。为每一步写断言，并统计段数与墓碑比例。然后回答：如果每秒有 10 篇文档更新，你需要什么压实策略（提示：ch6-l1 的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0379em;">δ</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6887em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span></span></span></span></span></span></span></span>）？</p>
+</li>
+<li><p><strong>缓存失效演练</strong>。给缓存加&quot;按 doc_id 反向失效&quot;：模拟一篇文档更新后，所有引用它的缓存条目被清除。用 <code>Cache</code> 记录 <code>cid → keys</code> 的反向索引并实现 <code>invalidate_doc(doc_id)</code>。回答：反向索引的存储成本与&quot;把 doc 版本写进 key、读取时校验&quot;相比，哪个更省？</p>
+</li>
+<li><p><strong>写一份 ADR</strong>。基于本案例的评测数据，为&quot;是否把默认 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 从 10 降到 5&quot;写一份完整 ADR（含背景、决策、替代方案、理由、后果、何时重审）。要求引用 §3.5 的具体数字，并说明这个改动会不会影响引用一致率。</p>
+</li>
+</ol>
+<h3 id="h-小结">小结<a class="anchor" href="#h-小结" aria-label="本节链接">#</a></h3>
+<ul>
+<li><strong>案例由 10 个模块组成</strong>：切分与内容寻址 id、BM25、稠密代理、RRF 融合、交互式重排、ACL 前置过滤、预算装配、抽取式生成 stub、带租户键的缓存、段式索引与回滚。<strong>每个模块都有明确的失效条件。</strong></li>
+<li><strong>消融表（⚠️ 合成，N=60，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span>=10，预算 120）</strong>：sparse <code>recall 0.300 / 答案 0.200</code>；dense <code>0.050 / 0.033</code>；hybrid <code>0.250 / 0.033</code>；hybrid+rerank(v1) <code>1.000 / 0.483</code>；<strong>hybrid+rerank-v2 <code>1.000 / 0.983</code></strong>。</li>
+<li><strong>混合检索在本案例里没有带来增益，反而低于稀疏</strong>（0.250 &lt; 0.300）。原因是 RRF 给每一路同等信任，而稠密代理接近随机 → 注入噪声。<strong>这正是 ch3-l3 互补度判据的实证：&quot;上了混合&quot;不等于&quot;更好&quot;。</strong></li>
+<li><strong>核心诊断判据</strong>：<code>recall@k</code> 高而 <code>答案正确率</code> 低 ⇒ 瓶颈在排序/装配/生成；反之才修召回。⚠️ v1 的 <code>recall@10 = 1.000</code>、答案 0.483，gap +0.517。</li>
+<li><strong>病根是&quot;特征可见性&quot;</strong>：v1 的键匹配特征只在 chunk 文本里查找，而切分把键切到了另一个 chunk → 该特征在黄金文档上<strong>从不触发</strong>。<strong>很多时候不是模型不够好，而是上游改变了输入的可见性。</strong></li>
+<li><strong>v2 只加一个文档级 <code>key_match</code> 特征</strong>：MRR 0.742→0.992、答案 0.483→<strong>0.983</strong>、上下文块 8.0→<strong>6.8</strong>（质量与成本同向改善）。</li>
+<li><strong><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 的饱和点</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8304em;vertical-align:-0.136em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≥</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">3</span></span></span></span> 后指标完全饱和，而上下文块继续涨 → 合理工作点是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">3</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∼</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">5</span></span></span></span>，不是 10。<strong>重排池的拐点在 50</strong>（10→50 是 recall 0.250→1.000 的关键区间，50→200 收益为 0）。</li>
+<li><strong>工程底线三项全部通过</strong>：canary 交叉断言 12 条泄漏 <strong>0</strong>（PASS）；缓存同租户命中、跨租户不命中；段式索引删除后回滚断言 PASS。</li>
+<li><strong>五份 ADR</strong> 覆盖：不单独依赖混合（ADR-001）、ACL 前置（ADR-002）、重排池 50（ADR-003）、缓存键含租户与 manifest（ADR-004）、先改在线特征而非改切分（ADR-005）。每份都写了&quot;何时重审&quot;。</li>
+<li><strong>本案例的三个诚实局限</strong>：① 稠密表示是随机投影代理，<strong>不具备真实双塔的语义泛化</strong>，故 dense 的 0.050 不可外推；② 生成是抽取式 stub，<strong>测不出生成层问题（位置/干扰/先验/引用装饰）</strong>；③ 延迟是单机数字，<strong>只能做相对比较</strong>。</li>
+<li><strong>一句话</strong>：<strong>一个案例的价值不在于&quot;跑通了&quot;，而在于它把&quot;哪一步错了&quot;变成一个确定性的结论，并把&quot;下一步做什么&quot;变成一条有收益、有成本、有重审条件的决策记录。</strong></li>
+</ul>
+<blockquote>
+<p>下一节：案例跑通了，但&quot;能跑通&quot;和&quot;该不该用 RAG&quot;是两件事。最后一节给出边界与失效清单：哪些场景不该用 RAG、该怎么选替代方案，以及上线前必须逐条过的检查表。</p>
+</blockquote>

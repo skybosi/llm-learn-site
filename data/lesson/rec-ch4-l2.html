@@ -1,0 +1,160 @@
+<h2 id="h-deepfm-等深度模型">DeepFM 等深度模型<a class="anchor" href="#h-deepfm-等深度模型" aria-label="本节链接">#</a></h2>
+<blockquote>
+<p>上一课我们用 GBDT 给 LR 补上了&quot;自动特征组合&quot;的能力。但树也有局限：连续特征被切成桶后信息有损、特征组合的阶数受限于树深、且 GBDT 和 LR 是两段式、不能端到端联合优化。本课我们进入深度排序模型的主线：从 FM 出发，理解 DeepFM 如何用一个网络同时完成&quot;显式二阶交叉 + 隐式高阶交叉&quot;。</p>
+</blockquote>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-先解决稀疏特征的稠密化embedding">1. 先解决稀疏特征的稠密化：Embedding<a class="anchor" href="#h-1-先解决稀疏特征的稠密化embedding" aria-label="本节链接">#</a></h4>
+<p>推荐系统的原始特征几乎都是<strong>高维稀疏</strong>的：用户 ID 有上亿个、物品 ID 有上千万个，one-hot 之后维度爆炸。深度模型的第一步，是把每个稀疏 ID 映射成一个<strong>低维稠密向量</strong>，也就是 Embedding：</p>
+<pre><code>用户 ID &quot;u_12345&quot; ──&gt; embedding 表 ──&gt; 向量 e_u ∈ R^d（d 通常取 8~64）
+物品 ID &quot;i_987&quot;    ──&gt; embedding 表 ──&gt; 向量 e_i ∈ R^d</code></pre>
+<p>Embedding 的意义远超&quot;降维&quot;。它把&quot;语义相近的东西映射到相近的位置&quot;——两个口味相似的用户，学出来的 <code>e_u</code> 会天然接近。而且一旦有了向量，特征之间的<strong>交叉</strong>就可以用向量运算（内积）来表示，这正是 FM 和双塔召回的共同基础。</p>
+<h4 id="h-2-fm用向量内积做二阶交叉">2. FM：用向量内积做二阶交叉<a class="anchor" href="#h-2-fm用向量内积做二阶交叉" aria-label="本节链接">#</a></h4>
+<p>矩阵分解只学&quot;用户向量 · 物品向量&quot;这一对交互。但排序阶段希望<strong>任意两个特征</strong>都能交叉。最直接的想法是给每对特征 <code>(i, j)</code> 都学一个权重 <code>w_ij</code>，预测值为：</p>
+<pre><code>y = w0 + Σ w_i x_i + Σ Σ w_ij x_i x_j</code></pre>
+<p>问题在于：<code>w_ij</code> 只有当特征 <code>i</code> 和 <code>j</code> <strong>在训练数据里同时非零</strong>时才能被学到。推荐数据极稀疏，很多特征对从来没一起出现过，<code>w_ij</code> 学不到，也就无法泛化。</p>
+<p><strong>因子分解机（FM，Factorization Machine）</strong> 的解法很优雅：不给每对特征单独存一个权重，而是给每个特征学一个向量 <code>v_i</code>，用<strong>两个向量的内积</strong>作为交叉权重：</p>
+<pre><code>w_ij ≈ &lt;v_i, v_j&gt;</code></pre>
+<p>于是二阶项可以化简（利用平方差恒等式）：</p>
+<pre><code>ΣΣ &lt;v_i, v_j&gt; x_i x_j = 1/2 · ( (Σ v_i x_i)² - Σ (v_i x_i)² )</code></pre>
+<p>这条式子把&quot;两两交叉&quot;从 <code>O(k²)</code> 次内积降到了 <code>O(k)</code> 次向量运算，同时解决了稀疏问题：哪怕特征 <code>i</code>、<code>j</code> 从未一起出现，只要它们各自和其他特征共现过，各自的 <code>v_i</code>、<code>v_j</code> 就能被训练，交叉权重依然能算出来。这就是 FM 的核心洞察——<strong>用低秩的向量分解，去逼近高维的交叉权重矩阵</strong>。</p>
+<h4 id="h-3-deepfmfm-和-dnn-共享-embedding">3. DeepFM：FM 和 DNN 共享 Embedding<a class="anchor" href="#h-3-deepfmfm-和-dnn-共享-embedding" aria-label="本节链接">#</a></h4>
+<p>FM 只做<strong>显式的二阶交叉</strong>，而且是固定二阶。DeepFM（2017 年华为诺亚方舟实验室提出）的动机是：把 FM 的&quot;显式交叉&quot;和 DNN 的&quot;隐式高阶交叉&quot;合并进<strong>一个端到端的网络</strong>，并且让两者<strong>共享同一套 Embedding</strong>。</p>
+<p>DeepFM 的输出是三个部分相加：</p>
+<pre><code>y = sigmoid( linear 部分 + FM 部分 + DNN 部分 )</code></pre>
+<ul>
+<li><strong>linear 部分</strong>：每个特征乘一个标量权重，再加一个偏置，承接&quot;记忆&quot;（把高频出现的强模式直接记住）。</li>
+<li><strong>FM 部分</strong>：对 Embedding 向量做上一节的二阶交叉，显式地建模两两组合。</li>
+<li><strong>DNN 部分</strong>：把所有字段的 Embedding 拼起来，过几层全连接，隐式地学任意高阶交叉。</li>
+</ul>
+<p>三个部分共享同一张 Embedding 表，所以 FM 和 DNN 会互相约束、协同训练：Embedding 既要能被内积解释（FM 需要），又要能拼进 MLP（DNN 需要）。相比 GBDT+LR 的两段式，DeepFM 是<strong>端到端联合训练</strong>的，梯度可以一路回传到 Embedding，避免了&quot;树先定死、后面只能凑&quot;的信息损失。</p>
+<p><figure><img class="md-img" src="content/courses/recommendation-systems/assets/chapter-4-figure-02.svg" alt="DeepFM 的三部分结构" loading="lazy" decoding="async"><figcaption>DeepFM 的三部分结构</figcaption></figure>
+</p>
+<h4 id="h-4-深度排序模型家族速览">4. 深度排序模型家族速览<a class="anchor" href="#h-4-深度排序模型家族速览" aria-label="本节链接">#</a></h4>
+<p>DeepFM 只是&quot;深度 + 显式交叉&quot;这一脉的代表。理解它之后，整个家族就是&quot;在<strong>记忆、显式交叉、隐式交叉、序列建模</strong>这几个维度上做加减&quot;：</p>
+<ul>
+<li><strong>Wide &amp; Deep（Google, 2016）</strong>：<code>wide</code>（线性部分，需人工特征交叉）+ <code>deep</code>（MLP）。DeepFM 可视作它的改进——用 FM 自动生成二阶交叉，替代 wide 里的人工交叉。</li>
+<li><strong>DCN（Deep &amp; Cross Network）</strong>：用一个 <code>Cross Network</code> 显式建模<strong>任意阶</strong>交叉（<code>x_{k+1} = x_0 · x_kᵀ w + x_k</code>），交叉阶数随层数线性增长。</li>
+<li><strong>DIN（Deep Interest Network，阿里, 2018）</strong>：引入<strong>用户历史行为序列</strong>，用注意力机制根据&quot;当前候选物品&quot;去加权用户的历史行为，解决&quot;用户兴趣多种多样、只看当前一个物品猜不准&quot;的问题。</li>
+<li><strong>xDeepFM / AFM</strong>：在交叉的阶数和交叉项的重要性加权上继续做文章。</li>
+</ul>
+<p>它们的共同趋势是：<strong>显式交叉保证可解释和稳定，序列/注意力捕捉兴趣的动态性，端到端训练让特征表示和打分一起优化</strong>。本课的代码示例聚焦 DeepFM，因为它结构完整、足以作为理解其余模型的支点。</p>
+<h3 id="h-二可运行示例">二、可运行示例<a class="anchor" href="#h-二可运行示例" aria-label="本节链接">#</a></h3>
+<h4 id="h-示例-1pytorch-简化实现-deepfm">示例 1：PyTorch 简化实现 DeepFM<a class="anchor" href="#h-示例-1pytorch-简化实现-deepfm" aria-label="本节链接">#</a></h4>
+<p>用一个精简但可训练的 DeepFM，跑在合成数据上。数据里埋了一个&quot;字段 0 与字段 1 的交叉信号&quot;，用来验证 FM 部分确实在学交叉。</p>
+<pre data-lang="python"><code class="language-python">import torch
+import torch.nn as nn
+
+class DeepFM(nn.Module):
+    def __init__(self, field_dims, embed_dim=8, mlp_dims=(32, 16)):
+        super().__init__()
+        self.num_fields = len(field_dims)
+        # 每个字段一张 Embedding 表，供 FM 和 DNN 共享
+        self.embeddings = nn.ModuleList(
+            [nn.Embedding(dim, embed_dim) for dim in field_dims]
+        )
+        # linear 部分：每个特征一个标量权重
+        self.linear = nn.ModuleList(
+            [nn.Embedding(dim, 1) for dim in field_dims]
+        )
+        self.bias = nn.Parameter(torch.zeros(1))
+
+        # DNN 部分：拼接所有字段 embedding -&gt; MLP -&gt; 1
+        input_dim = self.num_fields * embed_dim
+        layers = []
+        for out_dim in mlp_dims:
+            layers.append(nn.Linear(input_dim, out_dim))
+            layers.append(nn.ReLU())
+            input_dim = out_dim
+        layers.append(nn.Linear(input_dim, 1))
+        self.mlp = nn.Sequential(*layers)
+
+    def forward(self, x):
+        # x: (batch, num_fields)，每列是离散特征 id
+        # 1) linear 部分：每字段标量权重求和 + 偏置，得到 (batch, 1)
+        lin = sum(self.linear[i](x[:, i]) for i in range(self.num_fields)) + self.bias
+
+        # 2) FM 二阶交叉：1/2 * [(Σv)^2 - Σ(v^2)]
+        emb = torch.stack([emb(x[:, i]) for i, emb in enumerate(self.embeddings)], dim=1)
+        # emb: (batch, num_fields, embed_dim)
+        sum_sq = emb.sum(dim=1).pow(2)                        # (Σ v_i)^2
+        sq_sum = emb.pow(2).sum(dim=1)                        # Σ v_i^2
+        fm = 0.5 * (sum_sq - sq_sum).sum(dim=1, keepdim=True) # (batch, 1)
+
+        # 3) DNN 高阶交叉
+        dnn = self.mlp(emb.view(x.size(0), -1))               # (batch, 1)
+
+        logit = lin + fm + dnn
+        return torch.sigmoid(logit)
+
+
+def make_batch(field_dims, n=256):
+    &quot;&quot;&quot;构造带交叉信号的合成数据：字段0与字段1的 id 相等且为偶数时，正样本概率高。&quot;&quot;&quot;
+    x = torch.stack([torch.randint(0, d, (n,)) for d in field_dims], dim=1)
+    signal = ((x[:, 0] == x[:, 1]) &amp; (x[:, 0] % 2 == 0)).float()  # 交叉信号
+    y = (torch.rand(n) &lt; 0.2 + 0.6 * signal).float().unsqueeze(1) # 0.2 基础 + 0.6 交叉
+    return x, y
+
+torch.manual_seed(0)
+field_dims = [30, 30, 20, 20, 10]     # 5 个字段各自的词汇量
+model = DeepFM(field_dims)
+opt = torch.optim.Adam(model.parameters(), lr=2e-2)
+loss_fn = nn.BCELoss()
+
+for step in range(400):
+    x, y = make_batch(field_dims, n=512)
+    pred = model(x)
+    loss = loss_fn(pred, y)
+    opt.zero_grad()
+    loss.backward()
+    opt.step()
+    if step % 100 == 0:
+        print(f&quot;step {step:&gt;3}: loss = {loss.item():.4f}&quot;)
+
+# 简单验证：模型对&quot;交叉成立&quot;的样本打分应明显高于&quot;交叉不成立&quot;的样本
+with torch.no_grad():
+    x_pos = torch.tensor([[4, 4, 3, 3, 1]])   # 字段0==字段1 且为偶数 -&gt; 交叉成立
+    x_neg = torch.tensor([[1, 2, 3, 3, 1]])   # 字段0!=字段1 -&gt; 交叉不成立
+    print(&quot;交叉成立样本 pCTR =&quot;, round(model(x_pos).item(), 4))
+    print(&quot;交叉不成立样本 pCTR =&quot;, round(model(x_neg).item(), 4))</code></pre>
+<h4 id="h-示例-2验证-fm-公式的两种写法等价">示例 2：验证 FM 公式的两种写法等价<a class="anchor" href="#h-示例-2验证-fm-公式的两种写法等价" aria-label="本节链接">#</a></h4>
+<p>手工验证&quot;两两内积&quot;与&quot;平方差恒等式&quot;算出来的二阶交叉项数值一致，帮你看懂 DeepFM 里那行 <code>0.5 * (sum_sq - sq_sum)</code> 是怎么来的。</p>
+<pre data-lang="python"><code class="language-python">import torch
+
+# 3 个特征向量，维度 d=4
+v = torch.tensor([
+    [1.0, 0.0, 2.0, 0.0],
+    [0.0, 1.0, 0.0, 2.0],
+    [1.0, 1.0, 0.0, 0.0],
+])
+
+# 写法一：显式枚举所有两两内积
+explicit = 0.0
+for i in range(len(v)):
+    for j in range(i + 1, len(v)):
+        explicit += torch.dot(v[i], v[j])
+
+# 写法二：平方差恒等式
+sum_sq = v.sum(dim=0).pow(2).sum()
+sq_sum = v.pow(2).sum()
+identity = 0.5 * (sum_sq - sq_sum)
+
+print(&quot;两两内积求和 =&quot;, explicit.item())
+print(&quot;平方差恒等式   =&quot;, identity.item())
+print(&quot;两者相等？&quot;, torch.allclose(explicit, identity))</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>把示例 1 里的 <code>mlp_dims</code> 改成空元组 <code>()</code>（去掉 DNN 部分），模型就退化成&quot;LR + FM&quot;。对比损失和打分，说明 DNN 部分提供了什么。</li>
+<li>在 <code>make_batch</code> 里把交叉信号改成&quot;字段 0、1、2 三个字段的 id 同时相等&quot;（三阶交叉），观察 FM 部分还能否独立捕捉到它；若不能，思考为什么 FM 只有二阶、需要靠 DNN 补高阶。</li>
+<li>说明 DeepFM 里&quot;共享 Embedding&quot;为什么重要：如果 FM 和 DNN 各用一套独立的 Embedding，会发生什么？训练和泛化上各有什么坏处？</li>
+<li>思考题：DIN 引入&quot;用户历史行为序列 + 注意力&quot;，它和 DeepFM 解决的是同一类问题吗？二者关注的特征来源有什么不同？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>DeepFM 论文《DeepFM: A Factorization-Machine based Neural Network for CTR Prediction》：<a href="https://arxiv.org/abs/1703.04247" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1703.04247</a></li>
+<li>Wide &amp; Deep 论文《Wide &amp; Deep Learning for Recommender Systems》：<a href="https://arxiv.org/abs/1606.07792" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1606.07792</a></li>
+<li>FM 原始论文（Rendle, 2010）：<a href="https://www.csie.ntu.edu.tw/~b97053/paper/Rendle2010FM.pdf" target="_blank" rel="noopener noreferrer">https://www.csie.ntu.edu.tw/~b97053/paper/Rendle2010FM.pdf</a></li>
+<li>DCN 论文《Deep &amp; Cross Network for Ad Click Predictions》：<a href="https://arxiv.org/abs/1708.05123" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1708.05123</a></li>
+<li>DIN 论文《Deep Interest Network for Click-Through Rate Prediction》：<a href="https://arxiv.org/abs/1706.06978" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1706.06978</a></li>
+<li>王喆《深度学习推荐系统》配套论文清单 Reco-papers：<a href="https://github.com/wzhe06/Reco-papers" target="_blank" rel="noopener noreferrer">https://github.com/wzhe06/Reco-papers</a></li>
+</ul>
+<p><a href="#/l/rec-ch4-l3">下一课：特征工程</a></p>

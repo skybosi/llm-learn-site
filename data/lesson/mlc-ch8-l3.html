@@ -1,0 +1,252 @@
+<h2 id="h-与推理引擎的关系tensorrt-llm--vllm-里编译器的位置">与推理引擎的关系：TensorRT-LLM / vLLM 里编译器的位置<a class="anchor" href="#h-与推理引擎的关系tensorrt-llm--vllm-里编译器的位置" aria-label="本节链接">#</a></h2>
+<p>前七章讲&quot;编译器内部怎么做&quot;。到了线上，编译器只是引擎里的一个零件：批怎么组、KV cache 怎么分页、attention 用哪个 kernel，都由引擎决定；编译器只负责把剩下的算子段变成高效的 kernel 与执行计划。位置找错就会误判——把端到端没变快归咎于&quot;编译器不行&quot;，而真正的瓶颈根本不在编译器能碰的那部分。本课用 roofline 加覆盖率消融把这件事算成一张表。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-引擎的四层编译器只在其中一层">1. 引擎的四层，编译器只在其中一层<a class="anchor" href="#h-1-引擎的四层编译器只在其中一层" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>层</th>
+<th>职责</th>
+<th>是否属于编译器</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>调度</td>
+<td>连续批处理、请求进出、优先级</td>
+<td>否</td>
+</tr>
+<tr>
+<td>KV cache 管理</td>
+<td>分页/块管理、复用与驱逐</td>
+<td>否</td>
+</tr>
+<tr>
+<td>算子实现</td>
+<td>attention / MoE / 量化 kernel，多为手写</td>
+<td>部分（编译器生成或调库）</td>
+</tr>
+<tr>
+<td>执行器</td>
+<td>走表、内存池、图回放</td>
+<td>是（编译产物在此落地）</td>
+</tr>
+</tbody></table>
+<p><strong>本课不重复推理优化课</strong>：只回答&quot;编译器的输出在引擎里被谁消费、边界在哪&quot;。记住边界的形状：编译器覆盖&quot;能用图表达的稠密算子段&quot;，而 attention 这类带状态、带动态索引的算子常被引擎用<strong>自定义算子</strong>（custom op）实现，并成为编译图的边界。</p>
+<h4 id="h-2-vllm分段编译--自定义算子当边界">2. vLLM：分段编译 + 自定义算子当边界<a class="anchor" href="#h-2-vllm分段编译--自定义算子当边界" aria-label="本节链接">#</a></h4>
+<p>vLLM 的 torch.compile 集成文档的章节结构本身就说明了接入方式：<strong>编译缓存</strong>、<strong>动态形状与 guard 剔除</strong>、<strong>计算图处理与编译</strong>、<strong>CUDA Graph 捕获</strong>、<strong>自定义算子</strong>、<strong>优化级别</strong>、<strong>融合 pass</strong>。连起来是一条流水线：自定义算子把整图切成若干段 → 每段交给 torch.compile 编译 → 每段再被 CUDA Graph 捕获成可回放的片段（piecewise）。好处是 attention/MoE 这类手写 kernel 不必被编译器&quot;理解&quot;，代价是跨边界可能有额外调度与拷贝——边界画在哪本身就是性能决策。第 2 课的缓存与 guard 问题在这里同样是真问题：请求形状在变，guard 剔除做得好坏直接决定重编频率。</p>
+<h4 id="h-3-tensorrt-llmaot-构建-engine-与动态形状-profile">3. TensorRT-LLM：AOT 构建 engine 与动态形状 profile<a class="anchor" href="#h-3-tensorrt-llmaot-构建-engine-与动态形状-profile" aria-label="本节链接">#</a></h4>
+<p>另一边是<strong>离线构建</strong>：build 阶段一次性完成 kernel 选择、层融合、量化与插件绑定，产出可直接加载的 engine，运行时不再需要 Python 与框架。动态形状靠 <strong>optimization profile</strong> 表达——为每个输入张量声明 min / opt / max 三档维度，构建时按档位优化，运行期按实际 shape 选已编译的实现。工程含义很直接：<strong>声明得窄编译更充分但可能选不中，声明得宽命中率高但单档优化被稀释</strong>——这与第 2 课&quot;键的粒度&quot;是同一件事。</p>
+<h4 id="h-4-两条路线的取舍">4. 两条路线的取舍<a class="anchor" href="#h-4-两条路线的取舍" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>JIT（框架内编译，如 Inductor / XLA）</th>
+<th>AOT（引擎构建，如 TensorRT engine）</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>编译时机</td>
+<td>首次执行触发，按 guard 重编</td>
+<td>交付前一次性构建</td>
+</tr>
+<tr>
+<td>产物形态</td>
+<td>内存中 kernel + 执行计划，随进程消失</td>
+<td>落盘 engine，可脱离 Python</td>
+</tr>
+<tr>
+<td>形状处理</td>
+<td>符号形状 + guard，或逐 shape 特化</td>
+<td>optimization profile（min/opt/max）</td>
+</tr>
+<tr>
+<td>设备绑定</td>
+<td>绑定编译栈版本与设备</td>
+<td>绑定目标设备与 profile，跨代需重建</td>
+</tr>
+<tr>
+<td>失败回退</td>
+<td>易退回 eager 逐算子执行</td>
+<td>构建失败即无产物，粒度粗</td>
+</tr>
+<tr>
+<td>更新代价</td>
+<td>服务端热更新</td>
+<td>构建产物需重新生成并分发</td>
+</tr>
+</tbody></table>
+<h4 id="h-5-为什么同一模型常要两套-profile">5. 为什么同一模型常要&quot;两套 profile&quot;<a class="anchor" href="#h-5-为什么同一模型常要两套-profile" aria-label="本节链接">#</a></h4>
+<p>代码第 1 节的两行：decode 单 token 每层算力 0.004 ms、带宽 0.206 ms，<strong>卡在带宽</strong>；prefill 512 token 时每层算力时间 2.105 ms、带宽 0.224 ms，<strong>卡在算力</strong>。瓶颈不同，最优 tile、并行度与融合策略就不同，&quot;一个模型两份配置&quot;成了常态。这也解释了第 3 节的消融：prefill 上把 MLP 与投影交给编译器拿到 1.64x（算力利用率从假设的 60% 提到 100%），decode 上同样操作只有 1.08x——带宽受限时算得再快也超不过权重读取；decode 上真正有效的是<strong>图回放</strong>（少下发 13 个算子/层），一步贡献 8.4%。</p>
+<h4 id="h-6-常见坑">6. 常见坑<a class="anchor" href="#h-6-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>只看局部提速</strong>：把&quot;这段 kernel 快 3 倍&quot;当端到端结论；必须同时报覆盖率（第 4 节：decode 覆盖 92.1% 只换来 1.078x）。</li>
+<li><strong>把 engine 当好缓存</strong>：engine 与设备、profile、量化配置强绑定，跨机型直接复用是事故来源。</li>
+<li><strong>边界画得太多</strong>：每多一个自定义算子边界就多一次调度与潜在拷贝，融合机会也被切碎。</li>
+<li><strong>忽略 fallback</strong>：回退到 eager 后性能与显存行为完全不同，压测必须覆盖回退路径。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面这段纯 Python（无第三方依赖）用 roofline + 覆盖率消融算&quot;编译器能贡献多少&quot;：先判每个阶段的瓶颈，再按段归属统计耗时占比，最后用 Amdahl 把局部提速换算成端到端收益并对账；机器参数与效率系数都是显式假设值。</p>
+<pre data-lang="python"><code class="language-python"># ---- 第 3 课示例：推理引擎里的编译器位置 + roofline + 覆盖率归因 ----
+# 无 GPU、无第三方依赖。下面每个常量都是**显式假设的模型参数**，不是任何真实设备的实测值。
+H, L, F16 = 4096, 32, 2          # 隐藏维、层数、fp16 字节数
+VOCAB = 25600                    # 词表大小（lm_head 只在最后做一次）
+PEAK_TFLOPS, BW_GBPS = 100.0, 2000.0
+LAUNCH_US, REPLAY_US = 3.0, 5.0
+EAGER_EFF, ENGINE_EFF = 0.60, 0.90   # 假设：未融合路径 / 手写 kernel 能跑到的峰值比例
+
+def segs(s, ctx):
+    &quot;&quot;&quot;一层的四段：(名字, 归属, FLOPs, 权重字节, 理想激活字节, eager 激活字节, eager 算子数)。
+    s = 本批 token 数；ctx = 参与计算的上下文长度（decode 时 s=1 但仍要读完整 KV）。&quot;&quot;&quot;
+    kv = 2 * H * F16 * ctx
+    return [
+        (&#39;qkv_proj&#39;,  &#39;compiled&#39;, 2*3*H*H*s, 3*H*H*F16, 3*H*s*F16, 6*H*s*F16, 3),
+        (&#39;attention&#39;, &#39;engine&#39;,   2*2*s*ctx*H, 0,        kv + 4*H*s*F16, kv + 6*H*s*F16, 4),
+        (&#39;o_proj&#39;,    &#39;compiled&#39;, 2*H*H*s,   H*H*F16,   H*s*F16,   2*H*s*F16, 1),
+        (&#39;mlp&#39;,       &#39;compiled&#39;, 2*8*H*H*s, 8*H*H*F16, H*s*F16,   6*H*s*F16, 5),
+    ]
+
+def head(s):
+    return (&#39;lm_head&#39;, &#39;engine&#39;, 2*H*VOCAB*s, H*VOCAB*F16, VOCAB*s*F16, VOCAB*s*F16, 1)
+
+def t_one(seg, compiled, graph, bw, peak):
+    name, host, flops, wb, a_min, a_eager, ops_eager = seg
+    act = a_min if compiled else a_eager
+    ops = 1 if compiled else ops_eager
+    eff = (1.0 if compiled else EAGER_EFF) if host == &#39;compiled&#39; else ENGINE_EFF
+    t_comp = flops / (peak * eff * 1e12) * 1e3     # ms
+    t_mem = (wb + act) / (bw * 1e9) * 1e3          # ms
+    t = max(t_comp, t_mem) + (0 if graph else ops * LAUNCH_US / 1e3)
+    return t, (&#39;算力&#39; if t_comp &gt;= t_mem else &#39;带宽&#39;)
+
+def latency(s, ctx, v, graph=False):
+    per_layer, detail = 0.0, []
+    for seg in segs(s, ctx):
+        compiled = seg[0] in v
+        t, bound = t_one(seg, compiled, graph, BW_GBPS, PEAK_TFLOPS)
+        per_layer += t; detail.append((seg[0], seg[1], t, bound, compiled))
+    th, bound = t_one(head(s), False, graph, BW_GBPS, PEAK_TFLOPS)
+    detail.append((head(s)[0], head(s)[1], th, bound, False))
+    tot = per_layer * L + th + (REPLAY_US / 1e3 if graph else 0)
+    return tot, detail
+
+VARIANTS = [(&#39;V0 全 eager 回退&#39;, set(), False), (&#39;V1 只编译 MLP&#39;, {&#39;mlp&#39;}, False),
+            (&#39;V2 编译 MLP+三个投影&#39;, {&#39;mlp&#39;, &#39;qkv_proj&#39;, &#39;o_proj&#39;}, False),
+            (&#39;V3 V2 + 图回放&#39;, {&#39;mlp&#39;, &#39;qkv_proj&#39;, &#39;o_proj&#39;}, True)]
+PHASES = ((1, 512, &#39;decode 1 token(ctx512)&#39;), (512, 512, &#39;prefill 512&#39;), (4096, 4096, &#39;prefill 4096&#39;))
+
+if __name__ == &#39;__main__&#39;:
+    print(f&#39;假设机器：峰值 {PEAK_TFLOPS:.0f} TFLOP/s、带宽 {BW_GBPS:.0f} GB/s；模型 {L} 层 × 隐藏维 {H}、fp16，&#39;
+          f&#39;权重合计 {L*12*H*H*F16/1e9:.1f} GB&#39;)
+    print(f&#39;假设效率：完全融合 {1.0:.0%}、手写 kernel {ENGINE_EFF:.0%}、未融合 eager {EAGER_EFF:.0%} 峰值；&#39;
+          f&#39;下发 {LAUNCH_US} µs/次，回放 {REPLAY_US} µs/阶段 —— 均为模型参数&#39;)
+
+    print(&#39;\n=== 1. roofline：prefill 与 decode 是两种完全不同的瓶颈 ===&#39;)
+    print(f&#39;  {&quot;阶段&quot;:&lt;24}{&quot;FLOPs/层&quot;:&gt;15}{&quot;搬运字节/层&quot;:&gt;15}{&quot;算力时间&quot;:&gt;10}{&quot;带宽时间&quot;:&gt;10}{&quot;瓶颈&quot;:&gt;7}{&quot;端到端&quot;:&gt;11}&#39;)
+    for s, ctx, nm in PHASES:
+        per = segs(s, ctx); fl = sum(x[2] for x in per); by = sum(x[3] + x[4] for x in per)
+        tc, tm = fl/(PEAK_TFLOPS*1e12)*1e3, by/(BW_GBPS*1e9)*1e3
+        tot, _ = latency(s, ctx, set())
+        print(f&#39;  {nm:&lt;24}{fl:&gt;15,}{by:&gt;15,}{tc:&gt;9.3f}ms{tm:&gt;9.3f}ms{&quot;  算力&quot; if tc&gt;=tm else &quot;  带宽&quot;:&gt;8}{tot:&gt;10.1f}ms&#39;)
+    print(&#39;  读法：decode 每 token 都要把全部权重读一遍 → 带宽天花板；prefill 相反 → 算力天花板&#39;)
+
+    print(&#39;\n=== 2. 段归属与耗时（V0 未编译口径；lm_head 只算一次）===&#39;)
+    for s, ctx, nm in PHASES[:2]:
+        _, det = latency(s, ctx, set())
+        layer_tot = sum(d[2] for d in det[:4]) * L; tot = layer_tot + det[4][2]
+        print(f&#39;  -- {nm}（一层 {layer_tot/L:.3f} ms，端到端 {tot:.1f} ms）&#39;)
+        for name, host, t, bound, comp in det[:4]:
+            print(f&#39;     {name:&lt;10}{host:&lt;9}{t:&gt;8.3f} ms/层  占比 {t*L/tot*100:&gt;5.1f}%  瓶颈 {bound}&#39;)
+        print(f&#39;     {&quot;lm_head&quot;:&lt;10}{det[4][1]:&lt;9}{det[4][2]:&gt;8.3f} ms    占比 {det[4][2]/tot*100:&gt;5.1f}%  瓶颈 {det[4][3]}&#39;)
+    print(&#39;  编译器能动的只有 compiled 段；attention 与 lm_head 是引擎手写 kernel 的地盘&#39;)
+
+    print(&#39;\n=== 3. 覆盖率消融：每一步各自贡献多少 ===&#39;)
+    for s, ctx, nm in PHASES[:2]:
+        print(f&#39;  -- {nm}&#39;)
+        base, prev = None, None
+        for vname, v, graph in VARIANTS:
+            t, _ = latency(s, ctx, v, graph=graph)
+            if base is None:
+                base = t; print(f&#39;     {vname:&lt;22}{t:&gt;9.2f} ms   基准&#39;)
+            else:
+                print(f&#39;     {vname:&lt;22}{t:&gt;9.2f} ms   累计 {base/t:&gt;5.2f}x   本步贡献 {(prev-t)/base*100:&gt;6.1f}%&#39;)
+            prev = t
+
+    print(&#39;\n=== 4. Amdahl 对账：覆盖率 × 局部提速 → 端到端 ===&#39;)
+    COV = {&#39;mlp&#39;, &#39;qkv_proj&#39;, &#39;o_proj&#39;}
+    for s, ctx, nm in PHASES[:2]:
+        t0, d0 = latency(s, ctx, set()); t2, d2 = latency(s, ctx, COV)
+        e0 = sum(d[2] for d in d0[:4] if d[0] in COV) * L      # 可编译段的基准耗时
+        e2 = sum(d[2] for d in d2[:4] if d[0] in COV) * L      # 可编译段的编译后耗时
+        c, k = e0 / t0, e0 / e2
+        pred = 1 / ((1 - c) + c / k)
+        print(f&#39;  {nm}: 可编译段占基准 {c*100:&gt;5.1f}%，局部提速 {k:.2f}x → 预测 {pred:.3f}x，&#39;
+              f&#39;实测 {t0/t2:.3f}x  {&quot;一致&quot; if abs(pred-t0/t2) &lt; 1e-9 else &quot;不一致 ← 归因写错了&quot;}&#39;)
+    print(&#39;  读法：局部提速再漂亮，覆盖率低就被 Amdahl 按住 —— 报告必须同时给出这两个数&#39;)</code></pre>
+<p>实际运行结果（Python 3.14，无第三方依赖）：</p>
+<pre data-lang="text"><code class="language-text">假设机器：峰值 100 TFLOP/s、带宽 2000 GB/s；模型 32 层 × 隐藏维 4096、fp16，权重合计 12.9 GB
+假设效率：完全融合 100%、手写 kernel 90%、未融合 eager 60% 峰值；下发 3.0 µs/次，回放 5.0 µs/阶段 —— 均为模型参数
+
+=== 1. roofline：prefill 与 decode 是两种完全不同的瓶颈 ===
+  阶段                              FLOPs/层         搬运字节/层      算力时间      带宽时间     瓶颈        端到端
+  decode 1 token(ctx512)      411,041,792    411,115,520    0.004ms    0.206ms      带宽       7.9ms
+  prefill 512             210,453,397,504    448,790,528    2.105ms    0.224ms      算力     113.9ms
+  prefill 4096            1,924,145,348,608    771,751,936   19.241ms    0.386ms      算力     988.1ms
+  读法：decode 每 token 都要把全部权重读一遍 → 带宽天花板；prefill 相反 → 算力天花板
+
+=== 2. 段归属与耗时（V0 未编译口径；lm_head 只算一次）===
+  -- decode 1 token(ctx512)（一层 0.245 ms，端到端 7.9 ms）
+     qkv_proj  compiled    0.059 ms/层  占比  23.9%  瓶颈 带宽
+     attention engine      0.016 ms/层  占比   6.5%  瓶颈 带宽
+     o_proj    compiled    0.020 ms/层  占比   8.0%  瓶颈 带宽
+     mlp       compiled    0.149 ms/层  占比  60.2%  瓶颈 带宽
+     lm_head   engine      0.108 ms    占比   1.4%  瓶颈 带宽
+  -- prefill 512（一层 3.523 ms，端到端 113.9 ms）
+     qkv_proj  compiled    0.868 ms/层  占比  24.4%  瓶颈 算力
+     attention engine      0.060 ms/层  占比   1.7%  瓶颈 算力
+     o_proj    compiled    0.289 ms/层  占比   8.1%  瓶颈 算力
+     mlp       compiled    2.306 ms/层  占比  64.8%  瓶颈 算力
+     lm_head   engine      1.196 ms    占比   1.0%  瓶颈 算力
+  编译器能动的只有 compiled 段；attention 与 lm_head 是引擎手写 kernel 的地盘
+
+=== 3. 覆盖率消融：每一步各自贡献多少 ===
+  -- decode 1 token(ctx512)
+     V0 全 eager 回退              7.94 ms   基准
+     V1 只编译 MLP                 7.55 ms   累计  1.05x   本步贡献    4.8%
+     V2 编译 MLP+三个投影             7.36 ms   累计  1.08x   本步贡献    2.4%
+     V3 V2 + 图回放                6.69 ms   累计  1.19x   本步贡献    8.4%
+  -- prefill 512
+     V0 全 eager 回退            113.92 ms   基准
+     V1 只编译 MLP                84.22 ms   累计  1.35x   本步贡献   26.1%
+     V2 编译 MLP+三个投影            69.37 ms   累计  1.64x   本步贡献   13.0%
+     V3 V2 + 图回放               68.70 ms   累计  1.66x   本步贡献    0.6%
+
+=== 4. Amdahl 对账：覆盖率 × 局部提速 → 端到端 ===
+  decode 1 token(ctx512): 可编译段占基准  92.1%，局部提速 1.09x → 预测 1.078x，实测 1.078x  一致
+  prefill 512: 可编译段占基准  97.3%，局部提速 1.67x → 预测 1.642x，实测 1.642x  一致
+  读法：局部提速再漂亮，覆盖率低就被 Amdahl 按住 —— 报告必须同时给出这两个数</code></pre>
+<p>四处可核对结论：<strong>瓶颈随阶段反转</strong>（decode 带宽 0.206 ms 远超算力 0.004 ms，prefill 相反）；<strong>编译器只作用于 compiled 段</strong>（prefill 里约 97%，attention 仅 1.7%），覆盖率就是收益上限；<strong>局部提速 ≠ 端到端提速</strong>（decode 覆盖 92.1%、局部 1.09x、端到端 1.078x）；<strong>归因要能对上账</strong>（两次 Amdahl 预测与实测完全一致，对不上说明漏了收益或把不可编译段算进分母）。</p>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选：需要 GPU 与引擎环境（自备或云上按需）；无环境不影响本课 ----
+# vLLM：观察分段编译与自定义算子边界
+#   VLLM_USE_V1=1 vllm serve &lt;model&gt; -O3 --enforce-eager=false  # 0/1/2/3 的编译级别见引擎文档
+#   TORCH_LOGS=graph_breaks,perf_hints vllm serve &lt;model&gt;       # 数一数断点出现在哪些算子
+# TensorRT-LLM：观察构建产物与 profile
+#   trtllm-build --checkpoint_dir &lt;ckpt&gt; --output_dir &lt;out&gt;     # 构建期完成融合/量化/插件绑定
+#   # 再用 trtexec/polygraphy 打印 engine 的 optimization profile（min/opt/max）
+# 观察要点：把同一请求分别用 -O0 与 -O3 跑一遍，比较首 token 延迟与吞吐，再用本课的
+# roofline 表判断收益来自&quot;算力利用率&quot;还是&quot;下发/回放&quot;，避免把引擎调度收益算到编译器头上。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：把 <code>ENGINE_EFF</code> 改成 0.60（假装 attention 也没写好），重跑第 4 节，看 attention 占比抬升后收益怎么变——&quot;优化手写 kernel&quot;与&quot;提升编译覆盖率&quot;哪个更值？</li>
+<li><strong>解释</strong>：decode 的 <code>ctx</code> 从 512 改到 4096 重跑第 1 节，看 attention 搬运字节增长几倍，瓶颈是否从&quot;权重&quot;转成&quot;KV&quot;。</li>
+<li><strong>对比/验证</strong>：加一个 V4：编译覆盖 qkv/o_proj/mlp 但<strong>去掉 attention 段</strong>（模拟引擎没提供该 kernel）。比较 V4 与 V3，解释为什么&quot;覆盖率&quot;与&quot;段数&quot;不是一回事。</li>
+<li><strong>思考</strong>：TensorRT 的 optimization profile 要求人工声明 min/opt/max。若某个线上服务的形状分布是长尾的，你会怎么选这三档？提示：把第 2 课的&quot;键爆炸&quot;与本题的&quot;单档优化被稀释&quot;放在同一张权衡表上。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>vLLM 设计文档 <em>torch.compile integration</em>（分段编译的接入方式：编译缓存、动态形状与 guard 剔除、计算图处理/编译、CUDA Graph 捕获、自定义算子与优化级别）：<a href="https://docs.vllm.ai/en/latest/design/torch_compile.html" target="_blank" rel="noopener noreferrer">https://docs.vllm.ai/en/latest/design/torch_compile.html</a></li>
+<li>vLLM 设计文档 <em>CUDA Graphs</em>（引擎侧为何、何时用图捕获，以及与分批调度的配合）：<a href="https://docs.vllm.ai/en/latest/design/cuda_graphs.html" target="_blank" rel="noopener noreferrer">https://docs.vllm.ai/en/latest/design/cuda_graphs.html</a></li>
+<li>NVIDIA TensorRT 文档 <em>Working with Dynamic Shapes</em>（optimization profile 的 min/opt/max 语义与动态形状的构建期优化）：<a href="https://docs.nvidia.com/deeplearning/tensorrt/latest/inference-library/work-with-dynamic-shapes.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/deeplearning/tensorrt/latest/inference-library/work-with-dynamic-shapes.html</a></li>
+<li>Lianmin Zheng et al., <em>The Deep Learning Compiler: A Comprehensive Survey</em>（编译器与运行时/部署的分层框架，第 5、6 节）：<a href="https://arxiv.org/abs/2002.03794" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2002.03794</a></li>
+</ul>
+<p><a href="#/l/mlc-ch8-l4">下一课：项目：把同一模型编译到多个后端，给出性能与收益归因报告</a></p>

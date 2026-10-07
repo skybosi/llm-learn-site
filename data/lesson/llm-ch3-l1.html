@@ -1,0 +1,117 @@
+<h2 id="h-掩码语言模型">掩码语言模型<a class="anchor" href="#h-掩码语言模型" aria-label="本节链接">#</a></h2>
+<p>前两章的主角 GPT 是&quot;看着左边猜右边&quot;的自回归模型。BERT 走了另一条路：它把句子里的某些词<strong>挖掉</strong>，让模型<strong>同时看左右两边</strong>的上下文把词填回来。这个任务叫<strong>掩码语言模型（Masked Language Model，MLM）</strong>，是 BERT 的核心预训练目标，也是&quot;双向理解&quot;能力的关键来源。本课先讲 MLM 的原理与&quot;80/10/10&quot;掩码技巧，再对比它与 GPT 的因果语言模型，最后亲手实现掩码并用 BERT 填空。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-从猜下一个词到填空">1. 从&quot;猜下一个词&quot;到&quot;填空&quot;<a class="anchor" href="#h-1-从猜下一个词到填空" aria-label="本节链接">#</a></h4>
+<p>GPT 的自回归目标（因果语言模型，CLM）是预测<strong>下一个</strong> token：</p>
+<pre><code>P(x_t | x_1, ..., x_{t-1})   只看左边</code></pre>
+<p>BERT 的掩码语言模型（MLM）则是：随机遮住输入里的一部分 token，让模型根据<strong>它周围所有</strong> token 预测被遮住的原词：</p>
+<pre><code>P(x_t | x_1, ..., x_{t-1}, x_{t+1}, ..., x_n)   左右都看</code></pre>
+<p>因为被预测的词处在序列中间、两边都有上下文，模型必须学会&quot;双向&quot;地利用信息。这正是 BERT 能比单向模型更好地&quot;读懂&quot;一句话的原因——理解一个词的含义，往往既要看它前面的词，也要看它后面的词。</p>
+<h4 id="h-2-掩码怎么做15-与-801010">2. 掩码怎么做：15% 与 80/10/10<a class="anchor" href="#h-2-掩码怎么做15-与-801010" aria-label="本节链接">#</a></h4>
+<p>BERT 的训练流程是：从每个输入序列里随机挑 <strong>15%</strong> 的 token 作为&quot;预测目标&quot;，但这 15% 不是全部换成 <code>[MASK]</code>，而是按 80/10/10 拆成三种处理：</p>
+<ul>
+<li><strong>80%</strong> 换成特殊 token <code>[MASK]</code>——让模型真正练习&quot;填空&quot;；</li>
+<li><strong>10%</strong> 换成<strong>随机的一个词</strong>——逼模型不能&quot;看到 <code>[MASK]</code> 就抄上下文&quot;，而是要判断这里到底是不是原词；</li>
+<li><strong>10%</strong> <strong>保持原词不变</strong>——让模型在&quot;该不该改&quot;上保持谨慎，同时学到&quot;这个词本身也可能就是答案&quot;。</li>
+</ul>
+<p>被挑中的 15% 位置才计算损失，其余位置不参与预测。这个&quot;80/10/10&quot;设计是为了<strong>弥合预训练与微调之间的差距</strong>：微调阶段输入里没有 <code>[MASK]</code> 这个符号，如果预训练时只见过 <code>[MASK]</code>，模型会对它产生&quot;符号依赖&quot;；混入随机词和原词，能让模型在没见到 <code>[MASK]</code> 时也能正常理解。</p>
+<p><figure><img class="md-img" src="content/courses/llm-foundations/assets/chapter-3-figure-01.svg" alt="MLM 掩码流程：15% 位置按 80/10/10 处理，模型从双向上下文预测原词" loading="lazy" decoding="async"><figcaption>MLM 掩码流程：15% 位置按 80/10/10 处理，模型从双向上下文预测原词</figcaption></figure>
+</p>
+<h4 id="h-3-mlm-与-clm两种语言建模的分野">3. MLM 与 CLM：两种&quot;语言建模&quot;的分野<a class="anchor" href="#h-3-mlm-与-clm两种语言建模的分野" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>因果语言模型（CLM / GPT）</th>
+<th>掩码语言模型（MLM / BERT）</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>预测目标</td>
+<td>下一个 token</td>
+<td>被遮住的 token</td>
+</tr>
+<tr>
+<td>可见上下文</td>
+<td>只看左边</td>
+<td>左右都看</td>
+</tr>
+<tr>
+<td>架构</td>
+<td>仅解码器</td>
+<td>仅编码器</td>
+</tr>
+<tr>
+<td>擅长</td>
+<td>生成、续写</td>
+<td>理解、分类、抽取</td>
+</tr>
+<tr>
+<td>能否直接生成整句</td>
+<td>能（自回归）</td>
+<td>不能（一次只补一个空）</td>
+</tr>
+</tbody></table>
+<p>一句话概括：<strong>GPT 擅长&quot;往下写&quot;，BERT 擅长&quot;看懂&quot;</strong>。二者不是谁替代谁，而是同一套 Transformer 骨架走向了&quot;生成&quot;与&quot;理解&quot;两个方向。</p>
+<p><figure><img class="md-img" src="content/courses/llm-foundations/assets/chapter-3-figure-02.svg" alt="MLM（双向填空）与 CLM（单向预测下一个词）的对比示意" loading="lazy" decoding="async"><figcaption>MLM（双向填空）与 CLM（单向预测下一个词）的对比示意</figcaption></figure>
+</p>
+<h4 id="h-4-mlm-的局限与改进">4. MLM 的局限与改进<a class="anchor" href="#h-4-mlm-的局限与改进" aria-label="本节链接">#</a></h4>
+<p>原始 MLM 有几个公认的缺点：</p>
+<ol>
+<li><strong>每个 batch 只学习 15% 的 token</strong>：信息利用率低，需要大量训练步数；</li>
+<li><strong><code>[MASK]</code> 在微调阶段不存在</strong>：预训练/微调不一致（80/10/10 只是缓解）；</li>
+<li><strong>按&quot;词片&quot;而非&quot;词&quot;掩码</strong>：可能把一个词拆成几片分别遮，导致模型靠&quot;半个词&quot;就能蒙对。</li>
+</ol>
+<p>后续工作针对性改进：<strong>Whole Word Masking</strong> 掩掉整个词而非单个子词片段；RoBERTa 用<strong>动态掩码</strong>（每次 epoch 重新随机掩码）提升多样性；<strong>SpanBERT</strong> 改成遮掉连续的一段（span）。这些改进都围绕&quot;让模型更充分地利用双向上下文、学到更难的表示&quot;展开。</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>先手写 80/10/10 掩码，看清每一步在做什么：</p>
+<pre data-lang="python"><code class="language-python">import random
+
+def apply_mlm_mask(tokens, mask_token=&quot;[MASK]&quot;, vocab=(&quot;apple&quot;, &quot;cat&quot;, &quot;the&quot;),
+                   mask_prob=0.15, rng=None):
+    &quot;&quot;&quot;对 token 列表做 BERT 式掩码，返回 (掩码后的序列, 需要预测的原词)。&quot;&quot;&quot;
+    rng = rng or random.Random(0)
+    out = tokens[:]
+    labels = [&quot;-&quot;] * len(tokens)   # 只有被遮的位置才需要预测，其余记 &quot;-&quot;
+    for i, tok in enumerate(tokens):
+        if rng.random() &gt;= mask_prob:   # 85% 的位置不动
+            continue
+        r = rng.random()
+        if r &lt; 0.8:                     # 80% 换成 [MASK]
+            out[i] = mask_token
+        elif r &lt; 0.9:                   # 10% 换成随机词
+            out[i] = rng.choice(vocab)
+        # 剩下 10% 保持原词不变
+        labels[i] = tok                 # 无论哪种处理，模型都要预测原词
+    return out, labels
+
+tokens = [&quot;the&quot;, &quot;cat&quot;, &quot;sat&quot;, &quot;on&quot;, &quot;the&quot;, &quot;mat&quot;]
+masked, labels = apply_mlm_mask(tokens)
+print(&quot;原文  :&quot;, tokens)
+print(&quot;掩码后:&quot;, masked)
+print(&quot;需预测:&quot;, labels)</code></pre>
+<p>运行几次（换 <code>rng</code> 种子）你会看到：被挑中的位置有的变成 <code>[MASK]</code>，有的被随机词顶替，有的原封不动，但 <code>labels</code> 里都记下了原词——因为模型的最终任务是&quot;预测原词是什么&quot;。</p>
+<p>再用真正的 BERT 做一次&quot;填空&quot;：</p>
+<pre data-lang="python"><code class="language-python">from transformers import pipeline
+
+# fill-mask 管道内部就是一个在 MLM 目标上预训练好的 BERT
+mlm = pipeline(&quot;fill-mask&quot;, model=&quot;bert-base-uncased&quot;)
+result = mlm(&quot;The capital of France is [MASK].&quot;)
+for item in result:
+    print(f&quot;{item[&#39;token_str&#39;]:&gt;10}  得分 {item[&#39;score&#39;]:.4f}&quot;)</code></pre>
+<p>BERT 会给出 <code>Paris</code> 等高分候选。注意它靠的是 <code>[MASK]</code> <strong>左右两边</strong>的 &quot;capital of France&quot; 和句号——这就是&quot;双向上下文&quot;在起作用，也是自回归模型（只看左边）做不到的推理方式。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>把 <code>apply_mlm_mask</code> 的 <code>mask_prob</code> 从 0.15 改成 0.5，观察掩码后的序列，解释为什么 BERT 不把比例设得这么高（提示：上下文信息还剩下多少、预测难度如何变化）。</li>
+<li>修改代码，把 <code>vocab</code> 去掉 <code>&quot;cat&quot;</code>，多次运行观察&quot;10% 随机替换&quot;是否还会替换成 <code>&quot;cat&quot;</code>，理解随机替换词的来源。</li>
+<li>用 fill-mask 管道测试 <code>&quot;The [MASK] is barking loudly.&quot;</code>，观察模型是否填出 <code>dog</code>，并说明它利用了哪一侧的上下文。</li>
+<li>思考题：为什么 BERT 不能像 GPT 那样逐词生成一整句话？结合&quot;MLM 一次只补一个空、没有自回归的因果链&quot;来解释。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Devlin et al., <em>BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding</em>：<a href="https://arxiv.org/abs/1810.04805" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1810.04805</a></li>
+<li>Liu et al., <em>RoBERTa: A Robustly Optimized BERT Pretraining Approach</em>：<a href="https://arxiv.org/abs/1907.11692" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1907.11692</a></li>
+<li>Joshi et al., <em>SpanBERT: Improving Pre-training by Representing and Predicting Spans</em>：<a href="https://arxiv.org/abs/1907.10529" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1907.10529</a></li>
+<li>Hugging Face Transformers 文档 · fill-mask pipeline：<a href="https://huggingface.co/docs/transformers/main_classes/pipelines" target="_blank" rel="noopener noreferrer">https://huggingface.co/docs/transformers/main_classes/pipelines</a></li>
+</ul>
+<p><a href="#/l/llm-ch3-l2">下一课：BERT 架构</a></p>

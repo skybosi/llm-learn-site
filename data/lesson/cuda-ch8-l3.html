@@ -1,0 +1,329 @@
+<h2 id="h-项目三个-kernel-的实现与报告">项目：三个 kernel 的实现与报告<a class="anchor" href="#h-项目三个-kernel-的实现与报告" aria-label="本节链接">#</a></h2>
+<p>前两课给了方法与衔接面，但<strong>方法只有在别人能复核时才算成立</strong>。本项目交三件东西：三个代表不同瓶颈类型的 kernel（带宽/流式/算力受限各一）、一个验收/计时 harness、以及每份都回答&quot;为什么快 / 瓶颈在哪 / 还剩什么没榨出来&quot;的报告。下面的 harness 可照抄：它<strong>自己测量屋顶</strong>、用容差门挡住错误实现，并给报告打分——不合格会被退回。</p>
+<p><figure><img class="md-img" src="content/courses/gpu-cuda-kernels/assets/chapter-8-figure-02.svg" alt="项目闭环：从正确性门到报告卡校验" loading="lazy" decoding="async"><figcaption>项目闭环：从正确性门到报告卡校验</figcaption></figure>
+</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-交付物与验收标准">1. 交付物与验收标准<a class="anchor" href="#h-1-交付物与验收标准" aria-label="本节链接">#</a></h4>
+<p>三个 kernel 要覆盖三种瓶颈：</p>
+<table>
+<thead>
+<tr>
+<th>kernel</th>
+<th>瓶颈类型</th>
+<th>关键量</th>
+<th>优化主线</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>softmax（4096²）</td>
+<td>超越函数 + 带宽</td>
+<td>每个元素一次 exp</td>
+<td>行分块 + in-place，第二遍触碰收进 L2</td>
+</tr>
+<tr>
+<td>reduction（16M）</td>
+<td>纯带宽</td>
+<td>只读一遍</td>
+<td>分块两级归约，与库实现对齐</td>
+</tr>
+<tr>
+<td>GEMM（512³）</td>
+<td>算力</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">2</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">3</span></span></span></span></span></span></span></span></span></span></span> FLOPs</td>
+<td>tiling 提升复用（第 4 章）</td>
+</tr>
+</tbody></table>
+<p>每个 kernel 交<strong>朴素版 + 优化版</strong>，且要过四道门：<strong>正确性门</strong>（与参考实现逐元素对齐并给容差）、<strong>计时门</strong>（预热后多次取最小值）、<strong>搬运账</strong>（报字节，不只报时长）、<strong>屋顶对照</strong>（声明适用屋顶并算出 SOL 与剩余空间）。这与第 1 课的&quot;三问法&quot;是同一件事，只是把口头三问变成了必填字段。</p>
+<h4 id="h-2-三问怎么落到数字上">2. 三问怎么落到数字上<a class="anchor" href="#h-2-三问怎么落到数字上" aria-label="本节链接">#</a></h4>
+<p><strong>为什么快</strong>只能用一个对照回答：同一问题的朴素实现与优化实现的时间比。&quot;5.10 ms → 0.195 ms，26.2x，因为搬运算降了 32 倍&quot;才算答案。注意<strong>提速与搬运降幅不必相等</strong>：本次 GEMM 搬运降 64 倍、时间只快 51.9 倍，差额来自分块自身的循环开销。</p>
+<p><strong>瓶颈在哪</strong>要写&quot;卡在哪一类屋顶&quot;。做法是把每类屋顶的地板时间都算出来取最大者：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7651em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">floor</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.4em;vertical-align:-0.95em;"></span><span class="mop">max</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="minner"><span class="mopen delimcenter" style="top:0em;"><span class="delimsizing size3">(</span></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3714em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0502em;">B</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">W</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">roof</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord text"><span class="mord">bytes</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.836em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mpunct">,</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3603em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">F</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">roof</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord text"><span class="mord">FLOPs</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.836em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mpunct">,</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3603em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal" style="margin-right:0.0576em;">S</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0576em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">roof</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord text"><span class="mord">exp </span><span class="mord cjk_fallback">次数</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.836em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mclose delimcenter" style="top:0em;"><span class="delimsizing size3">)</span></span></span></span></span></span></span></p>
+<p>binding 的那项就是瓶颈，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord text"><span class="mord">headroom</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">实测</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord">/</span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">floor</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 就是&quot;还剩多少&quot;。<strong>算力屋顶不能套到只做加法的 kernel 上</strong>，故每个 kernel 要显式声明适用屋顶——这也是报告卡的硬条件之一。</p>
+<p><strong>还剩什么</strong>要给下一步的具体动作：&quot;分块已把第二遍触碰收进 L2，但第一遍仍要全量读输入，再压只能融合上游算子&quot;——它指向具体改动，并说明当前方案为什么到头了。</p>
+<h4 id="h-3-屋顶为什么必须实测而且不止一个数">3. 屋顶为什么必须实测，而且不止&quot;一个数&quot;<a class="anchor" href="#h-3-屋顶为什么必须实测而且不止一个数" aria-label="本节链接">#</a></h4>
+<p>规格书峰值假设满占用、理想访存、无降频，而同机三种风格测出的数字差别就很大：本次运行测得纯拷贝带宽 100.0 GB/s、库实现 fp32 算力 0.30 TFLOP/s、in-place <code>exp</code> 吞吐 739.5 Melem/s。而且<strong>屋顶本身也是测量值</strong>：连测三次，带宽在 92～103 GB/s、库算力在 0.23～0.31 TFLOP/s 间浮动，报告该写区间而非单点。</p>
+<p>更关键的是<strong>选错屋顶会得出荒谬结论</strong>。softmax 的字节账只有 2 个数组大小（各 64 MiB），只按带宽算地板是 1.34 ms，而实际耗时 33.3 ms，会得到&quot;还剩 24.8 倍空间&quot;的假结论；把 exp 吞吐算进屋顶后（4096² 次 exp ÷ 739.5 Melem/s ≈ 22.7 ms），SOL 是 68.1%、&quot;还剩 1.47x&quot;才可信。<strong>低 SOL 不等于有空间</strong>，也可能只是还没测到真正 binding 的资源。</p>
+<p>工程做法：三类屋顶都用<strong>与目标 kernel 同量级、同访问风格</strong>的参照来测（见下方 harness），并在报告里写明参照——换机器方法照样成立。</p>
+<h4 id="h-4-报告卡把写得好不好变成可执行的检查">4. 报告卡：把&quot;写得好不好&quot;变成可执行的检查<a class="anchor" href="#h-4-报告卡把写得好不好变成可执行的检查" aria-label="本节链接">#</a></h4>
+<p>报告卡由七条硬条件组成：正确性门、计时方式、搬运账、屋顶对照、<strong>片上预算</strong>、瓶颈判定、剩余空间说明。其中&quot;片上预算&quot;最容易漏也最致命：分块的前提是 <strong>tile 装得进目标存储层</strong>，声称 64 MiB 的 tile 落在 8 MiB 预算里，方案就不成立——代码里的反例自检演示了它被退回。</p>
+<p>把验收写成代码有两个好处：<strong>人不会漏项</strong>（跑一次就知道缺哪条），产出变成机器可读的 <code>report.json</code>，可进 CI、可做前后对比，也可把&quot;还剩 3.45x&quot;当下一轮基线。</p>
+<h4 id="h-5-常见坑">5. 常见坑<a class="anchor" href="#h-5-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>只交优化版</strong>：没有朴素版就没有&quot;为什么快&quot;，第一问无法回答。</li>
+<li><strong>容差给得太松</strong>：<code>atol=1e-1</code> 能放过任何错误实现；容差要按 dtype 与累加长度选。</li>
+<li><strong>计时不带预热</strong>：首次调用含惰性初始化与 autotune，测到的是编译时间。</li>
+<li><strong>拿单次测量当结论</strong>：取最小值是为了排噪声，但要同时报波动。</li>
+<li><strong>把&quot;库实现&quot;当绝对上限</strong>：它也可能没打满硬件，SOL 只作方向判断。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面的 harness 用 numpy 实现三个 kernel 的 CPU 参照版（GPU 上把实现换成 CUDA kernel，结构不变），完成：<strong>实测三类屋顶 → 正确性门 → 计时 → 搬运账 → 屋顶对照 → 报告卡校验 → 反例自检 → 落盘 report.json</strong>。</p>
+<pre data-lang="python"><code class="language-python"># ===== 本课示例：三个 kernel 的验收 + 报告卡流水线（numpy，无 GPU 可完整跑通）=====
+# 报告卡回答三问：为什么快 / 瓶颈在哪 / 还剩什么没榨出来。
+# 关键设计：屋顶不抄规格书，而是在同一台机器上实测三类屋顶——带宽 / 算力 / 超越函数吞吐。
+import json
+import time
+
+import numpy as np
+
+WARMUP, REPEAT = 2, 5
+
+def bench(fn, *args):
+    &quot;&quot;&quot;预热 WARMUP 次，取 REPEAT 次里的最小值（最小值最接近真实能力，受噪声干扰最小）。&quot;&quot;&quot;
+    for _ in range(WARMUP):
+        fn(*args)
+    ts = []
+    for _ in range(REPEAT):
+        t0 = time.perf_counter()
+        fn(*args)
+        ts.append(time.perf_counter() - t0)
+    return min(ts), ts
+
+# ---------- 0. 实测本机三类屋顶：代替「规格书里的峰值」 ----------
+big_src = np.random.default_rng(0).standard_normal(32 * 1024 * 1024).astype(np.float32)
+big_dst = np.empty_like(big_src)
+copy_s, _ = bench(lambda: np.copyto(big_dst, big_src))
+ROOF_GBS = 2 * big_src.nbytes / copy_s / 1e9           # 读+写都算，所以乘 2
+
+mm_a = np.random.default_rng(1).standard_normal((1024, 1024)).astype(np.float32)
+mm_b = np.random.default_rng(2).standard_normal((1024, 1024)).astype(np.float32)
+mm_c = np.empty_like(mm_a)
+gemm_s, _ = bench(lambda: np.matmul(mm_a, mm_b, out=mm_c))
+ROOF_TFLOPS = 2 * 1024 ** 3 / gemm_s / 1e12
+
+exp_src = np.random.default_rng(7).standard_normal(1 &lt;&lt; 24).astype(np.float32)
+exp_dst = np.empty_like(exp_src)
+exp_s, _ = bench(lambda: np.exp(exp_src, out=exp_dst))
+ROOF_MELEM_S = exp_src.size / exp_s / 1e6              # 超越函数吞吐（百万元素/秒）
+
+ROOFS = {&quot;带宽&quot;: ROOF_GBS, &quot;算力&quot;: ROOF_TFLOPS, &quot;超越函数&quot;: ROOF_MELEM_S}
+print(&quot;=&quot; * 82)
+print(&quot;[屋顶] 同机实测，不用规格书数字：&quot;)
+print(f&quot;  带宽      {ROOF_GBS:8.1f} GB/s    （{big_src.nbytes/2**20:.0f} MiB 数组拷贝，读+写计数）&quot;)
+print(f&quot;  算力      {ROOF_TFLOPS:8.2f} TFLOP/s  （1024^3 fp32 matmul 的库实现）&quot;)
+print(f&quot;  超越函数  {ROOF_MELEM_S:8.1f} Melem/s （2^24 个 fp32 的 np.exp，in-place）&quot;)
+print(&quot;=&quot; * 82)
+
+# ---------- 1. 三个 kernel：每个都给「朴素版 + 优化版」，好回答「为什么快」 ----------
+N1 = 4096                                   # 4096x4096 fp32 = 64 MiB
+X = np.random.default_rng(3).standard_normal((N1, N1)).astype(np.float32)
+
+def softmax_naive(x):
+    &quot;&quot;&quot;两遍读 x，且两次分配全尺寸临时缓冲区（e 与 e/s 各 64 MiB）。&quot;&quot;&quot;
+    m = x.max(axis=1, keepdims=True)
+    e = np.exp(x - m)
+    return e / e.sum(axis=1, keepdims=True)
+
+def softmax_blocked(x, RB=256):
+    &quot;&quot;&quot;按行分块：一块只有 RB×N 的 4 MiB，第二遍触碰落在 L2 而不是 DRAM（第 4 章 tiling 的整算子版）。&quot;&quot;&quot;
+    out = np.empty_like(x)
+    for i in range(0, x.shape[0], RB):
+        blk = x[i:i + RB]
+        m = blk.max(axis=1, keepdims=True)
+        o = out[i:i + RB]
+        np.subtract(blk, m, out=o)          # 全部 in-place：不再分配临时大数组
+        np.exp(o, out=o)
+        np.divide(o, o.sum(axis=1, keepdims=True), out=o)
+    return out
+
+N2 = 16 * 1024 * 1024
+V = np.random.default_rng(4).standard_normal(N2).astype(np.float32)
+
+def reduce_lib(x):
+    &quot;&quot;&quot;交给库：numpy 内部已是分块/树形归约。&quot;&quot;&quot;
+    return np.add.reduce(x)
+
+def reduce_manual(x):
+    &quot;&quot;&quot;手写两级归约：先分块各自求和，再对块和求和。搬运量与朴素版完全相同。&quot;&quot;&quot;
+    CH = 1 &lt;&lt; 16
+    part = np.array([x[i:i + CH].sum() for i in range(0, x.size, CH)], dtype=np.float32)
+    return float(part.sum())
+
+N3 = 512
+A = np.random.default_rng(5).standard_normal((N3, N3)).astype(np.float32)
+B = np.random.default_rng(6).standard_normal((N3, N3)).astype(np.float32)
+
+def gemm_lib(a, b):
+    return a @ b
+
+def gemm_naive(a, b):
+    &quot;&quot;&quot;逐输出元素写：每个 C[i][j] 都去读一整行 A 和一整列 B（第 4 章算过这笔搬运账）。&quot;&quot;&quot;
+    out = np.empty((a.shape[0], b.shape[1]), dtype=np.float32)
+    for i in range(a.shape[0]):
+        for j in range(b.shape[1]):
+            out[i, j] = a[i, :] @ b[:, j]
+    return out
+
+def gemm_tiled(a, b, T=64):
+    &quot;&quot;&quot;分块：一次搬入、T 次复用（第 4 章的 blocked_gemm，简化为固定 T 且整除）。&quot;&quot;&quot;
+    M, K = a.shape
+    N = b.shape[1]
+    out = np.zeros((M, N), dtype=np.float32)
+    for i in range(0, M, T):
+        for j in range(0, N, T):
+            for k in range(0, K, T):
+                out[i:i + T, j:j + T] += a[i:i + T, k:k + T] @ b[k:k + T, j:j + T]
+    return out
+
+# ---------- 2. 报告条目：正确性门 + 计时 + 搬运账 + 明确声明用哪几个屋顶 ----------
+KERNELS = [
+    dict(name=&quot;softmax&quot;,
+         naive=(&quot;两遍读 + 临时数组&quot;, lambda: softmax_naive(X)),
+         opt=(&quot;行分块 RB=256&quot;, lambda: softmax_blocked(X)),
+         reference=lambda: softmax_naive(X),
+         bytes_opt=2 * X.nbytes, flops=5 * N1 * N1, sfus=N1 * N1,   # 每个元素一次 exp
+         roofs=(&quot;带宽&quot;, &quot;超越函数&quot;),
+         budget=8 * 2 ** 20,                                       # 行块 4 MiB，按 L2 量级留余量
+         residual=&quot;分块把第二遍触碰收进 L2，但第一遍仍要全量读 x；再压只能融合上游生产 x 的算子&quot;),
+    dict(name=&quot;reduce_sum&quot;,
+         naive=(&quot;库 add.reduce&quot;, lambda: reduce_lib(V)),
+         opt=(&quot;手写两级归约&quot;, lambda: reduce_manual(V)),
+         reference=lambda: np.add.reduce(V),
+         bytes_opt=V.nbytes, flops=V.size, sfus=0,
+         roofs=(&quot;带宽&quot;,),
+         budget=1 &lt;&lt; 16,                                           # 单块的局部和，64 KiB
+         residual=&quot;纯带宽受限且只读一遍；numpy 归约是单线程，实测到三成带宽就是它自己的上限&quot;),
+    dict(name=&quot;gemm&quot;,
+         naive=(&quot;逐元素写&quot;, lambda: gemm_naive(A, B)),
+         opt=(&quot;分块 T=64&quot;, lambda: gemm_tiled(A, B)),
+         reference=lambda: gemm_lib(A, B),
+         bytes_opt=(2 * N3 ** 3 * 4 // 64 + N3 * N3 * 4), flops=2 * N3 ** 3, sfus=0,
+         roofs=(&quot;带宽&quot;, &quot;算力&quot;),
+         budget=3 * N3 * N3 * 4,
+         residual=&quot;分块把搬运降 64 倍后仍未到库的算力屋顶，差距在 warp/thread 级 tile 与指令级并行&quot;),
+]
+QTY = {&quot;带宽&quot;: lambda k: (k[&quot;bytes_opt&quot;], ROOF_GBS * 1e9),
+       &quot;算力&quot;: lambda k: (k[&quot;flops&quot;], ROOF_TFLOPS * 1e12),
+       &quot;超越函数&quot;: lambda k: (k[&quot;sfus&quot;], ROOF_MELEM_S * 1e6)}
+
+def verify(got, ref, rtol=1e-5, atol=1e-4):
+    g = np.asarray(got, dtype=np.float64).ravel()
+    r = np.asarray(ref, dtype=np.float64).ravel()
+    denom = np.maximum(np.abs(r), 1e-12)
+    max_rel = float(np.max(np.abs(g - r) / denom))
+    max_abs = float(np.max(np.abs(g - r)))
+    return (max_rel &lt;= rtol or max_abs &lt;= atol), max_rel, max_abs
+
+rows, gates = [], []
+for k in KERNELS:
+    ok_n, rel_n, abs_n = verify(k[&quot;naive&quot;][1](), k[&quot;reference&quot;]())
+    ok_o, rel_o, abs_o = verify(k[&quot;opt&quot;][1](), k[&quot;reference&quot;]())
+    t_n, _ = bench(k[&quot;naive&quot;][1])
+    t_o, _ = bench(k[&quot;opt&quot;][1])
+    floors = {name: QTY[name](k)[0] / QTY[name](k)[1] for name in k[&quot;roofs&quot;]}
+    binding = max(floors, key=floors.get)
+    sol = {name: 100 * floors[name] / t_o for name in k[&quot;roofs&quot;]}
+    rows.append(dict(kernel=k[&quot;name&quot;], ok=ok_n and ok_o, speedup=t_n / t_o,
+                     t_naive_ms=t_n * 1e3, t_opt_ms=t_o * 1e3,
+                     gbs=k[&quot;bytes_opt&quot;] / t_o / 1e9,
+                     floors_ms={n: v * 1e3 for n, v in floors.items()},
+                     sol={n: round(v, 1) for n, v in sol.items()},
+                     binding=binding, binding_sol=round(sol[binding], 1),
+                     headroom_x=t_o / floors[binding],
+                     budget_ok=k[&quot;budget&quot;] &lt;= 8 * 2 ** 20,
+                     residual=k[&quot;residual&quot;],
+                     tol=f&quot;rel {max(rel_n, rel_o):.1e} / abs {max(abs_n, abs_o):.1e}&quot;))
+
+print(f&quot;\n{&#39;kernel&#39;:&lt;10}{&#39;正确&#39;:&gt;6}{&#39;朴素ms&#39;:&gt;10}{&#39;优化ms&#39;:&gt;10}{&#39;提速&#39;:&gt;9}{&#39;GB/s&#39;:&gt;7}&quot;
+      f&quot;{&#39;带宽SOL&#39;:&gt;10}{&#39;算力SOL&#39;:&gt;10}{&#39;expSOL&#39;:&gt;9}{&#39;卡在哪&#39;:&gt;10}{&#39;还剩&#39;:&gt;8}&quot;)
+print(&quot;-&quot; * 106)
+for r in rows:
+    s = r[&quot;sol&quot;]
+    print(f&quot;{r[&#39;kernel&#39;]:&lt;10}{(&#39;PASS&#39; if r[&#39;ok&#39;] else &#39;FAIL&#39;):&gt;6}{r[&#39;t_naive_ms&#39;]:&gt;10.3f}&quot;
+          f&quot;{r[&#39;t_opt_ms&#39;]:&gt;10.3f}{r[&#39;speedup&#39;]:&gt;8.2f}x{r[&#39;gbs&#39;]:&gt;7.1f}&quot;
+          f&quot;{s.get(&#39;带宽&#39;, 0):&gt;9.1f}%{s.get(&#39;算力&#39;, 0):&gt;9.1f}%{s.get(&#39;超越函数&#39;, 0):&gt;8.1f}%&quot;
+          f&quot;{r[&#39;binding&#39;]:&gt;10}{r[&#39;headroom_x&#39;]:&gt;7.2f}x&quot;)
+
+# ---------- 3. 报告卡验收：报告里缺证据就不通过 ----------
+REQUIRED = {&quot;correctness&quot;: &quot;正确性门（与参考实现逐元素对齐 + 容差）&quot;,
+            &quot;timing&quot;: &quot;计时（预热 + 多次取最小值）&quot;,
+            &quot;traffic&quot;: &quot;搬运账（字节数，而不是只报时长）&quot;,
+            &quot;roof&quot;: &quot;屋顶对照（且声明了用哪几个屋顶）&quot;,
+            &quot;budget&quot;: &quot;片上预算（tile 必须装得下，否则分块方案不成立）&quot;,
+            &quot;verdict&quot;: &quot;瓶颈判定（写明卡在哪一类屋顶）&quot;,
+            &quot;residual&quot;: &quot;还剩什么没榨出来的具体说明&quot;}
+print(&quot;\n[报告卡验收] 每条都是缺了就退回的硬条件&quot;)
+for r in rows:
+    checks = {
+        &quot;correctness&quot;: r[&quot;ok&quot;],
+        &quot;timing&quot;: REPEAT &gt;= 5 and WARMUP &gt;= 1,
+        &quot;traffic&quot;: r[&quot;gbs&quot;] &gt; 0,
+        &quot;roof&quot;: bool(r[&quot;sol&quot;]) and r[&quot;binding_sol&quot;] &gt; 0,
+        &quot;budget&quot;: r[&quot;budget_ok&quot;],
+        &quot;verdict&quot;: r[&quot;binding&quot;] in ROOFS,
+        &quot;residual&quot;: len(r[&quot;residual&quot;]) &gt;= 15,
+    }
+    missing = [REQUIRED[c] for c, v in checks.items() if not v]
+    gates.append((r[&quot;kernel&quot;], not missing))
+    print(f&quot;  {r[&#39;kernel&#39;]:&lt;11} {&#39;通过&#39; if not missing else &#39;退回：&#39; + &#39;；&#39;.join(missing)}&quot;)
+
+# ---------- 4. 反例自检：声称的 tile 装不下时必须被退回 ----------
+print(&quot;\n[反例自检] 把 reduce_sum 的片上预算谎报成 64 MiB（真值 64 KiB）：&quot;)
+bogus = {&quot;budget_ok&quot;: V.nbytes &lt;= 8 * 2 ** 20}
+print(f&quot;  reduce_sum    {&#39;通过&#39; if bogus[&#39;budget_ok&#39;] else &#39;退回：&#39; + REQUIRED[&#39;budget&#39;]}&quot;)
+assert not bogus[&quot;budget_ok&quot;], &quot;反例自检失效：预算检查没有拦住装不下的 tile&quot;
+
+print(&quot;\n[三问] 逐 kernel 的回答必须落到数字上：&quot;)
+for r in rows:
+    print(f&quot;  {r[&#39;kernel&#39;]}: 为什么快 = 提速 {r[&#39;speedup&#39;]:.2f}x&quot;
+          f&quot;（{r[&#39;t_naive_ms&#39;]:.2f} ms -&gt; {r[&#39;t_opt_ms&#39;]:.2f} ms）；&quot;
+          f&quot;瓶颈在 {r[&#39;binding&#39;]}（SOL {r[&#39;binding_sol&#39;]}%）；还剩 {r[&#39;headroom_x&#39;]:.2f}x&quot;)
+
+report = {&quot;roofs&quot;: ROOFS, &quot;kernels&quot;: rows}
+open(&quot;report.json&quot;, &quot;w&quot;, encoding=&quot;utf-8&quot;).write(json.dumps(report, ensure_ascii=False, indent=2))
+print(f&quot;\n报告已落盘 report.json（{len(rows)} 个 kernel，&quot;
+      f&quot;{sum(1 for _, ok in gates if ok)}/{len(gates)} 过验收）&quot;)</code></pre>
+<p>实际运行结果（python3.10 + numpy，一次跑完约 5 秒；计时类数字每次会浮动）：</p>
+<pre data-lang="text"><code class="language-text">==================================================================================
+[屋顶] 同机实测，不用规格书数字：
+  带宽         100.0 GB/s    （128 MiB 数组拷贝，读+写计数）
+  算力          0.30 TFLOP/s  （1024^3 fp32 matmul 的库实现）
+  超越函数     739.5 Melem/s （2^24 个 fp32 的 np.exp，in-place）
+==================================================================================
+
+kernel        正确      朴素ms      优化ms       提速   GB/s     带宽SOL     算力SOL   expSOL       卡在哪      还剩
+----------------------------------------------------------------------------------------------------------
+softmax     PASS    40.760    33.307    1.22x    4.0      4.0%      0.0%    68.1%      超越函数   1.47x
+reduce_sum  PASS     1.995     2.315    0.86x   29.0     29.0%      0.0%     0.0%        带宽   3.45x
+gemm        PASS   257.911     4.969   51.90x    3.6      3.6%     18.0%     0.0%        算力   5.56x
+
+[报告卡验收] 每条都是缺了就退回的硬条件
+  softmax     通过
+  reduce_sum  通过
+  gemm        通过
+
+[反例自检] 把 reduce_sum 的片上预算谎报成 64 MiB（真值 64 KiB）：
+  reduce_sum    退回：片上预算（tile 必须装得下，否则分块方案不成立）
+
+[三问] 逐 kernel 的回答必须落到数字上：
+  softmax: 为什么快 = 提速 1.22x（40.76 ms -&gt; 33.31 ms）；瓶颈在 超越函数（SOL 68.1%）；还剩 1.47x
+  reduce_sum: 为什么快 = 提速 0.86x（2.00 ms -&gt; 2.31 ms）；瓶颈在 带宽（SOL 29.0%）；还剩 3.45x
+  gemm: 为什么快 = 提速 51.90x（257.91 ms -&gt; 4.97 ms）；瓶颈在 算力（SOL 18.0%）；还剩 5.56x
+
+报告已落盘 report.json（3 个 kernel，3/3 过验收）</code></pre>
+<p>三份报告覆盖三种典型结论：<strong>softmax = 优化成功但收益有限</strong>（1.22x，瓶颈是 exp 吞吐，搬运只占 4.0% 的 SOL，再减字节也超不过 1.47x）；<strong>reduce_sum = 优化失败但报告合格</strong>（0.86x，比库实现还慢，卡片仍通过——<strong>负结果也是结果</strong>，它把&quot;numpy 归约单线程只到 29.0% 带宽&quot;钉死了）；<strong>gemm = 结构性优化</strong>（51.9x，搬运降 64 倍，剩余 5.56x 落在 warp/thread 级 tile 与指令级并行上）。</p>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选，需要 GPU（云上按需开一台单卡实例即可，本课不需要多卡）----
+# GPU 版只换三处，harness 结构不动：
+# 1) 屋顶：带宽用 D2D 拷贝或纯拷贝 kernel 实测；算力用 cuBLAS/torch.matmul 实测；
+#    超越函数用逐元素 exp kernel 实测（三个都写成函数，不要敲数字）。
+# 2) 计时：用 CUDA event / torch.cuda.Event 包住 kernel，配合 synchronize()；
+#    预热 ≥ 5 次、取多次最小值，并在报告里附运行间波动。
+# 3) 搬运账：把模型算出的字节数与 ncu 的 dram__bytes_read/write 对照（第 1 课的
+#    parse_ncu_csv 可直接复用），差得越多说明合并访存或 L2 复用还有空间。
+# 没有 GPU 也能完整交付本项目：把三个 kernel 写成 numpy/纯 Python 版本，
+# 屋顶全部实测，报告卡与 report.json 一样成立 —— 方法与硬件无关。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：给 harness 加第四个 kernel（如 LayerNorm），判断它属于哪类瓶颈、声明适用屋顶、填齐七条字段并让报告卡通过。</li>
+<li><strong>解释</strong>：<code>reduce_sum</code> 的优化版比朴素版慢（0.86x），报告卡却仍通过。为什么&quot;提速 &lt; 1&quot;不妨碍验收？这份报告的价值落在哪一行数字上？</li>
+<li><strong>对比/验证</strong>：把 <code>REPEAT</code> 改成 1，看 SOL 与 headroom 波动多大；再把 softmax 的 <code>RB</code> 改成 4096（行块 64 MiB，超出 L2），解释提速为什么消失。</li>
+<li><strong>思考</strong>：为什么&quot;实测屋顶&quot;比&quot;抄规格书峰值&quot;更适合放进报告？规格书偏高、偏低各会导致什么错误结论，会以什么形式在报告卡里暴露？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>NVIDIA, <em>CUDA C++ Best Practices Guide</em> §9.2「Bandwidth」（有效带宽与&quot;请求带宽 vs 实际带宽&quot;的口径）：<a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#bandwidth" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#bandwidth</a></li>
+<li>NVIDIA, <em>CUDA C++ Best Practices Guide</em> §11.1「Occupancy」与 §10.2.7.1「Register Pressure」（残余收益的两个常见去处）：<a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#occupancy" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#occupancy</a></li>
+<li>NVIDIA, <em>Nsight Compute — Profiling Guide</em>（<code>SpeedOfLight</code> / <code>MemoryWorkloadAnalysis</code> 段与吞吐指标命名）：<a href="https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html</a></li>
+<li>NVIDIA, <em>NVIDIA Hopper Tuning Guide</em>（共享内存/寄存器等片上资源参数，用于核对自报的&quot;片上预算&quot;）：<a href="https://docs.nvidia.com/cuda/hopper-tuning-guide/" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/hopper-tuning-guide/</a></li>
+</ul>
+<p><a href="#/l/mlc-ch1-l1">下一门课：框架执行的三个代价：算子边界、内存搬运、动态开销</a></p>
+<p>恭喜你完成《GPU 编程与 Kernel 优化》！这门课的存储层次、访存优化、归约/GEMM/Attention 与性能闭环，接下来会直接用在《深度学习编译器与算子生成》里：编译器生成的 kernel 好不好，判断标准就是本项目的三问与报告卡。</p>

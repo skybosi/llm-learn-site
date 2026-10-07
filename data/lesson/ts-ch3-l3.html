@@ -1,0 +1,97 @@
+<h2 id="h-评估时间序列交叉验证">评估（时间序列交叉验证）<a class="anchor" href="#h-评估时间序列交叉验证" aria-label="本节链接">#</a></h2>
+<p>你花两天调出的预测模型，上线后效果暴跌，最常见的原因之一就是<strong>评估方式错了</strong>：用了随机切分或随机 K-fold，让模型&quot;偷看未来&quot;，指标虚高。这一课讲为什么时间序列不能随机切分、该用什么指标、以及正确的时间序列交叉验证长什么样。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-为什么不能随机切分三条硬理由">1. 为什么不能随机切分：三条硬理由<a class="anchor" href="#h-1-为什么不能随机切分三条硬理由" aria-label="本节链接">#</a></h4>
+<p>机器学习的标准套路是 <code>train_test_split</code> + K-fold，但在时间序列里这是<strong>错的</strong>，原因有三：</p>
+<p><strong>理由一：未来信息泄漏。</strong> 随机切分会把 2024 年的样本放进训练集、把 2023 年的放进测试集。模型于是&quot;用未来预测过去&quot;，测试集指标漂亮，线上却一塌糊涂。时间序列预测的本质约束是<strong>只能用过去预测未来</strong>，切分必须保证：<strong>训练集的全部时间点都早于测试集</strong>。</p>
+<p><strong>理由二：时序依赖被破坏。</strong> 时间序列的观测彼此相关（<code>y_t</code> 依赖 <code>y_{t-1}</code>）。随机切分把相邻观测拆开，训练集里到处都是&quot;缺了邻居的洞&quot;，模型既学不到真实的依赖结构，测试时又因为邻点信息&quot;泄漏&quot;过来而虚高。这种相关性意味着测试样本<strong>不再独立</strong>，经典 CV 的独立性假设根本不成立。</p>
+<p><strong>理由三：目标泄漏（label leakage）。</strong> 这比&quot;时间泄漏&quot;更隐蔽。哪怕你按时间切分了，如果特征/标准化在切分<strong>之前</strong>用了全量数据的统计量（全序列均值、全序列编码），未来信息仍会通过特征溜进训练。正确做法是：<strong>切分后再在训练段上计算所有统计量</strong>，或使用只能&quot;向前看&quot;的管道。</p>
+<blockquote>
+<p>一句话：时间序列评估的黄金规则是&quot;<strong>时间有序</strong>&quot;——训练在前、测试在后，且特征构造只用训练段及其之前的信息。</p>
+</blockquote>
+<h4 id="h-2-评估指标别只会用-rmse">2. 评估指标：别只会用 RMSE<a class="anchor" href="#h-2-评估指标别只会用-rmse" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>MAE / RMSE</strong>：最常用，量纲与数据一致。RMSE 对<strong>大误差</strong>更敏感（平方放大），MAE 更稳健；</li>
+<li><strong>MAPE</strong>：百分比误差 <code>mean(|(y−ŷ)/y|)</code>，直观但有两个坑——<code>y</code> 接近 0 时爆炸，且对&quot;预测偏低&quot;不对称惩罚；</li>
+<li><strong>sMAPE</strong>：对称版百分比误差，缓解 MAPE 的不对称，但在 <code>y</code> 与 <code>ŷ</code> 都接近 0 时仍不稳；</li>
+<li><strong>MASE</strong>：<strong>平均绝对比例误差</strong>，把模型的 MAE 除以&quot;朴素预测（naive）&quot;的 MAE。MASE = 1 表示和&quot;直接用上期值预测&quot;打平；<strong>MASE &lt; 1 才说明模型有真实价值</strong>。它无量纲、对 0 值稳健，且天然可跨序列比较。</li>
+</ul>
+<p>实务建议：报 <strong>RMSE/MAE 为主、MASE 为辅</strong>。MASE 的分母用训练集上的朴素误差计算，这样能避免测试集太短导致分母为 0 的问题。</p>
+<h4 id="h-3-时间序列交叉验证三种滑动窗口">3. 时间序列交叉验证：三种滑动窗口<a class="anchor" href="#h-3-时间序列交叉验证三种滑动窗口" aria-label="本节链接">#</a></h4>
+<p>正确的 CV 放弃&quot;随机打乱&quot;，改用<strong>沿时间向前滑动</strong>的窗口：</p>
+<p><strong>① 扩展窗口（expanding window）</strong>：训练集从序列开头开始，逐次向后扩一个测试点，像滚雪球一样越来越大。适合样本少、想充分利用全部历史的场景。</p>
+<p><strong>② 滑动窗口（sliding/rolling window）</strong>：训练集保持<strong>固定长度</strong>，随测试点一起向前滚动，丢弃过老的样本。适合序列机制会随时间漂移、旧数据已&quot;过时&quot;的场景。</p>
+<p><strong>③ TimeSeriesSplit</strong>：scikit-learn 提供的实现，本质是扩展窗口，第 <code>i</code> 折的训练集 = 前 <code>i+1</code> 段、测试集 = 紧接着的下一个 block。</p>
+<p>无论哪种，都有两条铁律：<strong>测试段永远在训练段之后</strong>；<strong>不同折的测试段互不重叠</strong>。对每一折算指标后取平均，就得到对模型泛化能力更诚实的估计。</p>
+<h4 id="h-4-一定要有基准模型">4. 一定要有基准模型<a class="anchor" href="#h-4-一定要有基准模型" aria-label="本节链接">#</a></h4>
+<p>评估模型之前，先建立<strong>基线</strong>，否则你连&quot;有没有进步&quot;都不知道。三个经典基线：</p>
+<ul>
+<li><strong>朴素法（naive）</strong>：<code>ŷ_{t+h} = y_t</code>，直接拿最后一期当预测；</li>
+<li><strong>季节朴素法（seasonal naive）</strong>：<code>ŷ_{t+h} = y_{t−m+h}</code>，用上一个季节周期同一位点；</li>
+<li><strong>漂移法（drift）</strong>：<code>ŷ_{t+h} = y_t + h·(y_t − y_1)/(t−1)</code>，把首尾连线外推。</li>
+</ul>
+<p>如果精心调出的模型连季节朴素都打不过，那它就只是&quot;昂贵的自我安慰&quot;。</p>
+<p><figure><img class="md-img" src="content/courses/time-series/assets/chapter-3-figure-03.svg" alt="时间序列交叉验证：扩展/滑动窗口与&quot;错误随机 K-fold&quot;的对比" loading="lazy" decoding="async"><figcaption>时间序列交叉验证：扩展/滑动窗口与&quot;错误随机 K-fold&quot;的对比</figcaption></figure>
+</p>
+<h3 id="h-二可运行示例">二、可运行示例<a class="anchor" href="#h-二可运行示例" aria-label="本节链接">#</a></h3>
+<p>用 TimeSeriesSplit 和手动扩展窗口做评估，并用 MASE 对照朴素基线。</p>
+<pre data-lang="python"><code class="language-python">import numpy as np
+import pandas as pd
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.metrics import mean_absolute_error
+
+# 1) 构造序列
+idx = pd.date_range(&quot;2022-01-01&quot;, periods=180, freq=&quot;D&quot;)
+rng = np.random.default_rng(1)
+t = np.arange(180)
+y = 20 + 0.2 * t + 8 * np.sin(2 * np.pi * t / 7) + rng.normal(0, 3, size=180)
+series = pd.Series(y, index=idx)
+
+# 2) 特征工程（只用过去信息）
+def make_features(s):
+    df = pd.DataFrame({&quot;y&quot;: s})
+    for lag in (1, 2, 7):
+        df[f&quot;lag_{lag}&quot;] = s.shift(lag)
+    df[&quot;roll_mean_7&quot;] = s.shift(1).rolling(7).mean()
+    df[&quot;target&quot;] = s.shift(-1)
+    return df.dropna()
+
+data = make_features(series)
+feats = [c for c in data.columns if c not in (&quot;y&quot;, &quot;target&quot;)]
+
+# 3) TimeSeriesSplit：训练段始终在测试段之前
+tscv = TimeSeriesSplit(n_splits=4)
+maes = []
+for train_idx, test_idx in tscv.split(data):
+    X_tr, X_te = data.iloc[train_idx][feats], data.iloc[test_idx][feats]
+    y_tr, y_te = data.iloc[train_idx][&quot;target&quot;], data.iloc[test_idx][&quot;target&quot;]
+    model = HistGradientBoostingRegressor(random_state=0)
+    model.fit(X_tr, y_tr)
+    mae = mean_absolute_error(y_te, model.predict(X_te))
+    maes.append(mae)
+    print(f&quot;训练 {len(train_idx):3d} 期 -&gt; 测试 {len(test_idx):2d} 期，MAE = {mae:.3f}&quot;)
+print(&quot;平均 MAE =&quot;, round(float(np.mean(maes)), 3))
+
+# 4) MASE：与朴素基线对比（分母 = 训练段朴素误差）
+naive_err = series.diff().abs().dropna()  # 朴素法的一步误差 = |y_t - y_{t-1}|
+naive_mae = float(naive_err.mean())
+print(&quot;朴素基线 MAE =&quot;, round(naive_mae, 3))
+print(&quot;MASE =&quot;, round(float(np.mean(maes)) / naive_mae, 3),
+      &quot;（&lt;1 表示优于朴素基线）&quot;)</code></pre>
+<p>关键点：每一折的测试段都严格在训练段之后，且模型从未&quot;看&quot;到过测试段及其未来。<code>MASE &lt; 1</code> 才能说明模型比&quot;照着昨天抄&quot;更有价值。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>把 <code>TimeSeriesSplit</code> 换成随机 <code>KFold</code>（<code>shuffle=True</code>），比较平均 MAE，观察它是否虚高，并解释为什么这个数字不可信。</li>
+<li>实现一个<strong>滑动窗口</strong> CV（固定训练窗口长度，如 90 期），和扩展窗口的结果对比，思考什么情况下滑动窗口更合适。</li>
+<li>计算<strong>季节朴素法</strong>的 MAE（用滞后 7 期作预测），与上面的梯度提升模型对比，看谁更强。</li>
+<li>思考：为什么 MASE 的分母建议用<strong>训练段</strong>的朴素误差，而不是测试段的？这能避免什么问题？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Hyndman &amp; Athanasopoulos《Forecasting: Principles and Practice》(3rd ed)，第 5 章「时间序列交叉验证」：<a href="https://otexts.com/fpp3/tscv.html" target="_blank" rel="noopener noreferrer">https://otexts.com/fpp3/tscv.html</a></li>
+<li>scikit-learn 官方文档 · <code>TimeSeriesSplit</code>：<a href="https://scikit-learn.org/stable/modules/generated/sklearn.model_selection.TimeSeriesSplit.html" target="_blank" rel="noopener noreferrer">https://scikit-learn.org/stable/modules/generated/sklearn.model_selection.TimeSeriesSplit.html</a></li>
+<li>Hyndman &amp; Koehler (2006)《Another look at measures of forecast accuracy》：<a href="https://robjhyndman.com/papers/mase.pdf" target="_blank" rel="noopener noreferrer">https://robjhyndman.com/papers/mase.pdf</a></li>
+<li>维基百科「平均绝对百分比误差」：<a href="https://zh.wikipedia.org/wiki/平均绝对百分比误差" target="_blank" rel="noopener noreferrer">https://zh.wikipedia.org/wiki/平均绝对百分比误差</a></li>
+</ul>
+<p><a href="#/l/ts-ch4-l1">下一课：深度学习时间序列</a></p>

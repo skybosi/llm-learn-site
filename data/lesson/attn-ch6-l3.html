@@ -1,0 +1,164 @@
+<h2 id="h-可视化注意力">可视化注意力<a class="anchor" href="#h-可视化注意力" aria-label="本节链接">#</a></h2>
+<p>注意力权重是 Transformer 最&quot;可解释&quot;的一扇窗：它明明白白地告诉我们，每个位置在生成时&quot;看了谁、看了多重&quot;。这一课回到第 2 课的序列反转任务，用 <code>nn.MultiheadAttention</code> 把三处注意力权重都抓出来，画成热力图，看它们各自呈现出什么结构。你会亲眼看到：编码器自注意力是双向的、解码器自注意力被因果掩码切成下三角、而交叉注意力形成一条漂亮的<strong>反对角线</strong>——那是模型在&quot;对着源序列找对应位置&quot;。最后我们也要给注意力泼一盆冷水：它好读，但<strong>不等于</strong>因果解释。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-三张热力图三种结构">1. 三张热力图，三种结构<a class="anchor" href="#h-1-三张热力图三种结构" aria-label="本节链接">#</a></h4>
+<p>反转任务里，源序列长度 <code>L=5</code>、目标序列（含 BOS/EOS）长度 <code>6</code>。训练收敛后，取出同一个样本的三处注意力：</p>
+<ul>
+<li><strong>编码器自注意力</strong>（<code>5 × 5</code>）：每个源位置对全体源位置的关注。双向，没有掩码，通常比较分散，或对数值相同的 token 有偏好。</li>
+<li><strong>解码器自注意力</strong>（<code>6 × 6</code>）：每个目标位置对已生成前缀的关注。因果掩码把它严格压成<strong>下三角</strong>——右上角整片为 0。</li>
+<li><strong>交叉注意力</strong>（<code>6 × 5</code>，行=目标、列=源）：目标位置 <code>i</code> 要输出源序列倒数第 <code>i</code> 个 token，所以它必须关注源位置 <code>L−1−i</code>，权重于是沿<strong>反对角线</strong>排列。</li>
+</ul>
+<p><figure><img class="md-img" src="content/courses/attention-transformer/assets/chapter-6-figure-03.svg" alt="三种注意力热力图：编码器自注意力、解码器因果自注意力、交叉注意力的反对角线" loading="lazy" decoding="async"><figcaption>三种注意力热力图：编码器自注意力、解码器因果自注意力、交叉注意力的反对角线</figcaption></figure>
+</p>
+<h4 id="h-2-如何拿到注意力权重">2. 如何拿到注意力权重<a class="anchor" href="#h-2-如何拿到注意力权重" aria-label="本节链接">#</a></h4>
+<p><code>nn.MultiheadAttention</code> 的 forward 有个 <code>need_weights</code> 参数：</p>
+<ul>
+<li><code>need_weights=False</code>（默认）：只返回 <code>(attn_output)</code>，快、省内存。</li>
+<li><code>need_weights=True</code>：额外返回 <code>(attn_output, attn_output_weights)</code>，权重形状为 <code>(batch, tgt_len, src_len)</code>（默认对多头取平均）。</li>
+</ul>
+<p>想看<strong>每个头</strong>各自的注意力，再加 <code>average_attn_weights=False</code>，权重形状就变成 <code>(batch, n_heads, tgt_len, src_len)</code>。本课先用&quot;对头取平均&quot;的版本画整体，你可以自行改成逐头绘制。</p>
+<h4 id="h-3-注意力--解释重要提醒">3. 注意力 ≠ 解释（重要提醒）<a class="anchor" href="#h-3-注意力--解释重要提醒" aria-label="本节链接">#</a></h4>
+<p>热力图好看、也好讲，但要克制地读。多篇研究（如 Jain &amp; Wallace 的 <em>Attention is not Explanation</em>）指出：<strong>注意力权重高的位置，未必是模型做决策真正依赖的位置</strong>；扰动注意力有时并不改变输出。注意力更准确的定位是&quot;模型计算时关注了什么&quot;，而不是&quot;是什么原因导致了这个输出&quot;的因果结论。可视化它的价值在于<strong>调试与直觉</strong>，而不是充当严格的可解释性证明。</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>先搭一个会&quot;吐注意力&quot;的小模型：单层编码器 + 单层解码器，都基于 <code>nn.MultiheadAttention</code>，在 forward 里把三处权重一并返回。</p>
+<pre data-lang="python"><code class="language-python">import math
+import torch
+import torch.nn as nn
+
+torch.manual_seed(0)
+VOCAB, BOS, EOS = 12, 0, 1
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=100):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        pos = torch.arange(max_len).unsqueeze(1).float()
+        div = torch.exp(torch.arange(0, d_model, 2).float()
+                        * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+        self.register_buffer(&quot;pe&quot;, pe.unsqueeze(0))
+    def forward(self, x):
+        return x + self.pe[:, :x.size(1)]
+
+def ff(d_model):
+    return nn.Sequential(nn.Linear(d_model, 4 * d_model), nn.ReLU(),
+                         nn.Linear(4 * d_model, d_model))
+
+class EncLayer(nn.Module):
+    def __init__(self, d_model, n_heads):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
+        self.ff = ff(d_model)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+    def forward(self, x):
+        h = self.norm1(x)
+        a, w = self.attn(h, h, h, need_weights=True)   # 双向自注意力
+        x = x + a
+        return x + self.ff(self.norm2(x)), w
+
+class DecLayer(nn.Module):
+    def __init__(self, d_model, n_heads):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
+        self.cross_attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
+        self.ff = ff(d_model)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+    def forward(self, x, memory, tgt_mask):
+        h = self.norm1(x)
+        a1, w_self = self.self_attn(h, h, h, attn_mask=tgt_mask, need_weights=True)
+        x = x + a1
+        h = self.norm2(x)
+        a2, w_cross = self.cross_attn(h, memory, memory, need_weights=True)
+        x = x + a2
+        return x + self.ff(self.norm3(x)), w_self, w_cross
+
+class AttnReverser(nn.Module):
+    def __init__(self, vocab, d_model=16, n_heads=2):
+        super().__init__()
+        self.d_model = d_model
+        self.embed = nn.Embedding(vocab, d_model)
+        self.pos = PositionalEncoding(d_model)
+        self.encoder = EncLayer(d_model, n_heads)
+        self.decoder = DecLayer(d_model, n_heads)
+        self.proj = nn.Linear(d_model, vocab)
+    def forward(self, src, tgt, tgt_mask):
+        src_emb = self.pos(self.embed(src) * math.sqrt(self.d_model))
+        memory, w_enc = self.encoder(src_emb)
+        tgt_emb = self.pos(self.embed(tgt) * math.sqrt(self.d_model))
+        out, w_self, w_cross = self.decoder(tgt_emb, memory, tgt_mask)
+        return self.proj(out), w_enc, w_self, w_cross</code></pre>
+<p>训练这个小模型（数据与第 2 课完全相同）：</p>
+<pre data-lang="python"><code class="language-python">def make_batch(b, L):
+    src = torch.randint(2, VOCAB, (b, L))
+    rev = src.flip(1)
+    dec_in = torch.cat([torch.full((b, 1), BOS), rev], dim=1)
+    dec_out = torch.cat([rev, torch.full((b, 1), EOS)], dim=1)
+    return src, dec_in, dec_out
+
+model = AttnReverser(VOCAB)
+opt = torch.optim.Adam(model.parameters(), lr=2e-3)
+loss_fn = nn.CrossEntropyLoss()
+
+for epoch in range(1, 201):
+    src, dec_in, dec_out = make_batch(32, 5)
+    tgt_mask = nn.Transformer.generate_square_subsequent_mask(dec_in.size(1))
+    logits, *_ = model(src, dec_in, tgt_mask)
+    loss = loss_fn(logits.reshape(-1, VOCAB), dec_out.reshape(-1))
+    opt.zero_grad(); loss.backward(); opt.step()
+    if epoch % 50 == 0:
+        print(f&quot;epoch {epoch:&gt;3}  loss {loss.item():.4f}&quot;)</code></pre>
+<p>训练好后，取一条样本，把三处注意力权重抓出来画热力图：</p>
+<pre data-lang="python"><code class="language-python">import matplotlib.pyplot as plt
+
+model.eval()
+src = torch.randint(2, VOCAB, (1, 5))            # 源序列长度 5
+rev = src.flip(1)
+dec_in = torch.cat([torch.full((1, 1), BOS), rev], dim=1)
+tgt_mask = nn.Transformer.generate_square_subsequent_mask(dec_in.size(1))
+
+with torch.no_grad():
+    _, w_enc, w_self, w_cross = model(src, dec_in, tgt_mask)
+
+w_enc, w_self, w_cross = w_enc[0], w_self[0], w_cross[0]  # 去掉 batch 维
+print(&quot;三处权重形状:&quot;, w_enc.shape, w_self.shape, w_cross.shape)  # (5,5) (6,6) (6,5)
+
+fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
+im0 = axes[0].imshow(w_enc.numpy(), cmap=&quot;viridis&quot;, vmin=0, vmax=1)
+axes[0].set_title(&quot;编码器自注意力（双向）&quot;)
+axes[0].set_xlabel(&quot;源位置&quot;); axes[0].set_ylabel(&quot;源位置&quot;)
+
+im1 = axes[1].imshow(w_self.numpy(), cmap=&quot;viridis&quot;, vmin=0, vmax=1)
+axes[1].set_title(&quot;解码器自注意力（因果，下三角）&quot;)
+axes[1].set_xlabel(&quot;目标位置&quot;); axes[1].set_ylabel(&quot;目标位置&quot;)
+
+im2 = axes[2].imshow(w_cross.numpy(), cmap=&quot;viridis&quot;, vmin=0, vmax=1)
+axes[2].set_title(&quot;交叉注意力（反对角线）&quot;)
+axes[2].set_xlabel(&quot;源位置&quot;); axes[2].set_ylabel(&quot;目标位置&quot;)
+
+for ax, im in zip(axes, [im0, im1, im2]):
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+plt.tight_layout()
+plt.show()
+
+print(&quot;源序列:&quot;, src.tolist()[0])
+print(&quot;交叉注意力各行最关注的源位置:&quot;, w_cross.argmax(dim=-1).tolist())</code></pre>
+<p>看点：解码器自注意力严格下三角；交叉注意力里，目标位置 <code>i</code>（<code>i=0..4</code>）最关注的源位置应约等于 <code>4−i</code>，形成反对角线；最后一行（预测 <code>&lt;eos&gt;</code>）的关注则较为分散。想看每个头的行为，把 <code>need_weights=True</code> 改成 <code>need_weights=True, average_attn_weights=False</code>，权重会变成 <code>(batch, heads, t, s)</code>，再逐头画即可。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>分别打印 <code>w_cross</code> 每一行 argmax 得到的源位置，与理论反对角线 <code>[4,3,2,1,0,...]</code> 对比，解释一致或不一致的原因。</li>
+<li>改成 <code>average_attn_weights=False</code>，把 2 个头的交叉注意力各画一张，观察不同头是否学到了不同的对齐模式。</li>
+<li>换一个样本（或换一组随机种子），确认反对角线模式是否稳定出现；若某条样本失败，尝试分析原因。</li>
+<li>阅读 Jain &amp; Wallace 的《Attention is not Explanation》，用一段话总结&quot;注意力高≠重要&quot;的论据，并说明可视化注意力更适合用来做什么。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>The Illustrated Transformer（Jay Alammar）· 注意力可视化：<a href="https://jalammar.github.io/illustrated-transformer/" target="_blank" rel="noopener noreferrer">https://jalammar.github.io/illustrated-transformer/</a></li>
+<li>PyTorch 官方文档 · MultiheadAttention（need_weights 参数）：<a href="https://pytorch.org/docs/stable/generated/torch.nn.MultiheadAttention.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/docs/stable/generated/torch.nn.MultiheadAttention.html</a></li>
+<li>Jain &amp; Wallace《Attention is not Explanation》：<a href="https://arxiv.org/abs/1902.10186" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1902.10186</a></li>
+<li>论文《Attention Is All You Need》Figure 3~5（注意力可视化）：<a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1706.03762</a></li>
+</ul>
+<p>恭喜你完成《注意力与 Transformer》！</p>

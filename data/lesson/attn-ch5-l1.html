@@ -1,0 +1,117 @@
+<h2 id="h-掩码注意力">掩码注意力<a class="anchor" href="#h-掩码注意力" aria-label="本节链接">#</a></h2>
+<p>进入编解码器细节的第一课，我们要解决一个&quot;作弊&quot;问题。Transformer 的解码器在训练时是一次看到整条目标序列的，但它要完成的任务是<strong>逐个生成</strong>：预测下一个 token 时，只能依赖&quot;已经生成的部分&quot;，绝不能偷看未来。如果不加约束，位置 <code>t</code> 的自注意力会顺手把 <code>t+1</code>、<code>t+2</code> 的信息也平均进来，训练时看起来很好，一到推理就崩盘——因为推理时未来根本还不存在。<strong>掩码注意力（masked attention）</strong>就是用一张&quot;禁止未来&quot;的掩码矩阵，把这种偷看堵死。这一课先讲清掩码的动机与结构，再讲它在代码里怎么实现，最后区分一下它和&quot;padding 掩码&quot;这两个容易混淆的概念。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-解码器的任务天然是因果的">1. 解码器的任务天然是&quot;因果&quot;的<a class="anchor" href="#h-1-解码器的任务天然是因果的" aria-label="本节链接">#</a></h4>
+<p>解码器的使命是自回归生成：已知 <code>y_1 ... y_{t-1}</code>，预测 <code>y_t</code>。这意味着位置 <code>t</code> 只能&quot;看见&quot;位置 <code>1</code> 到 <code>t</code>（含自己），不能看见 <code>t+1</code> 及以后。我们把这种&quot;只能看向过去、不能看向未来&quot;的约束叫做<strong>因果约束（causal constraint）</strong>，对应的掩码叫<strong>因果掩码</strong>，也叫<strong>前瞻掩码（look-ahead mask）</strong>。</p>
+<p>为什么训练时也要戴上这副&quot;眼罩&quot;？因为训练用的 <code>teacher forcing</code> 策略（第 3 课细讲）要求：喂进去的是真实的、但右移了一位的目标序列，模型预测的每一个位置，都应该恰好等于&quot;只凭历史能算出的那个答案&quot;。如果允许偷看未来，模型会学到一个在训练数据上完美、在真实生成时完全不存在的捷径。</p>
+<h4 id="h-2-掩码是怎么堵住的">2. 掩码是怎么&quot;堵&quot;住的<a class="anchor" href="#h-2-掩码是怎么堵住的" aria-label="本节链接">#</a></h4>
+<p>回忆注意力分数的计算：</p>
+<pre><code>scores = Q @ K^T / sqrt(d_k)         # (T, T)
+weights = softmax(scores)            # 每行归一化为一个概率分布
+output  = weights @ V</code></pre>
+<p>要让位置 <code>t</code> 完全不关注位置 <code>j &gt; t</code>，最直接的办法是：把 <code>scores[t][j]</code> 设成负无穷。经过 <code>softmax</code> 后，<code>exp(-inf) = 0</code>，对应权重变成精确的 0。于是整张掩码矩阵长这样：</p>
+<pre><code>        j=0  j=1  j=2  j=3
+  i=0 [  0, -inf, -inf, -inf ]
+  i=1 [  0,   0,  -inf, -inf ]
+  i=2 [  0,   0,   0,   -inf ]
+  i=3 [  0,   0,   0,    0  ]</code></pre>
+<p>这是一个<strong>下三角矩阵</strong>：对角线及以下为 0（允许关注），以上为 −inf（禁止）。把这张掩码逐元素加到 <code>scores</code> 上，再 <code>softmax</code>，就得到每行和仍为 1、但上半区全为 0 的注意力权重矩阵。</p>
+<p><figure><img class="md-img" src="content/courses/attention-transformer/assets/chapter-5-figure-01.svg" alt="因果掩码矩阵与掩码后的注意力权重：下三角保留、上三角置零" loading="lazy" decoding="async"><figcaption>因果掩码矩阵与掩码后的注意力权重：下三角保留、上三角置零</figcaption></figure>
+</p>
+<h4 id="h-3-编码器为什么不需要因果掩码">3. 编码器为什么不需要因果掩码<a class="anchor" href="#h-3-编码器为什么不需要因果掩码" aria-label="本节链接">#</a></h4>
+<p>对比一下编码器和解码器的自注意力：</p>
+<ul>
+<li><strong>编码器自注意力</strong>是<strong>双向</strong>的：翻译时，理解源句子里的一个词，完全可以参考它前面和后面的词（&quot;bank&quot; 是&quot;银行&quot;还是&quot;河岸&quot;，要看上下文）。所以编码器<strong>不加</strong>因果掩码，只可能加 padding 掩码。</li>
+<li><strong>解码器自注意力</strong>是<strong>单向（因果）</strong>的：只能看过去。它必须加因果掩码。</li>
+</ul>
+<p>注意，这两者都在<strong>解码器内部</strong>吗？不是——编码器里只有&quot;编码器自注意力&quot;，解码器里先有&quot;解码器自注意力（因果）&quot;，之后还有一层&quot;交叉注意力&quot;（第 2 课）。交叉注意力要看的是编码器的输出，那里不存在&quot;未来偷看&quot;的问题，所以它也不需要因果掩码。</p>
+<h4 id="h-4-因果掩码-vs-padding-掩码">4. 因果掩码 vs padding 掩码<a class="anchor" href="#h-4-因果掩码-vs-padding-掩码" aria-label="本节链接">#</a></h4>
+<p>这是最容易混的两个概念，务必分清：</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>因果掩码（causal / look-ahead mask）</th>
+<th>padding 掩码（padding mask）</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>目的</td>
+<td>禁止看未来位置</td>
+<td>禁止看填充位 <code>&lt;pad&gt;</code></td>
+</tr>
+<tr>
+<td>形状</td>
+<td><code>(T, T)</code> 方阵，按位置关系决定</td>
+<td>通常是 <code>(batch, T)</code> 的布尔序列</td>
+</tr>
+<tr>
+<td>填充值</td>
+<td>上三角 −inf</td>
+<td>被 pad 的位置 −inf</td>
+</tr>
+<tr>
+<td>用在哪</td>
+<td>解码器自注意力</td>
+<td>编码器和解码器都可能用（可变长序列）</td>
+</tr>
+</tbody></table>
+<p>一句话总结：<strong>因果掩码是&quot;顺序约束&quot;，padding 掩码是&quot;长度约束&quot;</strong>。两者经常同时出现：一个变长 batch 的解码器，既要按位置屏蔽未来，又要按内容屏蔽 pad。</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>先用最原始的方式手工构造因果掩码，看它如何把 softmax 的未来权重压成 0。</p>
+<pre data-lang="python"><code class="language-python">import torch
+import torch.nn.functional as F
+
+def causal_mask(seq_len):
+    &quot;&quot;&quot;返回 (seq_len, seq_len) 的因果掩码：下三角为 0，上三角为 -inf&quot;&quot;&quot;
+    # torch.triu 取上三角，diagonal=1 表示不含主对角线
+    return torch.triu(torch.full((seq_len, seq_len), float(&quot;-inf&quot;)), diagonal=1)
+
+T = 5
+mask = causal_mask(T)
+print(&quot;因果掩码矩阵:\n&quot;, mask)
+
+# 模拟一组随机的 Q、K，计算注意力权重
+d = 4
+Q = torch.randn(T, d)
+K = torch.randn(T, d)
+scores = Q @ K.T / (d ** 0.5)
+
+weights_masked = F.softmax(scores + mask, dim=-1)   # 关键：把掩码加到分数上
+print(&quot;掩码后的注意力权重（每行和=1，上三角=0）:\n&quot;, weights_masked)
+print(&quot;每行权重之和:&quot;, weights_masked.sum(dim=-1))   # 全为 1
+
+# 验证未来位置确实被屏蔽：第 2 行只看 0,1,2 三个位置
+print(&quot;第2行对未来位置(3,4)的权重:&quot;, weights_masked[2, 3:].tolist())  # [0, 0]</code></pre>
+<p>运行后可以看到，<code>softmax</code> 把 −inf 位置压成了 0，每一行仍是一个合法的概率分布。这就是因果约束的全部机制。</p>
+<p>接着演示 padding 掩码，并说明两者如何叠加使用：</p>
+<pre data-lang="python"><code class="language-python">def padding_mask(lengths, max_len):
+    &quot;&quot;&quot;返回 (batch, max_len) 的布尔掩码：True 表示是 pad，需要屏蔽&quot;&quot;&quot;
+    batch = len(lengths)
+    idx = torch.arange(max_len).unsqueeze(0).expand(batch, max_len)
+    return idx &gt;= torch.tensor(lengths).unsqueeze(1)   # 超出真实长度的位置为 True
+
+lengths = [3, 5]          # 两条序列：真实长度分别是 3 和 5
+pad = padding_mask(lengths, max_len=5)
+print(&quot;padding 掩码（True 为 pad）:\n&quot;, pad)
+
+# 把 padding 掩码也转成可加到 scores 上的形式（示意）：
+# 对每个 pad 位置，把对应整行/整列的分数设为 -inf，即可让其不参与注意力
+scores = torch.randn(2, 5, 5)                        # (batch, T, T)
+scores_pad = scores.masked_fill(pad.unsqueeze(1), float(&quot;-inf&quot;))  # pad 作为 key 被屏蔽
+print(&quot;叠加 padding 后第 0 条序列第 0 行:&quot;, scores_pad[0, 0])       # 位置 3、4 为 -inf</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>把 <code>T</code> 改成 8，手算 <code>causal_mask</code> 第 5 行的非零元素个数，再与 <code>softmax</code> 后该行的非零权重个数对照，说明&quot;对角线及以下共 6 个&quot;的含义。</li>
+<li>构造一个 batch 中序列长度不等的例子，同时叠加因果掩码和 padding 掩码，检查最终注意力权重每一行的和是否仍为 1。若某一行全部被屏蔽会发生什么？如何避免？</li>
+<li>思考：为什么交叉注意力不需要因果掩码？如果强行给交叉注意力也加上因果掩码，会对一个&quot;翻译&quot;任务造成什么后果？</li>
+<li>查阅 <code>torch.nn.Transformer</code> 的 <code>generate_square_subsequent_mask</code> 函数，用它生成一张 5×5 的掩码，验证它与本课手写的 <code>causal_mask</code> 完全一致。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>论文《Attention Is All You Need》3.2.3 节（Masking）：<a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1706.03762</a></li>
+<li>The Illustrated Transformer（Jay Alammar）· Masked Self-Attention：<a href="https://jalammar.github.io/illustrated-transformer/" target="_blank" rel="noopener noreferrer">https://jalammar.github.io/illustrated-transformer/</a></li>
+<li>PyTorch 官方文档 · generate_square_subsequent_mask：<a href="https://pytorch.org/docs/stable/generated/torch.nn.Transformer.generate_square_subsequent_mask.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/docs/stable/generated/torch.nn.Transformer.generate_square_subsequent_mask.html</a></li>
+<li>The Annotated Transformer（Harvard NLP）· subsequent mask 实现：<a href="https://nlp.seas.harvard.edu/annotated-transformer/" target="_blank" rel="noopener noreferrer">https://nlp.seas.harvard.edu/annotated-transformer/</a></li>
+</ul>
+<p><a href="#/l/attn-ch5-l2">下一课：交叉注意力</a></p>

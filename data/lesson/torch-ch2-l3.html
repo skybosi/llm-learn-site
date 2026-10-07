@@ -1,0 +1,91 @@
+<h2 id="h-计算图">计算图<a class="anchor" href="#h-计算图" aria-label="本节链接">#</a></h2>
+<p>前两课我们反复提到&quot;计算图&quot;，却一直把它当黑盒。本课揭开它：计算图由什么组成、<code>grad_fn</code> 是什么、为什么它是<strong>动态</strong>的，以及 PyTorch 如何靠它做到&quot;边前向边建图、反向完就释放&quot;。理解计算图，是理解 PyTorch 自动微分实现机制的最后一块拼图。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-计算图长什么样">1. 计算图长什么样<a class="anchor" href="#h-1-计算图长什么样" aria-label="本节链接">#</a></h4>
+<p>计算图是一个<strong>有向无环图（DAG）</strong>：</p>
+<ul>
+<li><strong>节点</strong>：张量（数据），以及产生张量的算子信息。</li>
+<li><strong>边</strong>：数据从输入流向输出的依赖关系。前向时数据正向流动，反向时梯度逆着边流动。</li>
+</ul>
+<p>例如 <code>z = x * y + y ** 2</code> 会形成一张小图：叶子 <code>x</code>、<code>y</code> → <code>mul</code> 与 <code>pow</code> → <code>add</code> → 结果 <code>z</code>。图 2-3 画出了这张图及反向时梯度沿边的传播。</p>
+<p><figure><img class="md-img" src="content/courses/pytorch-fundamentals/assets/chapter-2-figure-03.svg" alt="z = x*y + y^2 的计算图：前向与反向传播" loading="lazy" decoding="async"><figcaption>z = x*y + y^2 的计算图：前向与反向传播</figcaption></figure>
+</p>
+<h4 id="h-2-grad_fn每个节点的来历">2. grad_fn：每个节点的&quot;来历&quot;<a class="anchor" href="#h-2-grad_fn每个节点的来历" aria-label="本节链接">#</a></h4>
+<p>每个由运算产生的张量都带一个 <code>grad_fn</code>，指向产生它的那个<strong>算子（Function）</strong>，例如：</p>
+<ul>
+<li>加法 → <code>&lt;AddBackward0&gt;</code></li>
+<li>乘法 → <code>&lt;MulBackward0&gt;</code></li>
+<li>幂运算 → <code>&lt;PowBackward0&gt;</code></li>
+</ul>
+<p><code>grad_fn</code> 里封装了该算子的反向逻辑（局部导数）。<code>backward()</code> 时，PyTorch 沿着每个节点记录的 <code>grad_fn</code> 一路往回调用，正是链式法则的落地。<strong>叶子张量没有 <code>grad_fn</code>（为 <code>None</code>）</strong>，因为它们不是&quot;算&quot;出来的，而是用户给的。</p>
+<h4 id="h-3-动态图-vs-静态图">3. 动态图 vs 静态图<a class="anchor" href="#h-3-动态图-vs-静态图" aria-label="本节链接">#</a></h4>
+<p>PyTorch 用的是<strong>动态计算图（define-by-run）</strong>：</p>
+<ul>
+<li>图<strong>随前向代码的执行逐步构建</strong>，你写多少层、走哪个分支，图就是什么样；</li>
+<li>同一段代码跑两次前向，会得到两张<strong>全新的</strong>图；</li>
+<li>因此网络里可以自由使用 Python 的 <code>if</code>、<code>for</code>，模型结构可以是&quot;数据相关的&quot;。</li>
+</ul>
+<p>对照之下，TensorFlow 1.x 的静态图是&quot;先定义整张图，再喂数据执行&quot;，控制流需要专门的算子表达。动态图的好处是<strong>直观、易调试</strong>，代价是每次前向都要重建图（有少量开销，PyTorch 已通过缓存和 <code>torch.compile</code> 等手段优化）。</p>
+<h4 id="h-4-图的生与死">4. 图的生与死<a class="anchor" href="#h-4-图的生与死" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>构建</strong>：只要运算涉及 <code>requires_grad=True</code> 的张量，结果就会记录 <code>grad_fn</code>，边就被连上。</li>
+<li><strong>释放</strong>：<code>backward()</code> 跑完后，中间节点的图信息默认被释放以回收显存；之后再次 <code>backward()</code> 就会报错（除非 <code>retain_graph=True</code>）。</li>
+<li><strong>不建图</strong>：<code>no_grad()</code> 内、或对 <code>requires_grad=False</code> 的张量运算，不产生 <code>grad_fn</code>。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<pre data-lang="python"><code class="language-python">import torch
+
+# ---- 1. 观察 grad_fn：每个节点的&quot;来历&quot; ----
+x = torch.tensor(1.0, requires_grad=True)
+y = torch.tensor(2.0, requires_grad=True)
+
+z = x * y + y ** 2                    # 一张小计算图
+print(&quot;z        =&quot;, z)
+print(&quot;z.grad_fn =&quot;, z.grad_fn)       # &lt;AddBackward0&gt;
+
+# 拆开看中间节点
+mul = x * y
+pow_ = y ** 2
+print(&quot;\nmul.grad_fn =&quot;, mul.grad_fn)   # &lt;MulBackward0&gt;
+print(&quot;pow_.grad_fn =&quot;, pow_.grad_fn)   # &lt;PowBackward0&gt;
+print(&quot;x.grad_fn   =&quot;, x.grad_fn)       # None（叶子）
+
+# ---- 2. 反向：沿图传播 ----
+z.backward()
+# dz/dx = y = 2；dz/dy = x + 2y = 1 + 4 = 5
+print(&quot;\nx.grad =&quot;, x.grad)             # 2.0
+print(&quot;y.grad =&quot;, y.grad)               # 5.0
+
+# ---- 3. 动态图：控制流也能建图 ----
+def f(a):
+    if a &gt; 0:                           # 依赖数据的分支
+        return a ** 2
+    return -a
+
+a1 = torch.tensor(3.0, requires_grad=True)
+a2 = torch.tensor(-3.0, requires_grad=True)
+r1, r2 = f(a1), f(a2)                   # 两次前向走出不同分支
+r1.backward(); r2.backward()
+print(&quot;\n正数分支导数 a1.grad =&quot;, a1.grad)   # 6.0（d(a^2)/da = 2a）
+print(&quot;负数分支导数 a2.grad =&quot;, a2.grad)     # -1.0（d(-a)/da = -1）
+
+# ---- 4. no_grad 内不建图 ----
+with torch.no_grad():
+    q = x * y
+print(&quot;\nno_grad 内 q.grad_fn =&quot;, q.grad_fn)   # None</code></pre>
+<p>重点观察：<code>z.grad_fn</code> 是 <code>AddBackward0</code>，而叶子 <code>x.grad_fn</code> 是 <code>None</code>；带 <code>if</code> 的函数在动态图下可以正常反向，两次前向各走各的分支、各算各的导数。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>对 <code>z = x * y + y ** 2</code> 手工画出它的计算图：标出节点、边、每个节点的算子，以及反向时各边上的局部导数。</li>
+<li>创建 <code>a = torch.tensor(2.0, requires_grad=True)</code>，依次计算 <code>b = a * a</code>、<code>c = b + a</code>，打印 <code>b.grad_fn</code> 和 <code>c.grad_fn</code>，说明它们分别是什么算子、为什么不同。</li>
+<li>用带 <code>if</code>/<code>for</code> 的 Python 代码写一个前向函数，验证在动态图下可以正常反向并得到梯度，解释静态图为什么难以直接支持这种写法。</li>
+<li>连续调用两次 <code>z.backward()</code>（不设 <code>retain_graph</code>），观察报错信息；再改用 <code>retain_graph=True</code> 重跑，说明两者在&quot;图释放&quot;上的差异。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>PyTorch 官方文档 · Autograd 机制：<a href="https://pytorch.org/docs/stable/notes/autograd.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/docs/stable/notes/autograd.html</a></li>
+<li>PyTorch 官方文档 · torch.autograd.Function：<a href="https://pytorch.org/docs/stable/autograd.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/docs/stable/autograd.html</a></li>
+<li>PyTorch 官方教程 · Automatic Differentiation：<a href="https://pytorch.org/tutorials/beginner/basics/autogradqs_tutorial.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/tutorials/beginner/basics/autogradqs_tutorial.html</a></li>
+<li>PyTorch 官方博客 · 动态计算图（What is torch.nn really?）：<a href="https://pytorch.org/tutorials/beginner/nn_tutorial.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/tutorials/beginner/nn_tutorial.html</a></li>
+</ul>
+<p><a href="#/l/torch-ch3-l1">下一课：nn.Module</a></p>

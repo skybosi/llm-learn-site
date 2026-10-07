@@ -1,0 +1,350 @@
+<h2 id="h-relay--mlir--stablehlo三种路线的取舍">Relay / MLIR / StableHLO：三种路线的取舍<a class="anchor" href="#h-relay--mlir--stablehlo三种路线的取舍" aria-label="本节链接">#</a></h2>
+<p>同一段 <code>relu → softmax</code>，Relay、MLIR、StableHLO 都能写出来。表面差别在语法，真正的差别落在三份契约上：<strong>类型系统要求写多细、算子集合是否封闭、跨版本是否承诺兼容</strong>。选错路线的代价不会在&quot;能不能表示&quot;上暴露，而是在&quot;换个后端要重写多少&quot;和&quot;半年后升级框架还能不能读&quot;上暴露。本课把三种写法塞进同一个验证器，把取舍做成可执行的对比。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-relay为图优化设计的高层-ir">1. Relay：为图优化设计的高层 IR<a class="anchor" href="#h-1-relay为图优化设计的高层-ir" aria-label="本节链接">#</a></h4>
+<p>Relay 是 TVM 的高层图 IR（MAPL&#39;18 论文题目就叫 <em>Relay: A New IR for Machine Learning Frameworks</em>）：<strong>函数式、静态类型、支持 let-binding 与代数数据类型（ADT）</strong>，能表达控制流与复合结构。它的职责很明确：承接前端图、做图级优化（常量折叠、死代码消除、算子融合）与<strong>算子分解</strong>，把高层算子拆成可调度的原语；再交给 TensorIR 做分块、绑定线程与代码生成。TVM 的 OSDI&#39;18 论文把这条分层讲成&quot;图级 + 算子级两层优化&quot;，配一个学习型代价模型自动搜索低层实现。取舍很清楚：<strong>算子集由 TVM 本体定义，扩展要改编译器</strong>；好处是分解出的原语一定是后端能调的。</p>
+<h4 id="h-2-mlir不是一门-ir而是造-ir-的框架">2. MLIR：不是一门 IR，而是造 IR 的框架<a class="anchor" href="#h-2-mlir不是一门-ir而是造-ir-的框架" aria-label="本节链接">#</a></h4>
+<p>MLIR 里的一等抽象是 <strong>operation</strong>：它自带名字、操作数、结果、属性，还能挂 <strong>region</strong>（region 里有 block，block 里有 operation），于是同一套基础设施可以描述从高层张量到循环、到硬件指令的所有层级。命名空间由 <strong>dialect</strong> 提供，一个 dialect 里的 op 名形如 <code>myml.relu</code>；<strong>渐进 lowering</strong> 就是指&quot;这一层先降到下一层，剩下的留着&quot;。它的 pass 契约同样硬：一个 pass 只锚定到某个 operation，<strong>不得读兄弟 operation、不得改它之外的状态、不得跨调用保存可变数据</strong>——为了让 pass 能并行跑在成千上万个函数上。代价是：MLIR 自己不承诺长期兼容（其文档有专门的 Deprecations &amp; Current Refactoring 页），每个 dialect 各自演进；<strong>你能扩，但也得自己负责稳定</strong>。</p>
+<h4 id="h-3-stablehlo用封闭算子集换可移植性">3. StableHLO：用封闭算子集换可移植性<a class="anchor" href="#h-3-stablehlo用封闭算子集换可移植性" aria-label="本节链接">#</a></h4>
+<p>StableHLO 的定位写在规范第一句里：它是 ML 框架与 ML 编译器之间的<strong>可移植层（portability layer）</strong>——产出 StableHLO 的框架与消费它的编译器（规范点名 XLA、IREE）互不需要知道对方内部结构。做法是三条硬规矩：<strong>算子集封闭</strong>（不可能随便加 op）、<strong>高层算子必须留下可分解定义</strong>（<code>composite</code> 带一个 <code>decomposition</code> 字段），必要时才用 <code>custom_call</code> 逃逸；换来的则是：类型里可以写动态维（<code>tensor&lt;?x3xf32&gt;</code>）与量化类型，以及一份带版本日志的规范与&quot;向后兼容&quot;的自我定位。</p>
+<p>这里有个容易被忽略的事实：<strong>StableHLO 的算子集里根本没有 <code>relu</code> 和 <code>softmax</code></strong>——relu 要写成 <code>maximum(x, 0)</code>，softmax 只能登记成 <code>stablehlo.composite</code>（带 <code>decomposition</code> 字段，语义上可被分解替换）或者直接写分解。代码第 2 段把这条规矩算成数字：一个 composite softmax 展开成 7 条封闭算子（<code>reduce</code> 求 max → <code>broadcast_in_dim</code> → <code>subtract</code> → <code>exponential</code> → <code>reduce</code> 求和 → <code>broadcast_in_dim</code> → <code>divide</code>），与原 composite 的逐元素差是 <strong>0.00e+00</strong>；而另一个&quot;省掉 max 平移&quot;的分解同样全在算子集内，输入整体加 100 后直接给出 <code>nan</code>。结论很直接：<strong>封闭算子集不限制表达能力，但每个高层算子都必须留下数值等价的分解定义</strong>。</p>
+<h4 id="h-4-三条路线怎么选">4. 三条路线怎么选<a class="anchor" href="#h-4-三条路线怎么选" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>Relay</th>
+<th>MLIR</th>
+<th>StableHLO</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>扩展方式</td>
+<td>加算子要改 TVM 本体</td>
+<td>新 dialect 即可，命名空间隔离</td>
+<td>不允许加算子（走 composite / custom_call）</td>
+</tr>
+<tr>
+<td>兼容承诺</td>
+<td>随 TVM 版本演进</td>
+<td>项目明确不承诺稳定，dialect 自管</td>
+<td>封闭算子集 + 版本日志，主打向后兼容</td>
+</tr>
+<tr>
+<td>动态 shape</td>
+<td>支持符号维</td>
+<td>由各 dialect 自己定义</td>
+<td><code>?</code> 直接写进类型</td>
+</tr>
+<tr>
+<td>layout 在哪</td>
+<td>后端 pass 决定</td>
+<td><code>memref</code> 的 affine map 表达</td>
+<td>不进类型</td>
+</tr>
+<tr>
+<td>典型消费者</td>
+<td>TVM 自己的调度与 codegen</td>
+<td>IREE、各厂商后端、Triton 生态</td>
+<td>XLA、JAX / TF / PyTorch 的导出路径</td>
+</tr>
+</tbody></table>
+<p>判据可以浓缩成一句：<strong>要&quot;我能加东西&quot;就选 MLIR；要&quot;别人能稳定读我的东西&quot;就选 StableHLO；要&quot;图优化和调度一把抓&quot;就用 Relay 这类自带后端的图 IR</strong>。三者在真实系统里常常串联：框架导出 StableHLO → 编译器内部用 MLIR 多级 dialect 做 lowering → 算子级交给 TVM/Triton 风格的调度与代码生成。</p>
+<p><figure><img class="md-img" src="content/courses/ml-compilers/assets/chapter-3-figure-03.svg" alt="三条 IR 路线的选型判据：Relay 图优化与调度一把抓、MLIR 便于扩展、StableHLO 主打可移植" loading="lazy" decoding="async"><figcaption>三条 IR 路线的选型判据：Relay 图优化与调度一把抓、MLIR 便于扩展、StableHLO 主打可移植</figcaption></figure>
+</p>
+<h4 id="h-5-常见坑">5. 常见坑<a class="anchor" href="#h-5-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>把 StableHLO 当&quot;又一个方言&quot;</strong>：它有序列化格式与兼容性测试的约束，随便改语义会砸掉整条生态链。</li>
+<li><strong>加 dialect 却不写 verifier</strong>：非法 IR 一路漂到后端才报错。</li>
+<li><strong>以为&quot;能表示&quot;等于&quot;能优化&quot;</strong>：自定义 op 没有 lowering 就会卡住；Relay 的算子在 <code>LegalizeOps</code> 之后才有可调度形态。</li>
+<li><strong>只在&quot;语法&quot;层面比较三种 IR</strong>：契约（类型、算子集、兼容承诺）才是迁移成本所在。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>纯 Python + numpy，本机 <code>python3.10</code> + <code>numpy 1.26.2</code> 实跑：一个 MLIR 风格通用算子形式的解析器、三个&quot;方言注册表&quot;、一个最小验证器（SSA 顺序 + 算子集/方言注册 + 显式类型），再加一个 numpy 解释器做数值对拍。</p>
+<pre data-lang="python"><code class="language-python"># ---- Relay / MLIR / StableHLO 三条路线：同一段程序过三个&quot;方言注册表&quot;（numpy + 纯 Python 实跑）----
+import re
+import numpy as np
+
+
+# ---------- 0. 一段 IR 文本的通用解析：只认 MLIR 风格的通用算子形式 ----------
+def split_types(s):
+    &quot;&quot;&quot;按顶层逗号切分类型列表，&lt;&gt; 内部的逗号不算分隔符。&quot;&quot;&quot;
+    out, depth, cur = [], 0, &#39;&#39;
+    for ch in s:
+        if ch == &#39;&lt;&#39;:
+            depth += 1
+        elif ch == &#39;&gt;&#39;:
+            depth -= 1
+        if ch == &#39;,&#39; and depth == 0:
+            out.append(cur.strip()); cur = &#39;&#39;
+        else:
+            cur += ch
+    return [x for x in [cur.strip()] + out if x]
+
+
+def parse_type(t):
+    &quot;&quot;&quot;tensor&lt;2x3xf32&gt; → (&#39;tensor&#39;, (2, 3), &#39;f32&#39;)；动态维写 ? → None。&quot;&quot;&quot;
+    m = re.fullmatch(r&#39;tensor&lt;([0-9x?]+)x(\w+)&gt;&#39;, t.strip())
+    if not m:
+        raise ValueError(f&#39;看不懂的类型 {t!r}&#39;)
+    dims = tuple(None if d == &#39;?&#39; else int(d) for d in m.group(1).split(&#39;x&#39;))
+    return (&#39;tensor&#39;, dims, m.group(2))
+
+
+OP_RE = re.compile(r&#39;^(?:(\%\w+)\s*=\s*)?&quot;([\w.]+)&quot;\(([^)]*)\)&#39;
+                   r&#39;(?:\s*\{([^}]*)\})?\s*:\s*\(([^)]*)\)\s*-&gt;\s*\(([^)]*)\)$&#39;)
+
+
+def parse_ops(text):
+    ops = []
+    for raw in text.strip().splitlines():
+        line = raw.strip()
+        if not line or line.startswith(&#39;//&#39;):
+            continue
+        m = OP_RE.match(line)
+        if not m:
+            raise ValueError(f&#39;解析失败：{line}&#39;)
+        res, name, operand_s, attr_s, in_t, out_t = m.groups()
+        attrs = {}
+        for kv in [a.strip() for a in (attr_s or &#39;&#39;).split(&#39;,&#39;) if a.strip()]:
+            k, v = kv.split(&#39;=&#39;, 1)
+            attrs[k.strip()] = v.strip()
+        ops.append({&#39;result&#39;: res, &#39;op&#39;: name,
+                    &#39;operands&#39;: [o.strip() for o in operand_s.split(&#39;,&#39;) if o.strip()],
+                    &#39;attrs&#39;: attrs,
+                    &#39;in_types&#39;: [parse_type(t) for t in split_types(in_t)],
+                    &#39;out_types&#39;: [parse_type(t) for t in split_types(out_t)]})
+    return ops
+
+
+# ---------- 1. 三条路线的差异落在三处：类型契约 / 算子集合 / 兼容承诺 ----------
+REGISTRY = {
+    &#39;relay&#39;: dict(
+        label=&#39;relay（TVM 高层图 IR）&#39;, types_required=True,
+        opset={&#39;relay.nn.relu&#39;, &#39;relay.nn.softmax&#39;, &#39;relay.add&#39;, &#39;relay.multiply&#39;,
+               &#39;relay.nn.dense&#39;},
+        registered_dialects=set(), custom_ops=False,
+        promise=&#39;算子集由 TVM 本体维护，随版本演进&#39;),
+    &#39;mlir&#39;: dict(
+        label=&#39;mlir（多级可扩展 dialect）&#39;, types_required=True,
+        opset={&#39;myml.relu&#39;, &#39;myml.softmax&#39;, &#39;myml.matmul&#39;},
+        registered_dialects={&#39;myml&#39;}, custom_ops=True,
+        promise=&#39;不承诺跨版本稳定，dialect 各自演进&#39;),
+    &#39;stablehlo&#39;: dict(
+        label=&#39;stablehlo（可移植算子集）&#39;, types_required=True,
+        opset={&#39;stablehlo.constant&#39;, &#39;stablehlo.maximum&#39;, &#39;stablehlo.composite&#39;,
+               &#39;stablehlo.add&#39;, &#39;stablehlo.reduce&#39;, &#39;stablehlo.subtract&#39;,
+               &#39;stablehlo.exponential&#39;, &#39;stablehlo.divide&#39;,
+               &#39;stablehlo.broadcast_in_dim&#39;},
+        registered_dialects=set(), custom_ops=False,
+        promise=&#39;封闭算子集 + 版本日志，主打向后兼容&#39;),
+}
+
+# 同一条计算意图：relu → softmax，三种写法（注意 stablehlo 里没有 relu/softmax 这两个算子）
+PROGRAMS = {
+    &#39;relay&#39;: &#39;&#39;&#39;
+%0 = &quot;relay.nn.relu&quot;(%arg0) : (tensor&lt;2x3xf32&gt;) -&gt; (tensor&lt;2x3xf32&gt;)
+%1 = &quot;relay.nn.softmax&quot;(%0) {axis = 1 : i64} : (tensor&lt;2x3xf32&gt;) -&gt; (tensor&lt;2x3xf32&gt;)
+&#39;&#39;&#39;,
+    &#39;mlir&#39;: &#39;&#39;&#39;
+%0 = &quot;myml.relu&quot;(%arg0) : (tensor&lt;2x3xf32&gt;) -&gt; (tensor&lt;2x3xf32&gt;)
+%1 = &quot;myml.softmax&quot;(%0) {axis = 1 : i64} : (tensor&lt;2x3xf32&gt;) -&gt; (tensor&lt;2x3xf32&gt;)
+&#39;&#39;&#39;,
+    &#39;stablehlo&#39;: &#39;&#39;&#39;
+%c = &quot;stablehlo.constant&quot;() {value = 0.0} : () -&gt; (tensor&lt;2x3xf32&gt;)
+%0 = &quot;stablehlo.maximum&quot;(%arg0, %c) : (tensor&lt;2x3xf32&gt;, tensor&lt;2x3xf32&gt;) -&gt; (tensor&lt;2x3xf32&gt;)
+%1 = &quot;stablehlo.composite&quot;(%0) {name = mynamespace.softmax} : (tensor&lt;2x3xf32&gt;) -&gt; (tensor&lt;2x3xf32&gt;)
+&#39;&#39;&#39;,
+    # 一个想融进 attention 的自定义 op：三条路线的命运不同
+    &#39;custom&#39;: &#39;&#39;&#39;
+%0 = &quot;myml.fused_attention&quot;(%arg0) : (tensor&lt;2x3xf32&gt;) -&gt; (tensor&lt;2x3xf32&gt;)
+&#39;&#39;&#39;,
+}
+
+
+def verify(ops, dialect, defined=(&#39;%arg0&#39;,)):
+    &quot;&quot;&quot;最小验证器：SSA 定义先于使用 + 算子集合/方言注册 + 显式类型检查。&quot;&quot;&quot;
+    cfg = REGISTRY[dialect]
+    diags, known = [], set(defined)
+    for o in ops:
+        for operand in o[&#39;operands&#39;]:
+            if operand not in known:
+                diags.append(f&quot;{o[&#39;op&#39;]}: 使用了未定义的值 {operand}（SSA 顺序违规）&quot;)
+        if o[&#39;op&#39;] not in cfg[&#39;opset&#39;]:
+            prefix = o[&#39;op&#39;].split(&#39;.&#39;)[0]
+            if cfg[&#39;custom_ops&#39;] and prefix in cfg[&#39;registered_dialects&#39;]:
+                pass                       # 自定义 dialect 已注册 → 合法
+            else:
+                diags.append(f&quot;{o[&#39;op&#39;]}: 方言 {prefix} 未注册、不在算子集内&quot;)
+        if cfg[&#39;types_required&#39;] and not o[&#39;out_types&#39;]:
+            diags.append(f&quot;{o[&#39;op&#39;]}: 缺少显式结果类型&quot;)
+        if o[&#39;result&#39;]:
+            known.add(o[&#39;result&#39;])
+    return diags
+
+
+print(&#39;=== 1. 同一段程序过三个方言注册表 ===&#39;)
+for dialect in (&#39;relay&#39;, &#39;mlir&#39;, &#39;stablehlo&#39;):
+    cfg = REGISTRY[dialect]
+    print(f&quot;  --- {cfg[&#39;label&#39;]} ---&quot;)
+    for tag in (&#39;relay&#39;, &#39;mlir&#39;, &#39;stablehlo&#39;, &#39;custom&#39;):
+        ops = parse_ops(PROGRAMS[tag])
+        diags = verify(ops, dialect)
+        verdict = &#39;通过&#39; if not diags else &#39;拒绝：&#39; + &#39;；&#39;.join(diags)
+        print(f&#39;    {tag + &quot; 程序&quot;:&lt;14} {verdict}&#39;)
+    print(f&quot;    （兼容承诺：{cfg[&#39;promise&#39;]}）&quot;)
+print(f&quot;  stablehlo 注册表里有 relu / softmax 这种高层算子吗？ &quot;
+      f&quot;{&#39;stablehlo.relu&#39; in REGISTRY[&#39;stablehlo&#39;][&#39;opset&#39;] or &#39;stablehlo.softmax&#39; in REGISTRY[&#39;stablehlo&#39;][&#39;opset&#39;]}&quot;
+      &quot;（规范里确实没有：relu 要写成 maximum(x, 0)，softmax 只能靠 composite 或直接写分解）&quot;)
+
+# ---------- 2. StableHLO 的&quot;封闭算子集&quot;怎么容纳 softmax：composite 必须可分解 ----------
+SOFTMAX_DECOMP = &#39;&#39;&#39;
+%1 = &quot;stablehlo.reduce&quot;(%arg0) {kind = max, axis = 1} : (tensor&lt;2x3xf32&gt;) -&gt; (tensor&lt;2xf32&gt;)
+%2 = &quot;stablehlo.broadcast_in_dim&quot;(%1) {shape = 2x3} : (tensor&lt;2xf32&gt;) -&gt; (tensor&lt;2x3xf32&gt;)
+%3 = &quot;stablehlo.subtract&quot;(%arg0, %2) : (tensor&lt;2x3xf32&gt;, tensor&lt;2x3xf32&gt;) -&gt; (tensor&lt;2x3xf32&gt;)
+%4 = &quot;stablehlo.exponential&quot;(%3) : (tensor&lt;2x3xf32&gt;) -&gt; (tensor&lt;2x3xf32&gt;)
+%5 = &quot;stablehlo.reduce&quot;(%4) {kind = sum, axis = 1} : (tensor&lt;2x3xf32&gt;) -&gt; (tensor&lt;2xf32&gt;)
+%6 = &quot;stablehlo.broadcast_in_dim&quot;(%5) {shape = 2x3} : (tensor&lt;2xf32&gt;) -&gt; (tensor&lt;2x3xf32&gt;)
+%7 = &quot;stablehlo.divide&quot;(%4, %6) : (tensor&lt;2x3xf32&gt;, tensor&lt;2x3xf32&gt;) -&gt; (tensor&lt;2x3xf32&gt;)
+&#39;&#39;&#39;
+
+print(&#39;\n=== 2. 一个 composite softmax 展开成 7 条封闭算子（数值对拍）===&#39;)
+decomp = parse_ops(SOFTMAX_DECOMP)
+diags = verify(decomp, &#39;stablehlo&#39;)
+print(f&#39;  分解后 {len(decomp)} 条算子，全部在算子集内：{&quot;是&quot; if not diags else diags}&#39;)
+
+
+def numpy_exec(ops, feeds):
+    env = dict(feeds)
+    for o in ops:
+        a = [env[i] for i in o[&#39;operands&#39;]]
+        attrs = o[&#39;attrs&#39;]
+        if o[&#39;op&#39;].endswith(&#39;composite&#39;):                       # composite 语义 = 它的分解
+            m = a[0].max(axis=1, keepdims=True)
+            e = np.exp(a[0] - m)
+            v = e / e.sum(axis=1, keepdims=True)
+        elif o[&#39;op&#39;].endswith(&#39;constant&#39;):
+            v = np.full(o[&#39;out_types&#39;][0][1], np.float32(attrs[&#39;value&#39;]))
+        elif o[&#39;op&#39;].endswith(&#39;maximum&#39;):
+            v = np.maximum(a[0], a[1])
+        elif o[&#39;op&#39;].endswith(&#39;subtract&#39;):
+            v = a[0] - a[1]
+        elif o[&#39;op&#39;].endswith(&#39;exponential&#39;):
+            v = np.exp(a[0])
+        elif o[&#39;op&#39;].endswith(&#39;divide&#39;):
+            v = a[0] / a[1]
+        elif o[&#39;op&#39;].endswith(&#39;reduce&#39;):
+            axis = int(attrs[&#39;axis&#39;].split(&#39;:&#39;)[0])
+            v = a[0].max(axis=axis) if attrs[&#39;kind&#39;] == &#39;max&#39; else a[0].sum(axis=axis)
+        elif o[&#39;op&#39;].endswith(&#39;broadcast_in_dim&#39;):
+            v = np.broadcast_to(a[0][:, None], tuple(int(d) for d in attrs[&#39;shape&#39;].split(&#39;x&#39;)))
+        else:
+            raise ValueError(f&quot;解释器不认 {o[&#39;op&#39;]}&quot;)
+        env[o[&#39;result&#39;]] = v
+    return env
+
+
+rng = np.random.default_rng(0)
+x = rng.standard_normal((2, 3)).astype(np.float32) * 3.0
+relu = np.maximum(x, np.float32(0))
+composite = parse_ops(PROGRAMS[&#39;stablehlo&#39;])
+y_comp = numpy_exec(composite, {&#39;%arg0&#39;: x})[&#39;%1&#39;]
+y_decomp = numpy_exec(decomp, {&#39;%arg0&#39;: relu})[&#39;%7&#39;]
+print(f&#39;  composite 版 shape={y_comp.shape} sum={y_comp.sum(axis=1)}&#39;)
+print(f&#39;  分解版     shape={y_decomp.shape} sum={y_decomp.sum(axis=1)}&#39;)
+print(f&#39;  两版最大绝对差 = {np.abs(y_comp - y_decomp).max():.2e}（同一套数值稳定写法 → 逐位相同）&#39;)
+
+# 反例：不加 max 平移的&quot;分解&quot;，量级一大就溢出 —— 分解必须与 composite 数值等价
+NAIVE_DECOMP = &#39;&#39;&#39;
+%1 = &quot;stablehlo.exponential&quot;(%arg0) : (tensor&lt;2x3xf32&gt;) -&gt; (tensor&lt;2x3xf32&gt;)
+%2 = &quot;stablehlo.reduce&quot;(%1) {kind = sum, axis = 1} : (tensor&lt;2x3xf32&gt;) -&gt; (tensor&lt;2xf32&gt;)
+%3 = &quot;stablehlo.broadcast_in_dim&quot;(%2) {shape = 2x3} : (tensor&lt;2xf32&gt;) -&gt; (tensor&lt;2x3xf32&gt;)
+%4 = &quot;stablehlo.divide&quot;(%1, %3) : (tensor&lt;2x3xf32&gt;, tensor&lt;2x3xf32&gt;) -&gt; (tensor&lt;2x3xf32&gt;)
+&#39;&#39;&#39;
+naive = parse_ops(NAIVE_DECOMP)
+print(f&#39;  同一算子集内换个分解（省掉 max 平移）：仍在算子集内 = {not verify(naive, &quot;stablehlo&quot;)}&#39;)
+relu_big = np.maximum((x + np.float32(100)).astype(np.float32), np.float32(0))   # 量级抬到 ~100
+y_stable = numpy_exec(decomp, {&#39;%arg0&#39;: relu_big})[&#39;%7&#39;]
+with np.errstate(over=&#39;ignore&#39;, invalid=&#39;ignore&#39;):   # 故意制造溢出：关掉 numpy 警告，下面显式统计
+    y_naive = numpy_exec(naive, {&#39;%arg0&#39;: relu_big})[&#39;%4&#39;]
+print(f&#39;  输入整体 +100 后：稳定版 sum={y_stable.sum(axis=1)}，朴素版 sum={y_naive.sum(axis=1)}&#39;)
+print(f&#39;  朴素版里 inf 个数 = {int(np.isinf(y_naive).sum())}，nan 个数 = {int(np.isnan(y_naive).sum())}&#39;
+      &#39;（exp(100) 约 2.7e43，超出 float32 上界 3.4e38）&#39;)
+print(&#39;  结论：封闭算子集不牺牲表达能力，但每个高层算子必须留下&quot;数值等价&quot;的分解定义&#39;)
+
+# ---------- 3. 布局/动态 shape 写在哪里：类型里的信息量对比 ----------
+print(&#39;\n=== 3. 类型里到底能写什么（三方言的类型层）===&#39;)
+rows = [
+    (&#39;shape&#39;, &#39;tensor&lt;2x3xf32&gt; 写死&#39;, &#39;tensor&lt;2x3xf32&gt; 写死&#39;, &#39;tensor&lt;?x3xf32&gt; 支持动态维&#39;),
+    (&#39;dtype&#39;, &#39;float32/float16/int8&#39;, &#39;任意 dialect 类型&#39;, &#39;含 f8/bf16/tf32/量化类型&#39;),
+    (&#39;layout&#39;, &#39;由后端 pass 决定&#39;, &#39;memref 用 affine map 表达&#39;, &#39;不进类型（spec 列为未来工作）&#39;),
+    (&#39;控制流&#39;, &#39;函数式 + ADT&#39;, &#39;region/block 任意嵌套&#39;, &#39;无跳转算子，用 while/if 表达&#39;),
+    (&#39;自定义 op&#39;, &#39;有限，需改编译器&#39;, &#39;一等公民（dialect 隔离）&#39;, &#39;不允许，必须走 composite&#39;),
+]
+for name, a, b, c in rows:
+    print(f&#39;  {name:&lt;7} | relay: {a} | mlir: {b} | stablehlo: {c}&#39;)
+print(&#39;  取舍一句话：可扩展性（MLIR）↔ 生态稳定性（StableHLO）↔ 图优化友好度（Relay）&#39;)</code></pre>
+<p>运行结果：</p>
+<pre data-lang="text"><code class="language-text">=== 1. 同一段程序过三个方言注册表 ===
+  --- relay（TVM 高层图 IR） ---
+    relay 程序       通过
+    mlir 程序        拒绝：myml.relu: 方言 myml 未注册、不在算子集内；myml.softmax: 方言 myml 未注册、不在算子集内
+    stablehlo 程序   拒绝：stablehlo.constant: 方言 stablehlo 未注册、不在算子集内；stablehlo.maximum: 方言 stablehlo 未注册、不在算子集内；stablehlo.composite: 方言 stablehlo 未注册、不在算子集内
+    custom 程序      拒绝：myml.fused_attention: 方言 myml 未注册、不在算子集内
+    （兼容承诺：算子集由 TVM 本体维护，随版本演进）
+  --- mlir（多级可扩展 dialect） ---
+    relay 程序       拒绝：relay.nn.relu: 方言 relay 未注册、不在算子集内；relay.nn.softmax: 方言 relay 未注册、不在算子集内
+    mlir 程序        通过
+    stablehlo 程序   拒绝：stablehlo.constant: 方言 stablehlo 未注册、不在算子集内；stablehlo.maximum: 方言 stablehlo 未注册、不在算子集内；stablehlo.composite: 方言 stablehlo 未注册、不在算子集内
+    custom 程序      通过
+    （兼容承诺：不承诺跨版本稳定，dialect 各自演进）
+  --- stablehlo（可移植算子集） ---
+    relay 程序       拒绝：relay.nn.relu: 方言 relay 未注册、不在算子集内；relay.nn.softmax: 方言 relay 未注册、不在算子集内
+    mlir 程序        拒绝：myml.relu: 方言 myml 未注册、不在算子集内；myml.softmax: 方言 myml 未注册、不在算子集内
+    stablehlo 程序   通过
+    custom 程序      拒绝：myml.fused_attention: 方言 myml 未注册、不在算子集内
+    （兼容承诺：封闭算子集 + 版本日志，主打向后兼容）
+  stablehlo 注册表里有 relu / softmax 这种高层算子吗？ False（规范里确实没有：relu 要写成 maximum(x, 0)，softmax 只能靠 composite 或直接写分解）
+
+=== 2. 一个 composite softmax 展开成 7 条封闭算子（数值对拍）===
+  分解后 7 条算子，全部在算子集内：是
+  composite 版 shape=(2, 3) sum=[1. 1.]
+  分解版     shape=(2, 3) sum=[1. 1.]
+  两版最大绝对差 = 0.00e+00（同一套数值稳定写法 → 逐位相同）
+  同一算子集内换个分解（省掉 max 平移）：仍在算子集内 = True
+  输入整体 +100 后：稳定版 sum=[1.0000001 1.       ]，朴素版 sum=[nan nan]
+  朴素版里 inf 个数 = 0，nan 个数 = 6（exp(100) 约 2.7e43，超出 float32 上界 3.4e38）
+  结论：封闭算子集不牺牲表达能力，但每个高层算子必须留下&quot;数值等价&quot;的分解定义
+
+=== 3. 类型里到底能写什么（三方言的类型层）===
+  shape   | relay: tensor&lt;2x3xf32&gt; 写死 | mlir: tensor&lt;2x3xf32&gt; 写死 | stablehlo: tensor&lt;?x3xf32&gt; 支持动态维
+  dtype   | relay: float32/float16/int8 | mlir: 任意 dialect 类型 | stablehlo: 含 f8/bf16/tf32/量化类型
+  layout  | relay: 由后端 pass 决定 | mlir: memref 用 affine map 表达 | stablehlo: 不进类型（spec 列为未来工作）
+  控制流     | relay: 函数式 + ADT | mlir: region/block 任意嵌套 | stablehlo: 无跳转算子，用 while/if 表达
+  自定义 op  | relay: 有限，需改编译器 | mlir: 一等公民（dialect 隔离） | stablehlo: 不允许，必须走 composite
+  取舍一句话：可扩展性（MLIR）↔ 生态稳定性（StableHLO）↔ 图优化友好度（Relay）</code></pre>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选，需自备或云上按需：三条路线的真实入口 ----
+# 1) MLIR：把文本 IR 交给 mlir-opt，看 pass pipeline 与验证器是怎么报错的
+#    mlir-opt prog.mlir -pass-pipeline=&#39;builtin.module(func.func(canonicalize,cse))&#39;
+# 2) PyTorch → 可移植表示：torch.export 产出的 ExportedProgram 是可再降级的图表示
+#    python -c &quot;import torch; ep=torch.export.export(torch.nn.ReLU(), (torch.randn(2,3),)); \
+#                print(ep.graph_module.print_readable(print_output=False)[:400])&quot;
+# 3) XLA / TVM：XLA 消费 HLO/StableHLO（打印 HLO 的调试开关见 torch_xla 与 JAX 文档）；
+#    TVM 侧 import tvm 后打印 IRModule（见 TVM 的 Design and Architecture 文档）。
+# 三个入口都不是必需项：上面的纯 Python 版已经把三份契约做成了可执行检查。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：给 <code>verify</code> 加一条<strong>类型一致性</strong>规则——每个算子的操作数类型必须与声明签名一致（提示：<code>stablehlo.add</code> 的两个操作数形状要么相同、要么符合广播规则）。用一段故意写错的 IR 验证你的检查能报出位置。</li>
+<li><strong>解释</strong>：为什么 StableHLO 允许 <code>?</code> 动态维、却把 layout 排除在类型之外？把这两件事和&quot;谁在什么时候知道这些信息&quot;联系起来回答。</li>
+<li><strong>对比/验证</strong>：把 <code>PROGRAMS[&#39;mlir&#39;]</code> 里的 <code>myml.softmax</code> 换成 <code>myml.custom_fused_softmax</code>，并把它注册进 mlir 注册表——三条路线里谁还能通过验证？由此说明&quot;方言注册&quot;与&quot;算子集封闭&quot;两种扩展代价的差别。</li>
+<li><strong>思考</strong>：如果让你为自研加速器设计 IR，你会选哪条路线做起点？给出三条具体理由，并指出你会<strong>放弃</strong>哪一项能力（可扩展性 / 兼容承诺 / 图优化便利性），以及这个放弃在未来什么情况下会变成事故。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Tianqi Chen 等, <em>TVM: An Automated End-to-End Optimizing Compiler for Deep Learning</em>（OSDI&#39;18；图级与算子级两层优化、学习型代价模型的原始设计）：<a href="https://www.usenix.org/conference/osdi18/presentation/chen" target="_blank" rel="noopener noreferrer">https://www.usenix.org/conference/osdi18/presentation/chen</a></li>
+<li>Jared Roesch 等, <em>Relay: A New IR for Machine Learning Frameworks</em>（MAPL 2018；Relay 的类型系统与&quot;为 ML 框架设计 IR&quot;的动机）：<a href="https://dl.acm.org/doi/10.1145/3211346.3211348" target="_blank" rel="noopener noreferrer">https://dl.acm.org/doi/10.1145/3211346.3211348</a></li>
+<li>MLIR, <em>Pass Infrastructure</em> 与 <em>Understanding the IR Structure</em>（operation/region/block 的嵌套结构、pass 只能锚定在 operation 子树上的硬约束）：<a href="https://mlir.llvm.org/docs/PassManagement/" target="_blank" rel="noopener noreferrer">https://mlir.llvm.org/docs/PassManagement/</a></li>
+<li>OpenXLA, <em>StableHLO Specification</em>（&quot;portability layer&quot;定位、封闭算子集、<code>composite</code> 的 <code>decomposition</code> 字段、动态维与量化类型）：<a href="https://github.com/openxla/stablehlo/blob/main/docs/spec.md" target="_blank" rel="noopener noreferrer">https://github.com/openxla/stablehlo/blob/main/docs/spec.md</a></li>
+<li>Mingzhen Li 等, <em>The Deep Learning Compiler: A Comprehensive Survey</em>（TPDS 2021；多级 IR 与前后端优化的系统综述）：<a href="https://arxiv.org/abs/2002.03794" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2002.03794</a></li>
+</ul>
+<p><a href="#/l/mlc-ch3-l3">下一课：pass 基础设施：如何写一个图级 pass</a></p>

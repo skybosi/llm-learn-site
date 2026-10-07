@@ -1,0 +1,99 @@
+<h2 id="h-flashattention">FlashAttention<a class="anchor" href="#h-flashattention" aria-label="本节链接">#</a></h2>
+<p>从这一章起进入<strong>推理优化进阶</strong>：不再靠&quot;加卡&quot;或&quot;切模型&quot;，而是从注意力计算本身挖性能。第一个要攻克的就是 <strong>FlashAttention</strong>。它没有改变注意力输出的数学结果，却把注意力算得又快又省显存，几乎成为所有现代推理/训练框架的标配。理解它，关键是理解一个反直觉的事实：<strong>很多时候瓶颈不是&quot;算不过来&quot;，而是&quot;读写得太多&quot;。</strong></p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-标准注意力的显存灾难">1. 标准注意力的显存灾难<a class="anchor" href="#h-1-标准注意力的显存灾难" aria-label="本节链接">#</a></h4>
+<p>自注意力的核心是：</p>
+<pre><code>S = Q @ K^T        # [N, N] 的注意力分数矩阵
+P = softmax(S)
+O = P @ V</code></pre>
+<p>其中 <code>N</code> 是序列长度。问题就出在 <code>S</code> 和 <code>P</code> 这两个 <code>[N, N]</code> 的中间矩阵上：它们必须被写进 GPU 的高带宽显存（HBM）再读回来。当 <code>N</code> 较大时——例如预填充阶段一次进来 8K 个 token——这两个矩阵就是 8000×8000，单精度约 256 MB 一个，而且每一层、每一个头都要一份。显存被这些<strong>转瞬即逝的中间结果</strong>占满，KV Cache 反而没地方放；同时读写的速度远慢于计算速度，GPU 大量时间在空等数据。</p>
+<h4 id="h-2-io-感知从省显存到省时间">2. IO 感知：从&quot;省显存&quot;到&quot;省时间&quot;<a class="anchor" href="#h-2-io-感知从省显存到省时间" aria-label="本节链接">#</a></h4>
+<p>FlashAttention 的核心思想是 <strong>IO-aware（输入输出感知）</strong>：既然瓶颈是 HBM 读写，那就<strong>减少读写次数</strong>。它的手段是把 Q、K、V 切成小块（tile），每次只把一小块从 HBM 搬到芯片上的快速 SRAM，在 SRAM 里完成该块的 softmax 和输出累加，再把结果写回。整次注意力过程中，<code>S</code> 和 <code>P</code> 的完整矩阵<strong>从未在 HBM 中出现过</strong>。</p>
+<p>这样做的收益有两层：显存占用从 <code>O(N²)</code> 降到 <code>O(N)</code>（只剩输出和统计量），读写次数也大幅下降，于是既省显存又提速。注意：<strong>结果在数值上等价</strong>（误差在浮点舍入级别），它只是改变了计算的组织方式。</p>
+<h4 id="h-3-在线-softmax分块也能算对">3. 在线 softmax：分块也能算对<a class="anchor" href="#h-3-在线-softmax分块也能算对" aria-label="本节链接">#</a></h4>
+<p>分块带来的难题是：softmax 的分母是整行的指数和，块还没读完时怎么算？FlashAttention 用了 <strong>online softmax（在线 softmax）</strong> 技巧——维护两个&quot;流式统计量&quot;：当前看到的最大值 <code>m</code> 和指数和 <code>l</code>。每来一个新块，先更新 <code>m</code>，再用新旧最大值的差值对已累加的结果做<strong>重新缩放</strong>，最后累加新块。这样只需一趟扫描就能得到正确的 softmax 加权和，不需要先把整行读完。这也是 FlashAttention 能在一次遍历内完成的关键。</p>
+<h4 id="h-4-从-v1-到-v2v3以及和-gqa-的配合">4. 从 v1 到 v2/v3，以及和 GQA 的配合<a class="anchor" href="#h-4-从-v1-到-v2v3以及和-gqa-的配合" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>FlashAttention-1</strong>（2022）：提出分块 + 在线 softmax 的 IO 感知框架；</li>
+<li><strong>FlashAttention-2</strong>（2023）：优化了 GPU 线程调度与工作划分，减少非矩阵乘法的开销，进一步逼近硬件峰值；</li>
+<li><strong>FlashAttention-3</strong>（2024）：针对 Hopper 架构（H100）的异步执行、TMA 等特性做深挖。</li>
+</ul>
+<p>对推理而言，FlashAttention 对<strong>预填充阶段</strong>（长序列、大 <code>N</code>）的加速最明显，显存省下来还能放更多 KV Cache 从而提升批大小。同时它与 MQA/GQA 正交：GQA 让 KV 头变少、KV Cache 变小，FlashAttention 让中间矩阵不落盘，两者叠加效果更好。</p>
+<p><figure><img class="md-img" src="content/courses/llm-inference-optimization/assets/chapter-6-figure-01.svg" alt="FlashAttention 分块计算示意：Q/K/V 切块在 SRAM 内完成 softmax，避免 [N,N] 矩阵写回 HBM" loading="lazy" decoding="async"><figcaption>FlashAttention 分块计算示意：Q/K/V 切块在 SRAM 内完成 softmax，避免 [N,N] 矩阵写回 HBM</figcaption></figure>
+</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<h4 id="h-示例-1朴素注意力-vs-分块在线-softmax注意力">示例 1：朴素注意力 vs 分块（在线 softmax）注意力<a class="anchor" href="#h-示例-1朴素注意力-vs-分块在线-softmax注意力" aria-label="本节链接">#</a></h4>
+<p>下面用 PyTorch 实现两种注意力，验证&quot;分块 + 在线 softmax&quot;与朴素版本数值一致，同时直观看到中间矩阵的尺寸差异。为贴近原理，这里不写 CUDA kernel，而是用 Python 模拟分块逻辑。</p>
+<pre data-lang="python"><code class="language-python">import torch
+import torch.nn.functional as F
+
+torch.manual_seed(0)
+
+def naive_attention(Q, K, V):
+    &quot;&quot;&quot;朴素版：显式构造 [N,N] 的分数矩阵，再 softmax 再乘 V。&quot;&quot;&quot;
+    S = Q @ K.transpose(-2, -1) / (Q.size(-1) ** 0.5)   # [N, N] 中间矩阵
+    P = F.softmax(S, dim=-1)                            # [N, N] 第二个中间矩阵
+    return P @ V
+
+def flash_attention_blocks(Q, K, V, block=2):
+    &quot;&quot;&quot;分块版：一次只处理 block 个 query，在线维护最大值与指数和。&quot;&quot;&quot;
+    N, d = Q.shape
+    scale = d ** -0.5
+    O = torch.zeros_like(Q)
+    # 逐块取 query（真实实现连 key/value 也分块，这里为清晰只分 query 一侧）
+    for i in range(0, N, block):
+        q = Q[i:i+block]                       # [block, d]
+        # 在线 softmax 的流式统计量
+        m = torch.full((q.shape[0], 1), float(&quot;-inf&quot;))
+        l = torch.zeros(q.shape[0], 1)
+        acc = torch.zeros(q.shape[0], d)
+        for j in range(0, N, block):
+            k = K[j:j+block]; v = V[j:j+block]
+            s = (q @ k.transpose(-2, -1)) * scale      # [block, block] 小块
+            m_new = torch.maximum(m, s.max(dim=-1, keepdim=True).values)
+            # 用新旧最大值的差重新缩放已累加结果，保证数值正确
+            acc = acc * torch.exp(m - m_new) + torch.exp(s - m_new) @ v
+            l = l * torch.exp(m - m_new) + torch.exp(s - m_new).sum(dim=-1, keepdim=True)
+            m = m_new
+        O[i:i+block] = acc / l
+    return O
+
+# 构造数据：N=6 个 token，d=4
+N, d = 6, 4
+Q = torch.randn(N, d); K = torch.randn(N, d); V = torch.randn(N, d)
+
+ref = naive_attention(Q, K, V)
+out = flash_attention_blocks(Q, K, V, block=2)
+
+print(&quot;两版最大误差:&quot;, (ref - out).abs().max().item())   # 接近 0，说明数学等价
+print(&quot;朴素版中间矩阵尺寸: [%d, %d]&quot; % (N, N))
+print(&quot;分块版单块分数矩阵尺寸: [2, 2]（无需 [%d,%d] 全矩阵）&quot; % (N, N))</code></pre>
+<p>输出里误差接近 0：分块 + 在线 softmax 与朴素版结果一致，却从不需要把 <code>[N, N]</code> 的完整矩阵搬到显存。</p>
+<h4 id="h-示例-2在-pytorch-里启用-flashattention">示例 2：在 PyTorch 里启用 FlashAttention<a class="anchor" href="#h-示例-2在-pytorch-里启用-flashattention" aria-label="本节链接">#</a></h4>
+<p>生产里直接用现成的 <code>scaled_dot_product_attention</code>，它会自动回退到可用的最快后端（含 FlashAttention）：</p>
+<pre data-lang="python"><code class="language-python">import torch
+import torch.nn.functional as F
+
+Q = torch.randn(2, 8, 128, 64, device=&quot;cuda&quot;)   # [batch, heads, seq, dim]
+K = torch.randn(2, 8, 128, 64, device=&quot;cuda&quot;)
+V = torch.randn(2, 8, 128, 64, device=&quot;cuda&quot;)
+
+# is_causal=True 触发因果掩码；底层自动选用 FlashAttention（若可用）
+out = F.scaled_dot_product_attention(Q, K, V, is_causal=True)
+print(out.shape)   # [2, 8, 128, 64]</code></pre>
+<p>推理框架层面，vLLM、TensorRT-LLM 都已内置 FlashAttention，你无需改代码；理解它只是为了能看懂性能瓶颈来自哪里。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>把示例 1 的 <code>N</code> 改大（如 256），对比朴素版与分块版的显存占用（估算 <code>[N,N]</code> 矩阵大小），说明 FlashAttention 在长序列预填充时省下的显存去哪了。</li>
+<li>在示例 1 中把 <code>block</code> 改成 1、3，验证结果仍一致；并思考 block 大小的取舍（太小则循环多、太大则 SRAM 放不下）。</li>
+<li>解释&quot;在线 softmax&quot;里 <code>m</code>、<code>l</code>、<code>acc</code> 三个量的含义，以及为什么要用 <code>exp(m - m_new)</code> 重新缩放而不是直接累加。</li>
+<li>分别测量朴素注意力与 <code>scaled_dot_product_attention</code> 在 <code>seq=2048/4096/8192</code> 时的耗时与显存，画出曲线，观察 FlashAttention 的优势在哪个区间最明显。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness：<a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2205.14135</a></li>
+<li>FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning：<a href="https://arxiv.org/abs/2307.08691" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2307.08691</a></li>
+<li>FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision：<a href="https://arxiv.org/abs/2407.08608" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2407.08608</a></li>
+<li>FlashAttention 官方实现（Dao-AILab）：<a href="https://github.com/Dao-AILab/flash-attention" target="_blank" rel="noopener noreferrer">https://github.com/Dao-AILab/flash-attention</a></li>
+</ul>
+<p><a href="#/l/inf-ch6-l2">下一课：投机解码</a></p>

@@ -1,0 +1,190 @@
+<h2 id="h-对照训练并行-vs-推理并行">对照：训练并行 vs 推理并行<a class="anchor" href="#h-对照训练并行-vs-推理并行" aria-label="本节链接">#</a></h2>
+<p>前两课把训练算清了。很多人接着就照搬：训练时 <code>TP=4、PP=2</code>，推理也照配一份——然后发现延迟不达标、并发上不去。原因是<strong>训练与推理优化的是两个不同的目标函数</strong>：训练要 tokens/秒/成本，可以容忍全局同步与秒级延迟；推理要 TTFT（time to first token，首 token 延迟）与 TPOT（time per output token，每 token 延迟），延迟本身就是 SLA。本课用同一套账本把两者的差异算成数字（只做并行与显存口径的对照，算子与引擎细节留给推理优化课）。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-状态不同大头从优化器状态换成-kv-cache">1. 状态不同：大头从优化器状态换成 KV cache<a class="anchor" href="#h-1-状态不同大头从优化器状态换成-kv-cache" aria-label="本节链接">#</a></h4>
+<p>训练每卡的大头是模型状态：混合精度 Adam 下 16 字节/参数，纯 DP 时 6.57B 模型要 98.0 GiB/卡。推理没有优化器状态、也没有梯度，但要多存 <strong>KV cache</strong>（注意力 Key/Value 的缓存）：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord text"><span class="mord">KV bytes</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">2</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mopen">(</span><span class="mord text"><span class="mord">K </span><span class="mord cjk_fallback">与</span><span class="mord"> V</span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal">L</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">kv</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">d</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">head</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal">s</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7778em;vertical-align:-0.0833em;"></span><span class="mord mathnormal">b</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord text"><span class="mord">dtype</span></span></span></span></span></span></p>
+<p>示例模型（32 层、hidden 4096、8 个 KV 头、head_dim 128、fp16）的单 token 单序列 KV 是 128 KiB。代进不同 batch 与序列长：序列 4096、batch 32 时 KV 16.00 GiB，而 fp16 权重只有 12.2 GiB；batch 128 时 KV 64.00 GiB、合计 76.2 GiB；序列拉到 32768、batch 128 就是 512.00 GiB。<strong>结论：推理的并发上限由 KV cache 决定，不是权重</strong>；训练里 batch 调大要找激活显存的上限，推理里要找 KV cache 的上限。</p>
+<h4 id="h-2-通信模式不同训练是少量大消息推理是海量小消息">2. 通信模式不同：训练是少量大消息，推理是海量小消息<a class="anchor" href="#h-2-通信模式不同训练是少量大消息推理是海量小消息" aria-label="本节链接">#</a></h4>
+<p>把通信折到&quot;每个 token&quot;同一把尺子上。训练：DP=64、弱扩展下每步梯度 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">3Ψ</span></span></span></span> 个 fp16 元素（39.4 GB）除以 1,048,576 token/步 = <strong>36.7 KiB/token</strong>。推理 decode：每层前向两次 AllReduce（Megatron-LM 的口径：MLP 一次、注意力输出一次），每次 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">b</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">h</span></span></span></span> 个元素——折下来 TP=2 是 <strong>512 KiB/token</strong>、TP=4 是 768、TP=8 是 896，<strong>是训练的 14~24 倍</strong>。</p>
+<p>这个数量级差决定了优化方向：训练的一次大 AllReduce 由 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0528em;">β</span></span></span></span>（带宽）主导，靠分桶与重叠能藏进反向计算里；推理的 128 次（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">2</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span></span></span></span>）小 AllReduce 由 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span>（固定延迟）主导，<strong>藏不掉</strong>——它串在关键路径上。所以第 1 课的 α-β 模型在训练里主要算带宽账，在推理里主要算延迟账。</p>
+<h4 id="h-3-分片对象不同切-kv而不是切权重">3. 分片对象不同：切 KV，而不是切权重<a class="anchor" href="#h-3-分片对象不同切-kv而不是切权重" aria-label="本节链接">#</a></h4>
+<p>训练分片（ZeRO/FSDP）切的是权重、梯度、优化器状态三件套；推理的权重通常<strong>复制</strong>（每层都要用全部权重，切了就要在关键路径上 AllGather），真正需要切的是 KV cache：按 KV 头切（GQA 天然支持，8 个头切 4 份每卡 2 个）或按 token 分页切（PagedAttention）。</p>
+<p>TP 在推理里的作用是降单流延迟（权重访存按 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1/</span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span></span></span></span> 下降），但每层的小集合通信随 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mop">lo<span style="margin-right:0.0139em;">g</span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span></span></span></span> 上升，于是存在<strong>最优点</strong>：示例模型单流从 TP=1 的 114 token/s 升到 TP=8 的 331 token/s，TP=16 反而回落到 321 token/s——省下的访存（0.55 ms）已经不够付通信（2.57 ms）。这就是推理 TP 一般不超过单节点内 8 路的原因。DP 副本不降单流延迟，只放大总吞吐。</p>
+<h4 id="h-4-算术强度不同decode-是访存瓶颈prefill-才是算力瓶颈">4. 算术强度不同：decode 是访存瓶颈，prefill 才是算力瓶颈<a class="anchor" href="#h-4-算术强度不同decode-是访存瓶颈prefill-才是算力瓶颈" aria-label="本节链接">#</a></h4>
+<p>batch=1 时每 token 要读 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">2Ψ</span></span></span></span> 字节权重（26.3 GB）、只做 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">2Ψ</span></span></span></span> FLOPs（13.1 GFLOP），算术强度 0.50 FLOP/byte，而示例硬件拐点约 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">990/3</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">300</span></span></span></span> FLOP/byte——差三个数量级，<strong>decode 必然是显存带宽瓶颈</strong>，这就是低精度权重（fp8/int4）对 decode 立竿见影的原因。</p>
+<p>而 prefill 阶段序列长、矩阵乘大，是算力密集、可批处理，引擎会把两者分开调度。<strong>把两者平均值当&quot;推理性能&quot;，是这类对照里最常见的错误。</strong></p>
+<h4 id="h-5-一张对照表">5. 一张对照表<a class="anchor" href="#h-5-一张对照表" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>训练并行</th>
+<th>推理并行</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>目标</td>
+<td>tokens/秒/成本，可容忍同步</td>
+<td>TTFT 与 TPOT，延迟即 SLA</td>
+</tr>
+<tr>
+<td>最大显存项</td>
+<td>优化器状态（16 B/参数）</td>
+<td>KV cache（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord">2</span><span class="mord mathnormal">L</span><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">kv</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord mathnormal">d</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">s</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">b</span></span></span></span> 字节）</td>
+</tr>
+<tr>
+<td>通信形态</td>
+<td>每步一次大 AllReduce（带宽主导）</td>
+<td>每 token 每层多次小 AllReduce（延迟主导）</td>
+</tr>
+<tr>
+<td>分片对象</td>
+<td>权重 / 梯度 / 优化器状态（ZeRO、FSDP）</td>
+<td>KV cache（按 KV 头或分页）；权重多复制</td>
+</tr>
+<tr>
+<td>TP 的作用</td>
+<td>装下模型 + 缩短单步</td>
+<td>降单流延迟，有 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mop">lo<span style="margin-right:0.0139em;">g</span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span></span></span></span> 上限</td>
+</tr>
+<tr>
+<td>DP 的作用</td>
+<td>提升吞吐（需同步梯度）</td>
+<td>副本提升总吞吐，不降延迟</td>
+</tr>
+<tr>
+<td>并行域</td>
+<td>TP/PP 均可能跨节点（PP 天然跨节点）</td>
+<td>TP 留在节点内，跨节点主要靠副本</td>
+</tr>
+</tbody></table>
+<p><figure><img class="md-img" src="content/courses/distributed-training-systems/assets/chapter-8-figure-04.svg" alt="训练并行与推理并行在五处上的选择差异" loading="lazy" decoding="async"><figcaption>训练并行与推理并行在五处上的选择差异</figcaption></figure>
+</p>
+<h4 id="h-6-常见坑">6. 常见坑<a class="anchor" href="#h-6-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>照搬训练的 TP/PP</strong>：训练为装下模型切 PP，推理却把 PP 用在延迟关键路径上，token 要穿过整条流水线。</li>
+<li><strong>用算力估推理延迟</strong>：decode 是访存瓶颈，换更快的卡不如换更宽的显存带宽、更窄的权重。</li>
+<li><strong>忽略长上下文的量级</strong>：KV 随 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span></span></span></span> 线性涨、注意力计算随 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span> 涨，与权重不是同一量级。</li>
+<li><strong>把两者平均值当&quot;推理性能&quot;</strong>：瓶颈完全不同。</li>
+<li><strong>忘记数值口径</strong>：训练看 loss 曲线，推理要逐 token 对齐 logits，换并行配置会改数值。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>一段纯 numpy/Python：算 KV cache 账本、把训练与推理的通信折到每个 token 对比、再算 decode 延迟随 TP 的变化曲线。所有硬件参数（3 TB/s 显存带宽、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">5</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">μ</span><span class="mord mathnormal">s</span></span></span></span>、200 GB/s 互连）都是示例量级，请换成你的卡。</p>
+<pre data-lang="python"><code class="language-python">import numpy as np
+# ===== 对照：训练并行 vs 推理并行的三笔账 =====
+L, H, NKV, DH = 32, 4096, 8, 128          # 示例模型：32 层、hidden 4096、8 个 KV 头、head_dim 128
+P = L * 12 * H**2 + 32000 * H
+DT = 2                                     # fp16/bf16 2 字节
+
+def kv_bytes(layers, n_kv, d_head, seq, batch, dtype=DT):
+    &quot;&quot;&quot;KV cache = 2（K 与 V）× 层数 × KV 头数 × head_dim × 序列长 × batch × 字节数。&quot;&quot;&quot;
+    return 2 * layers * n_kv * d_head * seq * batch * dtype
+
+print(f&quot;模型 ≈ {P/1e9:.2f} B&quot;)
+print(&quot;账本一 · 显存：训练的大头是优化器状态，推理的大头是 KV cache&quot;)
+print(f&quot;  单 token 单序列 KV = 2*{L}*{NKV}*{DH}*{DT} = {kv_bytes(L,NKV,DH,1,1)} B = {kv_bytes(L,NKV,DH,1,1)/1024:.0f} KiB&quot;)
+print(f&quot;  {&#39;序列长&#39;:&gt;6} {&#39;batch&#39;:&gt;6} {&#39;KV cache&#39;:&gt;10} {&#39;+ 权重(fp16)&#39;:&gt;12} {&#39;合计 GiB&#39;:&gt;9}&quot;)
+for s in (4096, 32768):
+    for b in (1, 32, 128):
+        kv = kv_bytes(L, NKV, DH, s, b)
+        tot = (kv + 2 * P) / 2**30
+        print(f&quot;  {s:&gt;6} {b:&gt;6} {kv/2**30:&gt;9.2f}G {2*P/2**30:&gt;11.1f}G {tot:&gt;9.1f}&quot;)
+print(f&quot;  对照训练：优化器状态按 16 B/参数 = {16*P/2**30:.1f} GiB/卡（纯 DP），是权重的 {16*P/(2*P):.0f} 倍&quot;)
+
+print(&quot;\n  用 numpy 模拟 GQA 的 KV 分片：8 个 KV 头切给 tp=4 个 rank（每 rank 2 个头）&quot;)
+rng = np.random.default_rng(1)
+KV = rng.standard_normal((L, NKV, 128, 64)).astype(np.float32)   # 32 层 × 8 头 × 128 × 64
+shards = np.array_split(KV, 4, axis=1)
+print(f&quot;  每 rank 持有 shape={shards[0].shape}（{shards[0].nbytes/2**20:.1f} MiB/序列，原为 {KV.nbytes/2**20:.1f} MiB）&quot;)
+print(f&quot;  按 KV 头拼接可无损还原：{np.array_equal(np.concatenate(shards, axis=1), KV)}&quot;)
+
+def training_bytes_per_token(P, tokens_step, stage=3, dtype=DT):
+    &quot;&quot;&quot;训练：一个优化器步的梯度通信总量（全组视野）÷ 该步 token 数。&quot;&quot;&quot;
+    return (2 if stage &lt; 3 else 3) * P * dtype / tokens_step
+
+def inference_bytes_per_token(L, h, tp, dtype=DT, batch=1):
+    &quot;&quot;&quot;推理 decode：每层前向 2 次 AllReduce（Megatron 的 g 与注意力输出各一次），每次 b*h 个元素。&quot;&quot;&quot;
+    return 2 * L * (2 * (tp - 1) / tp if tp &gt; 1 else 0.0) * h * batch * dtype
+
+print(&quot;\n账本二 · 通信：折到「每个 token」看，推理 decode 比训练高一个量级&quot;)
+toks = 4096 * 4 * 64
+t_tr = training_bytes_per_token(P, toks)
+print(f&quot;  训练：梯度 {3*P*DT/1e9:.1f} GB/步 ÷ {toks} token/步 = {t_tr/1024:.1f} KiB/token（DP=64、弱扩展）&quot;)
+for tp in (2, 4, 8):
+    i_inf = inference_bytes_per_token(L, H, tp)
+    print(f&quot;  推理 decode：TP={tp} → {i_inf/1024:.0f} KiB/token，是训练的 {i_inf/t_tr:.0f} 倍&quot;)
+
+print(&quot;\n账本三 · 延迟：decode 由显存带宽决定，TP 的收益到 alpha 项吃掉它为止&quot;)
+print(&quot;  模型口径：每层前向 2 次 AllReduce（Megatron-LM 的 g 与注意力输出各一次）、每次按树形 O(log P) 步计延迟&quot;)
+BW_B, ALPHA_US, BETA = 3.0e12, 5.0, 200.0      # 示例：3 TB/s 显存带宽、5us、200GB/s 互连
+kv_tok = kv_bytes(L, NKV, DH, 1, 1)
+print(f&quot;  {&#39;TP&#39;:&gt;3} {&#39;权重/卡 GB&#39;:&gt;10} {&#39;访存 ms&#39;:&gt;8} {&#39;通信 ms&#39;:&gt;8} {&#39;合计 ms&#39;:&gt;8} {&#39;单流 token/s&#39;:&gt;12}&quot;)
+for tp in (1, 2, 4, 8, 16):
+    w = 2 * P * DT / tp
+    t_mem = (w + kv_tok * 1) / BW_B * 1e3
+    comm_b = 2 * L * (2 * (tp - 1) / tp if tp &gt; 1 else 0.0) * H * DT
+    steps = 0 if tp == 1 else 2 * ((tp - 1).bit_length())   # 小消息走树形：每层 2 次 AllReduce，各 O(log P) 步
+    t_c = comm_b / (BETA * 1e9) * 1e3 + 2 * L * steps * ALPHA_US / 1e3
+    print(f&quot;  {tp:&gt;3} {w/1e9:&gt;10.2f} {t_mem:&gt;8.2f} {t_c:&gt;8.3f} {t_mem+t_c:&gt;8.2f} {1000/(t_mem+t_c):&gt;12.0f}&quot;)
+P_ = P
+print(f&quot;  算术强度：每 token 访存 {2*P_*DT/1e9:.1f} GB、计算 {2*P_/1e9:.1f} GFLOP（batch=1）&quot;
+      f&quot; → {(2*P_)/(2*P_*DT):.2f} FLOP/byte；示例硬件拐点 990e12/3e12 ≈ 300 FLOP/byte，差 3 个数量级&quot;)</code></pre>
+<p>在 Python 3.14.5 + numpy 2.5.3 环境下实际运行结果：</p>
+<pre data-lang="text"><code class="language-text">模型 ≈ 6.57 B
+账本一 · 显存：训练的大头是优化器状态，推理的大头是 KV cache
+  单 token 单序列 KV = 2*32*8*128*2 = 131072 B = 128 KiB
+     序列长  batch   KV cache   + 权重(fp16)    合计 GiB
+    4096      1      0.50G        12.2G      12.7
+    4096     32     16.00G        12.2G      28.2
+    4096    128     64.00G        12.2G      76.2
+   32768      1      4.00G        12.2G      16.2
+   32768     32    128.00G        12.2G     140.2
+   32768    128    512.00G        12.2G     524.2
+  对照训练：优化器状态按 16 B/参数 = 98.0 GiB/卡（纯 DP），是权重的 8 倍
+
+  用 numpy 模拟 GQA 的 KV 分片：8 个 KV 头切给 tp=4 个 rank（每 rank 2 个头）
+  每 rank 持有 shape=(32, 2, 128, 64)（2.0 MiB/序列，原为 8.0 MiB）
+  按 KV 头拼接可无损还原：True
+
+账本二 · 通信：折到「每个 token」看，推理 decode 比训练高一个量级
+  训练：梯度 39.4 GB/步 ÷ 1048576 token/步 = 36.7 KiB/token（DP=64、弱扩展）
+  推理 decode：TP=2 → 512 KiB/token，是训练的 14 倍
+  推理 decode：TP=4 → 768 KiB/token，是训练的 21 倍
+  推理 decode：TP=8 → 896 KiB/token，是训练的 24 倍
+
+账本三 · 延迟：decode 由显存带宽决定，TP 的收益到 alpha 项吃掉它为止
+  模型口径：每层前向 2 次 AllReduce（Megatron-LM 的 g 与注意力输出各一次）、每次按树形 O(log P) 步计延迟
+   TP    权重/卡 GB    访存 ms    通信 ms    合计 ms   单流 token/s
+    1      26.29     8.76    0.000     8.76          114
+    2      13.15     4.38    0.643     5.03          199
+    4       6.57     2.19    1.284     3.48          288
+    8       3.29     1.10    1.925     3.02          331
+   16       1.64     0.55    2.565     3.11          321
+  算术强度：每 token 访存 26.3 GB、计算 13.1 GFLOP（batch=1） → 0.50 FLOP/byte；示例硬件拐点 990e12/3e12 ≈ 300 FLOP/byte，差 3 个数量级</code></pre>
+<p>判读：<strong>账本一</strong>给出推理的真正显存墙——batch 128、序列 4096 时 KV cache 占 64.00 GiB，是权重的 5 倍；<strong>账本二</strong>把&quot;训练通信靠带宽、推理通信靠延迟&quot;量化成 14~24 倍差；<strong>账本三</strong>给出 TP 的最优点（示例在 TP=8），以及为什么 decode 是访存瓶颈（0.50 FLOP/byte ≪ 拐点 300 FLOP/byte）。</p>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选，需自备或云上按需 1~2 卡：把上面的示例参数换成实测值 ----
+# 1) 小消息延迟段才是推理的关键：-b 8 到 -e 1M 之间那一排才是 decode 的通信形态
+./nccl-tests/build/all_reduce_perf -b 8 -e 1M -f 4 -g 2
+# 2) 两卡张量并行跑一次 decode 基准：脚本里按 q/k/v/o 列并行切权重，
+#    打印每 token 的网络等待时间与总延迟（tokens/s = 1 / TPOT）
+torchrun --nproc_per_node=2 decode_bench.py
+# 3) 看 KV cache 增长与 SM 利用率：decode 阶段 SM 活跃度低、显存占用随并发线性涨
+nvidia-smi --query-gpu=memory.used,utilization.gpu --format=csv -l 1
+nvidia-smi dmon -s u -d 1 -c 60
+# 判读：显存随并发近似线性上涨的是 KV cache；SM 利用率不高但延迟下不去，就是访存瓶颈。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：把 <code>kv_bytes</code> 用于你自己的模型配置（层数、KV 头数、head_dim），算出在&quot;单卡 80 GiB、权重 fp16、留 10 GiB 给激活与框架&quot;时，序列 4096 下最大能跑多大 batch；再把 KV 换成 fp8 算一遍。</li>
+<li><strong>解释</strong>：为什么训练里&quot;分桶 + 重叠&quot;能把通信藏起来，推理 decode 里同样的小 AllReduce 却藏不掉？用&quot;关键路径长度&quot;与第 1 课的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span> 项回答。</li>
+<li><strong>对比/验证</strong>：把账本三的 <code>BETA</code> 从 200 GB/s 改成 25 GB/s（跨机不再 NVLink），重跑 TP 曲线，指出最优点移到哪里；解释为什么推理的 TP 通常不跨节点。</li>
+<li><strong>思考</strong>：同一个 6.57B 模型，训练用 DP=64、推理用 TP=8 + 8 个副本。请分别写出两者&quot;每 token 的通信字节&quot;的表达式，并说明为什么两者不能共用一套并行配置。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>M. Shoeybi et al., <em>Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism</em>（本课张量并行通信量的依据：每个 transformer 层前向只有两次 all-reduce、反向两次，以及注意力头按列切分与 MLP 的切法）：<a href="https://arxiv.org/abs/1909.08053" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1909.08053</a></li>
+<li>W. Kwon et al., <em>Efficient Memory Management for Large Language Model Serving with PagedAttention</em>（推理侧 KV cache 的分页管理与&quot;KV cache 每请求占用巨大且动态涨落、限制 batch size&quot;的一手论述，SOSP 2023）：<a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2309.06180</a></li>
+<li>S. Rajbhandari et al., <em>ZeRO: Memory Optimizations Toward Training Trillion Parameter Models</em>（训练侧状态账本：优化器状态是训练显存最大项、16 字节/参数的口径，与本课&quot;训练 vs 推理大头不同&quot;的对照）：<a href="https://arxiv.org/abs/1910.02054" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1910.02054</a></li>
+<li>PyTorch, <em>FullyShardedDataParallel (FSDP)</em> 文档（训练侧分片对象：参数、梯度、优化器状态跨 data-parallel rank 分片，对应 ZeRO-3 式切分；与推理侧&quot;权重复制 + KV 分片&quot;形成对照）：<a href="https://docs.pytorch.org/docs/stable/fsdp.html" target="_blank" rel="noopener noreferrer">https://docs.pytorch.org/docs/stable/fsdp.html</a></li>
+</ul>
+<p><a href="#/l/dts-ch8-l4">下一课：项目：给定模型与机器，产出并行方案 + 预算表并实测验证</a></p>

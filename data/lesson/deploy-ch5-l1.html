@@ -1,0 +1,168 @@
+<h2 id="h-量化对比实验">量化对比实验<a class="anchor" href="#h-量化对比实验" aria-label="本节链接">#</a></h2>
+<p>把模型从 FP16 压到 INT8 甚至 INT4，能显著省显存、提吞吐，但代价是可能掉精度。问题是：<strong>掉多少？值不值？</strong> 各家论文和 README 里的数字往往在&quot;自己最有利的设置&quot;下测得，未必符合你的场景。这一课教你<strong>自己设计一次公平的量化对比实验</strong>，用同一套硬件、同一批数据、同一组指标，把 FP16 / INT8 / INT4 放上擂台。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-量化到底是什么权衡">1. 量化到底是什么权衡<a class="anchor" href="#h-1-量化到底是什么权衡" aria-label="本节链接">#</a></h4>
+<p>回顾推理优化课的内容：量化的本质是把权重（有时还有激活值）从高精度（FP16，每参数 2 字节）映射到低精度，从而同时换来三样东西——<strong>更小的显存占用、更快的 decode（每 token 要读的权重字节变少，访存压力下降）、以及可能在有限显存里塞下更大的模型或更多 KV Cache</strong>。代价是数值精度损失，可能体现在困惑度（perplexity）上升或下游任务准确率下降。</p>
+<p>几种主流方案：</p>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>位宽</th>
+<th>特点</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>FP16（基线）</td>
+<td>16bit</td>
+<td>无量化，作对照</td>
+</tr>
+<tr>
+<td>FP8</td>
+<td>8bit</td>
+<td>需要较新 GPU（H100 等），权重+激活都量化，速度快</td>
+</tr>
+<tr>
+<td>INT8（如 bitsandbytes）</td>
+<td>8bit</td>
+<td>权重量化为主，精度损失小</td>
+</tr>
+<tr>
+<td>INT4（AWQ）</td>
+<td>4bit</td>
+<td>基于激活分布保护重要通道，速度好</td>
+</tr>
+<tr>
+<td>INT4（GPTQ）</td>
+<td>4bit</td>
+<td>逐层误差最小化，校准成本高但效果好</td>
+</tr>
+</tbody></table>
+<p>注意还有一类&quot;KV Cache 量化&quot;（如 FP8 KV Cache），它量化的是缓存而非权重，目的是<strong>省显存容纳更长上下文/更多并发</strong>，与权重量化是两码事，别混淆。</p>
+<h4 id="h-2-为什么要自己测而不是信-readme">2. 为什么要自己测，而不是信 README<a class="anchor" href="#h-2-为什么要自己测而不是信-readme" aria-label="本节链接">#</a></h4>
+<p>因为量化的精度损失<strong>高度依赖模型、任务和校准数据</strong>。同一个 AWQ INT4，在通用对话上可能几乎无损，在数学推理或代码生成上却可能明显退化。此外吞吐数字还受硬件（显存带宽、算力）和引擎实现影响。所以&quot;你的模型 + 你的任务 + 你的硬件&quot;这三者组合出的结论，只能由你自己的实验得出。</p>
+<h4 id="h-3-一次公平实验的四要素">3. 一次公平实验的四要素<a class="anchor" href="#h-3-一次公平实验的四要素" aria-label="本节链接">#</a></h4>
+<p>公平对比要控制变量，只让&quot;量化方案&quot;这一个变量变化：</p>
+<ol>
+<li><strong>同一硬件</strong>：同一张卡、同一驱动、同一引擎版本；</li>
+<li><strong>同一批测试数据</strong>：固定一组有代表性的 prompt（覆盖你真实业务的长短、领域），质量评测用同一份 benchmark；</li>
+<li><strong>同一采样设置</strong>：<code>temperature</code>、<code>max_tokens</code>、<code>seed</code> 一致，避免随机性干扰；</li>
+<li><strong>四个维度的指标都要收</strong>：<ul>
+<li><strong>质量</strong>：困惑度（PPL）或下游任务准确率；</li>
+<li><strong>显存</strong>：加载后峰值显存占用；</li>
+<li><strong>吞吐</strong>：稳定负载下的 token/s（或 req/s）；</li>
+<li><strong>延迟</strong>：TTFT 与 TPOT 的分位数。</li>
+</ul>
+</li>
+</ol>
+<p>只有四维一起看，才能下&quot;值不值&quot;的结论——有时 INT4 掉了 1 个点准确率，却把吞吐翻倍、显存减半，对成本敏感场景完全可接受。</p>
+<h4 id="h-4-显存速算">4. 显存速算<a class="anchor" href="#h-4-显存速算" aria-label="本节链接">#</a></h4>
+<p>一个参数为 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span></span></span></span>（如 7B）、位宽 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">b</span></span></span></span> bit 的模型，纯权重约需 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.2251em;vertical-align:-0.345em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8801em;"><span style="top:-2.655em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">8</span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.394em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.1389em;">P</span><span class="mbin mtight">×</span><span class="mord mathnormal mtight">b</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.345em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span> 字节：</p>
+<ul>
+<li>7B FP16：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">7</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8974em;vertical-align:-0.0833em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">9</span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">14</span></span></span></span> GB；</li>
+<li>7B INT8：约 7 GB；</li>
+<li>7B INT4：约 3.5 GB（再加少量量化元数据与运行时开销）。</li>
+</ul>
+<p>别看 INT4 省得爽，它的&quot;人均精度&quot;通常也是掉得最多的，所以实验要回答的正是&quot;省下的这 10GB 显存，用多少精度换来的&quot;。</p>
+<p><figure><img class="md-img" src="content/courses/llm-deployment-practice/assets/chapter-5-figure-01.svg" alt="量化权衡示意图：三个并排柱子从左到右&quot;FP16(14GB)&quot;&quot;INT8(7GB)&quot;&quot;INT4(3.5GB)&quot;，柱高递减表示显存占用，柱子颜色从蓝到橙到红渐变表示精度损失逐步增加；每根柱子上方标注&quot;精度损失 ↑、显存 ↓、吞吐 ↑&quot;的权衡方向，底部一句话&quot;省下的显存，是用精度换来的&quot;" loading="lazy" decoding="async"><figcaption>量化权衡示意图：三个并排柱子从左到右&quot;FP16(14GB)&quot;&quot;INT8(7GB)&quot;&quot;INT4(3.5GB)&quot;，柱高递减表示显存占用，柱子颜色从蓝到橙到红渐变表示精度损失逐步增加；每根柱子上方标注&quot;精度损失 ↑、显存 ↓、吞吐 ↑&quot;的权衡方向，底部一句话&quot;省下的显存，是用精度换来的&quot;</figcaption></figure>
+</p>
+<h3 id="h-二可运行示例">二、可运行示例<a class="anchor" href="#h-二可运行示例" aria-label="本节链接">#</a></h3>
+<h4 id="h-示例-1用-vllm-分别启动三种量化配置">示例 1：用 vLLM 分别启动三种量化配置<a class="anchor" href="#h-示例-1用-vllm-分别启动三种量化配置" aria-label="本节链接">#</a></h4>
+<pre data-lang="bash"><code class="language-bash"># 基线：FP16
+vllm serve meta-llama/Llama-3.1-8B-Instruct --served-model-name llama-fp16
+
+# AWQ INT4（需下载对应 AWQ 量化权重）
+vllm serve casperhansen/Llama-3.1-8B-Instruct-AWQ \
+  --quantization awq --served-model-name llama-awq
+
+# FP8（需较新 GPU，权重+激活都量化）
+vllm serve meta-llama/Llama-3.1-8B-Instruct \
+  --quantization fp8 --served-model-name llama-fp8</code></pre>
+<p>启动后记下日志里打印的&quot;峰值显存占用&quot;，这是第一个对比维度。</p>
+<h4 id="h-示例-2写一个吞吐与延迟测量脚本">示例 2：写一个吞吐与延迟测量脚本<a class="anchor" href="#h-示例-2写一个吞吐与延迟测量脚本" aria-label="本节链接">#</a></h4>
+<pre data-lang="python"><code class="language-python"># -*- coding: utf-8 -*-
+# 对指定服务打固定负载，测吞吐与延迟分位数，保证各配置可比
+import time, asyncio, aiohttp
+
+async def one_request(session, url, payload):
+    t0 = time.perf_counter()
+    async with session.post(url, json=payload) as r:
+        await r.json()
+    return time.perf_counter() - t0
+
+async def benchmark(base, model, n_req=60, concurrency=8):
+    url = f&quot;{base}/v1/chat/completions&quot;
+    payload = {&quot;model&quot;: model,
+               &quot;messages&quot;: [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;用 200 字介绍推荐系统。&quot;}],
+               &quot;max_tokens&quot;: 200, &quot;temperature&quot;: 0.0}
+    async with aiohttp.ClientSession() as sess:
+        sem = asyncio.Semaphore(concurrency)   # 控制并发，模拟真实负载
+        async def run():
+            async with sem:
+                return await one_request(sess, url, payload)
+        t0 = time.perf_counter()
+        latencies = await asyncio.gather(*[run() for _ in range(n_req)])
+        wall = time.perf_counter() - t0
+    latencies.sort()
+    p99 = latencies[int(len(latencies) * 0.99)]
+    # 吞吐：总请求数 / 墙钟时间（含排队），反映并发下的真实吞吐
+    print(f&quot;吞吐={n_req/wall:.1f} req/s | 平均延迟={sum(latencies)/n_req*1000:.0f}ms | P99={p99*1000:.0f}ms&quot;)
+
+asyncio.run(benchmark(&quot;http://localhost:8000&quot;, &quot;llama-awq&quot;))</code></pre>
+<p>把 <code>model</code> 分别换成 <code>llama-fp16</code> / <code>llama-awq</code> / <code>llama-fp8</code>，各跑一遍，记录吞吐、P99 延迟，连同示例 1 的显存一起填入对比表。</p>
+<h4 id="h-示例-3质量评测用-lm-eval-测困惑度或任务分">示例 3：质量评测（用 lm-eval 测困惑度或任务分）<a class="anchor" href="#h-示例-3质量评测用-lm-eval-测困惑度或任务分" aria-label="本节链接">#</a></h4>
+<pre data-lang="bash"><code class="language-bash"># 用 lm-evaluation-harness 对同一任务测不同量化版本，得到可比的质量分
+pip install lm-eval
+# 以 8-shot MMLU 为例（对 FP16 与 AWQ 各跑一次）
+lm_eval --model vllm --model_args pretrained=meta-llama/Llama-3.1-8B-Instruct \
+        --tasks mmlu --num_fewshot 8 --batch_size auto
+lm_eval --model vllm --model_args pretrained=casperhansen/Llama-3.1-8B-Instruct-AWQ \
+        --tasks mmlu --num_fewshot 8 --batch_size auto</code></pre>
+<p>把四维结果整理成一张表：</p>
+<table>
+<thead>
+<tr>
+<th>配置</th>
+<th>峰值显存</th>
+<th>吞吐(req/s)</th>
+<th>P99 TTFT</th>
+<th>质量(MMLU)</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>FP16</td>
+<td>~16GB</td>
+<td>参考值</td>
+<td>参考值</td>
+<td>参考值</td>
+</tr>
+<tr>
+<td>INT4 AWQ</td>
+<td>~6GB</td>
+<td>↑</td>
+<td>略升</td>
+<td>略降</td>
+</tr>
+<tr>
+<td>FP8</td>
+<td>~9GB</td>
+<td>↑↑</td>
+<td>略降</td>
+<td>几乎持平</td>
+</tr>
+</tbody></table>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>用示例 1 的三种配置，各自记下启动日志里的峰值显存，验证示例 4 节的显存速算是否大致吻合，并解释差异来自哪里（运行时开销、KV Cache 预留）。</li>
+<li>把示例 2 的 <code>max_tokens</code> 从 200 改成 800，重测三种配置的吞吐，观察&quot;输出变长&quot;时 INT4 相对 FP16 的吞吐优势是变大还是变小，为什么（提示：decode 访存占比）。</li>
+<li>选一个数学或代码类 benchmark（如 GSM8K 或 HumanEval），对比 FP16 与 INT4 的质量分，说明为什么&quot;量化掉多少精度&quot;和任务类型强相关。</li>
+<li>思考：如果一个服务 90% 的请求是短文本分类（输出 &lt; 20 token），量化带来的吞吐收益还会明显吗？此时更该优先考虑哪种优化？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>vLLM · 支持的量化方法：<a href="https://docs.vllm.ai/en/latest/features/quantization/index.html" target="_blank" rel="noopener noreferrer">https://docs.vllm.ai/en/latest/features/quantization/index.html</a></li>
+<li>AWQ：Activation-aware Weight Quantization：<a href="https://arxiv.org/abs/2306.00978" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2306.00978</a></li>
+<li>GPTQ：Accurate Post-Training Quantization for GPT：<a href="https://arxiv.org/abs/2210.17323" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2210.17323</a></li>
+<li>EleutherAI lm-evaluation-harness：<a href="https://github.com/EleutherAI/lm-evaluation-harness" target="_blank" rel="noopener noreferrer">https://github.com/EleutherAI/lm-evaluation-harness</a></li>
+</ul>
+<p><a href="#/l/deploy-ch5-l2">下一课：批处理与并发调优</a></p>

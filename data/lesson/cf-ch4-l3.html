@@ -1,0 +1,223 @@
+<h2 id="h-ssa-函数与支配关系">SSA：φ 函数与支配关系<a class="anchor" href="#h-ssa-函数与支配关系" aria-label="本节链接">#</a></h2>
+<p>上一课给了我们&quot;前驱 / 后继&quot;，但三地址码里 <code>prod = prod + i</code> 这种写法仍然让分析很难受：同一个名字 <code>prod</code> 在循环的每一轮代表不同的值，而名字只有一个。想知道&quot;B4 里用的 <code>prod</code> 是谁算出来的&quot;，你得在图上倒着搜。<strong>SSA</strong>（Static Single Assignment，静态单赋值）用一个极端的约束解决这个问题：每个名字只允许被赋值一次；做不到就造新名字，并在汇合处用 <strong>φ 函数</strong>（phi function）把不同来源的值接起来。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-反复赋值让分析变难">1. 反复赋值让分析变难<a class="anchor" href="#h-1-反复赋值让分析变难" aria-label="本节链接">#</a></h4>
+<p><code>prod</code> 被赋值 N 次，就有 N 个不同的值，但名字只有一个。于是&quot;这个 use 用的是哪个 def&quot;不再是名字匹配问题，只能退化成集合问题：到达定值分析维护&quot;某个程序点上可能有哪些定值到达&quot;的集合，再迭代到不动点。代价不只是慢，还有精度损失：汇合处集合里会同时出现多个候选，给不出确定答案。</p>
+<h4 id="h-2-ssa-的定义与三条收益">2. SSA 的定义与三条收益<a class="anchor" href="#h-2-ssa-的定义与三条收益" aria-label="本节链接">#</a></h4>
+<p>SSA 的规则只有一句：<strong>每个名字只能被赋值一次</strong>。做法是给每次赋值产生新版本：<code>prod1</code>、<code>prod2</code>…于是：</p>
+<ol>
+<li>每个名字的唯一 def 点就是它的定义处，use-def 链可以直接从名字读出来；</li>
+<li>值编号、常量传播、死代码消除从&quot;集合迭代&quot;退化成&quot;沿 def-use 链的局部改写&quot;；</li>
+<li>优化后重新做 SSA 维护的成本可控，pass 之间不容易互相破坏。</li>
+</ol>
+<p>LLVM IR 就是 SSA 形式：<code>%x = add i32 %a, %b</code>，每个 <code>%x</code> 只赋值一次。代价是必须有东西表达&quot;两条路径汇合后取哪个值&quot;——这就是 φ。</p>
+<h4 id="h-3--函数由边决定取值的伪指令">3. φ 函数：由边决定取值的伪指令<a class="anchor" href="#h-3--函数由边决定取值的伪指令" aria-label="本节链接">#</a></h4>
+<p>把 if-else 两条分支都赋值的变量改成 SSA，会立刻卡住：</p>
+<pre><code>B1: x1 = 1
+B2: 分支 → B3 / B4
+B3: x2 = 2 ; goto B5
+B4: x3 = 3 ; goto B5
+B5: y = ? + 1        ← 该用 x2 还是 x3？</code></pre>
+<p>&quot;用哪个&quot;取决于<strong>从哪条边进来</strong>，普通指令表达不了。于是：</p>
+<pre><code>B5: x4 = φ(x2, x3)
+    y  = x4 + 1</code></pre>
+<p>φ 的语义有三条必须记牢：① 入参按<strong>前驱的顺序</strong>一一对应，取值由控制流走的边决定，不是运行时&quot;挑选&quot;；② 它是<strong>并行赋值</strong>，所有 φ 同时生效，不存在先后；③ 它<strong>不是可执行指令</strong>——只活在编译器的图里，退出 SSA 时会被拆成各前驱末尾的 <code>copy</code>。</p>
+<h4 id="h-4-支配关系与支配树">4. 支配关系与支配树<a class="anchor" href="#h-4-支配关系与支配树" aria-label="本节链接">#</a></h4>
+<p>φ 该插在哪里？答案依赖<strong>支配</strong>（dominance）：</p>
+<ul>
+<li><code>d</code> <strong>支配</strong> <code>n</code>（记 <code>d dom n</code>）：从入口到 <code>n</code> 的<strong>每一条</strong>路径都经过 <code>d</code>；</li>
+<li><strong>立即支配者</strong> <code>idom(n)</code>：支配 <code>n</code> 的严格支配者中&quot;最深&quot;的那个；</li>
+<li>把每个 <code>n</code> 连到 <code>idom(n)</code>，得到<strong>支配树</strong>（dominator tree）。</li>
+</ul>
+<p>支配集可以照定义迭代（这也是第 5 章数据流框架的一个实例）：</p>
+<pre><code>Dom(entry) = {entry}
+Dom(n)     = {n} ∪ ⋂ Dom(p),  p ∈ pred(n)</code></pre>
+<p>本课例子里：<code>Dom(B2)={B1,B2}</code>、<code>Dom(B3)={B1,B2,B3}</code>、<code>Dom(B4)={B1,B2,B4}</code>，且 <code>idom(B3)=idom(B4)=B2</code>。</p>
+<h4 id="h-5-支配边界-的落点">5. 支配边界：φ 的落点<a class="anchor" href="#h-5-支配边界-的落点" aria-label="本节链接">#</a></h4>
+<p><strong>支配边界</strong> <code>DF(n)</code> 指：所有&quot;<code>n</code> 支配它的某个前驱、但 <code>n</code> 不严格支配它&quot;的块。直觉上，DF 是&quot;支配作用刚失效的地方&quot;——两条控制流可能重新汇合的地方。计算可以照定义走：</p>
+<blockquote>
+<p>对每个有 ≥ 2 个前驱的块 <code>b</code>，对它的每个前驱 <code>p</code>：从 <code>p</code> 沿支配树往上走，走到 <code>idom(b)</code> 为止；沿途每个块都把 <code>b</code> 记进自己的 DF。</p>
+</blockquote>
+<p>本课例子里 <code>DF(B3)={B2}</code>、<code>DF(B2)={B2}</code>——<strong>B2 在自己的支配边界里</strong>，这正是循环头必须要 φ 的原因：下一轮的 <code>i</code> 要取&quot;循环体算出的版本&quot;。</p>
+<p>φ 的插入规则：对变量 <code>v</code> 的定值块取 <strong>DF+</strong>（迭代支配边界，新插的 φ 等价于一个新定值点），在这些块里插 φ。这是 Cytron 等人 1991 年提出的构造法。</p>
+<h4 id="h-6-重命名退出-ssa-与常见坑">6. 重命名、退出 SSA 与常见坑<a class="anchor" href="#h-6-重命名退出-ssa-与常见坑" aria-label="本节链接">#</a></h4>
+<p>插完 φ 还要给所有名字加版本。做法是沿<strong>支配树</strong> DFS，为每个变量维护一个版本栈：① 进入块时给它的每个 φ 压一个新版本；② 块内指令先把右值的名字替换成当前版本，再给左值压新版本；③ 对每个后继的每个 φ，用<strong>当前版本</strong>回填属于本块的那个入参；④ 处理完所有子节点后统一弹栈（φ 与赋值一起弹）。第 ③ 步是关键，它让入参自动对应到&quot;前驱出口处的版本&quot;。</p>
+<p>后端（寄存器分配、指令调度）不需要 φ，退出 SSA 是反向操作：对每个 <code>x = φ(v1, v2)</code>，在第 1 个前驱末尾插 <code>x = v1</code>、第 2 个前驱末尾插 <code>x = v2</code>。这里要小心<strong>关键边</strong>（critical edge，从出度 ≥ 2 的块进入入度 ≥ 2 的块的那条边）：直接在前驱末尾插 <code>copy</code> 会连带影响它的其他后继，需要先<strong>拆边</strong>（插入一个空块）。</p>
+<p><figure><img class="md-img" src="content/courses/compiler-foundations/assets/chapter-4-figure-03.svg" alt="φ 的落点：从支配关系、支配边界到插入 φ 与重命名" loading="lazy" decoding="async"><figcaption>φ 的落点：从支配关系、支配边界到插入 φ 与重命名</figcaption></figure>
+</p>
+<p>常见坑：① 把 φ 当运行时指令处理，或给只有一个前驱的块插 φ（无意义）；② φ 的入参顺序与前驱顺序不一致——这是最常见的实现 bug；③ 忘了循环头的 φ 有一个入参来自回边；④ 被取地址的变量无法提升成 SSA——LLVM 的 <code>mem2reg</code> 只处理<strong>没有被取地址</strong>的 <code>alloca</code>，被取地址的对象必须留在内存里；⑤ 插出大量死 φ：老式算法在支配边界上无脑插，靠死代码消除清理（minimal SSA 改用活跃变量，见第 5 章）。</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面这段纯 Python（无第三方依赖）把整条链路走通：算支配集 → 求 idom → 算支配边界 → 插 φ → 沿支配树重命名。例子是上一课那个 while 循环：</p>
+<pre data-lang="python"><code class="language-python"># ---- 支配关系 → 支配边界 → 插入 φ → 重命名（纯 Python，无第三方依赖）----
+# 等价源码：i = 1; prod = 0; while (i &lt;= 10) { prod = prod + i; i = i + 1; } 用 prod;
+import re
+BLOCKS = {
+    &#39;B1&#39;: ([(&#39;=&#39;, &#39;i&#39;, &#39;1&#39;), (&#39;=&#39;, &#39;prod&#39;, &#39;0&#39;)],            [&#39;B2&#39;]),
+    &#39;B2&#39;: ([(&#39;if&#39;, &#39;i &lt;= 10&#39;)],                             [&#39;B3&#39;, &#39;B4&#39;]),
+    &#39;B3&#39;: ([(&#39;=&#39;, &#39;prod&#39;, &#39;prod + i&#39;), (&#39;=&#39;, &#39;i&#39;, &#39;i + 1&#39;)], [&#39;B2&#39;]),
+    &#39;B4&#39;: ([(&#39;use&#39;, &#39;prod&#39;)],                               []),
+}
+ENTRY = &#39;B1&#39;
+
+def predecessors(blocks):
+    return {b: [p for p in blocks if b in blocks[p][1]] for b in blocks}
+
+def dominators(blocks, entry):
+    &quot;&quot;&quot;迭代到不动点：Dom(n) = {n} ∪ ⋂ Dom(前驱)&quot;&quot;&quot;
+    preds, nodes = predecessors(blocks), set(blocks)
+    dom = {b: set(nodes) for b in blocks}
+    dom[entry] = {entry}
+    changed = True
+    while changed:
+        changed = False
+        for b in blocks:
+            if b == entry or not preds[b]:
+                continue
+            new = {b} | set.intersection(*[dom[p] for p in preds[b]])
+            if new != dom[b]:
+                dom[b], changed = new, True
+    return dom
+
+def immediate_dominators(dom, entry):
+    &quot;&quot;&quot;严格支配者构成一条链，最深（被其余严格支配者支配）的那个就是 idom&quot;&quot;&quot;
+    idom = {entry: None}
+    for b in dom:
+        if b == entry:
+            continue
+        strict = dom[b] - {b}
+        idom[b] = next(d for d in strict if all(e in dom[d] for e in strict if e != d))
+    return idom
+
+def dominance_frontier(blocks, idom):
+    &quot;&quot;&quot;汇合块的每个前驱沿支配树往上走，直到 idom(汇合块)，沿途块都把它记进 DF&quot;&quot;&quot;
+    preds, df = predecessors(blocks), {b: set() for b in blocks}
+    for b in blocks:
+        if len(preds[b]) &lt; 2:
+            continue
+        for p in preds[b]:
+            runner = p
+            while runner is not None and runner != idom[b]:
+                df[runner].add(b)
+                runner = idom[runner]
+    return df
+
+def definitions(blocks):
+    d = {}
+    for b, (body, _) in blocks.items():
+        for ins in body:
+            if ins[0] == &#39;=&#39;:
+                d.setdefault(ins[1], set()).add(b)
+    return d
+
+def insert_phi(blocks, df, defs):
+    &quot;&quot;&quot;在迭代支配边界 DF+ 上插 φ。这里只处理「有多个定义块」的变量；
+    严格的 minimal SSA 还要求变量在块入口活跃（见第 5 章活跃变量分析）&quot;&quot;&quot;
+    phi = {b: [] for b in blocks}
+    for v, sites in sorted(defs.items()):
+        if len(sites) &lt; 2:
+            continue
+        work, placed = list(sites), set()
+        while work:
+            for d in sorted(df[work.pop()]):
+                if d in placed:
+                    continue
+                placed.add(d); phi[d].append(v)
+                if d not in sites:
+                    work.append(d)
+    return {b: sorted(v) for b, v in phi.items()}
+
+def rename(blocks, idom, phi, entry):
+    &quot;&quot;&quot;沿支配树 DFS：先给本块的 φ 与赋值压新版本，再回填后继 φ 的入参，最后统一弹栈&quot;&quot;&quot;
+    children, stack, result, operands = {}, {}, {}, {}
+
+    def cur(v):
+        return stack[v][-1] if stack.get(v) else v
+
+    def push(v):
+        stack.setdefault(v, []).append(f&#39;{v}{len(stack[v]) + 1}&#39;)
+        return stack[v][-1]
+
+    def subst(expr):
+        return re.sub(r&#39;[A-Za-z_]\w*&#39;, lambda m: cur(m.group(0)), expr)
+
+    def walk(b):
+        pushed, phis = [], []
+        for v in phi[b]:
+            phis.append((push(v), v)); pushed.append(v)
+        body = []
+        for ins in blocks[b][0]:
+            if ins[0] == &#39;use&#39;:
+                body.append((&#39;use&#39;, subst(ins[1])))
+            elif ins[0] == &#39;if&#39;:
+                body.append((&#39;if&#39;, subst(ins[1])))
+            else:
+                rhs = subst(ins[2])          # 先用：右值的名字按当前版本替换
+                body.append((&#39;=&#39;, push(ins[1]), rhs)); pushed.append(ins[1])
+        result[b] = (phis, body)
+        for s in blocks[b][1]:                       # 回填后继块的 φ 入参
+            for v in phi.get(s, []):
+                operands.setdefault(s, {}).setdefault(v, {})[b] = cur(v)
+        for c in sorted(children.get(b, [])):
+            walk(c)
+        for v in pushed:                             # 统一弹栈（φ 与赋值一起）
+            stack[v].pop()
+
+    for b, p in idom.items():
+        children.setdefault(p, []).append(b)
+    walk(entry)
+    return result, operands
+
+dom = dominators(BLOCKS, ENTRY)
+idom = immediate_dominators(dom, ENTRY)
+df = dominance_frontier(BLOCKS, idom)
+defs = definitions(BLOCKS)
+phi = insert_phi(BLOCKS, df, defs)
+ssa, operands = rename(BLOCKS, idom, phi, ENTRY)
+preds = predecessors(BLOCKS)
+
+print(&#39;Dom   :&#39;, {b: sorted(dom[b]) for b in sorted(dom)})
+print(&#39;idom  :&#39;, {b: idom[b] for b in sorted(idom)})
+print(&#39;DF    :&#39;, {b: sorted(df[b]) for b in sorted(df) if df[b]})
+print(&#39;定义块:&#39;, {v: sorted(s) for v, s in sorted(defs.items())})
+print(&#39;φ 位置:&#39;, {b: phi[b] for b in phi if phi[b]})
+print(&#39;\nSSA 形式:&#39;)
+for b in sorted(ssa):
+    phis, body = ssa[b]
+    head = [f&#39;{n} = φ(&#39; + &#39;, &#39;.join(operands[b][v][p] for p in preds[b]) + &#39;)&#39;
+            for n, v in phis if len(preds[b]) &gt; 1]
+    line = [f&#39;{ins[1]} = {ins[2]}&#39; if ins[0] == &#39;=&#39; else
+            (f&#39;use {ins[1]}&#39; if ins[0] == &#39;use&#39; else f&#39;if {ins[1]}&#39;) for ins in body]
+    print(f&#39;  {b}: &#39; + &#39;；&#39;.join(head + line) + f&#39;    → {BLOCKS[b][1]}&#39;)</code></pre>
+<p>运行结果——支配集、idom、DF 全部与手算一致，φ 只插在 B2：</p>
+<pre><code>Dom   : {&#39;B1&#39;: [&#39;B1&#39;], &#39;B2&#39;: [&#39;B1&#39;, &#39;B2&#39;], &#39;B3&#39;: [&#39;B1&#39;, &#39;B2&#39;, &#39;B3&#39;], &#39;B4&#39;: [&#39;B1&#39;, &#39;B2&#39;, &#39;B4&#39;]}
+idom  : {&#39;B1&#39;: None, &#39;B2&#39;: &#39;B1&#39;, &#39;B3&#39;: &#39;B2&#39;, &#39;B4&#39;: &#39;B2&#39;}
+DF    : {&#39;B2&#39;: [&#39;B2&#39;], &#39;B3&#39;: [&#39;B2&#39;]}
+定义块: {&#39;i&#39;: [&#39;B1&#39;, &#39;B3&#39;], &#39;prod&#39;: [&#39;B1&#39;, &#39;B3&#39;]}
+φ 位置: {&#39;B2&#39;: [&#39;i&#39;, &#39;prod&#39;]}
+
+SSA 形式:
+  B1: i1 = 1；prod1 = 0    → [&#39;B2&#39;]
+  B2: i2 = φ(i1, i3)；prod2 = φ(prod1, prod3)；if i2 &lt;= 10    → [&#39;B3&#39;, &#39;B4&#39;]
+  B3: prod3 = prod2 + i2；i3 = i2 + 1    → [&#39;B2&#39;]
+  B4: use prod2    → []</code></pre>
+<p>逐行核对三处最有信息量的地方：<code>i2 = φ(i1, i3)</code> 的两个入参分别来自&quot;初始化块&quot;和&quot;循环体末尾&quot;（即回边）；<code>prod3 = prod2 + i2</code> 里两个右值都是<strong>汇合之后的新版本</strong>；<code>B4: use prod2</code> 用的是循环退出时最后一次累加的结果，而不是某个&quot;所有版本混在一起&quot;的集合。</p>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选（需本机有 LLVM）：在真实 IR 上观察同一件事 ----
+#   clang -O0 -S -emit-llvm loop.c -o loop_O0.ll      # -O0：变量在栈上（alloca + load/store）
+#   opt -passes=mem2reg -S loop_O0.ll -o loop_ssa.ll  # 提升成 SSA 值与 phi 指令
+#   diff loop_O0.ll loop_ssa.ll                       # 看 alloca/load/store 怎样变成 %reg 与 phi
+# 没有 LLVM 不影响本课：上面的 Python 版把 Dom/DF/φ/重命名完整实现了一遍。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：把 <code>BLOCKS</code> 换成 if-else 菱形（<code>B1 → B2 → B3/B4 → B5</code>），运行代码并解释 φ 出现在哪个块、两个入参分别是什么。</li>
+<li><strong>解释</strong>：为什么 φ 必须是&quot;并行赋值&quot;？如果按顺序执行 <code>x2 = φ(x1, x3); x3 = φ(x2, x4)</code>，会得到什么错误结果？</li>
+<li><strong>对比/验证</strong>：把 <code>insert_phi</code> 的 DF+ 迭代改成&quot;只对真实汇合块插一次 φ&quot;，用含嵌套循环的 CFG 说明哪种做法会漏插。</li>
+<li><strong>思考</strong>：为什么寄存器分配要放在退出 SSA 之后？如果在带 φ 的 SSA 图上直接分配寄存器，φ 会带来什么麻烦？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Ron Cytron, Jeanne Ferrante, Barry Rosen, Mark Wegman, Kenneth Zadeck, <em>Efficiently Computing Static Single Assignment Form and the Control Dependence Graph</em>, ACM TOPLAS, 1991（支配边界与 φ 插入的原始算法）：<a href="https://dl.acm.org/doi/10.1145/115372.115320" target="_blank" rel="noopener noreferrer">https://dl.acm.org/doi/10.1145/115372.115320</a></li>
+<li>Matthias Braun et al., <em>Simple and Efficient Construction of Static Single Assignment Form</em>, CC 2013（工程上更常用的构造法，SSA Book 章节页）：<a href="https://link.springer.com/chapter/10.1007/978-3-642-37051-9_6" target="_blank" rel="noopener noreferrer">https://link.springer.com/chapter/10.1007/978-3-642-37051-9_6</a></li>
+<li>LLVM IR 参考手册 <code>phi</code> 指令（入参与前驱一一对应、并行语义）：<a href="https://llvm.org/docs/LangRef.html#phi-instruction" target="_blank" rel="noopener noreferrer">https://llvm.org/docs/LangRef.html#phi-instruction</a></li>
+<li>LLVM 官方文档：<code>mem2reg</code>（Promote Memory to Register，把 alloca 提升为 SSA 值）：<a href="https://llvm.org/docs/Passes.html" target="_blank" rel="noopener noreferrer">https://llvm.org/docs/Passes.html</a></li>
+</ul>
+<p><a href="#/l/cf-ch4-l4">下一课：从 AST 降到 IR：一次完整的 lowering</a></p>

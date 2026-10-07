@@ -1,0 +1,916 @@
+<h2 id="h-边界与失效清单什么场景不该用-rag">边界与失效清单：什么场景不该用 RAG<a class="anchor" href="#h-边界与失效清单什么场景不该用-rag" aria-label="本节链接">#</a></h2>
+<h3 id="h-这一节要解决什么">这一节要解决什么<a class="anchor" href="#h-这一节要解决什么" aria-label="本节链接">#</a></h3>
+<p>前面 27 节都在讲&quot;怎么把 RAG 做好&quot;。最后一节反过来问一个更值钱的问题：</p>
+<blockquote>
+<p><strong>什么情况下，你根本不该用 RAG？</strong></p>
+</blockquote>
+<p>这个问题比它看起来重要得多，因为 RAG 有一个很坏的失败模式：<strong>它能让一个不适合检索的任务&quot;看起来在工作&quot;</strong>。用户问&quot;这三年的营收同比是多少&quot;，系统会检索到三份财报、把三段文字拼进上下文、生成一段听起来合理但算术错误的回答。<strong>没有任何异常，指标也不难看，但答案是错的。</strong> 如果这个任务本该用 SQL 或代码执行，那这套 RAG 系统的全部复杂度都是在<strong>制造可信的错误</strong>。</p>
+<p>本节要回答四个问题：</p>
+<ol>
+<li>RAG 的适用条件是什么？<strong>不满足每一条时会怎样</strong>？</li>
+<li>哪些场景不该用（或不该只用）RAG？替代方案是什么？<strong>怎么判断该迁移了</strong>？</li>
+<li>参数记忆、检索、微调、工具 —— 四者怎么选？微调在什么条件下比 RAG 划算（给可算的判据）？</li>
+<li>上线前必须逐条过的检查表长什么样？<strong>每一项的判据与处置是什么</strong>？</li>
+</ol>
+<blockquote>
+<p><strong>结论先放在这里</strong>：RAG 不是&quot;默认正确的架构&quot;，它是一个<strong>有明确适用边界的工程方案</strong>。判据是：知识可外部化为文档、会变、需要审计与授权、查询可分解为&quot;定位 + 抽取/归纳&quot;、能容忍非确定性、且有评测与维护能力。<strong>缺其中任何一条，都要先解决那一条，而不是先搭 RAG。</strong> 而&quot;什么时候该迁移走&quot;同样可判：当任务的正确性依赖<strong>精确计算、全局聚合、结构化查询或确定性规则</strong>时，检索结构性地给不了保证。</p>
+</blockquote>
+<h3 id="h-一先立判据rag-的适用条件">一、先立判据：RAG 的适用条件<a class="anchor" href="#h-一先立判据rag-的适用条件" aria-label="本节链接">#</a></h3>
+<p>回到第 1 章立下的四条边界（容量 / 时效 / 可审计 / 可控），把它们展开成七条<strong>可检验的适用条件</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>适用条件</th>
+<th>不满足时的具体失效表现</th>
+<th>怎么检验</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1</td>
+<td>知识<strong>可外部化为文档</strong></td>
+<td>知识存在于人的经验、流程、口头约定里 → 检索无内容可召</td>
+<td>抽样 50 个真实问题，问&quot;答案在哪份文里&quot;；答不出的比例</td>
+</tr>
+<tr>
+<td>2</td>
+<td>知识<strong>会变</strong>，且变更频率高于重训成本</td>
+<td>知识static 且已进参数 → 检索是纯粹的额外复杂度</td>
+<td>统计知识变更频率与重训成本（§3 的盈亏平衡式）</td>
+</tr>
+<tr>
+<td>3</td>
+<td>查询可分解为<strong>&quot;定位 + 抽取/归纳&quot;</strong></td>
+<td>需要跨文档推理、计算、多步规划 → 检索给了材料但给不了结论</td>
+<td>标注 100 题：多少题在找到证据后&quot;读一遍就能答&quot;</td>
+</tr>
+<tr>
+<td>4</td>
+<td>能容忍<strong>非确定性</strong>输出</td>
+<td>同一问题两次回答必须逐字一致（合规/对账）→ 生成不满足</td>
+<td>对同一批题跑 3 次，测答案一致率</td>
+</tr>
+<tr>
+<td>5</td>
+<td>有（或愿意建立）<strong>评测能力</strong></td>
+<td>无评测 → 改动无法判断好坏，错误被平均分掩盖</td>
+<td>是否有带黄金证据的评测集与门禁（ch7-l2）</td>
+</tr>
+<tr>
+<td>6</td>
+<td>有<strong>权限与审计</strong>要求</td>
+<td>无权限要求 → 检索的可授权优势用不上，长上下文可能更简单</td>
+<td>是否存在多角色可见性差异</td>
+</tr>
+<tr>
+<td>7</td>
+<td><strong>错误代价可承受</strong>（或可拒答）</td>
+<td>错一次就是事故且不能拒答 → 需要规则引擎而非概率系统</td>
+<td>单次错误的业务代价与拒答的可接受性</td>
+</tr>
+</tbody></table>
+<p><strong>这七条不是&quot;全都满足才能用&quot;，而是&quot;不满足的那条要先被解决&quot;</strong>：</p>
+<ul>
+<li>不满足 1：先做知识沉淀（文档化），否则 RAG 无从下手；</li>
+<li>不满足 2：考虑微调或直接进提示（§3）；</li>
+<li>不满足 3：接工具（计算/查询/代码执行），把 RAG 降级为&quot;提供工具参数&quot;的一环；</li>
+<li>不满足 4：用检索 + 模板化输出（不生成自由文本），或改用规则；</li>
+<li>不满足 5：<strong>先建评测</strong> —— 这是最容易被跳过、代价最大的一条；</li>
+<li>不满足 6：可以省掉权限层，架构会简单很多；</li>
+<li>不满足 7：加拒答策略，或整体换方案。</li>
+</ul>
+<h3 id="h-二不该用或不该只用rag-的场景清单">二、不该用（或不该只用）RAG 的场景清单<a class="anchor" href="#h-二不该用或不该只用rag-的场景清单" aria-label="本节链接">#</a></h3>
+<p>下面 13 条，每条给出：<strong>为什么在这里 RAG 无效或低效（机制）→ 该用什么替代 → 迁移判据</strong>。</p>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>场景</th>
+<th>为什么 RAG 在这里不行（机制）</th>
+<th>替代方案</th>
+<th>迁移判据</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1</td>
+<td><strong>需要精确计算/聚合</strong>（同比、求和、比率）</td>
+<td>检索提供的是<strong>文本</strong>，模型的算术没有符号保证；即使证据正确，计算也可能错</td>
+<td>代码执行 / 计算器工具 / SQL 聚合</td>
+<td>评测里出现&quot;证据全对但答案错&quot;的比例 &gt; 5%</td>
+</tr>
+<tr>
+<td>2</td>
+<td><strong>结构化数据与事务查询</strong>（订单、库存、账户）</td>
+<td>RAG 对结构化查询是<strong>有损近似</strong>：切分会破坏行/列结构，语义相似度不等于条件匹配</td>
+<td>数据库直查 / SQL / API</td>
+<td>查询可用 WHERE/JOIN 精确表达</td>
+</tr>
+<tr>
+<td>3</td>
+<td><strong>单篇长文档深读</strong>（合同条款解释）</td>
+<td>检索会切碎跨段指代与条款引用关系</td>
+<td>长上下文直读（ch5-l1）</td>
+<td>文档总长 &lt; 有效上下文 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">eff</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span></td>
+</tr>
+<tr>
+<td>4</td>
+<td><strong>全局摘要/计数/全集否定</strong>（&quot;哪些文档<strong>没有</strong>提到 X&quot;）</td>
+<td>检索按相关度取样，<strong>天然漏</strong>；联合命中概率指数衰减（ch5-l1 §2.3）</td>
+<td>map-reduce / 层次摘要 / 结构化聚合</td>
+<td>问题需要覆盖全语料而非&quot;找到相关段&quot;</td>
+</tr>
+<tr>
+<td>5</td>
+<td><strong>必须 100% 确定且可审计的规则判定</strong>（风控、合规判定）</td>
+<td>生成是非确定的；同一输入两次输出可能不同</td>
+<td>规则引擎 / 决策表 / 有限状态机</td>
+<td>存在不容许例外的判定规则</td>
+</tr>
+<tr>
+<td>6</td>
+<td><strong>极低延迟</strong>（端到端 &lt;100ms）</td>
+<td>decode 是固定地板（ch5-l4：输出 220 token ≈ 1320ms 量级），检索优化改不动它</td>
+<td>缓存/预计算/小模型/不用 LLM</td>
+<td>P99 预算 &lt; decode 地板</td>
+</tr>
+<tr>
+<td>7</td>
+<td><strong>强多步数学/规划</strong></td>
+<td>检索不提供推理保证；证据齐全也可能算错</td>
+<td>工具 + 验证器 + 推理模型</td>
+<td>失败模式以&quot;推理错&quot;为主而非&quot;证据缺&quot;</td>
+</tr>
+<tr>
+<td>8</td>
+<td><strong>数据不允许出域且无法本地部署</strong></td>
+<td>合规优先：任何便利都不能换</td>
+<td>本地化部署 + 私有检索（需成本论证）</td>
+<td>数据驻留是硬约束</td>
+</tr>
+<tr>
+<td>9</td>
+<td><strong>没有评测能力也没有维护预算</strong></td>
+<td>无评测 → 错误被平均分掩盖；无预算 → 索引与评测集腐化</td>
+<td><strong>先补评测</strong>（ch7-l2）</td>
+<td>无人能说出当前 recall 与失败分布</td>
+</tr>
+<tr>
+<td>10</td>
+<td><strong>领域文档稀缺或质量极差</strong></td>
+<td>垃圾进垃圾出；检索放大噪声</td>
+<td>先做数据工程（ch7-l1 的需求问卷）</td>
+<td>抽样 50 题里&quot;文档里根本没有答案&quot;的比例高</td>
+</tr>
+<tr>
+<td>11</td>
+<td><strong>高风险对抗输入且无隔离</strong></td>
+<td>提示注入会直接打穿检索层（ch6-l3 的威胁模型第 6 条）</td>
+<td>先做安全边界与沙箱</td>
+<td>输入来自不可信用户且系统有副作用</td>
+</tr>
+<tr>
+<td>12</td>
+<td><strong>一次性/极低频问题</strong></td>
+<td>索引建设成本摊不薄</td>
+<td>直接查文档/搜索</td>
+<td>问题总次数 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6667em;vertical-align:-0.0833em;"></span><span class="mord">×</span></span></span></span> 单次价值 &lt; 建索引成本</td>
+</tr>
+<tr>
+<td>13</td>
+<td><strong>需要跨文档因果推理而证据稀疏</strong></td>
+<td>每篇只说一部分，且因果链不在单篇里</td>
+<td>知识图谱 / 结构化抽取 + 规则</td>
+<td>标注显示&quot;证据齐全仍无法答对&quot;的比例高</td>
+</tr>
+</tbody></table>
+<p><strong>使用这张表的正确姿势</strong>：不是&quot;命中一条就放弃 RAG&quot;，而是<strong>命中硬条件（1、2、5、6）时,必须引入替代方案</strong>；命中软条件（3、4、7、10、13）时，<strong>保留 RAG 但把它降级为流水线的一环</strong>（例如检索负责找参数，计算交给工具）。</p>
+<h4 id="h-21-一个常见误判把检索不到当成不该用-rag">2.1 一个常见误判：把&quot;检索不到&quot;当成&quot;不该用 RAG&quot;<a class="anchor" href="#h-21-一个常见误判把检索不到当成不该用-rag" aria-label="本节链接">#</a></h4>
+<p>第 9、10 条很容易被误用成&quot;RAG 不行&quot;的借口。判别方法：</p>
+<blockquote>
+<p><strong>如果失败的主要形态是&quot;证据根本不在语料里&quot;，那是数据问题</strong>（先补数据）；
+<strong>如果证据在语料里、检索也能找回，只是答案错，那才是方案问题</strong>（考虑替代方案）。</p>
+</blockquote>
+<p>这个区分靠第 7 章第 2 节的失败分类：<strong>&quot;召回失败&quot;占比高 ⇒ 数据/检索问题；&quot;生成未用&quot;占比高 ⇒ 方案问题。</strong></p>
+<h3 id="h-三参数记忆--检索--微调--工具四选一还是组合">三、参数记忆 / 检索 / 微调 / 工具：四选一还是组合<a class="anchor" href="#h-三参数记忆--检索--微调--工具四选一还是组合" aria-label="本节链接">#</a></h3>
+<h4 id="h-31-四维对比">3.1 四维对比<a class="anchor" href="#h-31-四维对比" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>参数记忆（预训练/微调）</th>
+<th>检索（RAG）</th>
+<th>工具（计算/查询/API）</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>时效性</td>
+<td>差（需重训）</td>
+<td><strong>好</strong>（改文档即生效）</td>
+<td>好（实时）</td>
+</tr>
+<tr>
+<td>可审计</td>
+<td>差（无法给出证据）</td>
+<td><strong>好</strong>（doc/chunk id + 版本）</td>
+<td>好（调用参数可记录）</td>
+</tr>
+<tr>
+<td>可授权</td>
+<td>差（无法按人裁剪权重）</td>
+<td><strong>好</strong>（ACL 前置过滤）</td>
+<td>好（按凭证）</td>
+</tr>
+<tr>
+<td>单次成本</td>
+<td>低（无检索与长上下文）</td>
+<td>中（检索 + 上下文 token）</td>
+<td>中（一次工具调用）</td>
+</tr>
+<tr>
+<td>更新成本</td>
+<td><strong>高</strong>（重训/重嵌入）</td>
+<td>低（增量索引，ch6-l1）</td>
+<td>中（改接口）</td>
+</tr>
+<tr>
+<td>可控性</td>
+<td>低（不可干预）</td>
+<td>中（可干预证据）</td>
+<td><strong>高</strong>（参数可校验）</td>
+</tr>
+<tr>
+<td>延迟</td>
+<td><strong>最低</strong></td>
+<td>中高</td>
+<td>低</td>
+</tr>
+<tr>
+<td>擅长</td>
+<td><strong>形式、风格、格式、领域语感</strong></td>
+<td><strong>事实、时效、可追溯</strong></td>
+<td><strong>精确计算、事务、副作用</strong></td>
+</tr>
+</tbody></table>
+<p><strong>一句话分工</strong>：</p>
+<blockquote>
+<p><strong>微调擅长&quot;怎么说&quot;，检索擅长&quot;依据什么说&quot;，工具擅长&quot;算得对/查得准&quot;。</strong></p>
+</blockquote>
+<h4 id="h-32-微调什么时候比-rag-划算一个盈亏平衡式">3.2 微调什么时候比 RAG 划算：一个盈亏平衡式<a class="anchor" href="#h-32-微调什么时候比-rag-划算一个盈亏平衡式" aria-label="本节链接">#</a></h4>
+<p>微调不是 RAG 的替代品，而是<strong>在某些条件下更划算的另一种手段</strong>。设：</p>
+<ul>
+<li>微调的一次性成本 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3175em;"><span style="top:-2.55em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">train</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>（数据准备 + 训练 + 评测 + 上线，含人力）；</li>
+<li>微调后每次调用的节省 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">Δ</span><span class="mord mathnormal">c</span></span></span></span>（省掉检索与长上下文的 token 成本，或可用更小模型）；</li>
+<li>查询总量 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8778em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">Q</span></span></span></span>（生命周期内）。</li>
+</ul>
+<p>则<strong>微调划算</strong>当且仅当：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3175em;"><span style="top:-2.55em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">train</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&lt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">Δ</span><span class="mord mathnormal">c</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8778em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">Q</span></span></span></span></span></p>
+<p>⚠️ 示例：设 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3175em;"><span style="top:-2.55em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">train</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">15</span></span></span></span> 万元（含标注与人力），<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">Δ</span><span class="mord mathnormal">c</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.02</span></span></span></span> 元/次（检索 + 上下文摊薄），则盈亏平衡点为</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.9331em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">Q</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.7387em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.0074em;vertical-align:-0.686em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3214em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">0.02</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">150000</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">7.5</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8641em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8641em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">6</span></span></span></span></span></span></span></span><span class="mspace"> </span><span class="mord text"><span class="mord cjk_fallback">次</span></span></span></span></span></span></p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.9331em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">Q</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.7387em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.0074em;vertical-align:-0.686em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3214em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">0.02</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">150000</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">7.5</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8641em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8641em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">6</span></span></span></span></span></span></span></span><span class="mspace"> </span><span class="mord text"><span class="mord cjk_fallback">次</span></span></span></span></span></span></p>
+<p><strong>读法</strong>：在 750 万次调用之前，微调在纯成本上不划算。这意味着：</p>
+<ul>
+<li><strong>高频、稳定、格式约束严格</strong>的场景（例如把结构化抽取固化进模型）值得微调；</li>
+<li><strong>低频、知识多变、需要审计</strong>的场景，RAG 几乎总是更优。</li>
+</ul>
+<p><strong>注意这里的比较只算成本，不算质量</strong>。微调真正的价值常常在质量维度（更好的格式遵循、更稳定的抽取），此时应当用第 5 章第 4 节的<strong>边际成本</strong>框架比较，而不是只看 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8831em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">Q</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6887em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span></span></span></span></span></span></span></span>。</p>
+<h4 id="h-33-组合的三种形态">3.3 组合的三种形态<a class="anchor" href="#h-33-组合的三种形态" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>形态</th>
+<th>分工</th>
+<th>适用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>RAG + 微调</strong></td>
+<td>微调管格式与风格，检索管事实</td>
+<td>输出格式严格（结构化字段、引用格式）且知识多变</td>
+</tr>
+<tr>
+<td><strong>RAG + 工具</strong></td>
+<td>检索找参数，工具做计算/查询</td>
+<td>需要精确计算或事务（场景 1、2）</td>
+</tr>
+<tr>
+<td><strong>微调 + 工具（无检索）</strong></td>
+<td>知识已稳定且可进参数，实时数据走 API</td>
+<td>知识 static、只差实时数据</td>
+</tr>
+</tbody></table>
+<p><strong>判据</strong>：先问&quot;这个任务的正确性依赖什么？&quot;——依赖<strong>事实</strong>就上检索；依赖<strong>形式</strong>就上微调；依赖<strong>计算/事务</strong>就上工具。<strong>三者不冲突，冲突的是&quot;以为一个能包打天下&quot;。</strong></p>
+<p><figure><img class="md-img" src="content/courses/rag-systems/assets/chapter-7-figure-04.svg" alt="微调的盈亏平衡点" loading="lazy" decoding="async"><figcaption>微调的盈亏平衡点</figcaption></figure>
+</p>
+<h3 id="h-四上线前失效清单可逐条打勾">四、上线前失效清单（可逐条打勾）<a class="anchor" href="#h-四上线前失效清单可逐条打勾" aria-label="本节链接">#</a></h3>
+<p>这是全课的收敛资产：<strong>33 条检查项，分五类，每条给出&quot;症状 → 判据 → 处置&quot;</strong>。它的用法是在发布前逐条过，任何一条 FAIL 都阻断发布（硬条件）或记录豁免理由（软条件）。</p>
+<h4 id="h-41-数据7-条">4.1 数据（7 条）<a class="anchor" href="#h-41-数据7-条" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>检查项</th>
+<th>症状</th>
+<th>判据</th>
+<th>处置</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>D1</td>
+<td>切分后无超长块</td>
+<td>长块稀释相关性、浪费预算</td>
+<td><code>max_chunk_tokens ≤ 1024</code></td>
+<td>收紧窗口 / 按语义边界切分</td>
+</tr>
+<tr>
+<td>D2</td>
+<td>近似重复率</td>
+<td>重复证据挤占预算、放大流行度偏差</td>
+<td><code>near_dup_ratio ≤ 0.05</code></td>
+<td>精确 + 近似去重</td>
+</tr>
+<tr>
+<td>D3</td>
+<td>编码与乱码</td>
+<td>检索命中率莫名低</td>
+<td>抽样检查非 UTF-8 比例 = 0</td>
+<td>统一编码、修复解析器</td>
+</tr>
+<tr>
+<td>D4</td>
+<td>页眉页脚/导航污染</td>
+<td>每个 chunk 都含样板文字</td>
+<td>样板 token 占比 &lt; 5%</td>
+<td>解析期剥离模板</td>
+</tr>
+<tr>
+<td>D5</td>
+<td>多语言处理</td>
+<td>跨语言检索全 miss</td>
+<td>语言识别覆盖率 = 100%</td>
+<td>分语言索引或跨语言嵌入</td>
+</tr>
+<tr>
+<td>D6</td>
+<td>表格/代码解析</td>
+<td>结构化内容被切碎</td>
+<td>抽样检查表格/代码块的完整性</td>
+<td>特殊类型单独处理</td>
+</tr>
+<tr>
+<td>D7</td>
+<td>文档时间戳与版本</td>
+<td>新旧内容混杂无法区分</td>
+<td>每篇有时间戳与版本字段</td>
+<td>补元数据（供重排与过滤）</td>
+</tr>
+</tbody></table>
+<h4 id="h-42-索引6-条">4.2 索引（6 条）<a class="anchor" href="#h-42-索引6-条" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>检查项</th>
+<th>症状</th>
+<th>判据</th>
+<th>处置</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>I1</td>
+<td>manifest 与发布清单一致</td>
+<td>线上跑的是未发布/已回滚版本</td>
+<td><code>manifest ∈ 发布清单</code></td>
+<td>回滚 + 查发布流水线</td>
+</tr>
+<tr>
+<td>I2</td>
+<td>墓碑比例</td>
+<td>召回损失 + 空间放大</td>
+<td><code>tomb_ratio ≤ 0.2</code></td>
+<td>压实（ch6-l1）</td>
+</tr>
+<tr>
+<td>I3</td>
+<td>段数上限</td>
+<td>查询放大、P99 抬升</td>
+<td><code>segments ≤ 8</code></td>
+<td>压实</td>
+</tr>
+<tr>
+<td>I4</td>
+<td>重建触发已配置</td>
+<td>长期漂移无重置</td>
+<td>四个触发器齐全（版本/δ/段数/时间）</td>
+<td>补触发规则</td>
+</tr>
+<tr>
+<td>I5</td>
+<td>量化误差在容差内</td>
+<td>召回对 <code>ef</code> 不敏感</td>
+<td>量化前后 recall 差 &lt; 2pt</td>
+<td>换量化参数或加重排</td>
+</tr>
+<tr>
+<td>I6</td>
+<td>召回基线有监控</td>
+<td>质量缓慢下滑无人知</td>
+<td>每日 recall 探针 + 变化点告警</td>
+<td>建探针（ch6-l4）</td>
+</tr>
+</tbody></table>
+<h4 id="h-43-检索8-条">4.3 检索（8 条）<a class="anchor" href="#h-43-检索8-条" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>检查项</th>
+<th>症状</th>
+<th>判据</th>
+<th>处置</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>R1</td>
+<td>空结果率</td>
+<td>用户直接得不到答案</td>
+<td><code>empty_rate ≤ 0.03</code></td>
+<td>查 ACL 字段 / 索引更新 / 改写回归</td>
+</tr>
+<tr>
+<td>R2</td>
+<td>ACL 缺字段文档数</td>
+<td>新文档默认可见或不可见</td>
+<td><code>acl_missing_docs == 0</code></td>
+<td>deny-by-default + 补字段</td>
+</tr>
+<tr>
+<td>R3</td>
+<td>canary 泄漏数</td>
+<td>越权（事故级）</td>
+<td><code>canary_leaks == 0</code></td>
+<td><strong>阻断发布</strong>，查过滤路径</td>
+</tr>
+<tr>
+<td>R4</td>
+<td>权限由服务层注入</td>
+<td>提示注入可越权</td>
+<td>代码审计：权限参数不来自提示</td>
+<td>改为强制参数</td>
+</tr>
+<tr>
+<td>R5</td>
+<td>融合权重未过拟合</td>
+<td>换一批查询就退化</td>
+<td>在留出集上重测融合权重</td>
+<td>回归到 RRF 等无参融合</td>
+</tr>
+<tr>
+<td>R6</td>
+<td>查询改写有回归门禁</td>
+<td>改写把好查询改坏</td>
+<td>改写前后 recall 不降（CI 上界）</td>
+<td>加门禁（ch4-l1）</td>
+</tr>
+<tr>
+<td>R7</td>
+<td>过滤导致图断裂已评估</td>
+<td>高选择性下召回骤降</td>
+<td>测 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span></span></span></span> 从 1.0 到 0.01 的召回曲线</td>
+<td>分区或过采样 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1/</span><span class="mord mathnormal">s</span></span></span></span></td>
+</tr>
+<tr>
+<td>R8</td>
+<td>重排池与延迟预算匹配</td>
+<td>重排吃掉预算</td>
+<td>池 × 每对耗时 ≤ 预算份额</td>
+<td>降池或加缓存</td>
+</tr>
+</tbody></table>
+<h4 id="h-44-生成6-条">4.4 生成（6 条）<a class="anchor" href="#h-44-生成6-条" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>检查项</th>
+<th>症状</th>
+<th>判据</th>
+<th>处置</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>G1</td>
+<td>引用一致率</td>
+<td>引用是装饰、不可核验</td>
+<td><code>citation_consistency ≥ 0.8</code></td>
+<td>grounding 指令 / 重排证据</td>
+</tr>
+<tr>
+<td>G2</td>
+<td>拒答率在区间内</td>
+<td>过低=硬答；过高=不可用</td>
+<td><code>0.02 ≤ refuse_rate ≤ 0.20</code></td>
+<td>调拒答阈值（ch5-l3）</td>
+</tr>
+<tr>
+<td>G3</td>
+<td>证据充分性测试</td>
+<td>无证据时模型凭记忆硬答</td>
+<td>空上下文测试：正确率应显著下降</td>
+<td>加&quot;证据不足则拒答&quot;</td>
+</tr>
+<tr>
+<td>G4</td>
+<td>先验冲突已测</td>
+<td>参数记忆压过证据</td>
+<td><code>PriorWin</code> 已测且可接受</td>
+<td>加 grounding 指令</td>
+</tr>
+<tr>
+<td>G5</td>
+<td>输出长度受控</td>
+<td>截断导致回答作废</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.1058em;vertical-align:-0.2753em;"></span><span class="mord"><span class="mord mathnormal">b</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8305em;"><span style="top:-2.4247em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">O</span></span></span><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mop mtight"><span class="mtight">m</span><span class="mtight">i</span><span class="mtight">n</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2753em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≥</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord">P99</span></span></span></span></span> 输出长度</td>
+<td>调整预算 / 限制输出</td>
+</tr>
+<tr>
+<td>G6</td>
+<td>注入测试通过</td>
+<td>证据里的指令被执行</td>
+<td>注入样本集全部不产生越权行为</td>
+<td>内容与指令隔离</td>
+</tr>
+</tbody></table>
+<h4 id="h-45-运营5-条">4.5 运营（5 条）<a class="anchor" href="#h-45-运营5-条" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>检查项</th>
+<th>症状</th>
+<th>判据</th>
+<th>处置</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>O1</td>
+<td>P95 延迟达标</td>
+<td>体验劣化</td>
+<td><code>p95_ms ≤ SLO</code></td>
+<td>查瓶颈段（ch5-l4）</td>
+</tr>
+<tr>
+<td>O2</td>
+<td>每正确回答成本达标</td>
+<td>效率劣化</td>
+<td><code>cost_per_correct ≤ 上限</code></td>
+<td>缓存 / <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> / 模型档位</td>
+</tr>
+<tr>
+<td>O3</td>
+<td>缓存版本无漂移</td>
+<td>返回旧文档内容</td>
+<td><code>version_drift == 0</code></td>
+<td>缓存键加 manifest + 反向失效</td>
+</tr>
+<tr>
+<td>O4</td>
+<td>评测集新鲜</td>
+<td>过拟合/漂移</td>
+<td><code>eval_age_days ≤ 90</code></td>
+<td>换血 + 保留 hidden set</td>
+</tr>
+<tr>
+<td>O5</td>
+<td>回滚演练定期做</td>
+<td>真出事时回滚不熟练</td>
+<td><code>rollback_drill_days ≤ 30</code></td>
+<td>定期演练（ch6-l1）</td>
+</tr>
+<tr>
+<td>O6</td>
+<td>降级路径明确</td>
+<td>依赖挂了全站不可用</td>
+<td>每个外部依赖都有降级动作</td>
+<td>补兜底（ch7-l1 §五）</td>
+</tr>
+</tbody></table>
+<p><strong>清单使用方法</strong>：把每一行写成一个<strong>自动化断言</strong>（代码里的实现给出了 16 条的版本），进 CI；数据类可以离线跑，运营类用每日快照跑。<strong>没有断言的检查项等于没有检查。</strong></p>
+<h3 id="h-五维护成本与长期责任">五、维护成本与长期责任<a class="anchor" href="#h-五维护成本与长期责任" aria-label="本节链接">#</a></h3>
+<p>RAG 是<strong>持续运营</strong>，不是一次性项目。年度成本项至少包括：</p>
+<table>
+<thead>
+<tr>
+<th>成本项</th>
+<th>驱动因素</th>
+<th>典型频率</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>全量重建索引</td>
+<td>embedder/切分版本变更、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7335em;vertical-align:-0.0391em;"></span><span class="mord mathnormal" style="margin-right:0.0379em;">δ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&gt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0379em;">δ</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6887em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span></span></span></span></span></span></span></span></td>
+<td>每季度 ~ 每年</td>
+</tr>
+<tr>
+<td>增量更新与压实</td>
+<td>文档变更率 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0379em;">δ</span></span></span></span></td>
+<td>每日</td>
+</tr>
+<tr>
+<td>评测集维护</td>
+<td>分布漂移、新租户、新话题</td>
+<td>每季度换血</td>
+</tr>
+<tr>
+<td>模型升级</td>
+<td>上游模型换代、成本下降</td>
+<td>每半年 ~ 每年</td>
+</tr>
+<tr>
+<td>权限变更</td>
+<td>组织调整、离职、租户增删</td>
+<td>持续</td>
+</tr>
+<tr>
+<td>成本增长</td>
+<td>用量增长、上下文变长</td>
+<td>持续（按月复核）</td>
+</tr>
+<tr>
+<td>告警与事故处理</td>
+<td>探针失败、版本漂移</td>
+<td>持续</td>
+</tr>
+<tr>
+<td>人员交接</td>
+<td>文档、ADR、运行手册</td>
+<td>每年</td>
+</tr>
+</tbody></table>
+<p><strong>判据</strong>：如果这套成本没有被计入预算，那么&quot;上线&quot;只是把技术债转成了运营事故。<strong>第 7 章第 1 节的需求问卷里&quot;运维&quot;那一行，问的就是这件事。</strong></p>
+<h3 id="h-代码">代码<a class="anchor" href="#h-代码" aria-label="本节链接">#</a></h3>
+<pre data-lang="python"><code class="language-python"># -*- coding: utf-8 -*-
+&quot;&quot;&quot;(a) 规则式&quot;该不该上 RAG&quot;决策器（每条结论可解释）；(b) 上线前失效清单自检。
+   ⚠️ 场景与指标快照均为构造数据，用于演示判据，不构成任何真实评估结论。&quot;&quot;&quot;
+
+# ============ (a) 决策器 ============
+RULES = [
+    (&quot;need_exact_compute&quot;, &quot;需要精确计算/聚合/计数&quot;, &quot;代码执行 / SQL 聚合&quot;, &quot;检索给不了算术保证&quot;),
+    (&quot;structured_data&quot;, &quot;查询对象是结构化数据/事务&quot;, &quot;数据库直查 / SQL&quot;, &quot;RAG 对结构化查询是有损近似&quot;),
+    (&quot;single_doc_deep_read&quot;, &quot;单篇长文档深读&quot;, &quot;长上下文直读&quot;, &quot;避免切碎与跨块指代丢失&quot;),
+    (&quot;global_aggregate&quot;, &quot;需要全局摘要/计数/全集否定&quot;, &quot;map-reduce / 结构化聚合&quot;, &quot;相关度取样天然漏&quot;),
+    (&quot;needs_determinism&quot;, &quot;必须 100% 确定且可审计的规则判定&quot;, &quot;规则引擎 / 决策表&quot;, &quot;检索是概率性的&quot;),
+    (&quot;ultra_low_latency&quot;, &quot;端到端 &lt;100ms&quot;, &quot;缓存/预计算/不用 LLM&quot;, &quot;decode 地板已超预算&quot;),
+    (&quot;heavy_math&quot;, &quot;强多步数学/规划&quot;, &quot;工具 + 验证器&quot;, &quot;检索不提供推理保证&quot;),
+    (&quot;no_data_boundary_ok&quot;, &quot;数据不允许出域且无本地部署&quot;, &quot;本地化 + 私有检索（需成本论证）&quot;, &quot;合规优先于便利&quot;),
+    (&quot;no_eval_capacity&quot;, &quot;没有评测能力也没有维护预算&quot;, &quot;先补评测（ch7-l2）&quot;, &quot;RAG 会把错误藏得更深&quot;),
+    (&quot;docs_missing&quot;, &quot;领域文档稀缺或质量极差&quot;, &quot;先做数据工程&quot;, &quot;垃圾进垃圾出&quot;),
+    (&quot;adversarial_no_isolation&quot;, &quot;高风险对抗输入且无隔离&quot;, &quot;先做安全（提示注入）&quot;, &quot;注入会打穿检索层&quot;),
+    (&quot;one_off_query&quot;, &quot;一次性/极低频问题&quot;, &quot;直接查文档 / 搜索&quot;, &quot;索引成本摊不薄&quot;),
+]
+
+def decide(feat):
+    hits = [(k, why, alt, reason) for k, why, alt, reason in RULES if feat.get(k)]
+    if not hits:
+        return dict(verdict=&quot;用 RAG&quot;, why=&quot;检索能提供外部知识 + 可审计 + 可更新 + 可授权&quot;,
+                    alternatives=[], note=&quot;仍需先建评测（ch7-l2）并量化 SLO（ch7-l1）&quot;)
+    hard = {&quot;need_exact_compute&quot;, &quot;structured_data&quot;, &quot;needs_determinism&quot;, &quot;ultra_low_latency&quot;}
+    if any(k in hard for k, *_ in hits):
+        return dict(verdict=&quot;不用（或不用纯）RAG&quot;, why=[h[1] for h in hits],
+                    alternatives=[h[2] for h in hits], note=&quot;以上任一条成立，纯 RAG 都不划算&quot;)
+    return dict(verdict=&quot;RAG + 其它手段（混合）&quot;, why=[h[1] for h in hits],
+                alternatives=[h[2] for h in hits],
+                note=&quot;保留检索，但对上述场景分别接工具/长上下文/先补数据与评测&quot;)
+
+print(&quot;== (a) ⚠️ 合成场景：规则式决策器（每条结论都可解释）==&quot;)
+SCEN = {
+    &quot;内部知识库问答&quot;: dict(),
+    &quot;财务指标问答（要算同比/求和）&quot;: dict(need_exact_compute=True, structured_data=True),
+    &quot;单份合同条款解释&quot;: dict(single_doc_deep_read=True),
+    &quot;“哪些文档没提到 X”&quot;: dict(global_aggregate=True),
+    &quot;实时风控规则判定（&lt;50ms）&quot;: dict(needs_determinism=True, ultra_low_latency=True),
+    &quot;科研文献调研（有评测、有维护预算）&quot;: dict(),
+}
+for name, feat in SCEN.items():
+    r = decide(feat)
+    print(f&quot;\n  场景：{name}&quot;)
+    print(f&quot;    结论：{r[&#39;verdict&#39;]}&quot;)
+    if isinstance(r[&quot;why&quot;], list):
+        for w in r[&quot;why&quot;]:
+            print(f&quot;    触发规则：{w}&quot;)
+        print(f&quot;    替代方案：{&#39; / &#39;.join(r[&#39;alternatives&#39;])}&quot;)
+    print(f&quot;    备注：{r[&#39;note&#39;]}&quot;)
+
+# ============ (b) 失效清单自检 ============
+CHECKS = [
+    (&quot;数据&quot;, &quot;切分后存在超长块&quot;, &quot;max_chunk_tokens&quot;, lambda v: v &lt;= 1024,
+     &quot;长块稀释相关性、浪费预算&quot;, &quot;收紧窗口/按语义边界切分&quot;),
+    (&quot;数据&quot;, &quot;近似重复率&quot;, &quot;near_dup_ratio&quot;, lambda v: v &lt;= 0.05,
+     &quot;重复证据挤占预算并放大流行度偏差&quot;, &quot;去重（精确+近似）&quot;),
+    (&quot;索引&quot;, &quot;索引版本与发布清单一致&quot;, &quot;manifest_in_release&quot;, lambda v: v is True,
+     &quot;线上跑的是未发布/已回滚版本&quot;, &quot;回滚并检查发布流水线&quot;),
+    (&quot;索引&quot;, &quot;墓碑比例&quot;, &quot;tomb_ratio&quot;, lambda v: v &lt;= 0.2,
+     &quot;召回损失 + 空间放大&quot;, &quot;压实（ch6-l1）&quot;),
+    (&quot;索引&quot;, &quot;召回基线未跌破&quot;, &quot;recall_at_10&quot;, lambda v: v &gt;= 0.85,
+     &quot;整体召回下降&quot;, &quot;先回滚再排查&quot;),
+    (&quot;检索&quot;, &quot;空结果率&quot;, &quot;empty_rate&quot;, lambda v: v &lt;= 0.03,
+     &quot;用户直接得不到答案&quot;, &quot;查 ACL 字段/索引更新/改写回归&quot;),
+    (&quot;检索&quot;, &quot;ACL 缺字段文档数&quot;, &quot;acl_missing_docs&quot;, lambda v: v == 0,
+     &quot;新文档默认可见或不可见&quot;, &quot;deny-by-default + 补字段&quot;),
+    (&quot;检索&quot;, &quot;canary 泄漏数&quot;, &quot;canary_leaks&quot;, lambda v: v == 0,
+     &quot;越权，事故级&quot;, &quot;阻断发布，查过滤路径&quot;),
+    (&quot;生成&quot;, &quot;引用一致率&quot;, &quot;citation_consistency&quot;, lambda v: v &gt;= 0.8,
+     &quot;引用是装饰，不可核验&quot;, &quot;加 grounding 指令/重排证据&quot;),
+    (&quot;生成&quot;, &quot;拒答率&quot;, &quot;refuse_rate&quot;, lambda v: 0.02 &lt;= v &lt;= 0.20,
+     &quot;过低=硬答；过高=不可用&quot;, &quot;调拒答阈值（ch5-l3）&quot;),
+    (&quot;运营&quot;, &quot;P95 延迟&quot;, &quot;p95_ms&quot;, lambda v: v &lt;= 3000,
+     &quot;体验劣化&quot;, &quot;查瓶颈段（ch5-l4）&quot;),
+    (&quot;运营&quot;, &quot;每正确回答成本&quot;, &quot;cost_per_correct&quot;, lambda v: v &lt;= 0.05,
+     &quot;效率劣化&quot;, &quot;缓存/k/模型档位（ch5-l4）&quot;),
+    (&quot;运营&quot;, &quot;缓存命中率&quot;, &quot;cache_hit_rate&quot;, lambda v: v &gt;= 0.1,
+     &quot;成本未摊薄&quot;, &quot;检查前缀布局与键维度（ch6-l2）&quot;),
+    (&quot;运营&quot;, &quot;索引-缓存版本漂移&quot;, &quot;version_drift&quot;, lambda v: v == 0,
+     &quot;返回旧文档内容&quot;, &quot;缓存键加 manifest + 反向失效&quot;),
+    (&quot;运营&quot;, &quot;评测集更新时间&quot;, &quot;eval_age_days&quot;, lambda v: v &lt;= 90,
+     &quot;评测集过拟合/漂移&quot;, &quot;换血 + 保留 hidden set（ch7-l2）&quot;),
+    (&quot;运营&quot;, &quot;回滚演练时间&quot;, &quot;rollback_drill_days&quot;, lambda v: v &lt;= 30,
+     &quot;真出事时回滚不熟练&quot;, &quot;定期演练（ch6-l1）&quot;),
+]
+
+def audit(snap, name):
+    print(f&quot;\n== (b) 失效清单自检：{name} ==&quot;)
+    n_pass = n_fail = 0
+    for cat, item, key, ok, sym, act in CHECKS:
+        v = snap.get(key, None)
+        status = &quot;FAIL&quot; if v is None else (&quot;PASS&quot; if ok(v) else &quot;FAIL&quot;)
+        n_pass += (status == &quot;PASS&quot;); n_fail += (status == &quot;FAIL&quot;)
+        if status != &quot;PASS&quot;:
+            print(f&quot;  [{status}] {cat}/{item}: {key}={v}&quot;)
+            print(f&quot;         症状：{sym}&quot;)
+            print(f&quot;         处置：{act}&quot;)
+    print(f&quot;  合计：PASS={n_pass} FAIL={n_fail}  -&gt; &quot;
+          f&quot;{&#39;可上线&#39; if n_fail == 0 else &#39;阻断：先修 FAIL 项&#39;}&quot;)
+
+HEALTHY = dict(max_chunk_tokens=512, near_dup_ratio=0.02, manifest_in_release=True,
+               tomb_ratio=0.05, recall_at_10=0.91, empty_rate=0.01, acl_missing_docs=0,
+               canary_leaks=0, citation_consistency=0.88, refuse_rate=0.07, p95_ms=1800,
+               cost_per_correct=0.03, cache_hit_rate=0.35, version_drift=0, eval_age_days=20,
+               rollback_drill_days=10)
+SICK = dict(max_chunk_tokens=2048, near_dup_ratio=0.22, manifest_in_release=False,
+            tomb_ratio=0.41, recall_at_10=0.71, empty_rate=0.18, acl_missing_docs=37,
+            canary_leaks=2, citation_consistency=0.44, refuse_rate=0.41, p95_ms=5200,
+            cost_per_correct=0.14, cache_hit_rate=0.02, version_drift=5, eval_age_days=210,
+            rollback_drill_days=120)
+audit(HEALTHY, &quot;健康快照&quot;)
+audit(SICK, &quot;病态快照&quot;)
+print(f&quot;\n  清单共 {len(CHECKS)} 条，覆盖 &quot;
+      f&quot;{len(set(c for c, *_ in CHECKS))} 类：{sorted(set(c for c, *_ in CHECKS))}&quot;)</code></pre>
+<pre data-lang="text"><code class="language-text">== (a) ⚠️ 合成场景：规则式决策器（每条结论都可解释）==
+
+  场景：内部知识库问答
+    结论：用 RAG
+    备注：仍需先建评测（ch7-l2）并量化 SLO（ch7-l1）
+
+  场景：财务指标问答（要算同比/求和）
+    结论：不用（或不用纯）RAG
+    触发规则：需要精确计算/聚合/计数
+    触发规则：查询对象是结构化数据/事务
+    替代方案：代码执行 / SQL 聚合 / 数据库直查 / SQL
+    备注：以上任一条成立，纯 RAG 都不划算
+
+  场景：单份合同条款解释
+    结论：RAG + 其它手段（混合）
+    触发规则：单篇长文档深读
+    替代方案：长上下文直读
+    备注：保留检索，但对上述场景分别接工具/长上下文/先补数据与评测
+
+  场景：“哪些文档没提到 X”
+    结论：RAG + 其它手段（混合）
+    触发规则：需要全局摘要/计数/全集否定
+    替代方案：map-reduce / 结构化聚合
+    备注：保留检索，但对上述场景分别接工具/长上下文/先补数据与评测
+
+  场景：实时风控规则判定（&lt;50ms）
+    结论：不用（或不用纯）RAG
+    触发规则：必须 100% 确定且可审计的规则判定
+    触发规则：端到端 &lt;100ms
+    替代方案：规则引擎 / 决策表 / 缓存/预计算/不用 LLM
+    备注：以上任一条成立，纯 RAG 都不划算
+
+  场景：科研文献调研（有评测、有维护预算）
+    结论：用 RAG
+    备注：仍需先建评测（ch7-l2）并量化 SLO（ch7-l1）
+
+== (b) 失效清单自检：健康快照 ==
+  合计：PASS=16 FAIL=0  -&gt; 可上线
+
+== (b) 失效清单自检：病态快照 ==
+  [FAIL] 数据/切分后存在超长块: max_chunk_tokens=2048
+         症状：长块稀释相关性、浪费预算
+         处置：收紧窗口/按语义边界切分
+  [FAIL] 数据/近似重复率: near_dup_ratio=0.22
+         症状：重复证据挤占预算并放大流行度偏差
+         处置：去重（精确+近似）
+  [FAIL] 索引/索引版本与发布清单一致: manifest_in_release=False
+         症状：线上跑的是未发布/已回滚版本
+         处置：回滚并检查发布流水线
+  [FAIL] 索引/墓碑比例: tomb_ratio=0.41
+         症状：召回损失 + 空间放大
+         处置：压实（ch6-l1）
+  [FAIL] 索引/召回基线未跌破: recall_at_10=0.71
+         症状：整体召回下降
+         处置：先回滚再排查
+  [FAIL] 检索/空结果率: empty_rate=0.18
+         症状：用户直接得不到答案
+         处置：查 ACL 字段/索引更新/改写回归
+  [FAIL] 检索/ACL 缺字段文档数: acl_missing_docs=37
+         症状：新文档默认可见或不可见
+         处置：deny-by-default + 补字段
+  [FAIL] 检索/canary 泄漏数: canary_leaks=2
+         症状：越权，事故级
+         处置：阻断发布，查过滤路径
+  [FAIL] 生成/引用一致率: citation_consistency=0.44
+         症状：引用是装饰，不可核验
+         处置：加 grounding 指令/重排证据
+  [FAIL] 生成/拒答率: refuse_rate=0.41
+         症状：过低=硬答；过高=不可用
+         处置：调拒答阈值（ch5-l3）
+  [FAIL] 运营/P95 延迟: p95_ms=5200
+         症状：体验劣化
+         处置：查瓶颈段（ch5-l4）
+  [FAIL] 运营/每正确回答成本: cost_per_correct=0.14
+         症状：效率劣化
+         处置：缓存/k/模型档位（ch5-l4）
+  [FAIL] 运营/缓存命中率: cache_hit_rate=0.02
+         症状：成本未摊薄
+         处置：检查前缀布局与键维度（ch6-l2）
+  [FAIL] 运营/索引-缓存版本漂移: version_drift=5
+         症状：返回旧文档内容
+         处置：缓存键加 manifest + 反向失效
+  [FAIL] 运营/评测集更新时间: eval_age_days=210
+         症状：评测集过拟合/漂移
+         处置：换血 + 保留 hidden set（ch7-l2）
+  [FAIL] 运营/回滚演练时间: rollback_drill_days=120
+         症状：真出事时回滚不熟练
+         处置：定期演练（ch6-l1）
+  合计：PASS=0 FAIL=16  -&gt; 阻断：先修 FAIL 项
+
+  清单共 16 条，覆盖 5 类：[&#39;数据&#39;, &#39;检索&#39;, &#39;生成&#39;, &#39;索引&#39;, &#39;运营&#39;]</code></pre>
+<p><strong>关键设计决策</strong>：<code>decide()</code> <strong>故意写成规则而非打分模型</strong>。原因是这类决策必须<strong>可解释</strong>：当它给出&quot;不用纯 RAG&quot;时，必须能列出<strong>具体是哪条规则触发的</strong>，否则使用者无法反驳也无法修正规则。同理，<code>audit()</code> 的每一条都输出&quot;症状 + 处置&quot;，而不是一个分数 —— <strong>检查表的价值在于它直接给出动作，而不是一个需要解释的数字。</strong></p>
+<h3 id="h-练习">练习<a class="anchor" href="#h-练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><p><strong>给决策器加规则并验证不冲突</strong>。加入两条新规则：&quot;需要流式输出且首 token &lt; 300ms&quot;与&quot;知识变更频率 &lt; 1 次/年&quot;。为每条写触发条件、替代方案与理由，然后构造两个场景验证它们不会与已有规则矛盾（提示：注意&quot;知识不常变&quot;与&quot;需要时效&quot;是互补条件）。</p>
+</li>
+<li><p><strong>把清单做成 CI 门禁</strong>。把 §4 的 33 条整理成一个 JSON 配置（每条含 <code>key</code>、<code>judge</code>、<code>severity</code>、<code>action</code>），并实现一个脚本读取指标快照输出 PASS/WARN/FAIL 与退出码。说明 severity 怎么分（提示：越权与合规类应为 <code>blocker</code>）。</p>
+</li>
+<li><p><strong>构造&quot;看起来健康但危险&quot;的快照</strong>。所有指标都在阈值内，但存在一个致命问题（例如 <code>canary_leaks=0</code> 但 <code>acl_missing_docs</code> 即将变成 100，或 <code>refuse_rate=0.02</code> 恰好在下界）。说明你的清单能否捕获它；如果不能，需要补哪一条检查项。</p>
+</li>
+<li><p><strong>算一次微调的盈亏平衡</strong>。用你系统的真实单价估算 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3175em;"><span style="top:-2.55em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">train</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 与 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">Δ</span><span class="mord mathnormal">c</span></span></span></span>，算出 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8831em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">Q</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6887em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span></span></span></span></span></span></span></span>。然后回答：如果把质量收益也计入（例如微调让格式遵循率从 80% 到 98%），你会怎么用第 5 章第 4 节的边际成本框架做决策？</p>
+</li>
+<li><p><strong>为 13 个&quot;不该用&quot;场景各写一个判据实验</strong>。要求每个实验都能在<strong>一天内</strong>用现有数据跑出来（例如场景 1 的判据是&quot;证据全对但答案错的比例 &gt; 5%&quot;，需要什么标注？）。说明哪些实验需要新标注、哪些只需现有日志。</p>
+</li>
+<li><p><strong>审查你自己的系统</strong>。用 §1 的七条适用条件与 §4 的 33 条清单，给你的系统逐条打分（满足/不满足/未知）。对&quot;未知&quot;项写出获取答案的最小动作（找谁、看什么、跑什么）。然后给出结论：现在最该做的<strong>一件事</strong>是什么，依据是哪一条检查项。</p>
+</li>
+<li><p><strong>降级路径设计</strong>。为 RAG 系统的四个外部依赖（LLM、检索、重排、缓存）各写一个降级动作与降级后的质量/延迟预期。回答：哪一条降级可以接受，哪一条应当直接拒绝服务，判据是什么。</p>
+</li>
+<li><p><strong>写一份&quot;退出方案&quot;</strong>。假设你的 RAG 系统上线一年后发现不适合（例如失败分类显示 60% 是&quot;推理错&quot;），写一份迁移方案：迁移到哪个方案、需要保留哪些资产（评测集、权限层、trace）、迁移期的双跑与回滚安排。这份文档应当与 ADR 一样包含&quot;何时重审&quot;。</p>
+</li>
+</ol>
+<h3 id="h-小结">小结<a class="anchor" href="#h-小结" aria-label="本节链接">#</a></h3>
+<ul>
+<li><strong>RAG 的七条适用条件</strong>：知识可外部化为文档、知识会变、查询可分解为&quot;定位 + 抽取/归纳&quot;、能容忍非确定性、有评测能力、有权限与审计要求、错误代价可承受。<strong>不满足的那一条要先被解决，而不是先搭 RAG。</strong></li>
+<li><strong>13 个不该用（或不该只用）RAG 的场景</strong>：精确计算、结构化/事务查询、单文档深读、全局聚合/计数/全集否定、确定性规则判定、极低延迟、强多步数学、数据不能出域、无评测无预算、文档稀缺、对抗输入无隔离、一次性问题、跨文档因果推理。每条都给了机制与替代方案。</li>
+<li><strong>硬条件（1/2/5/6）必须引入替代方案；软条件保留 RAG 但降级为流水线一环。</strong></li>
+<li><strong>别把&quot;检索不到&quot;当成&quot;不该用 RAG&quot;</strong>：先看失败分类 —— <code>召回失败</code>占比高是数据/检索问题，<code>生成未用</code>占比高才是方案问题。</li>
+<li><strong>分工一句话</strong>：<strong>微调擅长&quot;怎么说&quot;，检索擅长&quot;依据什么说&quot;，工具擅长&quot;算得对/查得准&quot;。</strong></li>
+<li><strong>微调的盈亏平衡</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3175em;"><span style="top:-2.55em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">train</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&lt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">Δ</span><span class="mord mathnormal">c</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8778em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">Q</span></span></span></span>。⚠️ 示例：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3175em;"><span style="top:-2.55em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">train</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">15</span></span></span></span> 万元、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">Δ</span><span class="mord mathnormal">c</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.02</span></span></span></span> 元/次 → <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8831em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">Q</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6887em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">7.5</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">6</span></span></span></span></span></span></span></span></span></span></span> 次。<strong>在 750 万次调用之前，纯成本上微调不划算</strong>（质量维度需另用 MC 框架比较）。</li>
+<li><strong>上线前 33 条失效清单</strong>（数据 7 / 索引 6 / 检索 8 / 生成 6 / 运营 6），每条含症状、判据、处置；⚠️ 代码实现了其中 16 条的自动自检：健康快照 <strong>PASS=16 FAIL=0</strong>，病态快照 <strong>PASS=0 FAIL=16</strong>（含 <code>canary_leaks=2</code>、<code>version_drift=5</code>、<code>recall_at_10=0.71</code>）。</li>
+<li><strong>清单必须是自动化断言</strong>（进 CI 或每日快照），否则等于没有检查。<strong>越权与合规类必须是 <code>blocker</code>，直接阻断发布。</strong></li>
+<li><strong>RAG 是持续运营不是一次性项目</strong>：全量重建、增量压实、评测集换血、模型升级、权限变更、成本增长、告警处理、人员交接 —— 这八项都要进预算。</li>
+<li><strong>一句话</strong>：<strong>RAG 不是默认正确的架构，而是一个有明确适用边界的方案。判断力体现在两处：动手前能说清&quot;为什么需要检索&quot;，上线后能说清&quot;哪一条检查项不过、该换成什么&quot;。</strong></li>
+</ul>
+<p>判断力清单 —— 遇到任何新的&quot;知识问答&quot;需求时，先问这九个问题：</p>
+<ol>
+<li><strong>知识在哪里？</strong> 能不能外部化为文档？变更频率多高？</li>
+<li><strong>正确答案依赖什么？</strong> 事实（检索）、形式（微调）、还是计算/事务（工具）？</li>
+<li><strong>失败的主要形态是什么？</strong> 证据不在语料（补数据）、召回不到（修检索）、还是找到了不用（修排序/生成）？</li>
+<li><strong>有效上下文有多大？</strong> 我有 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">eff</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 的实测值，还是只知道窗口标称值？</li>
+<li><strong>权限与审计的要求是什么？</strong> 谁来裁剪可见性？怎么证明不漏？</li>
+<li><strong>质量怎么度量？</strong> 有没有带黄金证据的评测集？它能检出多大的效应？</li>
+<li><strong>延迟与成本的瓶颈在哪一段？</strong> 是 decode 地板，还是检索/prefill？</li>
+<li><strong>出错能退回去吗？</strong> 索引、模型、模板、缓存，各自怎么回滚？</li>
+<li><strong>谁会维护它？</strong> 评测集换血、模型升级、权限变更、成本增长，谁负责？</li>
+</ol>
+<p>继续深入的方向：</p>
+<ul>
+<li><strong>多模态检索</strong>：图像、表格、图表的统一表征与跨模态检索（现有课止步于文本）；</li>
+<li><strong>Agentic 检索</strong>：把检索当作工具，由模型决定何时检索、检索几次、是否重写（对应 <code>agent-systems</code>）；</li>
+<li><strong>结构化与图检索</strong>：把知识图谱、SQL、表格与向量检索统一到一个查询计划里；</li>
+<li><strong>检索与训练的联合优化</strong>：把检索器放进训练回路（如可微检索、检索增强微调），而不是把检索当成训练后的外挂；</li>
+<li><strong>评测基准与失效分析</strong>：面向多跳、聚合、时效、权限的细粒度基准，以及&quot;证据全对但答案错&quot;这类失败的系统性归因。</li>
+</ul>
+<blockquote>
+<p>到此为止，这门课给出的不是一份&quot;最佳实践清单&quot;，而是一套<strong>判断依据</strong>：每一个设计决策都能推导或给出可测判据，每一个结论都标明了它成立的边界。<strong>当你在真实系统里遇到本课没覆盖的情况时，希望你能用同样的方式把它推出来 —— 这才是&quot;知其所以然&quot;的全部意义。</strong></p>
+</blockquote>
+<blockquote>
+<p><strong>全课收束</strong>：七章的主线是一条从&quot;为什么&quot;到&quot;怎么做&quot;再到&quot;什么时候不该做&quot;的链路。<strong>第 1 章</strong>立下外部知识的四条边界（容量/时效/可审计/可控），并证明稀疏、稠密、混合三条检索路线各自的成立前提与失效条件 —— 混合有效的关键不是&quot;用了两种方法&quot;，而是<strong>误差不相关</strong>。<strong>第 2 章</strong>把文档变成可检索单元：切分粒度是语义完整性与检索精度的定量交换；HNSW/IVF/量化的近似代价可算，端到端召回是&quot;定位 × 展开 × 打分&quot;三项之积；更新必须走墓碑与版本。<strong>第 3 章</strong>处理候选池到上下文之间的排序与融合：向量相似度不等于相关性是<strong>架构假设</strong>的必然结果，cross-encoder 用交互换精度、代价可算，RRF 稳健但需要互补度作前提。<strong>第 4 章</strong>把查询本身当作变量：词汇缺口、意图欠定、组合性三类缺陷的处方完全不同，选错类别等于白做。<strong>第 5 章</strong>划出长上下文的边界：窗口变大改变成本斜率而不改变判据，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">eff</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 要实测，上下文是一份要按边际收益分配的预算，&quot;检索到了却没用&quot;有四种可分离的病，延迟与成本可以逐段算清并落在 Pareto 前沿上。<strong>第 6 章</strong>把它变成能长期运行的系统：段式索引可回滚、缓存键决定权限边界、ACL 必须前置且要能被 canary 证伪、每次问答都要留下可重放的证据链。<strong>第 7 章</strong>把这一切收成一个能力 —— <strong>从 SLO 反推架构、用指标树与统计判据驱动迭代、用一个完整案例走一遍&quot;测量→诊断→修复&quot;，最后知道什么场景不该用 RAG</strong>。</p>
+</blockquote>

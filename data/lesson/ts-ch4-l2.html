@@ -1,0 +1,174 @@
+<h2 id="h-tcn-时序卷积">TCN 时序卷积<a class="anchor" href="#h-tcn-时序卷积" aria-label="本节链接">#</a></h2>
+<p>上一课我们用 LSTM 捕捉长程依赖。LSTM 有一个工程上的硬伤：<strong>它是逐时间步串行计算的</strong>——要算 <code>t=100</code> 的状态，必须先算完 <code>t=1</code> 到 <code>99</code>。这让训练没法充分利用 GPU 的并行性，序列一长就慢得难受。时序卷积网络（Temporal Convolutional Network，TCN）给出另一条路：<strong>用卷积同时处理整条序列</strong>，靠&quot;因果卷积 + 空洞卷积&quot;来既保持时序的因果性、又获得指数级增长的感受野。这一课我们把 TCN 的每一个设计动机讲透。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-把卷积搬进时间序列先解决因果">1. 把卷积搬进时间序列：先解决&quot;因果&quot;<a class="anchor" href="#h-1-把卷积搬进时间序列先解决因果" aria-label="本节链接">#</a></h4>
+<p>图像上的卷积是在空间上滑窗；时间序列上卷积则在时间上滑窗。但时间序列有一个图像没有的硬约束：<strong>预测 <code>t</code> 时刻时，不能用 <code>t</code> 之后的信息</strong>，否则就是&quot;偷看答案&quot;。违背这一点的卷积叫&quot;非因果卷积&quot;，它会让模型靠未来的值&quot;作弊&quot;，训练时表现好、部署时完全失效。</p>
+<p>解决办法是<strong>因果卷积（causal convolution）</strong>：卷积核只向右看，输出 <code>y_t</code> 只依赖 <code>x_t, x_{t-1}, ...</code>。实现上最简单的方式是<strong>在序列左端做单向 padding</strong>——把零补在左边，卷积核滑到任何位置都只看过去、不看未来。</p>
+<h4 id="h-2-感受野太小用空洞指数级扩张">2. 感受野太小：用&quot;空洞&quot;指数级扩张<a class="anchor" href="#h-2-感受野太小用空洞指数级扩张" aria-label="本节链接">#</a></h4>
+<p>单靠因果卷积，感受野（输出能看到多远的过去）等于 <code>核大小 k</code>。要看到 100 步之前，就得叠 100 层，不现实。</p>
+<p><strong>空洞卷积（dilated convolution）</strong>的妙处是：在卷积核的元素之间插入&quot;洞&quot;（gap），让相隔 <code>d</code> 个时间步的元素参与一次卷积，而参数量不增加。<code>d</code> 叫膨胀率（dilation rate）。一个核大小 3、膨胀率 d 的卷积层，感受野大约翻倍。让每一层的膨胀率按 <code>1, 2, 4, 8, ...</code> 指数递增，那么 L 层之后的感受野是：</p>
+<pre><code>感受野 = (k - 1) × (2^L - 1) + 1</code></pre>
+<p>取 <code>k=3, L=6</code>，感受野约 <code>2 × 63 + 1 = 127</code>。只用 6 层、每层 3 个参数，就能看到 127 步之前——<strong>层数对数增长，感受野指数增长</strong>。这就是 TCN 能高效覆盖长程依赖的关键。</p>
+<h4 id="h-3-残差连接让深层网络训得动">3. 残差连接：让深层网络训得动<a class="anchor" href="#h-3-残差连接让深层网络训得动" aria-label="本节链接">#</a></h4>
+<p>TCN 往往要叠很多层才能获得大感受野，深层网络会梯度消失。TCN 在每个块里引入<strong>残差连接</strong>：输出 = 输入 + 卷积变换(输入)。这样梯度有一条恒等映射的捷径，和 LSTM 细胞状态的&quot;加法传送带&quot;异曲同工——我们在上一课的&quot;母原理&quot;里已经点明。残差让 TCN 可以稳定地叠到十几层。</p>
+<h4 id="h-4-tcn-vs-rnn并行性的胜利">4. TCN vs RNN：并行性的胜利<a class="anchor" href="#h-4-tcn-vs-rnn并行性的胜利" aria-label="本节链接">#</a></h4>
+<p>把 TCN 和 LSTM 放在一起看：</p>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>LSTM</th>
+<th>TCN</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>训练并行度</td>
+<td>串行，慢</td>
+<td>全序列并行，快</td>
+</tr>
+<tr>
+<td>长程依赖</td>
+<td>靠门控</td>
+<td>靠空洞卷积扩大感受野</td>
+</tr>
+<tr>
+<td>内存</td>
+<td>每步都要存中间状态</td>
+<td>卷积更省</td>
+</tr>
+<tr>
+<td>因果性</td>
+<td>天然满足</td>
+<td>靠单向 padding 保证</td>
+</tr>
+<tr>
+<td>感受野可控性</td>
+<td>隐式</td>
+<td>显式可算</td>
+</tr>
+</tbody></table>
+<p>TCN 最大的红利是<strong>训练并行</strong>：整条序列一次性前向，不用等上一步。2018 年 Bai 等人的实证研究发现，在大量序列任务上，一个设计得当的 TCN 能打平甚至超过 LSTM/GRU。所以 TCN 常被当作&quot;RNN 的卷积替代品&quot;。</p>
+<p><figure><img class="md-img" src="content/courses/time-series/assets/chapter-4-figure-02.svg" alt="因果卷积 + 空洞卷积如何指数级扩大感受野" loading="lazy" decoding="async"><figcaption>因果卷积 + 空洞卷积如何指数级扩大感受野</figcaption></figure>
+</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面实现一个最小 TCN，做和上一课相同的单步预测。核心是<strong>逐层加大膨胀率的因果卷积 + 残差连接</strong>。为了清楚，我们不调库，手写膨胀率递增的堆叠。</p>
+<pre data-lang="python"><code class="language-python">import torch
+import torch.nn as nn
+import numpy as np
+import matplotlib.pyplot as plt
+
+torch.manual_seed(0)
+np.random.seed(0)
+
+# 1) 同样生成一条&quot;趋势 + 周期 + 噪声&quot;序列
+t = np.arange(0, 600)
+series = 0.02 * t + 5 * np.sin(t / 12.0) + np.random.randn(600) * 0.3
+
+# 2) 构造窗口样本（与上一课一致）
+def make_dataset(series, L):
+    X, y = [], []
+    for i in range(len(series) - L):
+        X.append(series[i:i + L])
+        y.append(series[i + L])
+    return torch.tensor(X, dtype=torch.float32), torch.tensor(y, dtype=torch.float32)
+
+L = 128                                  # TCN 用更长的窗口，感受野大
+X, y = make_dataset(series, L)
+X = X.unsqueeze(1)                       # (样本, 通道=1, 时间=L)，适配 Conv1d
+y = y.unsqueeze(-1)
+print(&quot;X 形状:&quot;, X.shape)
+
+# 3) 因果卷积：只在左侧 padding，保证&quot;不偷看未来&quot;
+class CausalConv1d(nn.Module):
+    def __init__(self, in_ch, out_ch, kernel_size, dilation):
+        super().__init__()
+        # 左侧 padding = (kernel_size - 1) * dilation，右侧不补
+        self.pad = (kernel_size - 1) * dilation
+        self.conv = nn.Conv1d(in_ch, out_ch, kernel_size,
+                              dilation=dilation, padding=self.pad)
+
+    def forward(self, x):
+        x = self.conv(x)
+        # 裁掉右侧因 padding 多出来的部分，保证输出长度与输入一致
+        return x[:, :, :x.size(2) - 0] if self.pad == 0 else x
+
+# 4) TCN 残差块：因果空洞卷积 + 激活，再与输入相加
+class TCNBlock(nn.Module):
+    def __init__(self, ch, kernel_size, dilation):
+        super().__init__()
+        self.conv1 = CausalConv1d(ch, ch, kernel_size, dilation)
+        self.conv2 = CausalConv1d(ch, ch, kernel_size, dilation)
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        residual = x                       # 恒等捷径
+        out = self.relu(self.conv1(x))
+        out = self.conv2(out)
+        return self.relu(out + residual)   # 残差连接
+
+class TCN(nn.Module):
+    def __init__(self, input_ch=1, hidden_ch=16, kernel_size=3, layers=5):
+        super().__init__()
+        # 每层膨胀率 1, 2, 4, 8, 16 ... 指数递增
+        self.blocks = nn.ModuleList([
+            TCNBlock(hidden_ch, kernel_size, 2 ** i) for i in range(layers)
+        ])
+        self.input_proj = nn.Conv1d(input_ch, hidden_ch, 1)
+        self.fc = nn.Linear(hidden_ch, 1)
+
+    def forward(self, x):
+        x = self.input_proj(x)
+        for block in self.blocks:
+            x = block(x)
+        # 取最后一个时间步的特征，预测下一个值
+        return self.fc(x[:, :, -1])
+
+model = TCN()
+criterion = nn.MSELoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+model.train()
+for epoch in range(300):
+    optimizer.zero_grad()
+    pred = model(X)
+    loss = criterion(pred, y)
+    loss.backward()
+    optimizer.step()
+    if (epoch + 1) % 50 == 0:
+        print(f&quot;epoch {epoch+1:3d}  loss={loss.item():.4f}&quot;)
+
+# 5) 自回归外推 60 步
+model.eval()
+with torch.no_grad():
+    window = torch.tensor(series[-L:], dtype=torch.float32).reshape(1, 1, L)
+    preds = []
+    for _ in range(60):
+        nxt = model(window)
+        preds.append(nxt.item())
+        window = torch.cat([window[:, :, 1:], nxt.reshape(1, 1, 1)], dim=2)
+
+plt.figure(figsize=(9, 3.5))
+plt.plot(range(-60, 0), series[-60:], label=&quot;真实值&quot;)
+plt.plot(range(0, 60), preds, label=&quot;预测值&quot;, linestyle=&quot;--&quot;)
+plt.legend(); plt.title(&quot;TCN 自回归外推 60 步&quot;)
+plt.show()</code></pre>
+<p>注意几处容易踩坑的细节：</p>
+<ul>
+<li><code>CausalConv1d</code> 把 <code>(kernel_size-1) * dilation</code> 的零全补在<strong>左侧</strong>，卷积核滑到任何位置都只覆盖过去，因果性由此保证；</li>
+<li>残差连接要求 <code>out</code> 和 <code>residual</code> 形状一致，所以每个块的输入输出通道都固定为 <code>hidden_ch</code>；</li>
+<li>最末只取 <code>x[:, :, -1]</code> 一个时间步的特征做预测——它已经通过空洞卷积&quot;看到&quot;了整段窗口，等价于 LSTM 里取最后一步隐藏状态。</li>
+</ul>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>把 <code>layers</code> 从 5 改成 3 和 7，用公式 <code>(k-1)×(2^L -1)+1</code> 手算各自感受野，再与训练效果对照。感受野小于窗口长度时会发生什么？</li>
+<li>把 <code>CausalConv1d</code> 的左侧 padding 改成<strong>双侧对称 padding</strong>（标准卷积），重跑训练。训练 loss 会明显偏低，但外推质量反而变差——解释为什么&quot;训练偷看未来&quot;会在部署时反噬。</li>
+<li>把残差连接去掉（<code>return self.relu(out)</code> 而非 <code>out + residual</code>），观察深层下是否训不动。这印证了哪一条母原理？</li>
+<li>思考：TCN 靠&quot;最后一步的特征&quot;预测，如果窗口长度远大于感受野，窗口开头的信息还能被用上吗？这时该调大什么参数？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Bai, Kolter &amp; Koltun · An Empirical Evaluation of Generic Convolutional and Recurrent Networks for Sequence Modeling：<a href="https://arxiv.org/abs/1803.01271" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1803.01271</a></li>
+<li>van den Oord et al. · WaveNet: A Generative Model for Raw Audio：<a href="https://arxiv.org/abs/1609.03499" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1609.03499</a></li>
+<li>PyTorch 官方文档 · torch.nn.Conv1d：<a href="https://pytorch.org/docs/stable/generated/torch.nn.Conv1d.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/docs/stable/generated/torch.nn.Conv1d.html</a></li>
+</ul>
+<p><a href="#/l/ts-ch4-l3">下一课：序列到序列预测</a></p>

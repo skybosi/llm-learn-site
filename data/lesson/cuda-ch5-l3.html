@@ -1,0 +1,256 @@
+<h2 id="h-协作组与线程束特化warp-specialization">协作组与线程束特化（warp specialization）<a class="anchor" href="#h-协作组与线程束特化warp-specialization" aria-label="本节链接">#</a></h2>
+<p>前两课解决&quot;跨 block 怎么安全地传一个值&quot;。这一课把 <strong>block 内不同 warp 分成不同角色</strong>：一部分专职搬数据、一部分专职算——这就是 Hopper 起被反复提到的 warp specialization（线程束特化），FlashAttention 等 kernel 的实现层都用它。前提要先说清：<strong>只有当流水线两个阶段本来就要互相等待时，拆分角色才有收益</strong>。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-三个层次的协作同步成本依次上升">1. 三个层次的协作，同步成本依次上升<a class="anchor" href="#h-1-三个层次的协作同步成本依次上升" aria-label="本节链接">#</a></h4>
+<p>第 2 课已经给过 <code>thread_scope_block</code> / <code>_device</code> / <code>_system</code> 三档作用域，协作组（cooperative groups）把&quot;我在哪个范围内协作&quot;从约定变成类型：</p>
+<table>
+<thead>
+<tr>
+<th>层次</th>
+<th>对象</th>
+<th>同步手段</th>
+<th>约束</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>warp 内</td>
+<td><code>cg::coalesced_threads()</code>、<code>tiled_partition&lt;32&gt;</code></td>
+<td>shuffle、<code>__syncwarp</code></td>
+<td>无额外约束</td>
+</tr>
+<tr>
+<td>block 内</td>
+<td><code>cg::this_thread_block()</code></td>
+<td><code>cg::sync(block)</code>（等价 <code>__syncthreads()</code>）、<code>cg::barrier</code></td>
+<td>参与方必须全部到达</td>
+</tr>
+<tr>
+<td>grid 内</td>
+<td><code>cg::this_grid()</code></td>
+<td><code>grid.sync()</code></td>
+<td>必须用 <code>cudaLaunchCooperativeKernel</code> 启动，且<strong>所有 block 必须能同时驻留</strong></td>
+</tr>
+<tr>
+<td>cluster 内（cc 9.0+）</td>
+<td><code>cg::this_cluster()</code></td>
+<td><code>cluster.sync()</code>、<code>cluster.barrier_arrive/wait</code></td>
+<td>cluster 大小受 portable 上限限制</td>
+</tr>
+</tbody></table>
+<p>grid 同步的硬约束：grid 里每个 block 都要在 SM 上同时活着，否则先到的等不到后到的，直接死锁。尺寸上限 ≈ <code>SM 数 × 每 SM 可驻留 block 数</code>。用示例参数（132 个 SM、每 SM 最多 32 个常驻 block）算：上限 4,224；启动 8,192 个时 <strong>根本不能用</strong>，得改用&quot;多轮 kernel 启动&quot;或&quot;fence + 原子计数&quot;。因此 <code>grid.sync()</code> 适合&quot;迭代不多、每轮要全局对齐&quot;的算法，不适合内层循环。</p>
+<h4 id="h-2-协作组还顺手给了什么">2. 协作组还顺手给了什么<a class="anchor" href="#h-2-协作组还顺手给了什么" aria-label="本节链接">#</a></h4>
+<p><code>cg::reduce(group, v, cg::plus&lt;T&gt;())</code>、<code>cg::inclusive_scan</code> / <code>exclusive_scan</code>、<code>cg::invoke_one</code> 把<strong>参与方集合</strong>变成 API 的一部分：谁参与、多大范围、什么操作都写进了类型。cc 8.0+ 上 <code>cg::reduce</code> 对 4 字节类型走硬件加速，更早架构或更大类型走软件回退。它未必比手写两级归约快——换来的是正确性与可维护性。</p>
+<h4 id="h-3-warp-specialization把等变成并行">3. warp specialization：把&quot;等&quot;变成&quot;并行&quot;<a class="anchor" href="#h-3-warp-specialization把等变成并行" aria-label="本节链接">#</a></h4>
+<p>看 FlashAttention 一轮循环：① 从全局内存搬一块 K/V 到 shared；② 用 shared 里的数据做 MMA。不分工时同一批线程先搬后算，搬时算力闲置、算时搬运单元闲置——两段串行。</p>
+<p>warp specialization 的做法是 fork 出两类 warp：</p>
+<ul>
+<li><strong>生产者 warp</strong>：只负责发起搬运（TMA 的 <code>cp.async.bulk.tensor</code>，或第 4 课的 <code>cp.async</code>），然后等待可用的空缓冲；</li>
+<li><strong>消费者 warp</strong>：只负责计算（MMA / 归约），消费满缓冲，算完后把缓冲还给生产者。</li>
+</ul>
+<p>两者之间用一个<strong>环形缓冲队列 + 一对计数信号</strong>（&quot;空位&quot;与&quot;满位&quot;）同步，或用 <code>cuda::pipeline</code> / mbarrier。生产者不等消费者算完就在准备下一块，两段的延迟被重叠掉。</p>
+<p><figure><img class="md-img" src="content/courses/gpu-cuda-kernels/assets/chapter-5-figure-03.svg" alt="生产者/消费者分工：搬运与计算从串行变成重叠" loading="lazy" decoding="async"><figcaption>生产者/消费者分工：搬运与计算从串行变成重叠</figcaption></figure>
+</p>
+<h4 id="h-4-收益的边界什么时候不值得">4. 收益的边界：什么时候不值得<a class="anchor" href="#h-4-收益的边界什么时候不值得" aria-label="本节链接">#</a></h4>
+<p>下面这张表是一个纯参数化的流水线模型（256 批，缓冲深度 S=4）算出<strong>总周期数</strong>，两列都在同一模型里：</p>
+<table>
+<thead>
+<tr>
+<th>每批生产</th>
+<th>每批消费</th>
+<th>不重叠</th>
+<th>专业化</th>
+<th>加速比</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>4</td>
+<td>16</td>
+<td>5120</td>
+<td>4100</td>
+<td>1.25×</td>
+</tr>
+<tr>
+<td>8</td>
+<td>8</td>
+<td>4096</td>
+<td>2056</td>
+<td>1.99×</td>
+</tr>
+<tr>
+<td>16</td>
+<td>16</td>
+<td>8192</td>
+<td>4112</td>
+<td>1.99×</td>
+</tr>
+<tr>
+<td>1</td>
+<td>16</td>
+<td>4352</td>
+<td>4097</td>
+<td>1.06×</td>
+</tr>
+</tbody></table>
+<p>读法：<strong>专业化把每批总周期从 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.9012em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">p</span><span class="mord mathnormal mtight" style="margin-right:0.0278em;">r</span><span class="mord mathnormal mtight">o</span><span class="mord mathnormal mtight">d</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7651em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">co</span><span class="mord mathnormal mtight">n</span><span class="mord mathnormal mtight">s</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 压到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0361em;vertical-align:-0.2861em;"></span><span class="mop">max</span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">p</span><span class="mord mathnormal mtight" style="margin-right:0.0278em;">r</span><span class="mord mathnormal mtight">o</span><span class="mord mathnormal mtight">d</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">co</span><span class="mord mathnormal mtight">n</span><span class="mord mathnormal mtight">s</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span></span></span></span></strong>，加速比趋近 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mop">min</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">/</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop">max</span></span></span></span>。两段越接近收益越大（8:8 与 16:16 都是 1.99×，理想值 2×）；极度不对称时收益很小（1:16 只有 1.06×）——瓶颈段没变短，而启动与收尾各要一个完整周期。</p>
+<p>第二个结论来自缓冲深度：S 从 1 提到 2，总周期从 5120 掉到 4100；再加到 3、4、8、16 <strong>一点没变</strong>——&quot;生产者提前一块写、消费者延后一块读&quot;，<strong>深度 2 就够覆盖一跳</strong>。缓冲区吃 shared memory，不是越大越好，第 4 章的占用率约束会随后回来找你。</p>
+<h4 id="h-5-两个前提缺一不可">5. 两个前提，缺一不可<a class="anchor" href="#h-5-两个前提缺一不可" aria-label="本节链接">#</a></h4>
+<ol>
+<li><strong>必须有&quot;等待&quot;可以重叠</strong>。纯带宽受限（搬完就没别的活）或逐元素算子（元素间无依赖）拆角色的收益近似为零：那点收益来自&quot;多一个 warp 干活&quot;，不是流水线。用同一模型算：4096 个元素、每元素&quot;算 6 存 2&quot;，不分工 32768 周期、分工 16384 周期——2.00×，纯粹是线程数翻倍。</li>
+<li><strong>专业化不改变语义</strong>。缓冲区只影响重叠程度，不影响累加顺序：示例 2 里串行求和与深度 2 的流水线求和都是 325.0。若为了让生产者提前跑而改了数据顺序，就回到第 1 课的非结合律问题。</li>
+</ol>
+<h4 id="h-6-常见坑">6. 常见坑<a class="anchor" href="#h-6-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>fork 出 warp 后忘了同步</strong>：生产者与消费者之间的&quot;空/满&quot;计数必须用原子或 barrier，不能靠&quot;我觉得它已经好了&quot;。</li>
+<li><strong>以为 <code>cg::sync()</code> 语义不同</strong>：官方明确它与 <code>__syncthreads()</code> 给出同样两条保证（到达 + 之前的内存访问可见）；但<strong>参与方集合必须完全一致</strong>，在条件分支里创建/使用子组是数据竞争。</li>
+<li><strong><code>barrier_wait</code> 的语义想当然</strong>：<code>barrier_wait</code> 只保证组内所有线程都调用了 <code>barrier_arrive</code>，<strong>不保证</strong>它们都调用了 <code>barrier_wait</code>。</li>
+<li><strong>grid 同步塞进内层循环</strong>：每轮都要全体驻留，尺寸一超就是死锁或启动失败。</li>
+<li><strong>忘了 cluster 的 portable 上限</strong>（第 4 课讲过）：跨 SM 的分布式共享内存只在 cluster 内成立。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>第一段纯 Python（无 GPU）：用参数化模型算出&quot;专业化在什么条件下值钱&quot;，并验证流水线不改变数值结果。</p>
+<pre data-lang="python"><code class="language-python"># ===== 示例 1：生产者-消费者流水线 —— 专业化快在哪、什么时候不快 =====
+def pipeline(need, t_prod, t_cons, S, specialized=True):
+    &quot;&quot;&quot;t_prod：生产一批的耗时；t_cons：消费一批的耗时；S：环形缓冲区深度。
+    specialized=True 时生产与消费由不同 warp 承担、可以重叠；S=1 时退化为不重叠。
+    返回 (总周期, 分摊到每批的周期)。&quot;&quot;&quot;
+    if not specialized or S == 1:
+        return need * (t_prod + t_cons), (t_prod + t_cons)
+    cycles = t_prod + (need - 1) * max(t_prod, t_cons) + t_cons
+    return cycles, cycles / need
+
+need = 256
+print(&quot;每批生产/消费耗时不同时，专业化流水线（S=4）的收益：&quot;)
+print(f&quot;{&#39;t_生产&#39;:&gt;7}{&#39;t_消费&#39;:&gt;7}{&#39;不重叠&#39;:&gt;9}{&#39;专业化&#39;:&gt;9}{&#39;加速比&#39;:&gt;9}&quot;)
+for tp, tc in ((4, 16), (8, 8), (16, 4), (16, 16), (1, 16)):
+    seq, _ = pipeline(need, tp, tc, 4, specialized=False)
+    spec, per = pipeline(need, tp, tc, 4, specialized=True)
+    print(f&quot;{tp:&gt;7}{tc:&gt;7}{seq:&gt;9}{spec:&gt;9}{seq/spec:&gt;8.2f}x&quot;)
+
+print(&quot;\n环形缓冲区深度 S（t_生产=4，t_消费=16）：&quot;)
+for S in (1, 2, 3, 4, 8, 16):
+    spec, per = pipeline(need, 4, 16, S, specialized=True)
+    print(f&quot;  S={S:&gt;2}：总周期 {spec:&gt;5}，每批 {per:&gt;5.1f}&quot;)
+
+# ===== 示例 2：不同重叠程度下，结果必须完全一致 =====
+import numpy as np
+def consume_serial(batches):
+    return sum(batches)
+
+def consume_pipelined(batches, S):
+    &quot;&quot;&quot;环形缓冲：生产者按序放，消费者按序取；S 只改变重叠程度，不改变顺序。&quot;&quot;&quot;
+    buf, out = [], []
+    for b in batches:
+        buf.append(b)
+        while buf and len(buf) &lt;= S:
+            out.append(buf.pop(0))
+            break
+    while buf:
+        out.append(buf.pop(0))
+    return sum(out)
+
+rng = np.random.default_rng(0)
+batches = [float(rng.integers(1, 10)) for _ in range(64)]
+print(f&quot;\n顺序 vs 流水线（S=2）的结果：{consume_serial(batches):.1f} vs &quot;
+      f&quot;{consume_pipelined(batches, 2):.1f}（缓冲区只影响重叠，不影响结果）&quot;)
+
+# ===== 示例 3：grid 同步的驻留约束（每 SM 最多 32 个常驻 block） =====
+def grid_sync_feasible(blocks, sms=132, blocks_per_sm=32):
+    resident = sms * blocks_per_sm
+    return resident, blocks &lt;= resident
+
+print(&quot;\ngrid 同步要求所有 block 同时驻留（SM 数与每 SM 驻留上限以自己显卡官方规格为准；&quot;)
+print(&quot;下面用 132 个 SM × 32 个 block 作示例）：&quot;)
+for blocks in (132, 1056, 4224, 8192):
+    resident, fit = grid_sync_feasible(blocks)
+    print(f&quot;  启动 {blocks:&gt;5} 个 block：驻留上限 {resident} → &quot;
+          f&quot;{&#39;可用 grid.sync()&#39; if fit else &#39;超出上限，必须换方案&#39;}&quot;)</code></pre>
+<p>在 Python 3.14.5 + numpy 2.5.3 下实际运行结果：</p>
+<pre data-lang="text"><code class="language-text">每批生产/消费耗时不同时，专业化流水线（S=4）的收益：
+   t_生产   t_消费      不重叠      专业化      加速比
+      4     16     5120     4100    1.25x
+      8      8     4096     2056    1.99x
+     16      4     5120     4100    1.25x
+     16     16     8192     4112    1.99x
+      1     16     4352     4097    1.06x
+环形缓冲区深度 S（t_生产=4，t_消费=16）：
+  S= 1：总周期  5120，每批  20.0
+  S= 2：总周期  4100，每批  16.0
+  S= 3：总周期  4100，每批  16.0
+  S= 4：总周期  4100，每批  16.0
+  S= 8：总周期  4100，每批  16.0
+  S=16：总周期  4100，每批  16.0
+顺序 vs 流水线（S=2）的结果：325.0 vs 325.0（缓冲区只影响重叠，不影响结果）
+grid 同步要求所有 block 同时驻留（SM 数与每 SM 驻留上限以自己显卡官方规格为准；
+下面用 132 个 SM × 32 个 block 作示例）：
+  启动   132 个 block：驻留上限 4224 → 可用 grid.sync()
+  启动  1056 个 block：驻留上限 4224 → 可用 grid.sync()
+  启动  4224 个 block：驻留上限 4224 → 可用 grid.sync()
+  启动  8192 个 block：驻留上限 4224 → 超出上限，必须换方案</code></pre>
+<p>三张表的读法在上文 §4 与 §6 里都点到了：<strong>收益由两段耗时的比例决定，缓冲深度 2 就够，grid 同步受驻留上限硬约束</strong>。</p>
+<p>对应的 CUDA 骨架：block 内两级协作组 + 一个生产者/消费者环。下面只保留骨架（真实实现里的搬运应换成 TMA / <code>cuda::pipeline</code>，等待应换成 mbarrier，否则生产者 warp 的自旋会在 L2 上打转）：</p>
+<pre data-lang="cuda"><code class="language-cuda">#include &lt;cooperative_groups.h&gt;
+namespace cg = cooperative_groups;
+
+__global__ void specializedKernel(const float* __restrict__ g, float* __restrict__ out,
+                                  int batches, int S) {
+    cg::thread_block block = cg::this_thread_block();   // 尽早取句柄（在任何分支之前）
+    extern __shared__ float buf[];                      // S 块滚动缓冲，每块 blockDim.x 个 float
+    __shared__ int produced;                            // 已产出的批数（生产者写、消费者读）
+
+    if (threadIdx.x == 0) produced = 0;                 // 初始化必须在同步之前
+    cg::sync(block);
+
+    int warp = threadIdx.x / 32;
+    if (warp == 0) {                                    // 生产者 warp：只负责搬数据
+        for (int t = 0; t &lt; batches; ++t) {
+            int slot = t % S;
+            // 骨架：真实实现用 cp.async.bulk.tensor + mbarrier 完成通知
+            for (int i = threadIdx.x; i &lt; blockDim.x; i += blockDim.x)
+                buf[slot * blockDim.x + i] = g[t * blockDim.x + i];
+            __threadfence_block();                      // 数据已写进 shared，对块内可见
+            if (threadIdx.x == 0) atomicAdd(&amp;produced, 1);
+        }
+    } else {                                            // 消费者 warp：只负责算
+        for (int t = 0; t &lt; batches; ++t) {
+            int slot = t % S;
+            while (atomicAdd(&amp;produced, 0) &lt;= t) { }    // 等第 t 批就绪
+            out[t * blockDim.x + threadIdx.x] =
+                buf[slot * blockDim.x + threadIdx.x] * 2.0f;
+            cg::sync(block);                            // 消费完本批才允许覆盖这个 slot
+        }
+    }
+}
+
+// grid 级同步：必须配 cudaLaunchCooperativeKernel，且 grid 尺寸不超过驻留上限
+__global__ void gridScale(float* g, int rounds) {
+    cg::grid_group grid = cg::this_grid();
+    for (int r = 0; r &lt; rounds; ++r) {
+        g[threadIdx.x] *= 1.0001f;
+        grid.sync();                                    // 全体对齐后才进下一轮
+    }
+}</code></pre>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选：需要 GPU。比较&quot;专业化&quot;与&quot;不分工&quot;两个版本的实测时间 ----
+# nvcc -O3 -arch=sm_90 -rdc=true -lcudadevrt -o spec spec.cu
+# 先用 nsys 看两段时间线是否真的重叠（专业化的收益会表现为 memcpy 与 kernel 并行）：
+#   nsys profile --stats=true ./spec
+# 再用 ncu 看 shared memory 与 barrier 的代价：
+#   ncu --metrics sm__warps_active.avg.pct_of_peak_sustained_elapsed,\
+#         smsp__average_warps_issue_stalled_barrier_per_issue_active.ratio ./spec
+# 判读：专业化后 stalled_barrier 比例应下降；若它上升，说明生产者/消费者速度不匹配，
+#       应先调缓冲深度 S 与每批大小，而不是继续加 warp。
+# 无 GPU 时用上面的 Python 参数化模型即可得到同样的定性结论。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：把示例 1 的模型扩成&quot;生产者与消费者各占若干 warp、角色内还有各自并行度&quot;的两级模型，找出 <code>t_prod=4, t_cons=16</code> 时让总周期最小的缓冲深度与角色配比。</li>
+<li><strong>解释</strong>：为什么缓冲深度从 2 加到 16 总周期一点没变？如果生产者是&quot;每批耗时抖动很大&quot;的随机变量，这个结论还成立吗？</li>
+<li><strong>对比/验证</strong>：把示例 3 的 <code>blocks_per_sm</code> 从 32 降到 8（模拟每块寄存器/共享内存占用很高的情况），重新算驻留上限；再查一次自己显卡（或云上实例）的 SM 数与每 SM 驻留上限，说明 grid 同步在你的机器上最多能带多少个 block。</li>
+<li><strong>思考</strong>：FlashAttention 的&quot;分块 + 在线 softmax&quot;里，哪些步骤适合交给生产者 warp、哪些必须留在消费者？如果一个 warp 同时做两者，收益会在哪里丢掉？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>NVIDIA, <em>CUDA Programming Guide</em> —「Cooperative Groups」（implicit group、<code>tiled_partition</code>/<code>labeled_partition</code>、<code>sync()</code> 与 <code>__syncthreads()</code> 的等价保证、<code>barrier_arrive</code>/<code>barrier_wait</code> 语义、<code>memcpy_async</code> 对齐要求、grid 同步需 <code>cudaLaunchCooperativeKernel</code> 及驻留要求）：<a href="https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/cooperative-groups.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/cooperative-groups.html</a></li>
+<li>NVIDIA, <em>CUDA Programming Guide</em> —「Asynchronous Barriers」与「Pipelines」两节（<code>cuda::barrier</code> / mbarrier 与 <code>cuda::pipeline</code> 的官方用法，专业化里&quot;空/满&quot;信号的两种标准实现）：<a href="https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/async-barriers.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/async-barriers.html</a></li>
+<li>NVIDIA, <em>NVIDIA Hopper Tuning Guide</em> — Thread Block Clusters 与 Warp Specialization 相关章节（producer/consumer 分工在 Hopper 上的官方建议与 cluster 约束）：<a href="https://docs.nvidia.com/cuda/hopper-tuning-guide/" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/hopper-tuning-guide/</a></li>
+<li>NVIDIA, <em>Parallel Thread Execution ISA</em> — <code>mbarrier</code> 与异步拷贝完成机制（生产者-消费者信号底层的精确语义）：<a href="https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-mbarrier" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-mbarrier</a></li>
+</ul>
+<p><a href="#/l/cuda-ch5-l4">下一课：多 GPU 视角：从单卡内存模型到集合通信的前置直觉</a></p>

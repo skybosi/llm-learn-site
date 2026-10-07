@@ -1,0 +1,207 @@
+<h2 id="h-自动调优autotvm--ansor-的搜索与代价模型">自动调优：AutoTVM / Ansor 的搜索与代价模型<a class="anchor" href="#h-自动调优autotvm--ansor-的搜索与代价模型" aria-label="本节链接">#</a></h2>
+<p>第 2 课说明好调度是稀有资源：720 条候选里只有 10% 值得考虑，问题于是变成&quot;怎么找&quot;。最朴素的办法是每条都在真机上跑一遍，但一次编译 + 计时通常要几十到几百毫秒，720 条就是几分钟到几十分钟；一个模型有几百个算子就是几十小时。<strong>自动调优的核心成果不是搜索算法，而是&quot;用学出来的代价模型代替真机计时&quot;</strong>——它把绝大多数候选的评估从&quot;跑一次&quot;降到&quot;预测一次&quot;。本课用一个 12 棵树的随机森林跑通这条路，并给出它相对随机搜索的实测优势。</p>
+<p><figure><img class="md-img" src="content/courses/ml-compilers/assets/chapter-6-figure-01.svg" alt="自动调优闭环：采样 → 学习代价模型 → 预测排序 → 真测验证" loading="lazy" decoding="async"><figcaption>自动调优闭环：采样 → 学习代价模型 → 预测排序 → 真测验证</figcaption></figure>
+</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-问题形式离散昂贵带噪声的黑盒优化">1. 问题形式：离散、昂贵、带噪声的黑盒优化<a class="anchor" href="#h-1-问题形式离散昂贵带噪声的黑盒优化" aria-label="本节链接">#</a></h4>
+<p>自动调优（auto-tuning）要解的是：在调度空间上最小化真实执行时间 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="mopen">(</span><span class="mord mathnormal">s</span><span class="mclose">)</span></span></span></span>，而 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span></span></span></span> 只能通过<strong>编译 + 运行</strong>得到，一次调用昂贵、结果带测量噪声、不同 shape 还不通用。三类经典解法都不完全适用：穷举太贵，梯度法需要可微目标，纯随机搜索受制于&quot;好区域只占 10%&quot;。可行做法只有一个：<strong>少量真测 + 大量廉价预测</strong>。</p>
+<h4 id="h-2-autotvm模板--参数空间--学出来的代价模型">2. AutoTVM：模板 + 参数空间 + 学出来的代价模型<a class="anchor" href="#h-2-autotvm模板--参数空间--学出来的代价模型" aria-label="本节链接">#</a></h4>
+<p>AutoTVM 走<strong>模板驱动</strong>：人先写好调度模板（如&quot;先分块再向量化的卷积&quot;），模板上开出参数（tile 大小、unroll 次数、向量宽度……）构成参数空间。官方博客把这个循环写得很清楚：<strong>每轮从搜索空间挑一批有希望的候选，在真机上 profile，用结果拟合预测模型，再按预测挑下一批</strong>——&quot;真测喂模型、模型指导真测&quot;的闭环。论文报告它在 CPU、移动 GPU、服务器 GPU 上都能让自动生成的算子接近手工调优库的量级（加速比随平台不同，以论文表格为准）。</p>
+<p>关键分工是：模型负责<strong>便宜地排序</strong>，搜索负责<strong>决定下一个测谁</strong>，真测负责<strong>把模型拉回现实</strong>。</p>
+<h4 id="h-3-ansor不写模板先枚举结构再精调">3. Ansor：不写模板，先枚举结构再精调<a class="anchor" href="#h-3-ansor不写模板先枚举结构再精调" aria-label="本节链接">#</a></h4>
+<p>模板路线的天花板来自模板本身——模板里没写的实现搜不到。Ansor 改成<strong>两段式</strong>：先从<strong>层次化表示</strong>里采样大量 sketch（粗略循环结构，如次序与并行方式），再对每个 sketch 施加 annotation（tile、向量化、unroll 等），用<strong>进化搜索</strong>精调并用<strong>学出来的代价模型</strong>筛选。论文摘要的量级是相对当时最优方案最多 3.8× / 2.6× / 1.7×（Intel CPU / ARM CPU / NVIDIA GPU，以论文为准）；它还用任务调度器让多个子图并行调优。</p>
+<p>两段式带来最重要的认识：<strong>搜索空间的形状比搜索算法本身更决定上限</strong>——模板法在被给定的空间里优化，Ansor 把结构也纳入搜索。</p>
+<h4 id="h-4-代价模型长什么样特征--时间">4. 代价模型长什么样：特征 → 时间<a class="anchor" href="#h-4-代价模型长什么样特征--时间" aria-label="本节链接">#</a></h4>
+<p>代价模型的输入是<strong>编译期可得的特征</strong>（tile 大小、循环次序、展开次数、向量宽度，以及从 IR 抽出的访存量、算术强度、并行度），输出是预测时间。三条关键做法：</p>
+<ol>
+<li><strong>只要排序、不要精度</strong>：模型只需把候选排对顺序，不必预测到毫秒级。</li>
+<li><strong>样本必须带噪声</strong>：代码给真测值乘了 3% 扰动，逼模型学趋势而不是背样本；第 4 课量化噪声的代价。</li>
+<li><strong>留验证集</strong>：预测永远要真测校验，第 3 节只对模型排出的前 5 条真测。</li>
+</ol>
+<h4 id="h-5-常见坑">5. 常见坑<a class="anchor" href="#h-5-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>把模型当 oracle</strong>：它预测的是相关性不是真值，真实系统都保留&quot;最后若干条真测&quot;。</li>
+<li><strong>训练集覆盖不到最优区域</strong>：30 条样本全落在小 tile 上时，模型对&quot;大 tile 更好&quot;一无所知。</li>
+<li><strong>同一批数据既训练又调参</strong>：会系统性高估模型质量，验证集必须独立。</li>
+<li><strong>忽略编译与运行的比值</strong>：若编译远贵于运行，代价模型应拟合&quot;编译+运行&quot;总时间，而不是只看 kernel 时间。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<pre data-lang="python"><code class="language-python"># ---- 第 3 课：学习型代价模型 + 搜索（纯 Python，无第三方依赖）----
+import itertools, random
+
+TILES = [(1, 1, 1), (8, 8, 1), (16, 16, 1), (32, 32, 1), (64, 64, 1), (128, 64, 8)]
+ORDERS = [(&#39;i&#39;, &#39;j&#39;, &#39;k&#39;), (&#39;j&#39;, &#39;i&#39;, &#39;k&#39;)]
+VECS = [1, 4]
+UNROLLS = [1, 4, 8]
+FIELDS = [&#39;ti&#39;, &#39;tj&#39;, &#39;tk&#39;, &#39;is_ijk&#39;, &#39;vec&#39;, &#39;par_ij&#39;, &#39;unroll&#39;, &#39;tile_area&#39;]
+
+
+def space():
+    for t, o, v, u in itertools.product(TILES, ORDERS, VECS, UNROLLS):
+        yield dict(tiles=t, order=o, vec=v, unroll=u, parallel=(&#39;i&#39;, &#39;j&#39;))
+
+
+def true_cost(s):
+    &quot;&quot;&quot;本课用解析模型扮演&quot;真机&quot;：调优程序只能通过 measure() 看它（带测量噪声）。&quot;&quot;&quot;
+    area = s[&#39;tiles&#39;][0] * s[&#39;tiles&#39;][1]
+    e = 1.0 + 2.0 * abs(area - 4096) / 4096 + 0.8 * abs(s[&#39;unroll&#39;] - 4) / 4
+    e += 0.2 if s[&#39;order&#39;][0] != &#39;i&#39; else 0.0
+    return e * (1.0 + 0.15 * (1 if s[&#39;vec&#39;] == 1 else 0))
+
+
+def features(s):
+    &quot;&quot;&quot;代价模型的输入：把一条调度写成 8 维向量（真实系统里还会有更多结构特征）。&quot;&quot;&quot;
+    ti, tj, tk = s[&#39;tiles&#39;]
+    return [ti, tj, tk, 1.0 if s[&#39;order&#39;][0] == &#39;i&#39; else 0.0,
+            s[&#39;vec&#39;], 1.0 if s[&#39;parallel&#39;] == (&#39;i&#39;, &#39;j&#39;) else 0.0, s[&#39;unroll&#39;], ti * tj]
+
+
+# ---------- 极简回归树 + 随机森林：能学出&quot;哪片区域便宜&quot;就够用 ----------
+def build_tree(rows, depth=0, max_depth=5, min_leaf=4):
+    y = [r[1] for r in rows]
+    if depth &gt;= max_depth or len(rows) &lt; 2 * min_leaf or max(y) - min(y) &lt; 1e-12:
+        return (&#39;leaf&#39;, sum(y) / len(y))
+    best = None
+    for f in range(len(rows[0][0])):
+        vals = sorted({r[0][f] for r in rows})
+        for th in [(a + b) / 2 for a, b in zip(vals, vals[1:])]:
+            L = [r for r in rows if r[0][f] &lt;= th]
+            R = [r for r in rows if r[0][f] &gt; th]
+            if len(L) &lt; min_leaf or len(R) &lt; min_leaf:
+                continue
+            def sse(rs):
+                m = sum(r[1] for r in rs) / len(rs)
+                return sum((r[1] - m) ** 2 for r in rs)
+            err = sse(L) + sse(R)
+            if best is None or err &lt; best[0]:
+                best = (err, f, th, L, R)
+    if best is None:
+        return (&#39;leaf&#39;, sum(y) / len(y))
+    _, f, th, L, R = best
+    return (&#39;node&#39;, f, th, build_tree(L, depth + 1, max_depth, min_leaf),
+            build_tree(R, depth + 1, max_depth, min_leaf))
+
+
+def predict(tree, x):
+    while tree[0] == &#39;node&#39;:
+        _, f, th, L, R = tree
+        tree = L if x[f] &lt;= th else R
+    return tree[1]
+
+
+class Forest:
+    def __init__(self, n_trees=12, max_depth=6, seed=0):
+        self.n_trees, self.max_depth, self.seed, self.trees = n_trees, max_depth, seed, []
+
+    def fit(self, xs, ys):
+        rng = random.Random(self.seed)
+        for _ in range(self.n_trees):
+            idx = [rng.randrange(len(xs)) for _ in xs]          # bootstrap 采样
+            self.trees.append(build_tree([(xs[i], ys[i]) for i in idx], max_depth=self.max_depth))
+        return self
+
+    def predict(self, x):
+        return sum(predict(t, x) for t in self.trees) / len(self.trees)
+
+
+if __name__ == &#39;__main__&#39;:
+    pool = list(space())
+    oracle = min(true_cost(s) for s in pool)
+    print(f&#39;=== 1. 全空间 {len(pool)} 条；真值最优 {oracle:.4f}（只有解析模型知道它）===&#39;)
+
+    rng = random.Random(11)
+    sample = rng.sample(range(len(pool)), 30)
+    best_rand = min(true_cost(pool[i]) for i in sample)
+    print(f&#39;\n=== 2. 随机搜索：抽 30 条真测，最好 {best_rand:.4f}（最优的 {best_rand / oracle:.2f} 倍）===&#39;)
+    print(&#39;  随机搜索的问题不是&quot;测不起&quot;，而是&quot;好区域太小，抽不到&quot;&#39;)
+
+    xs = [features(pool[i]) for i in sample]
+    ys = [true_cost(pool[i]) * (1.0 + rng.gauss(0, 0.03)) for i in sample]   # 实测带噪
+    forest = Forest(n_trees=12, max_depth=6, seed=1).fit(xs, ys)
+    rest = [i for i in range(len(pool)) if i not in sample]
+    pred = {i: forest.predict(features(pool[i])) for i in rest}
+    ranked = sorted(rest, key=lambda i: pred[i])
+    checked = ranked[:5]
+    best_model = min(true_cost(pool[i]) for i in checked)
+    print(f&#39;\n=== 3. 学习型代价模型：同一批 30 条实测做训练，给其余 {len(rest)} 条排序，只挑前 5 条真测 ===&#39;)
+    for rank, i in enumerate(checked, 1):
+        s = pool[i]
+        print(f&#39;  第{rank}候选 预测={pred[i]:5.3f} 真值={true_cost(s):5.3f} &#39;
+              f&#39;tile={str(s[&quot;tiles&quot;]):&lt;12} vec={s[&quot;vec&quot;]} unroll={s[&quot;unroll&quot;]}&#39;)
+    print(f&#39;  代价模型挑出的最好一条 = {best_model:.4f}（最优的 {best_model / oracle:.2f} 倍）&#39;)
+
+    print(&#39;\n=== 4. 谁更划算：20 次独立比较，各自用了多少次&quot;真测&quot; ===&#39;)
+    wins_r = wins_m = 0
+    for trial in range(20):
+        r2 = random.Random(900 + trial)
+        idx = r2.sample(range(len(pool)), 30)
+        if min(true_cost(pool[i]) for i in idx) &lt;= oracle * 1.02:
+            wins_r += 1
+        xs2 = [features(pool[i]) for i in idx]
+        ys2 = [true_cost(pool[i]) * (1.0 + r2.gauss(0, 0.03)) for i in idx]
+        f2 = Forest(n_trees=12, max_depth=6, seed=trial).fit(xs2, ys2)
+        rest2 = [i for i in range(len(pool)) if i not in idx]
+        top = sorted(rest2, key=lambda i: f2.predict(features(pool[i])))[:5]
+        if min(true_cost(pool[i]) for i in top) &lt;= oracle * 1.02:
+            wins_m += 1
+    print(f&#39;  随机搜索 30 条真测：{wins_r}/20 次落在最优 2% 以内（真测 30 次）&#39;)
+    print(f&#39;  代价模型 30 条训练 + 5 条验证：{wins_m}/20 次（真测 35 次）&#39;)
+    print(&#39;  差异的根源：模型把&quot;tile 面积、unroll&quot;这些结构特征用上了，&#39;
+          &#39;把预算花在预测值最好的那几条上&#39;)
+
+    print(&#39;\n=== 5. 预测质量：模型认为的前 25% 里有多少真属于前 25% ===&#39;)
+    n = len(rest)
+    truth_rank = {i: r for r, i in enumerate(sorted(rest, key=lambda i: true_cost(pool[i])))}
+    top_q = ranked[:n // 4]
+    hit = sum(1 for i in top_q if truth_rank[i] &lt; n // 4)
+    print(f&#39;  前 25%（{len(top_q)} 条）命中 {hit} 条；随机瞎猜的期望命中率是 25%&#39;)</code></pre>
+<p>运行结果（Python 3.10.14，无第三方依赖）：</p>
+<pre data-lang="text"><code class="language-text">=== 1. 全空间 72 条；真值最优 1.0000（只有解析模型知道它）===
+
+=== 2. 随机搜索：抽 30 条真测，最好 1.1500（最优的 1.15 倍）===
+  随机搜索的问题不是&quot;测不起&quot;，而是&quot;好区域太小，抽不到&quot;
+
+=== 3. 学习型代价模型：同一批 30 条实测做训练，给其余 42 条排序，只挑前 5 条真测 ===
+  第1候选 预测=2.001 真值=1.000 tile=(64, 64, 1)  vec=4 unroll=4
+  第2候选 预测=2.090 真值=1.200 tile=(64, 64, 1)  vec=4 unroll=4
+  第3候选 预测=2.291 真值=1.800 tile=(64, 64, 1)  vec=4 unroll=8
+  第4候选 预测=2.427 真值=1.380 tile=(64, 64, 1)  vec=1 unroll=4
+  第5候选 预测=2.432 真值=2.070 tile=(64, 64, 1)  vec=1 unroll=8
+  代价模型挑出的最好一条 = 1.0000（最优的 1.00 倍）
+
+=== 4. 谁更划算：20 次独立比较，各自用了多少次&quot;真测&quot; ===
+  随机搜索 30 条真测：7/20 次落在最优 2% 以内（真测 30 次）
+  代价模型 30 条训练 + 5 条验证：12/20 次（真测 35 次）
+  差异的根源：模型把&quot;tile 面积、unroll&quot;这些结构特征用上了，把预算花在预测值最好的那几条上
+
+=== 5. 预测质量：模型认为的前 25% 里有多少真属于前 25% ===
+  前 25%（10 条）命中 8 条；随机瞎猜的期望命中率是 25%</code></pre>
+<p>可核对的结论：<strong>随机搜索受限于覆盖率</strong>（20 次独立比较只有 7 次落在最优 2% 以内）；<strong>同一批 30 条真测喂给模型后升到 12/20</strong>（真测 35 次，只多 5 次）；<strong>模型认为的前 25% 里 8 条真属于前 25%</strong>；<strong>模型最看好的一条恰是真正最优</strong>（第 1 候选：预测 2.001、真值 1.000）。</p>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选，需自备或云上按需：在真实工具链里跑一次自动调优 ----
+# Apache TVM（pip install apache-tvm）：
+#   1) meta_schedule 是当前的自动调优主线（文档页 deep_dive/tensor_ir/tutorials/meta_schedule.html）：
+#      默认 SearchStrategy = EvolutionarySearch，默认 CostModel = XGBModel（官方文档原文：
+#      &quot;Predicts schedule performance using XGBoost, reducing the number of actual hardware
+#      measurements needed&quot;），调优记录可落盘复用。
+#   2) 老的模板路线（autotvm 模块）在现行文档导航里已不再出现，只作为历史路径了解即可；
+#      要读它的实现，以官方仓库里当轮版本的文件为准。
+#   python -c &quot;import tvm; print(tvm.__version__)&quot;   # 版本以官方为准，本课不假设具体号
+# Triton（需 NVIDIA GPU）：@triton.autotune(configs=[...], key=[&#39;M&#39;,&#39;N&#39;,&#39;K&#39;]) 就是同一套逻辑的
+#   工程化版本：候选 = triton.Config 列表，&quot;代价模型&quot;在官方实现里被简化为直接各自测一次。
+# 没有 GPU / 没装 TVM 都不影响本课：上面的随机森林已经把&quot;学习型代价模型&quot;这条路走通了。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：给 <code>features()</code> 增加两个特征：<code>tiles[2]</code>（归约维 tile）与&quot;tile 面积是否超过 L2 容量&quot;的布尔量，用同一批 30 条样本重训，看第 5 节命中率是否变化，并说明哪个特征真正贡献了信息。</li>
+<li><strong>解释</strong>：为什么本课给训练标签乘了 3% 的噪声（<code>rng.gauss(0, 0.03)</code>）而不是用干净的真值？如果把噪声调到 0，模型在&quot;同一档 72 条差别极小&quot;的情形下会有什么行为变化？</li>
+<li><strong>对比/验证</strong>：把 <code>n_trees</code> 从 12 改成 1（单棵回归树）与 48，重跑第 4 节的 20 次比较并记录命中次数，讨论&quot;模型复杂度—样本量&quot;的匹配。</li>
+<li><strong>思考</strong>：代价模型的训练数据来自真测；若模型有系统偏差（例如系统性高估大 tile），进化搜索会朝哪边漂移？这算搜索问题还是数据问题？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Lianmin Zheng et al., <em>Ansor: Generating High-Performance Tensor Programs for Deep Learning</em>（OSDI&#39;20；采样 sketch → 进化精调的层次化搜索、学出来的代价模型、任务调度器；摘要给出相对当时最优方案最多 3.8×/2.6×/1.7×，平台为 Intel CPU / ARM CPU / NVIDIA GPU）：<a href="https://arxiv.org/abs/2006.06762" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2006.06762</a></li>
+<li>Zheng / Yan / Chen, <em>Automatic Kernel Optimization for Deep Learning on All Hardware Platforms</em>（TVM 官方的 AutoTVM 博客；&quot;每轮挑候选 → 真机 profile → 拟合预测模型 → 按预测挑下一批&quot;的迭代闭环原文）：<a href="https://tvm.apache.org/2018/10/03/auto-opt-all" target="_blank" rel="noopener noreferrer">https://tvm.apache.org/2018/10/03/auto-opt-all</a></li>
+<li>同文 OSDI&#39;20 会议页：<a href="https://www.usenix.org/conference/osdi20/presentation/zheng" target="_blank" rel="noopener noreferrer">https://www.usenix.org/conference/osdi20/presentation/zheng</a></li>
+<li>Tianqi Chen et al., <em>TVM: An Automated End-to-End Optimizing Compiler for Deep Learning</em>（OSDI&#39;18；算子级自动优化与&quot;学习型代价模型&quot;的首次系统化描述）：<a href="https://www.usenix.org/conference/osdi18/presentation/chen" target="_blank" rel="noopener noreferrer">https://www.usenix.org/conference/osdi18/presentation/chen</a></li>
+<li>Apache TVM, <em>MetaSchedule: Search-Based Auto-Tuning</em>（AutoTVM 模板路线的后继：采样式搜索、代价模型与调优记录的工程实现）：<a href="https://tvm.apache.org/docs/deep_dive/tensor_ir/tutorials/meta_schedule.html" target="_blank" rel="noopener noreferrer">https://tvm.apache.org/docs/deep_dive/tensor_ir/tutorials/meta_schedule.html</a></li>
+</ul>
+<p><a href="#/l/mlc-ch6-l4">下一课：自动调优的成本：搜索预算、缓存与可复现性</a></p>

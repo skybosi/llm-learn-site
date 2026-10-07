@@ -1,0 +1,268 @@
+<h2 id="h-多流与异步stream事件与并发执行">多流与异步：stream、事件与并发执行<a class="anchor" href="#h-多流与异步stream事件与并发执行" aria-label="本节链接">#</a></h2>
+<p>到现在为止，我们的 kernel 都是&quot;排队执行&quot;的：H2D 拷完 → kernel 算 → D2H 拷回，一步等一步。可这三步用的根本不是同一批硬件——拷贝走拷贝引擎（copy engine）与内存带宽，kernel 用 SM 与寄存器，于是顺序执行时总有一半机器在闲着。这一课讲怎么用 <strong>stream（流）</strong>把它们叠起来，怎么用 <strong>event（事件）</strong>表达&quot;谁等谁&quot;，以及为什么很多人&quot;写了双流却量不到任何 overlap&quot;：问题几乎总出在默认流的隐式同步语义上。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-stream-是什么一条按序执行的队列">1. stream 是什么：一条按序执行的队列<a class="anchor" href="#h-1-stream-是什么一条按序执行的队列" aria-label="本节链接">#</a></h4>
+<p><strong>stream</strong> 是一串按提交顺序执行的操作队列：同一个 stream 内严格 in-order（前一个操作没完成，后一个不会开始），不同 stream 之间<strong>没有顺序关系</strong>，因此可能并发。<code>kernel&lt;&lt;&lt;grid, block, 0, stream&gt;&gt;&gt;(...)</code> 里的第四个参数就是 stream；<code>cudaMemcpyAsync</code> 也接受 stream 参数。</p>
+<p>能让两条 stream 真正重叠的前提是&quot;资源不冲突&quot;：</p>
+<table>
+<thead>
+<tr>
+<th>资源</th>
+<th>谁在用</th>
+<th>能否与别的操作并行</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>SM / 寄存器</td>
+<td>kernel</td>
+<td>两个都占满 SM 的 kernel 不会重叠；各占一半才可能</td>
+</tr>
+<tr>
+<td>拷贝引擎</td>
+<td>H2D/D2H 拷贝</td>
+<td>与 SM 上的 kernel 可并行，与另一条拷贝串行</td>
+</tr>
+<tr>
+<td>内存带宽</td>
+<td>拷贝与访存型 kernel</td>
+<td>共享，抢起来会互相拖慢</td>
+</tr>
+<tr>
+<td>依赖关系</td>
+<td>你自己写的事件</td>
+<td>有依赖就必须等，与资源无关</td>
+</tr>
+</tbody></table>
+<p>这就是本课代码里模型的形状：一条拷贝引擎 + 两个&quot;SM 槽位&quot;，于是&quot;拷贝与 kernel 重叠&quot;能发生，而&quot;两个拷贝&quot;永远串行。</p>
+<h4 id="h-2-异步拷贝的真正门槛pinned-memory">2. 异步拷贝的真正门槛：pinned memory<a class="anchor" href="#h-2-异步拷贝的真正门槛pinned-memory" aria-label="本节链接">#</a></h4>
+<p>官方文档明确要求：要真正异步，主机内存必须是 <strong>page-locked（pinned，锁页）</strong> 的，否则 <code>cudaMemcpyAsync</code> 可能退化成同步拷贝，<code>stream</code> 参数形同虚设。原因是设备要直接访问主机内存做 DMA，操作系统不能把这页换出去。常用做法是用 <code>cudaHostAlloc</code>/<code>cudaMallocHost</code> 分配（或对已有内存用 <code>cudaHostRegister</code> 注册），代价是这类内存分配慢、占用物理内存、过多会拖慢整个系统——所以常见模式是<strong>分配一小块 pinned 缓冲做流水线，别把整个数据集都钉住</strong>。</p>
+<h4 id="h-3-最常见的坑legacy-默认流会把并发抹平">3. 最常见的坑：legacy 默认流会把并发&quot;抹平&quot;<a class="anchor" href="#h-3-最常见的坑legacy-默认流会把并发抹平" aria-label="本节链接">#</a></h4>
+<p>如果你不指定 stream，操作落在<strong>默认流（legacy default stream）</strong>上。它的语义是：<strong>默认流里的操作与所有阻塞流（blocking stream）互相隐式同步</strong>——默认流中的 kernel 没结束，别的流里的活就不能开始（反之亦然）。于是&quot;一半任务用默认流、一半用自定义流&quot;的写法量不到任何 overlap。官方文档把这件事拆成三节讲清楚：Blocking and Non-Blocking Streams、Legacy Default Stream、Per-Thread Default Stream。出路有两条：</p>
+<ol>
+<li>显式创建 stream 并全程使用（<code>cudaStreamCreate</code>，或 <code>cudaStreamCreateWithFlags(..., cudaStreamNonBlocking)</code> 让流不与默认流隐式同步）；</li>
+<li>用 per-thread 默认流（编译选项 <code>--default-stream per-thread</code>），每个 host 线程有独立的默认流，彼此不再互相等待。</li>
+</ol>
+<h4 id="h-4-event跨-stream-的依赖与-gpu-时间线计时">4. event：跨 stream 的依赖与 GPU 时间线计时<a class="anchor" href="#h-4-event跨-stream-的依赖与-gpu-时间线计时" aria-label="本节链接">#</a></h4>
+<p><strong>event（事件）</strong> 是一个可被&quot;记录&quot;到某条 stream 里的时间标记：<code>cudaEventRecord(ev, stream)</code> 之后，<code>cudaStreamWaitEvent(otherStream, ev)</code> 就让另一条 stream 等到这个点再继续；<code>cudaEventSynchronize(ev)</code> 让主机等；<code>cudaEventElapsedTime(&amp;ms, a, b)</code> 量两个事件之间的 GPU 时间。</p>
+<p>三个容易踩的细节：</p>
+<ul>
+<li><strong>计时前必须同步</strong>。<code>cudaEventElapsedTime</code> 要求两个事件都已完成，否则读到的是垃圾值（常见现象：量出 0 ms）。</li>
+<li><strong>事件量的是 GPU 时间线</strong>，不是主机墙上时间：它把重叠的执行也算成&quot;同时发生&quot;，这正是分析流水线想要的口径。</li>
+<li><strong>依赖要写全</strong>。只把任务丢进不同 stream 而不写事件依赖，可能读到没准备好的数据（正确性问题，性能调优前先保正确）。</li>
+</ul>
+<p><figure><img class="md-img" src="content/courses/gpu-cuda-kernels/assets/chapter-2-figure-04.svg" alt="多流与事件：同流有序、异流并发，跨流依赖靠 event 接起来" loading="lazy" decoding="async"><figcaption>多流与事件：同流有序、异流并发，跨流依赖靠 event 接起来</figcaption></figure>
+</p>
+<h4 id="h-5-常见坑">5. 常见坑<a class="anchor" href="#h-5-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>在循环里 <code>cudaDeviceSynchronize()</code></strong>：一次同步就把流水线打平，前面排的并发全白费。</li>
+<li><strong>假异步</strong>：用未 pinned 的主机内存做 <code>cudaMemcpyAsync</code>，看起来异步、实际同步。</li>
+<li><strong>假设&quot;不同 stream 一定并发&quot;</strong>：资源冲突、显存不够、依赖未满足时都不会重叠，必须实测。</li>
+<li><strong>不测就信</strong>：overlap 要用 timeline 工具看（Nsight Systems 的 GPU timeline），或至少用事件对比&quot;总耗时 vs 各段耗时之和&quot;。</li>
+<li><strong>流开太多</strong>：硬件侧能真正并发的队列数有限（与 <code>CUDA_DEVICE_MAX_CONNECTIONS</code> 这类设置有关，见官方 Environment Variables），流数量远大于能并发的操作数只是增加调度开销。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面用一个纯 Python 的&quot;资源槽 + 事件依赖&quot;离散事件调度器，把 stream 并发算出来：哪些操作能叠、瓶颈在拷贝引擎还是 SM、完工时间是多少。模型很简单——一条拷贝引擎、两个 SM 槽位、同一 stream 内严格串行、跨 stream 靠显式依赖——但足以解释真机上的典型现象。</p>
+<pre data-lang="python"><code class="language-python"># ---- 无 GPU 模拟 stream 并发：资源槽 + 事件依赖的离散事件调度（纯 Python）----
+CAP = {&#39;copy&#39;: 1, &#39;sm&#39;: 2}     # 1 条拷贝引擎 + 2 个 SM 资源槽（每个 kernel 占 1 槽）
+
+
+def simulate(tasks, cap=CAP, legacy_default=False):
+    &quot;&quot;&quot;tasks: [{&#39;name&#39;,&#39;stream&#39;,&#39;res&#39;,&#39;units&#39;,&#39;dur&#39;,&#39;deps&#39;}]；同一 stream 内按列表顺序串行。&quot;&quot;&quot;
+    for i, t in enumerate(tasks):
+        t[&#39;i&#39;] = i
+        t[&#39;seq&#39;] = sum(1 for u in tasks[:i] if u[&#39;stream&#39;] == t[&#39;stream&#39;])
+    for t in tasks:                    # legacy 默认流：与非默认流互相隐式同步
+        if legacy_default and t[&#39;stream&#39;] != &#39;default&#39;:
+            t[&#39;deps&#39;] = list(t[&#39;deps&#39;]) + [u[&#39;i&#39;] for u in tasks if u[&#39;stream&#39;] == &#39;default&#39;]
+
+    done, running, free, plan = set(), {}, dict(cap), {}
+    time, horizon = 0, 500
+    while len(done) &lt; len(tasks) and time &lt;= horizon:
+        for i, (end, t) in [x for x in running.items() if x[1][0] &lt;= time]:
+            free[t[&#39;res&#39;]] += t[&#39;units&#39;]      # 任务结束，归还资源
+            done.add(i)
+            del running[i]
+        for t in tasks:
+            if t[&#39;i&#39;] in done or t[&#39;i&#39;] in running:
+                continue
+            if any(u[&#39;stream&#39;] == t[&#39;stream&#39;] and u[&#39;seq&#39;] &lt; t[&#39;seq&#39;]
+                   and u[&#39;i&#39;] not in done for u in tasks):
+                continue                       # 同 stream 的更早的活还没完
+            if any(d not in done for d in t[&#39;deps&#39;]):
+                continue                       # 事件依赖未满足
+            if free[t[&#39;res&#39;]] &lt; t[&#39;units&#39;]:
+                continue                       # 资源不够
+            free[t[&#39;res&#39;]] -= t[&#39;units&#39;]
+            running[t[&#39;i&#39;]] = (time + t[&#39;dur&#39;], t)
+            plan[t[&#39;i&#39;]] = (time, time + t[&#39;dur&#39;])
+        time += 1
+    return plan, max(e for _, e in plan.values())
+
+
+def chart(tasks, plan):
+    lanes = {r: [[] for _ in range(CAP[r])] for r in CAP}
+    for t in tasks:
+        s, e = plan[t[&#39;i&#39;]]
+        for lane in lanes[t[&#39;res&#39;]]:
+            if all(not (s &lt; oe and os_ &lt; e) for os_, oe, _ in lane):
+                lane.append((s, e, t[&#39;name&#39;]))
+                break
+    span = max(e for _, e in plan.values())
+    print(&#39;    时间 →   &#39; + &#39;&#39;.join(str(i % 10) for i in range(span)))
+    for r, ls in lanes.items():
+        for k, lane in enumerate(ls):
+            row = [&#39;.&#39;] * span
+            for s, e, name in lane:
+                for x in range(s, e):
+                    row[x] = name[0]
+            print(f&#39;  {r}[{k}]      &#39; + &#39;&#39;.join(row))
+    print(&#39;  图例：&#39; + &#39;  &#39;.join(
+        f&#39;{t[&quot;name&quot;][0]}={t[&quot;name&quot;]}&#39; for t in sorted(tasks, key=lambda t: t[&#39;i&#39;])))
+
+
+def run(title, tasks, **kw):
+    plan, makespan = simulate(tasks, **kw)
+    print(f&#39;=== {title} ===&#39;)
+    for t in sorted(tasks, key=lambda t: plan[t[&#39;i&#39;]]):
+        s, e = plan[t[&#39;i&#39;]]
+        print(f&#39;  {t[&quot;name&quot;]:&lt;7} stream={t[&quot;stream&quot;]:&lt;5} {t[&quot;res&quot;]:&lt;5} &#39;
+              f&#39;{s:&gt;3}→{e:&lt;3}（{t[&quot;dur&quot;]}ms）&#39;)
+    chart(tasks, plan)
+    print(f&#39;  完工时间 = {makespan} ms\n&#39;)
+    return makespan
+
+
+def chunk(tag):
+    &quot;&quot;&quot;一块数据三步：H2D 拷贝 → kernel → D2H 拷贝。&quot;&quot;&quot;
+    return [dict(name=f&#39;H2D_{tag}&#39;, stream=tag, res=&#39;copy&#39;, units=1, dur=2, deps=[]),
+            dict(name=f&#39;K_{tag}&#39;, res=&#39;sm&#39;, units=1, dur=3, deps=[f&#39;H2D_{tag}&#39;]),
+            dict(name=f&#39;D2H_{tag}&#39;, res=&#39;copy&#39;, units=1, dur=2, deps=[f&#39;K_{tag}&#39;])]
+
+
+def build(spec):
+    &quot;&quot;&quot;spec: [(stream, tag)]；deps 用名字写，这里统一换成下标。&quot;&quot;&quot;
+    tasks = []
+    for stream, tag in spec:
+        for t in chunk(tag):
+            t[&#39;stream&#39;] = stream
+            tasks.append(t)
+    idx = {t[&#39;name&#39;]: i for i, t in enumerate(tasks)}
+    for i, t in enumerate(tasks):
+        t[&#39;i&#39;] = i
+        t[&#39;deps&#39;] = [idx[d] for d in t[&#39;deps&#39;]]
+    return tasks
+
+
+print(f&#39;单块数据顺序执行 = 7 ms（H2D 2 + kernel 3 + D2H 2）；下面看两条 stream 怎么把它压下去\n&#39;)
+
+two = build([(&#39;A&#39;, &#39;A&#39;), (&#39;B&#39;, &#39;B&#39;)])
+m2 = run(&#39;两个 stream、各 1 块数据：D2H 与另一个 kernel 叠起来了&#39;, two)
+m1 = run(&#39;同一批活全塞进一个 stream：只能串行&#39;, build([(&#39;S&#39;, &#39;A&#39;), (&#39;S&#39;, &#39;B&#39;)]))
+print(f&#39;两条 stream 相对单 stream 的加速比 = {m1 / m2:.2f}x\n&#39;)
+
+run(&#39;4 块数据、4 条 stream：拷贝引擎（只有 1 条）成为瓶颈&#39;,
+    build([(f&#39;s{i}&#39;, f&#39;t{i}&#39;) for i in range(4)]))
+
+legacy = build([(&#39;A&#39;, &#39;A&#39;), (&#39;B&#39;, &#39;B&#39;)])
+for i, t in enumerate(legacy):        # 前 3 个任务改用默认流，触发隐式同步
+    if i &lt; 3:
+        t[&#39;stream&#39;] = &#39;default&#39;
+ml = run(&#39;同两个 stream，但走 legacy 默认流语义：隐式同步抹平并发&#39;, legacy, legacy_default=True)
+print(f&#39;legacy 默认流下比显式双流慢 {ml / m2:.2f}x —— 这是&quot;量不到 overlap&quot;的最常见原因&#39;)</code></pre>
+<p>运行结果（CPU 实测）：</p>
+<pre><code>单块数据顺序执行 = 7 ms（H2D 2 + kernel 3 + D2H 2）；下面看两条 stream 怎么把它压下去
+
+=== 两个 stream、各 1 块数据：D2H 与另一个 kernel 叠起来了 ===
+  H2D_A   stream=A     copy    0→2  （2ms）
+  H2D_B   stream=B     copy    2→4  （2ms）
+  K_A     stream=A     sm      2→5  （3ms）
+  K_B     stream=B     sm      4→7  （3ms）
+  D2H_A   stream=A     copy    5→7  （2ms）
+  D2H_B   stream=B     copy    7→9  （2ms）
+    时间 →   012345678
+  copy[0]      HHHH.DDDD
+  sm[0]      ..KKK....
+  sm[1]      ....KKK..
+  图例：H=H2D_A  K=K_A  D=D2H_A  H=H2D_B  K=K_B  D=D2H_B
+  完工时间 = 9 ms
+
+=== 同一批活全塞进一个 stream：只能串行 ===
+  H2D_A   stream=S     copy    0→2  （2ms）
+  K_A     stream=S     sm      2→5  （3ms）
+  D2H_A   stream=S     copy    5→7  （2ms）
+  H2D_B   stream=S     copy    7→9  （2ms）
+  K_B     stream=S     sm      9→12 （3ms）
+  D2H_B   stream=S     copy   12→14 （2ms）
+    时间 →   01234567890123
+  copy[0]      HH...DDHH...DD
+  sm[0]      ..KKK....KKK..
+  sm[1]      ..............
+  图例：H=H2D_A  K=K_A  D=D2H_A  H=H2D_B  K=K_B  D=D2H_B
+  完工时间 = 14 ms
+
+两条 stream 相对单 stream 的加速比 = 1.56x
+
+=== 4 块数据、4 条 stream：拷贝引擎（只有 1 条）成为瓶颈 ===
+  H2D_t0  stream=s0    copy    0→2  （2ms）
+  H2D_t1  stream=s1    copy    2→4  （2ms）
+  K_t0    stream=s0    sm      2→5  （3ms）
+  H2D_t2  stream=s2    copy    4→6  （2ms）
+  K_t1    stream=s1    sm      4→7  （3ms）
+  D2H_t0  stream=s0    copy    6→8  （2ms）
+  K_t2    stream=s2    sm      6→9  （3ms）
+  D2H_t1  stream=s1    copy    8→10 （2ms）
+  D2H_t2  stream=s2    copy   10→12 （2ms）
+  H2D_t3  stream=s3    copy   12→14 （2ms）
+  K_t3    stream=s3    sm     14→17 （3ms）
+  D2H_t3  stream=s3    copy   17→19 （2ms）
+    时间 →   0123456789012345678
+  copy[0]      HHHHHHDDDDDDHH...DD
+  sm[0]      ..KKK.KKK.....KKK..
+  sm[1]      ....KKK............
+  图例：H=H2D_t0  K=K_t0  D=D2H_t0  H=H2D_t1  K=K_t1  D=D2H_t1  H=H2D_t2  K=K_t2  D=D2H_t2  H=H2D_t3  K=K_t3  D=D2H_t3
+  完工时间 = 19 ms
+
+=== 同两个 stream，但走 legacy 默认流语义：隐式同步抹平并发 ===
+  H2D_A   stream=default copy    0→2  （2ms）
+  K_A     stream=default sm      2→5  （3ms）
+  D2H_A   stream=default copy    5→7  （2ms）
+  H2D_B   stream=B     copy    7→9  （2ms）
+  K_B     stream=B     sm      9→12 （3ms）
+  D2H_B   stream=B     copy   12→14 （2ms）
+    时间 →   01234567890123
+  copy[0]      HH...DDHH...DD
+  sm[0]      ..KKK....KKK..
+  sm[1]      ..............
+  图例：H=H2D_A  K=K_A  D=D2H_A  H=H2D_B  K=K_B  D=D2H_B
+  完工时间 = 14 ms
+
+legacy 默认流下比显式双流慢 1.56x —— 这是&quot;量不到 overlap&quot;的最常见原因</code></pre>
+<p>从输出能读出三件事：双流把 14 ms 压到 9 ms（1.56x），因为 <code>D2H_A</code> 与 <code>K_B</code> 重叠了；4 条 stream 时完工时间 19 ms，比&quot;4 块全放一个 stream&quot;的 28 ms 好，但天花板是那条只有 1 条的拷贝引擎（<code>copy[0]</code> 行几乎排满）；legacy 默认流把 9 ms 打回 14 ms，等于白写双流。要进一步提升，只能减少拷贝次数（异步拷贝到 shared、TMA）或让拷贝与计算落在不同分片上（第 3、4 章）。</p>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选（需自备 GPU 或云上按需）：真机上的最小可复现步骤 ----
+# 1) 双流 + 事件计时的骨架（C++）：
+#      cudaStream_t s[2]; cudaEvent_t e0, e1;
+#      cudaStreamCreateWithFlags(&amp;s[i], cudaStreamNonBlocking);   // 不与默认流隐式同步
+#      cudaHostAlloc(&amp;h, bytes, cudaHostAllocDefault);            // 必须 pinned 才能真异步
+#      cudaEventRecord(e0, s[0]);
+#      cudaMemcpyAsync(d, h, bytes, cudaMemcpyHostToDevice, s[0]);
+#      kernel&lt;&lt;&lt;grid, block, 0, s[0]&gt;&gt;&gt;(d);
+#      cudaEventRecord(e1, s[0]); cudaEventSynchronize(e1);
+#      cudaEventElapsedTime(&amp;ms, e0, e1);                          // 先同步再读，否则是垃圾值
+# 2) 看 overlap：nsys profile --stats=true ./app，在 GPU timeline 上确认拷贝与 kernel 是否真叠了；
+# 3) 对照实验：把同一份代码的 pinned 换成 malloc、把 s[i] 换成默认流，各跑一次，
+#    对比总耗时——你应该能复现本课代码里的&quot;隐式同步抹平并发&quot;。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：给 <code>simulate</code> 加&quot;拷贝引擎有 2 条&quot;的配置（<code>CAP = {&#39;copy&#39;: 2, &#39;sm&#39;: 2}</code>），重跑 4 块数据、4 条 stream 的场景，记录完工时间与瓶颈资源的变化；再改成 <code>{&#39;copy&#39;: 1, &#39;sm&#39;: 4}</code>，说明瓶颈从哪儿转移到了哪儿。</li>
+<li><strong>解释</strong>：为什么 <code>cudaMemcpyAsync</code> 在主机内存没有 pinned 时会退化成同步？请从&quot;设备要靠 DMA 直接读主机内存&quot;这一点出发，说明操作系统为什么必须保证这些页不被换出。</li>
+<li><strong>对比/验证</strong>：把 2 条 stream 的例子改成&quot;两个 kernel 各占 2 个 SM 槽位&quot;（把 <code>units</code> 从 1 改成 2 且 <code>CAP[&#39;sm&#39;] = 2</code>），重新运行，观察两个 kernel 是否还能重叠；解释这个结果对应真机上哪一类现象。</li>
+<li><strong>思考</strong>：本章的模型把&quot;拷贝引擎&quot;和&quot;SM&quot;当成两个独立资源池。真机上还有哪些资源会成为并发上限（提示：显存容量、L2、<code>CUDA_DEVICE_MAX_CONNECTIONS</code> 限制的硬件队列数、以及同一 kernel 内部对 SM 的占用）？为什么&quot;流越多越快&quot;是错的？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>NVIDIA, <em>CUDA C++ Programming Guide</em> §2.5「Asynchronous Execution」— CUDA Streams、Blocking and Non-Blocking Streams and the Default Stream、Legacy Default Stream、Per-Thread Default Stream、CUDA Events、Timing Operations in CUDA Streams（流与事件的权威语义）：<a href="https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/asynchronous-execution.html#cuda-streams" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/asynchronous-execution.html#cuda-streams</a></li>
+<li>同上 — Stream Synchronization、Creating and Destroying CUDA Events、Inserting Events into CUDA Streams（<code>cudaStreamWaitEvent</code> / <code>cudaEventElapsedTime</code> 的用法与前提）：<a href="https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/asynchronous-execution.html#stream-synchronization" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/asynchronous-execution.html#stream-synchronization</a></li>
+<li>同上 §2.6「Unified and System Memory」— Page-Locked（pinned）Host Memory 与 <code>cudaHostAlloc</code>（异步拷贝对主机内存的要求）：<a href="https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/understanding-memory.html#page-locked-host-memory" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/understanding-memory.html#page-locked-host-memory</a></li>
+<li>NVIDIA, <em>Nsight Systems</em> 用户指南（用 GPU timeline 验证 overlap 的官方入口）：<a href="https://docs.nvidia.com/nsight-systems/UserGuide/index.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/nsight-systems/UserGuide/index.html</a></li>
+</ul>
+<p><a href="#/learn/../chapter-3/lesson-01">下一章：存储层次</a></p>

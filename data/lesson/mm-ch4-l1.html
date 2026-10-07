@@ -1,0 +1,133 @@
+<h2 id="h-clip-对比学习">CLIP 对比学习<a class="anchor" href="#h-clip-对比学习" aria-label="本节链接">#</a></h2>
+<p>在前面三章，你已经完整走过了扩散模型的主线：正向加噪、反向去噪、UNet、条件引导，以及 Stable Diffusion 如何用一段文字生成图像。当时我们提到一个细节——&quot;文本条件&quot;是通过 CLIP 文本编码器变成向量再注入的。本课时我们就回到这个更上游的问题：<strong>图像和文本这两类完全不同的信号，到底是怎么被放进同一个向量空间、彼此&quot;对齐&quot;的？</strong> 答案的核心就是 CLIP 的对比学习（contrastive learning）。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-从固定标签到自然语言监督">1. 从&quot;固定标签&quot;到&quot;自然语言监督&quot;<a class="anchor" href="#h-1-从固定标签到自然语言监督" aria-label="本节链接">#</a></h4>
+<p>在 CLIP 出现之前，视觉模型的主流训练方式是<strong>监督分类</strong>：收集 ImageNet 这样的数据集，人工标注 1000 个类别，训练模型输出这 1000 类上的概率分布。这套方法有效，但有一个根本限制——<strong>标签空间是封闭的</strong>。训练好一个 1000 分类器后，你无法让它识别&quot;一只戴着圣诞帽的柯基&quot;，因为这个概念根本不在标签集里；想支持新类别，只能重新采集数据、重新标注、重新训练。</p>
+<p>CLIP（Contrastive Language–Image Pre-training，对比语言-图像预训练）换了一种监督信号：<strong>用互联网上天然存在的&quot;图片 + 配文&quot;对</strong>。作者从网上收集了 4 亿对（图像，文本）数据。文本不是 1000 个固定标签，而是自然语言句子——它几乎可以描述任意概念。这样一来，监督信号从&quot;封闭的分类标签&quot;变成了&quot;开放的自然语言&quot;，模型学到的就不再是&quot;把图分到 1000 类&quot;，而是&quot;图像和语言之间的一般对应关系&quot;。</p>
+<h4 id="h-2-双塔结构两个编码器一个共享空间">2. 双塔结构：两个编码器，一个共享空间<a class="anchor" href="#h-2-双塔结构两个编码器一个共享空间" aria-label="本节链接">#</a></h4>
+<p>CLIP 的结构被称为&quot;双塔&quot;（dual encoder），因为它有两座并行、互不共享参数的编码器：</p>
+<ul>
+<li><strong>图像编码器</strong>：把一张图片映射成一个向量。原论文实验了 ResNet 系列和 ViT（Vision Transformer），ViT 效果更好。</li>
+<li><strong>文本编码器</strong>：把一个句子映射成向量。用的是标准的 Transformer（原论文约 6300 万参数，12 层）。</li>
+</ul>
+<p>关键不是这两个编码器本身多复杂，而是它们<strong>输出向量被投影到同一个 d 维嵌入空间</strong>，并且约束成单位长度（L2 归一化）。归一化后，两个向量的点积就等于它们的<strong>余弦相似度</strong>：相似度越高，说明这对图文越&quot;匹配&quot;。</p>
+<p><figure><img class="md-img" src="content/courses/multimodal-diffusion/assets/chapter-4-figure-01.svg" alt="CLIP 双塔结构与对比学习示意" loading="lazy" decoding="async"><figcaption>CLIP 双塔结构与对比学习示意</figcaption></figure>
+</p>
+<blockquote>
+<p>为什么要归一化？因为我们要比较的是&quot;方向&quot;而非&quot;长度&quot;。两个向量方向一致（余弦相似度接近 1）表示语义接近；长度则受句子长短、图片亮度等无关因素影响，应被消除。归一化后所有向量都落在单位球面上，点积 = 余弦相似度，计算也统一了。</p>
+</blockquote>
+<h4 id="h-3-对比学习目标在一个-batch-里做配对游戏">3. 对比学习目标：在一个 batch 里做&quot;配对游戏&quot;<a class="anchor" href="#h-3-对比学习目标在一个-batch-里做配对游戏" aria-label="本节链接">#</a></h4>
+<p>CLIP 的训练信号不是&quot;这张图属于第 3 类&quot;，而是&quot;这个 batch 里，第 i 张图和第 i 句文本是一对&quot;。设一个 batch 有 N 对（图 Iᵢ，文本 Tᵢ），我们计算所有图与所有文本的两两相似度，得到一个 N×N 的相似度矩阵：</p>
+<ul>
+<li><strong>对角线</strong>上是 N 对真实配对的相似度（正样本），我们希望它尽可能大；</li>
+<li><strong>非对角线</strong>上是 N²−N 个&quot;错配&quot;的相似度（负样本），我们希望它尽可能小。</li>
+</ul>
+<p><figure><img class="md-img" src="content/courses/multimodal-diffusion/assets/chapter-4-figure-02.svg" alt="batch 内图文相似度矩阵与正负样本" loading="lazy" decoding="async"><figcaption>batch 内图文相似度矩阵与正负样本</figcaption></figure>
+</p>
+<p>具体损失用的是 <strong>InfoNCE</strong>（噪声对比估计的信息下界）。以&quot;图像 → 文本&quot;方向为例，对第 i 张图：</p>
+<pre><code>L_i = -log( exp(sim(I_i, T_i) / τ) / Σ_j exp(sim(I_i, T_j) / τ) )</code></pre>
+<p>其中 τ 是可学习的<strong>温度系数</strong>（原论文实现为一个可训练的对数标度 logit_scale，取 exp 得到 τ）。温度控制相似度分布的&quot;锐利程度&quot;：τ 越小，softmax 越尖锐，模型越被&quot;逼&quot;着把正样本分数拉开；τ 越大越平缓。这个参数不是手工调的，而是让梯度自己学。</p>
+<p>CLIP 的最终损失是<strong>双向对称</strong>的：既算&quot;图像找文本&quot;的 InfoNCE，也算&quot;文本找图像&quot;的 InfoNCE，两者取平均：</p>
+<pre><code>L = (L_{I→T} + L_{T→I}) / 2</code></pre>
+<p>对称的意义在于：既要求每张图能&quot;认出&quot;自己对应的文本，也要求每句文本能&quot;认出&quot;自己对应的图，两个方向互相约束，学出的对齐更稳定。</p>
+<h4 id="h-4-为什么这招能行">4. 为什么这招能行<a class="anchor" href="#h-4-为什么这招能行" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>监督信号几乎免费</strong>：互联网上的图文对不用人工标注，规模可以轻松做到几亿，远超任何人工标注数据集。</li>
+<li><strong>语言是&quot;开放词汇&quot;的</strong>：一句自然语言能组合出无数概念，模型被迫学会理解词与词、图与图的组合语义，而不是背下固定类别。</li>
+<li><strong>对比学习学到的是&quot;表征&quot;而非&quot;分类器&quot;</strong>：模型输出的向量本身就有语义结构，可以直接拿去做检索、分类、生成条件等多种下游任务，而不只是输出一个类别编号。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<h4 id="h-示例-1用-clip-计算图文相似度">示例 1：用 CLIP 计算图文相似度<a class="anchor" href="#h-示例-1用-clip-计算图文相似度" aria-label="本节链接">#</a></h4>
+<p>下面用 Hugging Face <code>transformers</code> 加载一个真实的 CLIP 模型，观察它如何把图片和文本变成可比较的向量。</p>
+<pre data-lang="python"><code class="language-python">from transformers import CLIPProcessor, CLIPModel
+from PIL import Image
+import torch
+
+# 加载 CLIP 模型与配套的预处理组件（tokenizer + 图像变换）
+model = CLIPModel.from_pretrained(&quot;openai/clip-vit-base-patch32&quot;)
+processor = CLIPProcessor.from_pretrained(&quot;openai/clip-vit-base-patch32&quot;)
+
+# 三句候选文本，其中只有第一句真正描述图片
+texts = [
+    &quot;a photo of a golden retriever running on a beach&quot;,
+    &quot;a photo of a traffic light&quot;,
+    &quot;a bowl of hot noodles&quot;,
+]
+
+# 用任意一张本地图片替换此处路径（可先构造一张 3x224x224 的占位图演示流程）
+img = Image.new(&quot;RGB&quot;, (224, 224), color=(180, 160, 90))
+
+# processor 会把文本 tokenize、把图片缩放裁剪成模型需要的尺寸
+inputs = processor(text=texts, images=img, return_tensors=&quot;pt&quot;, padding=True)
+
+with torch.no_grad():
+    outputs = model(**inputs)
+
+# 得到图像向量与文本向量（已 L2 归一化）
+img_emb = outputs.image_embeds          # shape: (1, d)
+text_emb = outputs.text_embeds          # shape: (3, d)
+
+# 归一化后点积即余弦相似度，对图像向量做转置以完成矩阵乘
+logits = (img_emb @ text_emb.T)         # shape: (1, 3)
+probs = logits.softmax(dim=-1)[0]       # 转为概率分布
+
+print(&quot;图文相似度 logits：&quot;, logits[0].tolist())
+print(&quot;softmax 概率：&quot;, probs.tolist())
+print(&quot;最匹配的文本索引：&quot;, torch.argmax(probs).item())</code></pre>
+<p>运行后，<code>probs</code> 中第一句的概率应当显著高于另外两句——模型在没有见过这张具体图片的情况下，仅凭预训练学到的图文对齐就&quot;读懂&quot;了它。</p>
+<h4 id="h-示例-2从零实现一个-mini-infonce-对比损失">示例 2：从零实现一个 mini InfoNCE 对比损失<a class="anchor" href="#h-示例-2从零实现一个-mini-infonce-对比损失" aria-label="本节链接">#</a></h4>
+<p>为了真正&quot;知其所以然&quot;，我们把 CLIP 的损失函数自己写一遍。这里用一个随机初始化的双塔做示范，重点是理解损失的计算流程，而非真实训练。</p>
+<pre data-lang="python"><code class="language-python">import torch
+import torch.nn.functional as F
+
+def clip_loss(image_emb, text_emb, temperature=0.07):
+    &quot;&quot;&quot;计算 CLIP 的双向 InfoNCE 对比损失。
+
+    参数:
+        image_emb: 图像向量, shape (N, d), 已 L2 归一化
+        text_emb:  文本向量, shape (N, d), 已 L2 归一化
+        temperature: 温度系数 τ
+    返回:
+        标量损失, 以及一个 N×N 的相似度矩阵(便于观察)
+    &quot;&quot;&quot;
+    # 相似度矩阵: 第 i 行第 j 列 = 第 i 张图与第 j 句文本的余弦相似度
+    sim = image_emb @ text_emb.T          # (N, N)
+    sim = sim / temperature               # 除以温度, 缩放 logits
+
+    N = sim.shape[0]
+    # 正确配对在对角线上, 用 0..N-1 作为标签
+    labels = torch.arange(N, device=sim.device)
+
+    # 图像 → 文本: 每行做一个 softmax 交叉熵
+    loss_i2t = F.cross_entropy(sim, labels)
+    # 文本 → 图像: 每列(即 sim.T 的每行)做一个 softmax 交叉熵
+    loss_t2i = F.cross_entropy(sim.T, labels)
+
+    return (loss_i2t + loss_t2i) / 2, sim
+
+# 构造一个 batch 的假向量: 4 对图文, 嵌入维度 8
+N, d = 4, 8
+torch.manual_seed(0)
+image_emb = F.normalize(torch.randn(N, d), dim=-1)  # 归一化到单位长度
+text_emb  = F.normalize(torch.randn(N, d), dim=-1)
+
+loss, sim = clip_loss(image_emb, text_emb)
+print(&quot;相似度矩阵（对角线是正样本）：&quot;)
+print(sim.detach().numpy().round(2))
+print(&quot;CLIP 对比损失：&quot;, loss.item())</code></pre>
+<p>要点在 <code>labels = torch.arange(N)</code>：我们不需要任何类别标注，只要约定&quot;第 i 行必须和第 i 列配对&quot;，模型就会在梯度推动下把对角线上的相似度抬高、其余位置压低——这就是对比学习训练的全部秘密。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>概念判断</strong>：为什么说 CLIP 的监督信号是&quot;开放&quot;的，而 ImageNet 分类器的监督信号是&quot;封闭&quot;的？请用自己的话解释两者本质区别。</li>
+<li><strong>动手实验</strong>：在示例 2 中把 <code>temperature</code> 从 0.07 改成 0.7 再改成 0.007，观察损失值和相似度矩阵的变化趋势。温度变小后，损失对负样本的惩罚是变强还是变弱？</li>
+<li><strong>推导练习</strong>：写出&quot;文本 → 图像&quot;方向的 InfoNCE 公式，并说明 CLIP 为什么要取双向损失的平均，而不是只用一个方向。</li>
+<li><strong>思考题</strong>：一个 batch 只有 4 对图文时，负样本只有 3 个；如果 batch 增大到 1024，负样本数量如何变化？为什么说&quot;batch 内的负样本是免费的&quot;，但这也让 CLIP 训练对显存和 batch 大小非常敏感？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>CLIP 原论文（Learning Transferable Visual Models From Natural Language Supervision）：<a href="https://arxiv.org/abs/2103.00020" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2103.00020</a></li>
+<li>OpenAI CLIP 官方介绍：<a href="https://openai.com/research/clip" target="_blank" rel="noopener noreferrer">https://openai.com/research/clip</a></li>
+<li>Hugging Face CLIP 文档：<a href="https://huggingface.co/docs/transformers/model_doc/clip" target="_blank" rel="noopener noreferrer">https://huggingface.co/docs/transformers/model_doc/clip</a></li>
+<li>CLIP GitHub 仓库：<a href="https://github.com/openai/CLIP" target="_blank" rel="noopener noreferrer">https://github.com/openai/CLIP</a></li>
+</ul>
+<p><a href="#/l/mm-ch4-l2">下一课：图文对齐</a></p>

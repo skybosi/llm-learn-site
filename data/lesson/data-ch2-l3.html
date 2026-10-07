@@ -1,0 +1,603 @@
+<h2 id="h-质量过滤与打分阈值偏差与自举坍缩">质量过滤与打分：阈值、偏差与自举坍缩<a class="anchor" href="#h-质量过滤与打分阈值偏差与自举坍缩" aria-label="本节链接">#</a></h2>
+<h3 id="h-这一节要解决什么">这一节要解决什么<a class="anchor" href="#h-这一节要解决什么" aria-label="本节链接">#</a></h3>
+<p>过滤看起来是数据管线里最直观的一步：&quot;把坏数据删掉&quot;。但真正做过一轮的人都会遇到同一个困惑：<strong>删掉了大量看起来明显是垃圾的样本，模型的评测却几乎没变，某些能力反而变差了。</strong> 这个困惑里藏着三个必须分清的问题：</p>
+<ol>
+<li><strong>过滤器的目标是分类准确率，还是下游收益？</strong> 这两者<strong>不是一回事</strong>。本节代码会给出一组实测：过滤器自己的最优 F1 阈值是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.50</span></span></span></span>，但下游部署准确率的最优阈值是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.40</span></span></span></span>；更常见的情况是，为了把 precision 调到 1.0（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7719em;vertical-align:-0.136em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≥</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.60</span></span></span></span>）而牺牲 3 个点的部署准确率与一整个切片（口语数据从 0.63 掉到 0.51）。</li>
+<li><strong>&quot;质量分&quot;到底在测量什么？</strong> 启发式规则在测量&quot;统计量是否落在某个区间&quot;，模型打分器在测量&quot;与参考分布的相似度&quot;。<strong>后者常常被当成&quot;质量&quot;，但它是别的量</strong> —— 一个 95% 准确的&quot;像不像维基&quot;分类器，用在中文客服对话上会系统性删掉大部分正确数据。</li>
+<li><strong>反复用模型筛数据会发生什么？</strong> 每一轮保留的都是&quot;当前模型认为好&quot;的子集，等价于把数据分布反复投影到同一个子空间。本节代码实测：8 轮之后唯一 bigram 从 67599 降到 33169（<strong>腰斩</strong>），token 熵与词表覆盖单调下降。</li>
+</ol>
+<p>学完这一节，你应该能为一个具体的过滤决策写出：分数怎么算、阈值怎么选、用哪条曲线选、以及&quot;删掉的样本里有多少属于某个我其实在乎的切片&quot;。</p>
+<h3 id="h-一过滤是一个决策不是清理">一、过滤是一个决策，不是&quot;清理&quot;<a class="anchor" href="#h-一过滤是一个决策不是清理" aria-label="本节链接">#</a></h3>
+<h4 id="h-11-形式化">1.1 形式化<a class="anchor" href="#h-11-形式化" aria-label="本节链接">#</a></h4>
+<p>给每个样本 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">x</span></span></span></span> 一个分数 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">s</span><span class="mopen">(</span><span class="mord mathnormal">x</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6889em;"></span><span class="mord mathbb">R</span></span></span></span>，选阈值 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span></span></span></span>，保留 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">s</span><span class="mopen">(</span><span class="mord mathnormal">x</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&gt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span></span></span></span>。于是过滤是<strong>两个</strong>决策：</p>
+<ul>
+<li><strong>打分函数 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">s</span><span class="mopen">(</span><span class="mord">⋅</span><span class="mclose">)</span></span></span></span></strong>：决定&quot;什么样的样本排在前面&quot;；</li>
+<li><strong>阈值 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span></span></span></span></strong>：决定&quot;排到哪一刀为止&quot;。</li>
+</ul>
+<p>工程上最常见的错误是<strong>把注意力全部放在打分函数上</strong>（换更好的分类器、加更多特征），而阈值用一个&quot;看起来合理&quot;的数。但本节的实验会说明：<strong>在同一个打分函数下，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span></span></span></span> 从 0.40 挪到 0.70 就能让部署准确率掉 2.7 个点、让一个切片崩到随机水平。</strong> 阈值才是那个真正需要被论证的参数。</p>
+<h4 id="h-12-三个可测目标">1.2 三个可测目标<a class="anchor" href="#h-12-三个可测目标" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>目标</th>
+<th>定义</th>
+<th>怎么测</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>下游性能</strong></td>
+<td>在<strong>目标部署分布</strong>上的指标</td>
+<td>用一个 held-out 评测集，在过滤后的数据上训练再评</td>
+</tr>
+<tr>
+<td><strong>保留率</strong></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">∣{</span><span class="mord mathnormal">s</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&gt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mclose">}∣</span><span class="mord">/</span><span class="mord mathnormal">n</span></span></span></span></td>
+<td>直接算；但必须<strong>按切片</strong>分别算</td>
+</tr>
+<tr>
+<td><strong>切片伤害</strong></td>
+<td>各切片保留率与下游指标的变化</td>
+<td>切片清单与门禁（第 1 章 E54）</td>
+</tr>
+</tbody></table>
+<p><strong>关键在第三项，也在&quot;目标部署分布&quot;这个词上</strong>：过滤决策的收益/代价必须在<strong>部署分布</strong>上评估，而不是在训练数据内部评估。部署分布可能包含你训练时没有的切片、也可能给某个切片更高的权重 —— 本节代码里，口语切片在训练数据里占 21%（1200/5600），但在部署分布里占 30%。这个权重差决定了最优阈值的位置。</p>
+<h4 id="h-13-反直觉的结论过滤不一定提升下游">1.3 反直觉的结论：过滤不一定提升下游<a class="anchor" href="#h-13-反直觉的结论过滤不一定提升下游" aria-label="本节链接">#</a></h4>
+<p>过滤的作用是把&quot;噪声&quot;从训练分布里拿走。但去掉数据本身<strong>永远有代价</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0278em;">D</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0278em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">eff</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 变小（第 1 章 4.1），在 scaling law 里按 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8491em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0278em;">D</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8491em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mathnormal mtight" style="margin-right:0.0528em;">β</span></span></span></span></span></span></span></span></span></span></span></span> 直接体现。于是过滤的净收益是两项的差：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">Δ</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.3263em;vertical-align:-1.5763em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.75em;"><span style="top:-1.4237em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">去噪收益</span></span></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.75em;"><span class="svg-align" style="top:-2.102em;"><span class="pstrut" style="height:3em;"></span><span class="stretchy" style="height:0.548em;min-width:1.6em;"><span class="brace-left" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMinYMin slice"><path d="M0 6l6-6h17c12.688 0 19.313.3 20 1 4 4 7.313 8.3 10 13
+ 35.313 51.3 80.813 93.8 136.5 127.5 55.688 33.7 117.188 55.8 184.5 66.5.688
+ 0 2 .3 4 1 18.688 2.7 76 4.3 172 5h399450v120H429l-6-1c-124.688-8-235-61.7
+-331-161C60.687 138.7 32.312 99.3 7 54L0 41V6z"/></svg></span><span class="brace-center" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMidYMin slice"><path d="M199572 214
+c100.7 8.3 195.3 44 280 108 55.3 42 101.7 93 139 153l9 14c2.7-4 5.7-8.7 9-14
+ 53.3-86.7 123.7-153 211-199 66.7-36 137.3-56.3 212-62h199568v120H200432c-178.3
+ 11.7-311.7 78.3-403 201-6 8-9.7 12-11 12-.7.7-6.7 1-18 1s-17.3-.3-18-1c-1.3 0
+-5-4-11-12-44.7-59.3-101.3-106.3-170-141s-145.3-54.3-229-60H0V214z"/></svg></span><span class="brace-right" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMaxYMin slice"><path d="M399994 0l6 6v35l-6 11c-56 104-135.3 181.3-238 232-57.3
+ 28.7-117 45-179 50H-300V214h399897c43.3-7 81-15 113-26 100.7-33 179.7-91 237
+-174 2.7-5 6-9 10-13 .7-1 7.3-1 20-1h17z"/></svg></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0077em;">R</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mclose">)</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.898em;"><span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.5763em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:2.3263em;vertical-align:-1.5763em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.75em;"><span style="top:-1.4237em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">数据量损失</span></span></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.75em;"><span class="svg-align" style="top:-2.102em;"><span class="pstrut" style="height:3em;"></span><span class="stretchy" style="height:0.548em;min-width:1.6em;"><span class="brace-left" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMinYMin slice"><path d="M0 6l6-6h17c12.688 0 19.313.3 20 1 4 4 7.313 8.3 10 13
+ 35.313 51.3 80.813 93.8 136.5 127.5 55.688 33.7 117.188 55.8 184.5 66.5.688
+ 0 2 .3 4 1 18.688 2.7 76 4.3 172 5h399450v120H429l-6-1c-124.688-8-235-61.7
+-331-161C60.687 138.7 32.312 99.3 7 54L0 41V6z"/></svg></span><span class="brace-center" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMidYMin slice"><path d="M199572 214
+c100.7 8.3 195.3 44 280 108 55.3 42 101.7 93 139 153l9 14c2.7-4 5.7-8.7 9-14
+ 53.3-86.7 123.7-153 211-199 66.7-36 137.3-56.3 212-62h199568v120H200432c-178.3
+ 11.7-311.7 78.3-403 201-6 8-9.7 12-11 12-.7.7-6.7 1-18 1s-17.3-.3-18-1c-1.3 0
+-5-4-11-12-44.7-59.3-101.3-106.3-170-141s-145.3-54.3-229-60H0V214z"/></svg></span><span class="brace-right" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMaxYMin slice"><path d="M399994 0l6 6v35l-6 11c-56 104-135.3 181.3-238 232-57.3
+ 28.7-117 45-179 50H-300V214h399897c43.3-7 81-15 113-26 100.7-33 179.7-91 237
+-174 2.7-5 6-9 10-13 .7-1 7.3-1 20-1h17z"/></svg></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mclose">)</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.898em;"><span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.5763em;"><span></span></span></span></span></span></span></span></span></span></p>
+<p><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0077em;">R</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mclose">)</span></span></span></span> 是<strong>凹增后饱和</strong>的（去噪的收益随去掉的噪声量递减）；<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mclose">)</span></span></span></span> 近似<strong>线性或按幂律</strong>增长（删得越多损失越大）。因此 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">Δ</span></span></span></span> 一般在中间的某个 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6887em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6887em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span></span></span></span></span></span></span></span> 取极大 —— 这就是&quot;适度过滤最好&quot;的定量根据，也解释了为什么<strong>极端过滤（只留最优质的那一小撮）常常比不过滤更差</strong>。</p>
+<p>本节代码的实测（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0077em;">R</span></span></span></span> 侧还叠加了切片伤害）：</p>
+<pre><code>τ=0.00  部署总体 0.5439
+τ=0.30  部署总体 0.5746
+τ=0.40  部署总体 0.5787   ← 峰值
+τ=0.55  部署总体 0.5769
+τ=0.70  部署总体 0.5520
+τ=0.75  部署总体 0.5528</code></pre>
+<p>注意 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6887em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6887em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.40</span></span></span></span> 时<strong>所有切片都还是 100% 保留</strong>（口语保留率 1.000）。也就是说：<strong>最优阈值出现在&quot;噪声刚被清干净、还没有开始碰任何有效切片&quot;的位置。</strong> 这不是巧合 —— 越过那个点之后，每删一点数据都在伤害某个切片，而收益侧（precision）早已饱和（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.40</span></span></span></span> 时 precision 已经 0.987）。</p>
+<h4 id="h-14-为什么优化过滤器的指标会走偏">1.4 为什么&quot;优化过滤器的指标&quot;会走偏<a class="anchor" href="#h-14-为什么优化过滤器的指标会走偏" aria-label="本节链接">#</a></h4>
+<p>上面那段已经说明了机制：过滤器的 precision 在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.40</span></span></span></span> 已经饱和到 0.987，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.70</span></span></span></span> 是 1.000 —— <strong>它在自己的指标上只涨了 0.013，代价是删掉 42% 的有效数据</strong>。任何把&quot;precision 提到 1.0&quot;当目标的调参过程都会走到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.70</span></span></span></span>，而且在过滤器的报告里看起来完全成功（F1 仍有 0.758~0.94）。</p>
+<h3 id="h-二启发式规则族每条规则是一个分布假设">二、启发式规则族：每条规则是一个分布假设<a class="anchor" href="#h-二启发式规则族每条规则是一个分布假设" aria-label="本节链接">#</a></h3>
+<h4 id="h-21-规则清单与它们各自在断言什么">2.1 规则清单与它们各自在断言什么<a class="anchor" href="#h-21-规则清单与它们各自在断言什么" aria-label="本节链接">#</a></h4>
+<p>大型语料清洗里被广泛使用的一族规则（Gopher/C4 类）大致包括：</p>
+<table>
+<thead>
+<tr>
+<th>规则</th>
+<th>具体形式（示意）</th>
+<th>它在断言什么</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>词数区间</td>
+<td>词数在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0641em;vertical-align:-0.25em;"></span><span class="mopen">[</span><span class="mord">50</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">5</span></span></span></span></span></span></span></span><span class="mclose">]</span></span></span></span></td>
+<td>太短没信息，太长可能是拼接/日志</td>
+</tr>
+<tr>
+<td>平均词长</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">[</span><span class="mord">3</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">10</span><span class="mclose">]</span></span></span></span> 字符</td>
+<td>排除无空格语言与乱码</td>
+</tr>
+<tr>
+<td>行结束标点比例</td>
+<td>以句末标点结尾的行 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7719em;vertical-align:-0.136em;"></span><span class="mrel">≥</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">80%</span></span></span></span></td>
+<td>正文是句子，不是列表/代码/表格</td>
+</tr>
+<tr>
+<td>符号-词比</td>
+<td><code>#</code>、<code>…</code> 的比例 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7719em;vertical-align:-0.136em;"></span><span class="mrel">≤</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.1</span></span></span></span></td>
+<td>排除代码、模板、乱码</td>
+</tr>
+<tr>
+<td>停用词比例</td>
+<td>含至少 2 个常见停用词</td>
+<td>排除关键词堆砌</td>
+</tr>
+<tr>
+<td>重复行比例</td>
+<td>重复行字符占比 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7719em;vertical-align:-0.136em;"></span><span class="mrel">≤</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.3</span></span></span></span></td>
+<td>排除导航栏、模板</td>
+</tr>
+<tr>
+<td>重复 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span>-gram 比例</td>
+<td>最高频 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span>-gram 占比 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7719em;vertical-align:-0.136em;"></span><span class="mrel">≤</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.2</span></span></span></span></td>
+<td>排除复读机文本</td>
+</tr>
+<tr>
+<td>困惑度</td>
+<td>在参考 LM 下处于某个分位区间</td>
+<td>排除与自然语言偏离过远的文本</td>
+</tr>
+</tbody></table>
+<p><strong>每条规则背后都是一个分布假设</strong>：&quot;高质量文本的某个统计量落在某个区间内&quot;。理解这一点有两个直接后果：</p>
+<ol>
+<li><strong>规则不能当真理用</strong>，它们是&quot;大多数情况下成立&quot;的经验假设。比如&quot;以句末标点结尾的行 ≥80%&quot;在中文长句、诗歌、对话文本上都会失效。</li>
+<li><strong>规则的失效是成片的，不是零星的</strong>。一条规则失效时，它会系统性地删除某一类文本（而不是随机删）—— 这与第 1 章 E21/E24 完全对应。</li>
+</ol>
+<h4 id="h-22-为什么用规则而不是模型">2.2 为什么用规则而不是模型<a class="anchor" href="#h-22-为什么用规则而不是模型" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>便宜</strong>：规则是一次线性扫描（甚至可以用正则一次过），模型打分要多一次前向。在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">12</span></span></span></span></span></span></span></span></span></span></span></span> token 的规模上，这个差别是&quot;几天&quot;与&quot;几个月&quot;。</li>
+<li><strong>可解释</strong>：删掉一条样本时可以指出是哪条规则触发的，这让&quot;看被删样本&quot;这件事变得可行。</li>
+<li><strong>确定性</strong>：规则是纯函数，模型打分依赖权重版本与推理实现（浮点、批大小都可能影响结果）。</li>
+</ul>
+<p>这三条让规则成为<strong>第一道过滤</strong>的正确选择。但<strong>它们不能替代模型打分</strong>：规则只能表达&quot;某个一维统计量在区间内&quot;，表达不了&quot;这段文本是否连贯/是否有信息量&quot;。</p>
+<h4 id="h-23-迁移性陷阱">2.3 迁移性陷阱<a class="anchor" href="#h-23-迁移性陷阱" aria-label="本节链接">#</a></h4>
+<p><strong>规则阈值几乎总是从别的语料上定的</strong>（多数来自英文网页）。直接迁移会出问题，而且是成片的：</p>
+<table>
+<thead>
+<tr>
+<th>规则</th>
+<th>在英文网页上</th>
+<th>迁移到中文</th>
+<th>迁移到代码</th>
+<th>迁移到客服对话</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>停用词比例</td>
+<td>有效</td>
+<td>需重定（中文停用词表不同，且分词影响大）</td>
+<td><strong>完全失效</strong>（代码没有停用词）</td>
+<td>偏弱（口语停用词多，会误判为&quot;好&quot;）</td>
+</tr>
+<tr>
+<td>平均词长</td>
+<td>3~10 字符</td>
+<td>中文字符级&quot;词长&quot;不适用</td>
+<td>失效</td>
+<td>失效</td>
+</tr>
+<tr>
+<td>行末标点</td>
+<td>有效</td>
+<td>弱（中文长句多）</td>
+<td><strong>反向</strong>（代码行多不以标点结尾）</td>
+<td>弱（对话常无标点）</td>
+</tr>
+<tr>
+<td>符号-词比</td>
+<td>排除代码</td>
+<td>有效</td>
+<td><strong>反向</strong>（代码符号多，但代码是好数据）</td>
+<td>弱</td>
+</tr>
+<tr>
+<td>重复 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span>-gram</td>
+<td>有效</td>
+<td>有效</td>
+<td>有效（但要排除必要的重复，如 import）</td>
+<td>有效</td>
+</tr>
+</tbody></table>
+<p><strong>正确做法</strong>：把规则的阈值当作<strong>需要重新标定的参数</strong>，在目标语料上用小样本人工标注（&quot;该留/该删&quot;）标定，得到每条规则在<strong>本语料</strong>上的 precision/recall 后才使用。这件事的成本是几百条标注，收益是避免一次成片的误删。</p>
+<h3 id="h-三模型打分学到的往往是像不像语料">三、模型打分：学到的往往是&quot;像不像语料&quot;<a class="anchor" href="#h-三模型打分学到的往往是像不像语料" aria-label="本节链接">#</a></h3>
+<h4 id="h-31-质量分类器fasttext-类">3.1 质量分类器（fastText 类）<a class="anchor" href="#h-31-质量分类器fasttext-类" aria-label="本节链接">#</a></h4>
+<p>典型做法：正类 = 维基百科/书籍，负类 = 未过滤的网络文本，训一个线性分类器，用它的输出作为质量分，保留高分。</p>
+<p><strong>它实际学到的是什么</strong>：<strong>&quot;这段文本与维基百科的相似度&quot;</strong>，而不是&quot;质量&quot;。这两者在英文网页语料上高度相关，所以效果好；在别的分布上相关性会崩掉：</p>
+<ul>
+<li>中文客服对话（口语、省略、表情）：与维基相似度低 → 被判低质 → 大面积误删；</li>
+<li>诗歌、歌词、方言文本：同上；</li>
+<li>代码注释、医学报告、法律文书：格式与维基差很远 → 误删；</li>
+<li>而某些&quot;很像维基&quot;的无信息文本（例如大段抄来的百科条目）会被判高质量 —— 它们确实&quot;像&quot;，但可能已经重复了几百遍。</li>
+</ul>
+<p><strong>所以它的准确率数字不可迁移。</strong> 一个&quot;95% 准确&quot;的声明只在它的训练分布上成立；换域之后必须重新标注、重新测。</p>
+<h4 id="h-32-困惑度过滤kenlm-类">3.2 困惑度过滤（KenLM 类）<a class="anchor" href="#h-32-困惑度过滤kenlm-类" aria-label="本节链接">#</a></h4>
+<p>用高质量语料训一个 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span>-gram 语言模型，保留困惑度低的样本。机制上是同一件事：<strong>&quot;像不像那份高质量语料&quot;</strong>。同样的问题、同样的失效条件。它多一个特点：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span>-gram LM 对<strong>领域词汇</strong>很敏感（一个陌生的人名/术语就会让困惑度飙升），所以它会系统性删掉&quot;术语密集但正确&quot;的文本（医学、法律、工程文档）。</p>
+<h4 id="h-33-一个必须区分的概念质量--典型性">3.3 一个必须区分的概念：质量 ≠ 典型性<a class="anchor" href="#h-33-一个必须区分的概念质量--典型性" aria-label="本节链接">#</a></h4>
+<p>上面两种打分器测量的都是<strong>典型性</strong>（typicality，与参考分布的接近程度），而我们要的是<strong>质量</strong>（quality，对下游任务的价值）。这两者的差别在长尾上最大：</p>
+<ul>
+<li><strong>高典型、低质量</strong>：模板化文本、抄来抄去的内容、正确的废话；</li>
+<li><strong>低典型、高质量</strong>：罕见但正确的专业知识、方言中的准确表达、新颖的表达方式。</li>
+</ul>
+<p><strong>用典型性做质量代理，等于系统性地用&quot;常见&quot;换&quot;正确&quot;。</strong> 这是&quot;模型打分过滤&quot;最根本的偏差来源，而且它无法通过调阈值修（只能通过换打分目标、或者加切片配额缓解）。</p>
+<h4 id="h-34-自举偏见与分布坍缩">3.4 自举偏见与分布坍缩<a class="anchor" href="#h-34-自举偏见与分布坍缩" aria-label="本节链接">#</a></h4>
+<p>如果过滤不止一轮（用模型 A 筛数据 → 训模型 B → 用 B 再筛 → 训 C……），会发生更严重的事：<strong>分布坍缩</strong>。</p>
+<p>机制：每一轮保留的都是&quot;在当前分布下最典型&quot;的子集。把&quot;保留 top <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span></span></span></span>&quot;看成一个投影算子 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">Π</span></span></span></span>，则整个过程是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">Π</span></span></span></span> 的反复作用。<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">Π</span></span></span></span> 是<strong>收缩的</strong>：它系统性地削掉分布的尾部（低频模式），因为低频模式在&quot;典型性&quot;打分上永远排在后面。于是：</p>
+<ul>
+<li>词表覆盖单调下降（罕见词先消失）；</li>
+<li><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span>-gram 多样性单调下降（罕见搭配先消失）；</li>
+<li>分布熵单调下降（分布越来越尖）。</li>
+</ul>
+<p>本节代码实测（3000 篇文档，每轮保留&quot;在当前语料下一元对数似然&quot;最高的 90%，迭代 8 轮）：</p>
+<pre><code>轮次   文档数   唯一bigram   token熵   词表覆盖
+  0     2700      67599    5.3942     4807
+  2     2187      54789    5.2939     4651
+  4     1771      44751    5.2127     4442
+  7     1290      33169    5.1034     4037</code></pre>
+<p><strong>唯一 bigram 腰斩（−51%），词表覆盖 −16%，熵单调下降。</strong> 注意这只是一个<strong>代理实验</strong>（用一元 LM 打分代替真实模型打分），但它精确复现了机制：<strong>&quot;按典型性选择&quot;是一个尾部消除过程</strong>。真实场景里这个效应会被模型的能力放大（模型对&quot;像训练数据&quot;的判断更精细，因此尾部消除更彻底）。</p>
+<p><strong>这件事的严重性在于它的不可逆性</strong>：被删的数据不会再回来，而且每多一轮就多一重收窄。用合成数据做蒸馏迭代时，这就是&quot;模型自噬&quot;（第 1 章 E43）。</p>
+<h4 id="h-35-缓解手段以及各自的代价">3.5 缓解手段（以及各自的代价）<a class="anchor" href="#h-35-缓解手段以及各自的代价" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>手段</th>
+<th>机制</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>切片保留配额</strong></td>
+<td>每个切片至少保留 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">q</span></span></span></span> 比例，不论其分数</td>
+<td>会放进一部分真噪声；配额本身是新的超参</td>
+</tr>
+<tr>
+<td><strong>多个互补打分器</strong></td>
+<td>只有被多个打分器同时判低的才删</td>
+<td>计算成本；打分器之间的相关性会削弱效果</td>
+</tr>
+<tr>
+<td><strong>保留&quot;低分但多样&quot;样本</strong></td>
+<td>显式按多样性（去重后的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span>-gram 覆盖）补一批低分样本</td>
+<td>多样性度量本身要调参</td>
+</tr>
+<tr>
+<td><strong>限制迭代轮数</strong></td>
+<td>打分器只用一次，不自我循环</td>
+<td>放弃多轮带来的收益（但避免了坍缩）</td>
+</tr>
+<tr>
+<td><strong>真实数据锚定</strong></td>
+<td>每轮保留固定比例的真实数据</td>
+<td>真实数据量决定上限；合成/蒸馏的收益被稀释</td>
+</tr>
+</tbody></table>
+<p><strong>最有效也最简单的是最后一条</strong>：在任何&quot;用模型筛数据&quot;的流程里，<strong>保留一个固定比例的真实数据不被筛</strong>。它同时限制了坍缩速度（分布始终有一条通往真实分布的通道）与评测的可信度（评测不依赖被筛过的数据）。</p>
+<h3 id="h-四阈值选择从-pr-曲线到下游收益">四、阈值选择：从 PR 曲线到下游收益<a class="anchor" href="#h-四阈值选择从-pr-曲线到下游收益" aria-label="本节链接">#</a></h3>
+<h4 id="h-41-标注小样本--pr-曲线">4.1 标注小样本 → PR 曲线<a class="anchor" href="#h-41-标注小样本--pr-曲线" aria-label="本节链接">#</a></h4>
+<p>流程（与去重的评测同构，第 2 节 7.1）：</p>
+<ol>
+<li>抽 300~1000 条样本，人工标&quot;该留/该删&quot;；</li>
+<li>用打分器在标注集上算分，扫 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span></span></span></span> 画 PR 曲线；</li>
+<li><strong>分层抽样</strong>：保证&quot;接近阈值&quot;的样本在标注集里有足够占比（否则曲线在决策边界附近最不可靠）。</li>
+</ol>
+<p>本节代码的实测 PR 曲线（ground truth = 切片身份：标准/口语为好数据，噪声为坏数据）：</p>
+<pre><code>   τ     保留率  precision   recall      F1    std保留    oral保留
+0.10   0.982      0.582    1.000   0.736    1.000     1.000
+0.30   0.638      0.895    1.000   0.945    1.000     1.000
+0.40   0.579      0.987    1.000   0.994    1.000     1.000
+0.50   0.571      0.999    0.999   0.999    1.000     0.998
+0.60   0.508      1.000    0.889   0.941    0.996     0.712
+0.70   0.349      1.000    0.610   0.758    0.959     0.029</code></pre>
+<p><strong>四条读法</strong>：</p>
+<ul>
+<li><strong>F1 的最优点在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.50</span></span></span></span>（0.999）</strong>，而下游部署准确率的最优点在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.40</span></span></span></span>。两者不同，虽然只差一档 —— 但差别会随语料变化放大。</li>
+<li><strong>最危险的是&quot;追求 precision = 1.0&quot;</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7719em;vertical-align:-0.136em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≥</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.60</span></span></span></span> 起 precision 就是 1.000，看起来是&quot;完全干净的过滤&quot;，而口语切片的保留率从 0.998 掉到 0.712（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.60</span></span></span></span>）再到 0.029（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.70</span></span></span></span>）。</li>
+<li><strong>注意 oral 保留率的形状不是平滑的</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.50</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">→</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.998</span></span></span></span>，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.60</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">→</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.712</span></span></span></span>，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.70</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">→</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.029</span></span></span></span>。这是因为打分器只看长度与符号率，而口语切片的长度分布恰好压在阈值附近 —— <strong>一个切片的存活完全取决于它的长度分布与阈值的相对位置，这是一个脆弱的结构</strong>。</li>
+<li><strong>PR 曲线看不见切片伤害</strong>：在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.60</span></span></span></span> 时 PR 曲线的 F1 仍有 0.941（因为口语切片在&quot;好数据&quot;里只占 1200/3200 = 37.5%，删掉一半只让 recall 掉 0.11），但它的<strong>部署影响</strong>是 30% 的流量上准确率掉 0.09。</li>
+</ul>
+<h4 id="h-42-把阈值选择写成代价分解">4.2 把阈值选择写成代价分解<a class="anchor" href="#h-42-把阈值选择写成代价分解" aria-label="本节链接">#</a></h4>
+<p>正确做法不是&quot;看哪条曲线好&quot;，而是做<strong>逐切片的代价分解</strong>。以本节代码为例，从 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.40</span></span></span></span> 挪到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.70</span></span></span></span>：</p>
+<table>
+<thead>
+<tr>
+<th>切片</th>
+<th>权重</th>
+<th>准确率变化</th>
+<th>贡献</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>std</td>
+<td>0.5</td>
+<td>0.6250 → 0.6600（+0.035）</td>
+<td><strong>+0.0175</strong></td>
+</tr>
+<tr>
+<td>oral</td>
+<td>0.3</td>
+<td>0.6295 → 0.5105（−0.119）</td>
+<td><strong>−0.0357</strong></td>
+</tr>
+<tr>
+<td>noise</td>
+<td>0.2</td>
+<td>0.3870 → 0.3445（−0.0425）</td>
+<td><strong>−0.0085</strong></td>
+</tr>
+<tr>
+<td><strong>合计</strong></td>
+<td>1.0</td>
+<td>—</td>
+<td><strong>−0.0267</strong></td>
+</tr>
+</tbody></table>
+<p>实测部署准确率变化是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.5787</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">→</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.5520</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">−</span><span class="mord">0.0267</span></span></span></span> —— <strong>分解与实测完全对上</strong>。</p>
+<p><strong>这张表就是&quot;阈值选择&quot;应该产出的东西</strong>：它不是一条曲线，而是一张&quot;每个切片贡献多少&quot;的账单。有了它，&quot;<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span></span></span></span> 该取多少&quot;变成一个可以开会讨论的问题（&quot;口语切片的 3 个点换标准切片的 1.7 个点，我们要不要？&quot;），而不是一个调参直觉。</p>
+<h4 id="h-43-切片配额把不能碰写成约束">4.3 切片配额：把&quot;不能碰&quot;写成约束<a class="anchor" href="#h-43-切片配额把不能碰写成约束" aria-label="本节链接">#</a></h4>
+<p>从上面的分解可以看出，最优阈值恰好落在&quot;所有切片都还没被碰&quot;的位置。要把这个性质变成工程保证，做法是<strong>先设切片保留下限，再优化阈值</strong>：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.45em;vertical-align:-0.7em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.4306em;"><span style="top:-2.4em;margin-left:0em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.1132em;">τ</span></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span><span class="mop">max</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.7em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">Δ</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mclose">)</span><span class="mspace" style="margin-right:1em;"></span><span class="mord text"><span class="mord">s.t.</span></span><span class="mspace" style="margin-right:1em;"></span><span class="mord"><span class="mord text"><span class="mord">keep</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.0573em;"><span style="top:-2.4559em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0359em;">g</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.3802em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≥</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.9805em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0359em;">q</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0359em;">g</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mord">∀</span><span class="mord mathnormal" style="margin-right:0.0359em;">g</span></span></span></span></span></p>
+<p><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7167em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0359em;">q</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0359em;">g</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span></span> 是切片 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">g</span></span></span></span> 的保留率下限。这是一个<strong>带约束</strong>的一维搜索，实现上就是&quot;先算出满足约束的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span></span></span></span> 上界，再在这个区间里找最优&quot;。<strong>它把&quot;我们真的在乎这个切片&quot;从一句口号变成了一条硬约束</strong> —— 这正是第 1 章 E24 的修法。</p>
+<p><strong>代价</strong>：配额会放进一部分真噪声（因为约束可能迫使你保留低分样本）。这个代价必须显式接受并记录，而不是偷偷把配额调低。</p>
+<p><figure><img class="md-img" src="content/courses/data-engineering/assets/chapter-2-figure-03.svg" alt="过滤门槛往下游走：收益在 0.40 处见顶" loading="lazy" decoding="async"><figcaption>过滤门槛往下游走：收益在 0.40 处见顶</figcaption></figure>
+</p>
+<h3 id="h-五数据选择data-selection与过滤的区别">五、数据选择（data selection）与过滤的区别<a class="anchor" href="#h-五数据选择data-selection与过滤的区别" aria-label="本节链接">#</a></h3>
+<p><strong>过滤</strong>是&quot;删坏&quot;（一个与任务无关的绝对判断）；<strong>数据选择</strong>是&quot;挑对当前训练最有用的&quot;（一个相对于模型与训练阶段的判断）。三个流派：</p>
+<table>
+<thead>
+<tr>
+<th>流派</th>
+<th>做法</th>
+<th>危险</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>启发式打分</strong></td>
+<td>用上面那些规则</td>
+<td>典型性偏差（3.3）</td>
+</tr>
+<tr>
+<td><strong>代理模型</strong></td>
+<td>用小模型的 loss / 梯度作为样本价值</td>
+<td>小模型的价值判断不等于大模型；且它奖励&quot;当前学不会的&quot;，可能专门挑噪声（第 1 章 2.5）</td>
+</tr>
+<tr>
+<td><strong>可学习选择</strong></td>
+<td>把选择本身参数化并用元梯度优化（DoReMi 的域级版本）</td>
+<td>需要额外的训练循环；在评测上过拟合的风险（第 1 章 3.3）</td>
+</tr>
+</tbody></table>
+<p><strong>一个必须记住的负面结论</strong>：<strong>用模型损失筛数据无法区分&quot;难样本&quot;与&quot;噪声样本&quot;</strong>（第 1 章 2.5 已证）。高损失样本里混着两者，删掉高损失的会把决策面附近的全部信息一起删掉 —— 而决策面正是分类器唯一在乎的地方。所以数据选择必须配合某种&quot;难度归一化&quot;（例如用样本在参考模型上的 loss 做基线），否则它退化成&quot;删难样本&quot;。</p>
+<h3 id="h-六什么时候不该过滤">六、什么时候不该过滤<a class="anchor" href="#h-六什么时候不该过滤" aria-label="本节链接">#</a></h3>
+<p>与第 1 章 4.3 的清单一致，这里给出可执行的判断：</p>
+<ol>
+<li><strong>数据量本身就是瓶颈。</strong> 算一下 scaling law 的局部斜率：如果删掉 50% 数据带来的 loss 上升大于去噪带来的下降，就别删。判据是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0528em;">β</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop">ln</span><span class="mopen">(</span><span class="mord">1/</span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">ρ</span><span class="mclose">))</span></span></span></span> 与质量提升的对比（第 1 章 4.1）。</li>
+<li><strong>目标领域本身就是&quot;低质文本&quot;。</strong> 社交媒体、ASR 转写、口语对话 —— 此时&quot;低质&quot;是分布的一部分，过滤等于把训练分布推离部署分布。</li>
+<li><strong>过滤器未在本领域标定。</strong> 阈值来自别的语料时，先做一次小样本标定，而不是&quot;先过滤再观察&quot;。</li>
+<li><strong>切片配额无法满足。</strong> 如果任何阈值下都有某个你在乎的切片被打穿，那说明打分函数本身不适合这个语料 —— 该换打分器，而不是硬调阈值。</li>
+</ol>
+<h3 id="h-七取舍清单">七、取舍清单<a class="anchor" href="#h-七取舍清单" aria-label="本节链接">#</a></h3>
+<table>
+<thead>
+<tr>
+<th>取舍</th>
+<th>一端</th>
+<th>另一端</th>
+<th>怎么选</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>过滤强度</strong></td>
+<td>激进：噪声少但数据少</td>
+<td>保守：数据多但噪声多</td>
+<td>用 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">Δ</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mclose">)</span></span></span></span> 曲线选，且先满足切片配额</td>
+</tr>
+<tr>
+<td><strong>规则 vs 模型</strong></td>
+<td>规则便宜、可解释、确定</td>
+<td>模型能表达连贯性/信息量</td>
+<td>序贯使用：规则做第一道，模型做第二道</td>
+</tr>
+<tr>
+<td><strong>precision vs recall</strong></td>
+<td>高 precision（宁删）</td>
+<td>高 recall（宁留）</td>
+<td>FP 不可逆、FN 可逆 → 默认偏保守；但<strong>不能以 precision=1.0 为目标</strong></td>
+</tr>
+<tr>
+<td><strong>迭代轮数</strong></td>
+<td>多轮收益更高</td>
+<td>多轮坍缩更重</td>
+<td>限制轮数 + 保留真实数据锚定</td>
+</tr>
+<tr>
+<td><strong>切片配额</strong></td>
+<td>配额高：切片安全</td>
+<td>配额低：噪声少</td>
+<td>按切片的业务价值定；配额必须写进配置而不是代码里</td>
+</tr>
+<tr>
+<td><strong>质量 vs 典型性</strong></td>
+<td>—</td>
+<td>—</td>
+<td><strong>明确你要的是哪个</strong>；用典型性时必须在长尾切片上做保留率监控</td>
+</tr>
+</tbody></table>
+<h3 id="h-代码">代码<a class="anchor" href="#h-代码" aria-label="本节链接">#</a></h3>
+<p>三段：过滤器的 PR 曲线、阈值对下游的逐切片影响、以及自举坍缩。</p>
+<pre data-lang="python"><code class="language-python"># -*- coding: utf-8 -*-
+&quot;&quot;&quot;质量过滤：PR 曲线、阈值对下游的非单调影响、切片伤害、自举坍缩。
+
+设计决策：
+- 过滤器只看**长度与符号率**，看不到标签相关的特征 —— 因此它分不清
+  &quot;短且有信号&quot;（口语切片）与&quot;短且是噪声&quot;，切片伤害是结构性的，不是调参能修的；
+- 训练集的三段共用同一套特征空间：std 用 x[:12]、oral 用 x[12:24]（互不重叠），
+  所以&quot;删掉 oral&quot;确实会让学生模型对它一无所知 —— 这是最常见的真实情形（子群消失）；
+- 评测在**未过滤**的测试集上做，并且按切片分别报告：总体指标会掩盖切片崩溃。
+&quot;&quot;&quot;
+import numpy as np
+
+rng = np.random.default_rng(3)
+D = 50
+
+def make(n, r, kind, invert=False, ml=120, sl=30, sy=0.01):
+    x = r.normal(size=(n, D))
+    b = 0.50 * x[:, 12:24].sum(1) if kind == &quot;oral&quot; else 0.30 * x[:, :12].sum(1)
+    p = 1.0 / (1.0 + np.exp(-b))
+    y = (r.random(n) &lt; p).astype(int)
+    if invert:
+        y = 1 - y                                  # 对抗噪声：标签与特征提示的相反
+    ln = np.clip(r.normal(ml, sl, n), 3, None).astype(int)
+    sr = np.clip(r.normal(sy, 0.004 if not invert else 0.08, n), 0, 1)
+    return {&quot;x&quot;: x, &quot;y&quot;: y, &quot;s&quot;: 0.5 * np.clip(ln / 150.0, 0, 1) + 0.5 * np.exp(-5.0 * sr)}
+
+TR = {&quot;std&quot;:   make(2000, rng, &quot;std&quot;),
+      &quot;oral&quot;:  make(1200, rng, &quot;oral&quot;, ml=45, sl=12),
+      &quot;noise&quot;: make(2400, rng, &quot;noise&quot;, invert=True, ml=40, sl=20, sy=0.35)}
+TE = {&quot;std&quot;:   make(2000, rng, &quot;std&quot;),
+      &quot;oral&quot;:  make(2000, rng, &quot;oral&quot;, ml=45, sl=12),
+      &quot;noise&quot;: make(2000, rng, &quot;noise&quot;, invert=True, ml=40, sl=20, sy=0.35)}
+DEPLOY_W = {&quot;std&quot;: 0.5, &quot;oral&quot;: 0.3, &quot;noise&quot;: 0.2}   # 部署分布权重（效用函数的一部分）
+
+def logreg(X, y, steps=1500, lr=0.8, l2=1e-3):
+    W, b = np.zeros(X.shape[1]), 0.0
+    for _ in range(steps):
+        q = 1.0 / (1.0 + np.exp(-(X @ W + b)))
+        g = q - y
+        W -= lr * ((X * g[:, None]).mean(0) + l2 * W)
+        b -= lr * g.mean()
+    return W, b
+
+def acc(W, b, d):
+    return float(((1 / (1 + np.exp(-(d[&quot;x&quot;] @ W + b))) &gt; 0.5).astype(int) == d[&quot;y&quot;]).mean())
+
+# ---------- 1. 过滤器本身的 PR 曲线（正类 = 好数据） ----------
+print(&quot;=== 1. 过滤器 PR 曲线（ground truth = 切片身份：std/oral 为好，noise 为坏）===&quot;)
+allS = np.concatenate([TR[k][&quot;s&quot;] for k in (&quot;std&quot;, &quot;oral&quot;, &quot;noise&quot;)])
+good = np.concatenate([np.ones(2000 + 1200), np.zeros(2400)])
+print(f&quot;{&#39;τ&#39;:&gt;5} {&#39;保留率&#39;:&gt;7} {&#39;precision&#39;:&gt;10} {&#39;recall&#39;:&gt;8} {&#39;F1&#39;:&gt;7} &quot;
+      f&quot;{&#39;std保留&#39;:&gt;8} {&#39;oral保留&#39;:&gt;9}&quot;)
+for tau in (0.10, 0.20, 0.30, 0.40, 0.50, 0.55, 0.60, 0.65, 0.70):
+    keep = allS &gt; tau
+    tp = np.sum(keep &amp; (good == 1)); fp = np.sum(keep &amp; (good == 0))
+    fn = np.sum(~keep &amp; (good == 1))
+    pr = tp / max(1, tp + fp); rc = tp / max(1, tp + fn)
+    f1 = 2 * pr * rc / max(1e-9, pr + rc)
+    rs = {k: float(np.mean(TR[k][&quot;s&quot;] &gt; tau)) for k in TR}
+    print(f&quot;{tau:5.2f} {keep.mean():7.3f} {pr:10.3f} {rc:8.3f} {f1:7.3f} &quot;
+          f&quot;{rs[&#39;std&#39;]:8.3f} {rs[&#39;oral&#39;]:9.3f}&quot;)
+
+# ---------- 2. 阈值对下游：在保留数据上训练，在未过滤的测试集上评测 ----------
+print(f&quot;\n=== 2. 阈值 → 下游（部署权重 {DEPLOY_W}）===&quot;)
+print(f&quot;{&#39;τ&#39;:&gt;5} {&#39;保留量&#39;:&gt;7} {&#39;部署总体&#39;:&gt;9} {&#39;std&#39;:&gt;7} {&#39;oral&#39;:&gt;7} {&#39;noise&#39;:&gt;7} {&#39;oral保留&#39;:&gt;9}&quot;)
+for tau in (0.0, 0.2, 0.3, 0.4, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75):
+    Xs, ys, ns = [], [], 0
+    for k in TR:
+        m = TR[k][&quot;s&quot;] &gt; tau
+        Xs.append(TR[k][&quot;x&quot;][m]); ys.append(TR[k][&quot;y&quot;][m]); ns += int(m.sum())
+    W, b = logreg(np.vstack(Xs), np.concatenate(ys))
+    a = {k: acc(W, b, TE[k]) for k in TE}
+    dep = sum(DEPLOY_W[k] * a[k] for k in a)
+    print(f&quot;{tau:5.2f} {ns:7d} {dep:9.4f} {a[&#39;std&#39;]:7.4f} {a[&#39;oral&#39;]:7.4f} &quot;
+          f&quot;{a[&#39;noise&#39;]:7.4f} {np.mean(TR[&#39;oral&#39;][&#39;s&#39;] &gt; tau):9.3f}&quot;)
+
+# ---------- 3. 自举坍缩：反复按&quot;像当前语料&quot;打分并截断 ----------
+print(&quot;\n=== 3. 自举坍缩：反复保留&#39;在当前语料下最典型&#39;的 90% ===&quot;)
+V = 5000
+zipf = 1.0 / (np.arange(1, V + 1) ** 1.1); zipf /= zipf.sum()
+corpus = [rng.choice(V, 60, p=zipf) for _ in range(3000)]
+
+def entropy(counts):
+    p = counts / counts.sum(); p = p[p &gt; 0]
+    return float(-(p * np.log(p)).sum())
+
+def uniq_bigrams(seqs):
+    return len({(s[i], s[i + 1]) for s in seqs for i in range(len(s) - 1)})
+
+print(f&quot;{&#39;轮次&#39;:&gt;5} {&#39;文档数&#39;:&gt;7} {&#39;唯一bigram&#39;:&gt;11} {&#39;token熵&#39;:&gt;9} {&#39;词表覆盖&#39;:&gt;9}&quot;)
+for t in range(8):
+    cnt = np.bincount(np.concatenate(corpus), minlength=V).astype(float)
+    lp = np.log((cnt + 1e-3) / (cnt.sum() + 1e-3 * V))     # &quot;当前语料&quot;的一元模型打分
+    sc = np.array([lp[s].mean() for s in corpus])
+    thresh = np.quantile(sc, 0.10)
+    corpus = [s for s, v in zip(corpus, sc) if v &gt;= thresh]
+    cnt = np.bincount(np.concatenate(corpus), minlength=V).astype(float)
+    print(f&quot;{t:5d} {len(corpus):7d} {uniq_bigrams(corpus):11d} {entropy(cnt):9.4f} &quot;
+          f&quot;{int((cnt &gt; 0).sum()):9d}&quot;)</code></pre>
+<p>实际输出：</p>
+<pre><code>=== 1. 过滤器 PR 曲线（ground truth = 切片身份：std/oral 为好，noise 为坏）===
+    τ     保留率  precision   recall      F1    std保留    oral保留
+ 0.10   0.982      0.582    1.000   0.736    1.000     1.000
+ 0.20   0.839      0.681    1.000   0.811    1.000     1.000
+ 0.30   0.638      0.895    1.000   0.945    1.000     1.000
+ 0.40   0.579      0.987    1.000   0.994    1.000     1.000
+ 0.50   0.571      0.999    0.999   0.999    1.000     0.998
+ 0.55   0.563      0.999    0.984   0.992    1.000     0.958
+ 0.60   0.508      1.000    0.889   0.941    0.996     0.712
+ 0.65   0.406      1.000    0.711   0.831    0.990     0.246
+ 0.70   0.349      1.000    0.610   0.758    0.959     0.029
+
+=== 2. 阈值 → 下游（部署权重 {&#39;std&#39;: 0.5, &#39;oral&#39;: 0.3, &#39;noise&#39;: 0.2}）===
+    τ     保留量      部署总体     std    oral   noise    oral保留
+ 0.00    5600    0.5439  0.4625  0.6900  0.5280     1.000
+ 0.20    4696    0.5653  0.5280  0.6915  0.4690     1.000
+ 0.30    3574    0.5746  0.6050  0.6450  0.3930     1.000
+ 0.40    3241    0.5787  0.6250  0.6295  0.3870     1.000
+ 0.50    3200    0.5777  0.6220  0.6310  0.3870     0.998
+ 0.55    3151    0.5769  0.6215  0.6325  0.3820     0.958
+ 0.60    2846    0.5712  0.6335  0.6025  0.3685     0.712
+ 0.65    2275    0.5596  0.6560  0.5410  0.3465     0.246
+ 0.70    1953    0.5520  0.6600  0.5105  0.3445     0.029
+ 0.75    1800    0.5528  0.6595  0.5155  0.3420     0.000
+
+=== 3. 自举坍缩：反复保留&#39;在当前语料下最典型&#39;的 90% ===
+   轮次     文档数    唯一bigram    token熵      词表覆盖
+    0    2700       67599    5.3942      4807
+    1    2430       60767    5.3407      4747
+    2    2187       54789    5.2939      4651
+    3    1968       49524    5.2519      4554
+    4    1771       44751    5.2127      4442
+    5    1594       40487    5.1748      4317
+    6    1434       36645    5.1384      4177
+    7    1290       33169    5.1034      4037</code></pre>
+<p><strong>六个设计决策与它们各自要展示的东西：</strong></p>
+<ul>
+<li><strong>打分函数刻意不看 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">x</span></span></span></span></strong>：只由 <code>len</code> 与 <code>sym</code> 决定。这是整段代码的核心设计 —— 它让&quot;过滤器分不清短而有信号与短而噪声&quot;成为<strong>结构性事实</strong>，而不是调参失误。任何只由文本统计量决定的打分器都有这个性质（这也是 3.3 节&quot;典型性 ≠ 质量&quot;的可运行版本）。</li>
+<li><strong>口语切片用的是独立特征 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">x</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">12</span><span class="mrel mtight">:</span><span class="mord mtight">24</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span></strong>：所以&quot;删掉它&quot;确实等于&quot;模型对它一无所知&quot;。如果两段共享特征，删掉一段只会让那一段的精度下降一点（因为可以从另一段迁移），无法复现真实的&quot;子群消失&quot;。第一版实现里两段共享特征，口语切片在保留率 3% 时仍有 0.62 的准确率 —— <strong>那不是&quot;没被伤害&quot;，而是&quot;迁移在起作用&quot;，很容易让人得出错误结论。</strong></li>
+<li><strong>评测在未过滤的测试集上做，并按切片报告</strong>：如果只在&quot;过滤后的训练分布&quot;上测，口语切片的样本已经被删了，指标会看起来更好。<strong>&quot;在哪测&quot;和&quot;删了什么&quot;一样重要。</strong></li>
+<li><strong><code>DEPLOY_W</code> 显式写成字典</strong>：部署权重是效用函数的一部分（第 1 章第 2 节），它必须可被 review。把 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord text"><span class="mord">oral</span></span></span></span></span> 的权重从 0.3 改成 0.1，最优阈值会往右移 —— <strong>最优阈值依赖效用函数，这一点必须让读者看见。</strong></li>
+<li><strong>第 2 段的峰值出现在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.40</span></span></span></span>，此时所有切片保留率都还是 1.000</strong>：这不是偶然，它说明&quot;最优过滤&quot;就是&quot;把噪声清干净、但一个有效切片都不碰&quot;。一旦越过，precision 侧早已饱和（0.987 → 1.000），收益无法再涨。</li>
+<li><strong>第 3 段用一元 LM 打分代替真实模型</strong>：这是一个<strong>代理实验</strong>。它的价值是精确复现机制（按典型性选择 = 尾部消除），而不是给出任何真实语料上的数字。真实场景的坍缩速度取决于打分器，但方向不变。</li>
+<li>⚠️ 全部为<strong>合成数据</strong>：所有数值只用于展示机制与量级，不代表任何真实语料上的过滤收益。</li>
+</ul>
+<h3 id="h-练习">练习<a class="anchor" href="#h-练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><p><strong>收益函数算一遍</strong>：设去噪收益 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0077em;">R</span><span class="mopen">(</span><span class="mord mathnormal">ρ</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0077em;">R</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0077em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">∞</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.138em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal">e</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.888em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mathnormal mtight">ρ</span><span class="mord mtight">/</span><span class="mord mtight"><span class="mord mathnormal mtight">ρ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3173em;"><span style="top:-2.357em;margin-left:0em;margin-right:0.0714em;"><span class="pstrut" style="height:2.5em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.143em;"><span></span></span></span></span></span></span></span></span></span></span></span></span></span></span><span class="mclose">)</span></span></span></span>（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">ρ</span></span></span></span> 是过滤掉的噪声比例），数据量损失 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="mopen">(</span><span class="mord mathnormal">ρ</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0502em;">B</span><span class="mopen">[(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.0991em;vertical-align:-0.25em;"></span><span class="mord mathnormal">ρ</span><span class="mclose"><span class="mclose">)</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8491em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mathnormal mtight" style="margin-right:0.0528em;">β</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">]</span></span></span></span>，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0528em;">β</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.28</span></span></span></span>。
+（a）取 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0077em;">R</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0077em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">∞</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.05</span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">ρ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.3</span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0502em;">B</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.02</span></span></span></span>，求最优 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8831em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">ρ</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6887em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span></span></span></span></span></span></span></span>（数值扫描即可）；
+（b）若数据量损失系数 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0502em;">B</span></span></span></span> 翻倍（数据更稀缺），<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8831em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">ρ</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6887em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span></span></span></span></span></span></span></span> 变大还是变小？解释；
+（c）把你的结果与代码里实测的最优 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.40</span></span></span></span>（删除约 42%）对照，说明两者是否在同一量级，以及不一致的可能来源。</p>
+</li>
+<li><p><strong>逐切片代价分解</strong>：用代码第 2 段的输出，做两件事：
+（a）把从 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.30</span></span></span></span> 到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.40</span></span></span></span> 的部署准确率变化按切片分解，验证分解之和等于实测变化；
+（b）把 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord text"><span class="mord">oral</span></span></span></span></span> 权重从 0.3 改成 0.1、0.6，分别预测最优阈值会向左还是向右移动（用第 2 段的表估算），然后用代码验证。
+（c）在此基础上回答：<strong>为什么&quot;最优阈值&quot;不能写死在代码里，而必须与效用函数一起版本化？</strong></p>
+</li>
+<li><p><strong>典型性 vs 质量</strong>：构造一个人工例子，使得&quot;典型性打分&quot;与&quot;质量&quot;完全相反：
+（a）造 100 条&quot;高典型低质量&quot;（模板化、正确但重复）与 100 条&quot;低典型高质量&quot;（罕见但正确）的文本；
+（b）用一个你自己选的一元/二元 LM 打分，展示前者的分数高于后者；
+（c）设计一个能区分两者的额外信号（不是&quot;再多一个 LM&quot;），并说明它的代价。</p>
+</li>
+<li><p><strong>切片配额</strong>：设三个切片 std / oral / code，保留率下限 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">q</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord">0.8</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">0.7</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">0.9</span><span class="mclose">)</span></span></span></span>。
+（a）写出&quot;在配额约束下最大化部署准确率&quot;的求解流程；
+（b）如果约束导致可行域为空（没有任何 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span></span></span></span> 能同时满足三个下限），你的处理顺序是什么？
+（c）说明配额约束会放进多少噪声，以及如何量化这个代价。</p>
+</li>
+<li><p><strong>自举坍缩的终止条件</strong>：在代码第 3 段里，每轮额外保留 10% 的<strong>真实数据（第一轮的语料）</strong>不参与筛选。
+（a）重跑 8 轮，比较唯一 bigram、熵、词表覆盖的曲线与原版的差别；
+（b）把锚定比例改成 1% 与 50%，画出&quot;坍缩速度 vs 锚定比例&quot;的关系；
+（c）据此回答：<strong>为什么&quot;保留真实数据锚定&quot;比&quot;限制迭代轮数&quot;更可靠？</strong> 各自的失效条件是什么？</p>
+</li>
+<li><p><strong>过滤决策文档</strong>：为一个真实场景（自选：中文客服对话 / 代码语料 / 医疗文本）写一份过滤决策文档，必须包含：
+（a）打分函数（至少两条规则 + 一个模型打分）与各自的依据；
+（b）阈值及其 PR 曲线、切片保留率、以及逐切片代价分解；
+（c）切片配额与&quot;如果配额与最优阈值冲突&quot;的裁决规则；
+（d）你预期会被误删的样本类型，以及你会用什么方式抽检它们（<strong>只看保留样本是不够的</strong>）。</p>
+</li>
+</ol>
+<h3 id="h-小结">小结<a class="anchor" href="#h-小结" aria-label="本节链接">#</a></h3>
+<ul>
+<li><strong>过滤是两个决策</strong>：打分函数 + 阈值。工程上的注意力几乎全在打分函数上，而本节实测表明，同一个打分器下 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span></span></span></span> 从 0.40 挪到 0.70 就能让部署准确率掉 2.7 个点、让一个切片崩到随机水平。<strong>阈值才是真正需要被论证的参数。</strong></li>
+<li><strong>过滤的净收益是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">Δ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0077em;">R</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mclose">)</span></span></span></span></strong>：去噪收益凹增饱和，数据量损失近似线性/幂律增长 —— 所以存在内部最优，且<strong>&quot;极端过滤&quot;常常比不过滤更差</strong>。</li>
+<li><strong>最优阈值出现在&quot;噪声刚清干净、所有切片保留率仍为 1.000&quot;的位置</strong>（代码实测 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.40</span></span></span></span>：precision 已 0.987，删除 42%）。越过它之后收益侧饱和、代价侧开始伤害切片。</li>
+<li><strong>不要以 precision = 1.0 为目标</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7719em;vertical-align:-0.136em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≥</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.60</span></span></span></span> 时 precision 就是 1.000，而口语切片保留率从 0.998 掉到 0.712（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.60</span></span></span></span>）再到 0.029（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.70</span></span></span></span>）。<strong>过滤器的指标看不见切片伤害</strong>，因为切片在它的正类里只占一部分，而在部署分布里可能占三成。</li>
+<li><strong>启发式规则每条都是一个分布假设</strong>，阈值几乎都来自别的语料 —— 迁移到中文/代码/对话上会<strong>成片</strong>误删。正确做法是在目标语料上用几百条标注重新标定。</li>
+<li><strong>模型打分器学到的是&quot;典型性&quot;而不是&quot;质量&quot;</strong>：fastText/KenLM 类方法本质是&quot;与参考分布的相似度&quot;，在长尾上质量与典型性系统性背离。<strong>用典型性做质量代理等于用&quot;常见&quot;换&quot;正确&quot;。</strong></li>
+<li><strong>反复筛数据会导致分布坍缩</strong>：代码实测 8 轮后唯一 bigram 腰斩（67599 → 33169）、词表覆盖 −16%、熵单调下降。<strong>&quot;保留真实数据锚定&quot;是比&quot;限制轮数&quot;更可靠的缓解</strong>，因为它始终保留一条通往真实分布的通道。</li>
+<li><strong>阈值选择的正确产出不是一条曲线，而是一张逐切片的账单</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span></span></span></span> 从 0.40 到 0.70 的部署变化 −0.0267 可以精确分解为 std +0.0175、oral −0.0357、noise −0.0085。有了这张账单，&quot;阈值取多少&quot;才能从调参直觉变成可讨论的取舍。</li>
+<li><strong>切片配额把&quot;我们在乎这个切片&quot;从口号变成硬约束</strong>（带约束的一维搜索），代价是会放进一部分真噪声 —— 这个代价必须显式接受并记录。</li>
+</ul>

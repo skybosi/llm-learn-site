@@ -1,0 +1,207 @@
+<h2 id="h-异步拷贝与双缓冲cpasync-与流水线">异步拷贝与双缓冲：cp.async 与流水线<a class="anchor" href="#h-异步拷贝与双缓冲cpasync-与流水线" aria-label="本节链接">#</a></h2>
+<p>上一课把搬运量降了一个数量级，但块内循环仍然是&quot;搬完才能算、算完才能搬&quot;：一次 HBM 访问的延迟是几百个周期量级，而一次 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span></span></span></span> 块的计算只要几十个周期。串行执行的结果是流水线大半时间在空转。这一课讲清 <strong>cp.async</strong>（Ampere 起提供的异步拷贝）与多级缓冲（double buffering / multi-stage pipeline）如何把这段延迟藏起来。</p>
+<p><figure><img class="md-img" src="content/courses/gpu-cuda-kernels/assets/chapter-4-figure-02.svg" alt="cp.async 与双缓冲：拷贝和计算分头进行" loading="lazy" decoding="async"><figcaption>cp.async 与双缓冲：拷贝和计算分头进行</figcaption></figure>
+</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-同步搬运的三个代价">1. 同步搬运的三个代价<a class="anchor" href="#h-1-同步搬运的三个代价" aria-label="本节链接">#</a></h4>
+<p>一段同步的 shared memory 装载代码长这样：<code>LDG</code>（global → 寄存器）→ <code>STS</code>（寄存器 → shared memory）→ <code>__syncthreads()</code> → 计算。它有三个问题：</p>
+<ol>
+<li><strong>延迟完全暴露</strong>：装载必须全部完成才轮到计算，等待期无法用别的活填补。</li>
+<li><strong>占着寄存器</strong>：数据在寄存器里过一遍，在飞的 load 越多，被占的寄存器越多，直接压低 occupancy（第 4 课）。</li>
+<li><strong>指令可能被穿插</strong>：官方文档在 stencil 例子里明确指出，条件代码下编译器可能生成 <code>LDG/STS/LDG/STS…</code> 交替序列，而不是理想的&quot;3 个 LDG 全发出去再 3 个 STS&quot;——那样才能让多个 load 同时在飞。</li>
+</ol>
+<h4 id="h-2-cpasyncldgsts把数据直接写进-shared-memory">2. cp.async（LDGSTS）：把数据直接写进 shared memory<a class="anchor" href="#h-2-cpasyncldgsts把数据直接写进-shared-memory" aria-label="本节链接">#</a></h4>
+<p><strong>cp.async</strong> 是 Ampere（compute capability 8.0）引入的异步拷贝机制，官方文档按 PTX 指令名叫它 <strong>LDGSTS</strong>。它的关键性质都是可查的硬约束：</p>
+<ul>
+<li><strong>尺寸</strong>：一次拷贝 4、8 或 16 字节。4/8 字节走 <strong>L1 ACCESS</strong> 模式（数据也会缓存进 L1），16 字节走 <strong>L1 BYPASS</strong> 模式（不污染 L1）。</li>
+<li><strong>方向</strong>：只支持 global → shared memory；写回 global 仍要走寄存器。</li>
+<li><strong>对齐</strong>：指针按 4/8/16 字节对齐（取决于拷贝尺寸）；两边都 128 字节对齐时性能最好。</li>
+<li><strong>不经寄存器</strong>：数据从 global 直接落到 shared memory，这是它同时省指令和省寄存器的原因。</li>
+</ul>
+<p>它带来的是<strong>三个问题换一个</strong>：拷贝发起之后线程可以继续干活，但&quot;数据到底到了没有&quot;必须显式等。完成信号走 pipeline 机制：<code>__pipeline_commit()</code> 提交当前一批拷贝，<code>__pipeline_wait_prior(N)</code> 表示&quot;最多允许还有 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span></span></span></span> 批没完成&quot;。还有一条容易踩的规则：<strong>默认每个线程只等自己的拷贝</strong>，所以只要拷贝结果会被别的线程读，<code>wait_prior</code> 之后必须再补一个 <code>__syncthreads()</code>。</p>
+<p>CUDA 提供三层 API 做同一件事，理解差异比记住函数名重要：</p>
+<table>
+<thead>
+<tr>
+<th>API</th>
+<th>完成机制</th>
+<th>备注</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>__pipeline_memcpy_async</code> + <code>__pipeline_commit</code> + <code>__pipeline_wait_prior</code>（<code>&lt;cuda_pipeline.h&gt;</code>）</td>
+<td>pipeline</td>
+<td>最底层、最啰嗦，但保证底层用 LDGSTS</td>
+</tr>
+<tr>
+<td><code>cuda::memcpy_async</code>（配 <code>cuda::barrier</code>）</td>
+<td>异步 barrier</td>
+<td>可用 <code>cuda::aligned_size_t&lt;N&gt;()</code> 声明对齐以启用 LDGSTS</td>
+</tr>
+<tr>
+<td><code>cooperative_groups::memcpy_async</code></td>
+<td><code>cg::wait(block)</code></td>
+<td>写法最短；文档明确指出它<strong>每次拷贝立即提交</strong>，失去了批量提交的优化</td>
+</tr>
+</tbody></table>
+<h4 id="h-3-双缓冲把搬和算摆到同一段时间里">3. 双缓冲：把&quot;搬&quot;和&quot;算&quot;摆到同一段时间里<a class="anchor" href="#h-3-双缓冲把搬和算摆到同一段时间里" aria-label="本节链接">#</a></h4>
+<p>思路一句话：<strong>在计算第 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6595em;"></span><span class="mord mathnormal">i</span></span></span></span> 块的同时，让硬件去搬第 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7429em;vertical-align:-0.0833em;"></span><span class="mord mathnormal">i</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> 块</strong>。shared memory 里开两块缓冲，交替使用。</p>
+<p>用一个可验证的周期模型算账（下一节代码实跑）：设每轮拷贝发起占 2 周期、数据在发起后 40 周期可用、每轮计算 20 周期，共 12 轮：</p>
+<table>
+<thead>
+<tr>
+<th>缓冲级数 S</th>
+<th>总周期</th>
+<th>每轮</th>
+<th>相对 S=1</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1</td>
+<td>720</td>
+<td>60.0</td>
+<td>1.00×</td>
+<td>完全串行（40+20）</td>
+</tr>
+<tr>
+<td>2</td>
+<td>380</td>
+<td>31.7</td>
+<td>1.89×</td>
+<td>只能提前 1 轮，藏不完 40 周期的延迟</td>
+</tr>
+<tr>
+<td>3</td>
+<td>280</td>
+<td>23.3</td>
+<td>2.57×</td>
+<td>等于下界 40+12×20，延迟已完全隐藏</td>
+</tr>
+<tr>
+<td>4</td>
+<td>280</td>
+<td>23.3</td>
+<td>2.57×</td>
+<td>再深无收益，只多占 shared memory</td>
+</tr>
+</tbody></table>
+<p>规律很清楚：<strong>要藏住延迟 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span></span></span></span>、每轮计算 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">C</span></span></span></span>，需要的级数约为 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">L</span><span class="mord">/</span><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span></strong>。这正是官方 prefetch 示例里 <code>num_stages</code> 与 <code>consumer_wait_prior&lt;num_stages-1&gt;</code> 的语义——允许提前 <code>num_stages-1</code> 批拷贝在飞。</p>
+<p>寄存器侧同样有账可算。一个 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">128</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">64</span></span></span></span> 的 fp16 tile = 16 KiB，用 256 线程搬：</p>
+<ul>
+<li>同步路径：每线程 64 字节 = 4 次 16 字节访问，需要 4 条 <code>LDG.128</code> + 4 条 <code>STS.128</code> = <strong>8 条指令</strong>，外加约 16 个在飞数据寄存器；</li>
+<li>cp.async：每线程 <strong>4 条指令</strong>，数据寄存器 <strong>0 个</strong>（16 字节模式走 L1 BYPASS）。</li>
+</ul>
+<p>指令少了、寄存器空了——省下的寄存器正是留给累加器和更大 tile 的（第 4 课）。</p>
+<h4 id="h-4-级数不是越多越好">4. 级数不是越多越好<a class="anchor" href="#h-4-级数不是越多越好" aria-label="本节链接">#</a></h4>
+<p>每加深一级就多一份 shared memory：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span></span></span></span> 级 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6667em;vertical-align:-0.0833em;"></span><span class="mord">×</span></span></span></span> 每块 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span></span></span></span> 的 A/B 条带。<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">32</span></span></span></span>、单精度时一份 8 KB，3 级就是 24 KB 起步；shared memory 是 occupancy 的四个限制因素之一。所以实践中常见 2~4 级：<strong>先按 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">L</span><span class="mord">/</span><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> 估下界，再看 shared memory 允许多少</strong>。此外，级数超过 k 段数（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">K</span><span class="mord">/</span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span></span></span></span>）毫无意义——没有那么多块可提前搬。</p>
+<h4 id="h-5-常见坑">5. 常见坑<a class="anchor" href="#h-5-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>漏 <code>__syncthreads()</code></strong>：cp.async 默认只等自己那批，别的线程可能读到半成品数据。</li>
+<li><strong>漏 <code>wait_prior</code></strong>：数据没到就读，读到的是 buffer 里的旧值——结果错得&quot;看起来合理&quot;，最难查。</li>
+<li><strong>对齐没做</strong>：16 字节拷贝要求指针 16 字节对齐，否则退化甚至报错；两边 128 字节对齐才拿到最好性能。</li>
+<li><strong>想用 cp.async 写回 global</strong>：不支持，方向只有 global → shared。</li>
+<li><strong>缓冲生命周期搞错</strong>：一个 stage 还没被消费完就又拿去发起新拷贝（producer/consumer 顺序颠倒）。</li>
+<li><strong>无脑加深</strong>：延迟藏住之后加深只浪费 shared memory 和同步开销。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面的纯 Python（标准库，无需 GPU）把两件事算清楚：流水线的周期账（级数 → 收敛时间）与搬运指令/寄存器账。</p>
+<pre data-lang="python"><code class="language-python"># ===== 本课示例：软件流水线的周期账 + cp.async 的指令/寄存器账 =====
+def pipeline(S, n=12, latency=40, t_copy=2, t_comp=20, trace=False):
+    &quot;&quot;&quot;S 级缓冲的软件流水线：拷贝引擎按发起顺序串行；数据在发起后 latency 周期可用。&quot;&quot;&quot;
+    issue_free, buf_free, comp_end = 0, [0] * S, 0
+    rows = []
+    for i in range(n):
+        s = i % S
+        start = max(issue_free, buf_free[s])       # 该级缓冲被上一轮计算占着就得等
+        ready = start + latency
+        prev_end = comp_end
+        cs = max(prev_end, ready)                  # 计算要等数据到，也要等上一轮算完
+        ce = cs + t_comp
+        buf_free[s], issue_free, comp_end = ce, start + t_copy, ce
+        rows.append((i, start, ready, cs, ce,
+                     &#39;等数据就绪&#39; if ready &gt; prev_end else &#39;等上轮计算&#39;))
+    if trace:
+        print(f&quot;  {&#39;轮次&#39;:&gt;4} {&#39;发起&#39;:&gt;5} {&#39;就绪&#39;:&gt;5} {&#39;计算起&#39;:&gt;7} {&#39;计算止&#39;:&gt;7}  卡在哪&quot;)
+        for i, st, rd, cs, ce, why in rows:
+            print(f&quot;  {i:&gt;4} {st:&gt;5} {rd:&gt;5} {cs:&gt;7} {ce:&gt;7}  {why}&quot;)
+    return comp_end
+
+n, lat, tc, tf = 12, 40, 2, 20
+print(f&quot;模型：每轮 copy 发起占 {tc} 周期，数据 {lat} 周期后就绪，计算 {tf} 周期，共 {n} 轮\n&quot;)
+base = pipeline(1)
+print(f&quot;{&#39;缓冲级数 S&#39;:&gt;10} {&#39;总周期&#39;:&gt;7} {&#39;每轮周期&#39;:&gt;9} {&#39;相对 S=1&#39;:&gt;9}  {&#39;说明&#39;:&lt;12}&quot;)
+for S in (1, 2, 3, 4):
+    tot = pipeline(S)
+    note = &#39;完全串行&#39; if S == 1 else (&#39;延迟尚未藏完&#39; if tot &gt; n * tf + lat else &#39;延迟已完全隐藏&#39;)
+    print(f&quot;{S:&gt;10} {tot:&gt;7} {tot/n:&gt;9.1f} {base/tot:&gt;8.2f}x  {note:&lt;12}&quot;)
+print(f&quot;\n理想下界（prologue + n×计算）= {lat + n*tf} 周期\n&quot;)
+print(&quot;S=2 的时序：&quot;)
+pipeline(2, trace=True)
+
+print(&quot;\n--- 一个 128×64 fp16 tile（16 KiB）的搬运指令账，block = 256 线程 ---&quot;)
+TILE_BYTES, THREADS = 128 * 64 * 2, 256
+per_thread = TILE_BYTES // THREADS
+print(f&quot;每线程搬运 {per_thread} 字节 = {per_thread//16} 次 16B 访问&quot;)
+print(f&quot;同步路径 LDG.128 + STS.128 : {2*per_thread//16} 条指令/线程，&quot;
+      f&quot;~{per_thread//4} 个寄存器在-flight&quot;)
+print(f&quot;cp.async.cg 16B           : {per_thread//16} 条指令/线程，0 个数据寄存器&quot;)
+print(f&quot;TMA（Hopper，整块描述符）  : 1 条指令/线程块（由 1 个线程发起）&quot;)</code></pre>
+<p>实跑输出（<code>python3</code>，纯标准库）：</p>
+<pre data-lang="text"><code class="language-text">模型：每轮 copy 发起占 2 周期，数据 40 周期后就绪，计算 20 周期，共 12 轮
+
+    缓冲级数 S     总周期      每轮周期    相对 S=1  说明          
+         1     720      60.0     1.00x  完全串行        
+         2     380      31.7     1.89x  延迟尚未藏完      
+         3     280      23.3     2.57x  延迟已完全隐藏     
+         4     280      23.3     2.57x  延迟已完全隐藏     
+
+理想下界（prologue + n×计算）= 280 周期
+
+S=2 的时序：
+    轮次    发起    就绪     计算起     计算止  卡在哪
+     0     0    40      40      60  等数据就绪
+     1     2    42      60      80  等上轮计算
+     2    60   100     100     120  等数据就绪
+     3    80   120     120     140  等上轮计算
+     4   120   160     160     180  等数据就绪
+     5   140   180     180     200  等上轮计算
+     6   180   220     220     240  等数据就绪
+     7   200   240     240     260  等上轮计算
+     8   240   280     280     300  等数据就绪
+     9   260   300     300     320  等上轮计算
+    10   300   340     340     360  等数据就绪
+    11   320   360     360     380  等上轮计算
+
+--- 一个 128×64 fp16 tile（16 KiB）的搬运指令账，block = 256 线程 ---
+每线程搬运 64 字节 = 4 次 16B 访问
+同步路径 LDG.128 + STS.128 : 8 条指令/线程，~16 个寄存器在-flight
+cp.async.cg 16B           : 4 条指令/线程，0 个数据寄存器
+TMA（Hopper，整块描述符）  : 1 条指令/线程块（由 1 个线程发起）</code></pre>
+<p>时序表里&quot;卡在哪&quot;一列正是这一课的核心：S=2 的每轮不是等数据就是等上一轮计算，<strong>交替出现说明缓冲在精确地周转</strong>；而 S=3 之后总周期压到下界 280，说明额外的缓冲已经把 40 周期延迟完全吸收。</p>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选：需要 GPU。跑通一个多级缓冲的 prefetch kernel 并用 ncu 看它有没有真的重叠 ----
+# 官方 prefetch 示例（num_stages 级缓冲 + pipeline producer/consumer）见参考来源第 1 条；
+# 编译： nvcc -O3 -arch=sm_80 -o prefetch prefetch.cu
+# 用 ncu 看两件事：
+#   ncu --metrics smsp__average_warps_issue_stalled_long_scoreboard_per_issue_active.ratio,\
+#         gpu__time_duration.sum,sm__throughput.avg.pct_of_peak_sustained_elapsed \
+#       ./prefetch
+# 判读：long_scoreboard（等访存）占比在 num_stages=2 时明显高于 num_stages=3，
+#      说明级数不够、延迟没藏完；把 __pipeline_wait_prior(N) 的 N 与缓冲级数对齐后再测一次。
+# 没有 GPU 不影响本课：上面的周期模型已经把&quot;几级才够&quot;算出来了。
+# 指标名以 ncu --query-metrics 在本机输出的清单为准。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：改 <code>pipeline</code> 让每轮计算时间不均匀（例如前 6 轮 20 周期、后 6 轮 5 周期），找出仍能完全隐藏 40 周期延迟的最小 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span></span></span></span>，并解释为什么它比均匀时要大。</li>
+<li><strong>解释</strong>：为什么 <code>__pipeline_wait_prior(N)</code> 的语义是&quot;最多还有 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span></span></span></span> 批没完成&quot;，而不是&quot;等第 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span></span></span></span> 批完成&quot;？用 S=3 的时序说明它与&quot;提前 2 轮发起拷贝&quot;是同一件事。</li>
+<li><strong>对比/验证</strong>：取真实量级 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">400</span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">8</span></span></span></span>，用公式 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">L</span><span class="mord">/</span><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> 估算最少级数；再假设每级要 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span></span></span></span> 的 A/B 条带（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">64</span></span></span></span>、fp16），算出 shared memory 占用，解释为什么实践中常见 2~4 级而不是 50 级。</li>
+<li><strong>思考</strong>：如果 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">K</span></span></span></span> 只有 2 段（即块内循环只跑 2 轮），双缓冲还能带来收益吗？如果这个 kernel 的计算只占每轮时间的 10%，你更应该去优化什么？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>NVIDIA, <em>CUDA Programming Guide</em> §4.12「Asynchronous Data Copies」（LDGSTS/cp.async 的尺寸、L1 模式、方向、对齐要求与三层 API 清单，含 prefetch 示例的 <code>num_stages</code> 流水线）：<a href="https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/async-copies.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/async-copies.html</a></li>
+<li>NVIDIA, <em>CUDA Programming Guide</em> §4.11「Pipelines」（<code>cuda::pipeline</code> 的 producer/consumer 语义与 <code>wait_prior</code> 家族）：<a href="https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/pipelines.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/pipelines.html</a></li>
+<li>NVIDIA, <em>CUDA C++ Best Practices Guide</em> §10.2.3.4「Asynchronous Copy from Global Memory to Shared Memory」：<a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#asynchronous-copy-from-global-memory-to-shared-memory" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#asynchronous-copy-from-global-memory-to-shared-memory</a></li>
+<li>NVIDIA, <em>Parallel Thread Execution ISA</em>（<code>cp.async</code> / <code>cp.async.commit_group</code> / <code>cp.async.wait_group</code> 的精确语义）：<a href="https://docs.nvidia.com/cuda/parallel-thread-execution/" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/parallel-thread-execution/</a></li>
+</ul>
+<p><a href="#/l/cuda-ch4-l3">下一课：TMA 与 Hopper 起的异步数据搬运</a></p>

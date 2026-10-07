@@ -1,0 +1,439 @@
+<h3 id="h-这一节要解决什么">这一节要解决什么<a class="anchor" href="#h-这一节要解决什么" aria-label="本节链接">#</a></h3>
+<p>前两节讲的都是&quot;怎么知道改动有没有效果&quot;。这一节讲一个在它之前、也更难的问题：<strong>怎么定义&quot;没有变坏&quot;？</strong></p>
+<p>工程现实是：一个只优化主指标的实验几乎必然会在别处造成损伤。更推荐一条回复，往往意味着更长（成本涨）、更慢（延迟涨）、更自信（幻觉风险涨）；更激进地自动回复，意味着自动化率上涨而错误自动化率也上涨。这些副作用<strong>不会</strong>出现在主指标里，也不会被&quot;显著性检验&quot;自动发现——你必须<strong>事先声明</strong>它们是什么、怎么测、什么水平不可接受。</p>
+<p>这一节把&quot;不能变坏的东西&quot;系统化：</p>
+<ol>
+<li><strong>三类指标的分工</strong>：护栏（guardrail）、负向指标（negative metric）、反向指标（counter-metric）——它们常被混用，但用途不同。</li>
+<li><strong>四类护栏</strong>：安全/合规、体验、性能与成本、公平性。每一类的可观测性要求不同（有的能实时测，有的只能靠采样或人工）。</li>
+<li><strong>阈值怎么定</strong>：不能拍脑袋。用历史分布 + 业务可承受损失反推，并显式记录&quot;这个阈值是谁基于什么定的&quot;。</li>
+<li><strong>多重护栏的统计代价</strong>：12 个护栏各做 95% 检验，至少误报一个的概率是 46%。而<strong>安全护栏的最优做法恰恰相反</strong>——不做校正。这一节会把这个反直觉的结论算给你看。</li>
+<li><strong>违反之后怎么办</strong>：停止规则、回滚、灰阶发布节奏、以及&quot;护栏被触发但业务想上&quot;时该谁决策。</li>
+</ol>
+<p>核心取舍会在最后一节给出来：<strong>护栏的敏感度与可用性是对立的</strong>。护栏越紧，事故拦得越多，也越容易把有效改动误杀。这个取舍没有技术上的最优解，只有&quot;显式记录并由业务承担&quot;的解。</p>
+<h3 id="h-一先把三个词分开">一、先把三个词分开<a class="anchor" href="#h-一先把三个词分开" aria-label="本节链接">#</a></h3>
+<p>这三个词在日常讨论里经常互换使用，但它们的<strong>判定逻辑不同</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>类型</th>
+<th>定义</th>
+<th>判定</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>护栏指标（guardrail）</strong></td>
+<td>绝对不能越过的约束</td>
+<td><strong>硬阈值</strong>：越过即停/回滚</td>
+<td>安全、合规、资金、隐私</td>
+</tr>
+<tr>
+<td><strong>负向指标（negative metric）</strong></td>
+<td>&quot;越小越好&quot;的指标</td>
+<td>方向 + 阈值</td>
+<td>延迟、成本、幻觉率、投诉率</td>
+</tr>
+<tr>
+<td><strong>反向指标（counter-metric）</strong></td>
+<td>与主指标<strong>预期反向</strong>的对照指标</td>
+<td>用于诊断，不设发布门禁</td>
+<td>长度、token 数、拒答率、多样性</td>
+</tr>
+</tbody></table>
+<p>区别的关键在<strong>判定规则</strong>：</p>
+<ul>
+<li>护栏是<strong>布尔</strong>的：&quot;用户投诉率 &gt; 0.5% 就停&quot;。它不需要统计检验，因为它是一个<strong>预先承诺的约束</strong>，不是一个需要推断的假设。</li>
+<li>负向指标是<strong>带方向的连续量</strong>：延迟下降是好事，但降到多少算&quot;够&quot;？它需要和主指标一起看。</li>
+<li>反向指标是<strong>读数</strong>，不是门禁：如果主指标涨了 3%，而平均输出长度也涨了 40%，那么&quot;涨 3%&quot;这件事需要重新解释（很可能是长度驱动的，参见第 4 章的长度偏差）。反向指标的价值在于<strong>它能让主指标的变化变得可解释</strong>。</li>
+</ul>
+<p><strong>为什么这样分</strong>：因为把三者混在一起会产生两类典型事故。</p>
+<p>第一类是<strong>用统计检验管安全</strong>：&quot;这次越狱率上升不显著（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.12</span></span></span></span>），所以可以上线&quot;——安全边界不是假设检验问题，一次成功攻击就足够（第 5 章会给出严格的风险上界算法）。第二类是<strong>用硬阈值管体验指标</strong>：&quot;首字延迟超过 300 ms 就回滚&quot;——延迟有正常的日周期波动，硬阈值会导致大量误回滚，反而让团队不敢上线，最终护栏形同虚设。</p>
+<p><strong>怎么做</strong>：给每个指标在实验注册文档里标一个类型。类型决定了它的判定方式（硬阈值 / 方向 + 区间 / 仅记录）与它在多重比较里的归属（见第四节）。<strong>一个指标没有类型，就等于没有护栏。</strong></p>
+<h3 id="h-二四类护栏及其可观测性">二、四类护栏及其可观测性<a class="anchor" href="#h-二四类护栏及其可观测性" aria-label="本节链接">#</a></h3>
+<p><strong>（a）安全与合规</strong>：有害内容命中率、越狱成功率、个人信息泄漏事件数、版权/引用合规率。这类指标的特征是<strong>基线极低（常为 0）</strong>，因此不能用比例指标的常规方法测：你需要的是<strong>风险上界</strong>——&quot;以 95% 置信度，真实违规率不超过 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord mathnormal">x</span><span class="mord">%</span></span></span></span>&quot;。</p>
+<p>可观测性：多数可以离线红队 + 线上采样审计两层。线上通常是<strong>抽样人审</strong>（成本高）或<strong>分类器自动检测</strong>（有漏报）。<strong>只依赖分类器做安全护栏是不合格的</strong>：分类器本身有 5%~30% 的漏报率，必须先估出这个漏报率，再据此决定采样率——否则你测的是分类器，不是模型。</p>
+<p><strong>（b）用户体验</strong>：任务完成率、放弃率、重复提问率、投诉率、退款率、会话轮次。这里的难点是<strong>&quot;异常上升&quot;和&quot;异常下降&quot;都可能是坏事</strong>：轮次太少可能是模型一次答对（好），也可能是一次答错后用户放弃（坏）。所以体验类护栏几乎总是<strong>需要配对指标</strong>（完成率 + 放弃率 + 投诉率）才能判定方向。</p>
+<p>可观测性：线上直接可测，但有<strong>沉淀延迟</strong>——退款、投诉类指标通常要等数天到数周，无法作为实时护栏。做法是分层：即时护栏（放弃率、重复提问率）实时看；滞后护栏（投诉、退款）在观察期结束后看，并把实验结果标记为&quot;待定&quot;而不是&quot;通过&quot;。</p>
+<p><strong>（c）性能与成本</strong>：P50/P95/P99 延迟、TTFT、吞吐、单次会话成本、缓存命中率、降级触发率。这里的坑是<strong>平均值掩盖尾部</strong>：P50 变化 0，P99 可能翻倍。护栏必须用分位数，并且要明确是哪个分位数——&quot;延迟涨了&quot;这句话在 P95 与 P99 上可能是完全不同的结论。</p>
+<p>另一个坑是<strong>成本与延迟的耦合</strong>：改动让每次回答多花 30% token，成本涨 30%，同时 P95 延迟涨 200 ms。这两个数字通常有共同原因（更长的生成），修一处能同时改善两者——所以护栏之间不是独立的，第 4 节的归因要利用这一点，而不是把它们当成两个独立警报。</p>
+<p><strong>（d）公平性与分布</strong>：分群性能差（不同用户群/语言/地区/设备上的效果差）、特定子群的覆盖率、内容多样性（推荐崩溃）。这类护栏的特殊困难是<strong>样本量</strong>：子群往往只占流量的 5%，要在子群上检出显著差异需要的总样本量约是总体所需的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1/</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0269em;">w</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0269em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0315em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 倍。这意味着<strong>公平性护栏在很多团队里天然功效不足</strong>——正确的应对是明确写出&quot;本实验对小于 5% 的子群无检测能力（功效 &lt; 0.3）&quot;，而不是假装它通过。</p>
+<p><strong>取舍</strong>：护栏数量不是越多越好。每加一类护栏，就多一份监控成本、多一次误报机会（见第四节），并且需要有人负责。实践中一个健康的规模是：<strong>硬约束 3<del>5 个、软约束 6</del>10 个、反向指标 3~5 个</strong>，其余放进探索族。</p>
+<h3 id="h-三阈值怎么定不能拍脑袋">三、阈值怎么定：不能拍脑袋<a class="anchor" href="#h-三阈值怎么定不能拍脑袋" aria-label="本节链接">#</a></h3>
+<p>阈值必须来自两个输入，缺一不可：</p>
+<ol>
+<li><strong>历史分布</strong>：这个指标在&quot;正常时期&quot;的均值与波动，给出 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord mathnormal">μ</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">σ</span><span class="mclose">)</span></span></span></span> 或分位数。</li>
+<li><strong>可承受损失</strong>：业务能接受多大损伤。这是一个<strong>业务决策</strong>，不是技术决策。</li>
+</ol>
+<p>把两者合起来，有三种常见的阈值形式：</p>
+<p><strong>（a）绝对值型</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">∣Δ∣</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&gt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0379em;">δ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0379em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">abs</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 即触发。适用于有硬约束的指标（P99 延迟 &lt; 800 ms、单次成本 &lt; 0.03 元）。特点是<strong>可解释性强、与基线无关</strong>，也最适合写成合同/SLA。</p>
+<p><strong>（b）相对型</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">∣Δ∣/</span><span class="mord"><span class="mord mathnormal">μ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&gt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span></span></span></span> 即触发，比如&quot;投诉率相对上升 &gt; 20%&quot;。适用于量纲随规模变化、但业务感受是相对的指标。风险是：当基线极低时（投诉率 0.01%），相对阈值会频繁误触发；此时应加一个绝对下限（&quot;相对上升 20% <strong>且</strong> 绝对上升 &gt; 0.02 个百分点&quot;）。<strong>相对阈值 + 绝对下限</strong>是低基线指标的正确写法。</p>
+<p><strong>（c）统计型 / 非劣性检验（non-inferiority）</strong>：这是护栏最合适的统计工具。它的原假设是&quot;处理组比对照组差至少 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0379em;">δ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:-0.0379em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">NI</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>&quot;：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0813em;">H</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.0813em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">:</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8193em;vertical-align:-0.136em;"></span><span class="mord">Δ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≤</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord">−</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0379em;">δ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:-0.0379em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">NI</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:2em;"></span><span class="mord text"><span class="mord">vs</span></span><span class="mspace" style="margin-right:2em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0813em;">H</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.0813em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">:</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7224em;vertical-align:-0.0391em;"></span><span class="mord">Δ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&gt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord">−</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0379em;">δ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:-0.0379em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">NI</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">Δ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7778em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">μ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.1389em;">T</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">μ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0715em;">C</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span></span></p>
+<p>只有当<strong>单侧置信下界</strong> <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7224em;vertical-align:-0.0391em;"></span><span class="mord mathnormal">L</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&gt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord">−</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0379em;">δ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:-0.0379em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">NI</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 时才拒绝 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0813em;">H</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.0813em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>，才能宣称&quot;没有实质变差&quot;。这与普通检验完全不同：普通检验&quot;不显著&quot;只说明<strong>证据不足</strong>，绝不能说明&quot;没变差&quot;——样本量不足时，一个 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.0833em;"></span><span class="mord">−</span><span class="mord">4%</span></span></span></span> 的真实损伤同样会&quot;不显著&quot;。</p>
+<p>非劣性检验必须注意两点：用<strong>单侧</strong>临界值 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6389em;vertical-align:-0.2083em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.044em;">z</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.044em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">1</span><span class="mbin mtight">−</span><span class="mord mathnormal mtight" style="margin-right:0.0037em;">α</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2083em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1.645</span></span></span></span>（不是 1.96），且<strong>必须事先声明</strong> <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0379em;">δ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:-0.0379em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">NI</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>。这个值就是&quot;可承受损失&quot;的形式化，写不出来就说明业务还没想清楚。</p>
+<p><strong>怎么做（流程要求）</strong>：</p>
+<ol>
+<li>每个护栏写一行：指标名 / 方向 / 阈值 / 依据（历史数据的哪段区间 + 谁的决策）/ 检测方式（实时 or 观测期末）/ 违反后的动作。</li>
+<li>阈值来源必须落到<strong>具体的历史区间</strong>（比如&quot;2026-01 至 2026-06 的 P99 分布，均值 620 ms、标准差 80 ms&quot;），而不是&quot;经验上 800 还行&quot;。</li>
+<li>阈值<strong>变更要留版本记录</strong>。放宽阈值通常是事故前的征兆——把它变成一次显式评审。</li>
+</ol>
+<p><strong>取舍（阈值可以算出来）</strong>：以 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7778em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">μ</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mord mathnormal" style="margin-right:0.0359em;">σ</span></span></span></span> 为例，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0813em;">H</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.0813em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 下的单日误报率是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">Φ</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mclose">)</span></span></span></span>。取 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2</span></span></span></span> 约每 44 天误报一次，取 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">3</span></span></span></span> 约每 741 天一次。团队能接受的误报频率直接决定了 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span>。<strong>先问&quot;我们每月能容忍几次误回滚&quot;，阈值的一半就有了。</strong></p>
+<p><figure><img class="md-img" src="content/courses/llm-evaluation/assets/chapter-3-figure-04.svg" alt="护栏越多，误报率涨得越快" loading="lazy" decoding="async"><figcaption>护栏越多，误报率涨得越快</figcaption></figure>
+</p>
+<h3 id="h-四多个护栏的统计代价两族的最优策略相反">四、多个护栏的统计代价：两族的最优策略相反<a class="anchor" href="#h-四多个护栏的统计代价两族的最优策略相反" aria-label="本节链接">#</a></h3>
+<p>12 个护栏各自做 95% 检验，至少误报一个的概率是：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8641em;"></span><span class="mord">0.9</span><span class="mord"><span class="mord">5</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8641em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">12</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">46%</span></span></span></span></span></p>
+<p>这带来一个真实的两难：</p>
+<ul>
+<li><strong>如果不校正</strong>：几乎每次实验都会有一两个护栏&quot;变红&quot;，团队会被假警报淹没，最终形成&quot;红的也不管&quot;的习得性无视——这比没有护栏更糟。</li>
+<li><strong>如果无脑校正</strong>（Bonferroni，12 个则每个用 0.0042）：真实的小损伤会被漏掉，而护栏最重要的恰恰是抓小损伤。</li>
+</ul>
+<p>解决方式不是二选一，而是<strong>把护栏按错误代价分成两族</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>族</th>
+<th>内容</th>
+<th>统计处理</th>
+<th>理由</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>硬约束族</strong></td>
+<td>安全、合规、隐私、资金</td>
+<td><strong>不校正</strong>（甚至放宽 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span>）</td>
+<td>漏检的代价远大于误报：宁可多查一次，不可漏一次事故</td>
+</tr>
+<tr>
+<td><strong>软约束族</strong></td>
+<td>体验、性能、成本、多样性</td>
+<td><strong>FWER 校正</strong>（Holm）或 FDR（BH）</td>
+<td>每个假阳性都有回滚成本，需要控制误杀</td>
+</tr>
+<tr>
+<td><strong>探索族</strong></td>
+<td>分群细分、次要指标</td>
+<td>不校正，只用点估计并标注&quot;未校正&quot;</td>
+<td>用于生成假设，不进入门禁</td>
+</tr>
+</tbody></table>
+<p><strong>为什么硬约束族不校正（这是本节最反直觉的结论）</strong>：因为它的两类错误代价极度不对称。假阳性（护栏误报）的代价是一次调查；假阴性（漏掉真实攻击）的代价可能是事故。<strong>统计校正的前提是两类错误代价可比</strong>，这个前提在安全场景不成立。</p>
+<p>把它算成一个两笔账的问题（统一以&quot;一次误报&quot;为 1 个代价单位）：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord cjk_fallback">误报账面</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord mathnormal">e</span><span class="mord mathnormal">x</span><span class="mord mathnormal">t</span><span class="mord"><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">F</span><span class="mord mathnormal" style="margin-right:0.1389em;">W</span><span class="mord mathnormal" style="margin-right:0.0576em;">E</span><span class="mord mathnormal" style="margin-right:0.0077em;">R</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">raw</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8778em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord cjk_fallback">检出账面</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7306em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.1076em;">f</span><span class="mord mathnormal mtight">n</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.5945em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0359em;">π</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">harm</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.2em;vertical-align:-0.35em;"></span><span class="mord"><span class="delimsizing size1">(</span></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">det</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.2em;vertical-align:-0.35em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">det</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mord">/</span><span class="mord mathnormal">m</span><span class="mclose">)</span><span class="mord"><span class="delimsizing size1">)</span></span></span></span></span></span></p>
+<ul>
+<li><strong>误报账面</strong>：从&quot;不校正的 46%&quot;降到&quot;校正后的 5%&quot;，每实验省下 0.41 个误报单位。<strong>这一项只取决于 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">m</span></span></span></span>，与损伤代价无关。</strong></li>
+<li><strong>检出账面</strong>：校正把单个检验的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span> 从 0.05 压到 0.0042，检出概率随之下降。当真实损伤只有 0.4 个标准误时，检出概率从 0.107 掉到 0.013，损失 0.094；当漏检一次值 5000 个单位、且每实验有 0.02 的概率真有损伤时，这一项是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">0.094</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">5000</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.02</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">9.4</span></span></span></span> —— <strong>比误报账面大 23 倍</strong>。</li>
+</ul>
+<p>所以结论由&quot;两笔账面谁大&quot;决定，而它有一个干净的分界：</p>
+<table>
+<thead>
+<tr>
+<th>情形（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">m</span></span></span></span> / <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">λ</span></span></span></span> / <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7167em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.1076em;">f</span><span class="mord mathnormal mtight">n</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span></span> / <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0359em;">π</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">harm</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>）</th>
+<th>误报账面</th>
+<th>检出账面</th>
+<th>结论</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>12 / 0.4 / 1 / 1.0（软约束，弱信号，损伤便宜）</td>
+<td>0.410</td>
+<td>0.094</td>
+<td><strong>校正更优</strong></td>
+</tr>
+<tr>
+<td>12 / 1.0 / 3 / 1.0（软约束，中等信号）</td>
+<td>0.410</td>
+<td>0.626</td>
+<td>不校正更优</td>
+</tr>
+<tr>
+<td>20 / 1.0 / 3 / 1.0（软约束，护栏很多）</td>
+<td>0.592</td>
+<td>0.672</td>
+<td>不校正更优（接近）</td>
+</tr>
+<tr>
+<td>4 / 0.4 / 5000 / 0.02（硬约束）</td>
+<td>0.135</td>
+<td>7.381</td>
+<td><strong>远不校正更优</strong></td>
+</tr>
+<tr>
+<td>12 / 3.1 / 5000 / 0.02（硬约束，信号很强）</td>
+<td>0.410</td>
+<td>24.932</td>
+<td><strong>远不校正更优</strong></td>
+</tr>
+</tbody></table>
+<p>注意最后两行：即使 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">λ</span></span></span></span> 大到 3.1（信号很强、很容易检出），硬约束族<strong>仍然是不校正更差</strong>——因为 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7167em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.1076em;">f</span><span class="mord mathnormal mtight">n</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span></span> 的量级差了两个数量级。反过来看第一行：软约束族的损伤只值一次误报，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">m</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">12</span></span></span></span> 时校正就赢了。<strong>这就是&quot;严谨性不是免费的，它的价格由两类错误的代价比决定&quot;的定量版本。</strong></p>
+<p>还有一个让&quot;不校正&quot;更站得住的效应：<strong>护栏指标之间通常正相关</strong>（安全类的几个指标都是&quot;不安全&quot;的不同侧面）。正相关会显著压低&quot;不校正&quot;时的真实族错误率（代码第 4b 段给出模拟）：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">m</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">12</span></span></span></span> 独立时是 0.46，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">ρ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.5</span></span></span></span> 时只有 0.22，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">ρ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.8</span></span></span></span> 时降到 0.14。这意味着：</p>
+<ul>
+<li>对硬约束族，校正的收益比&quot;1-(1-α)^m&quot;算出来的更小 → <strong>更加不该校正</strong>。</li>
+<li>对软约束族，如果你把高度相关的指标（P95 与 P99）放进同一个族做校正，你是在为一份重复的信息付两次税 → <strong>先合并相关指标，再做校正</strong>。</li>
+</ul>
+<p><strong>软约束族怎么做 FDR</strong>：用 Benjamini-Hochberg。<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">q</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.10</span></span></span></span> 意味着&quot;被判为变差的护栏里，预期 10% 是假的&quot;。这比 Bonferroni 更符合&quot;护栏是筛子而不是法官&quot;的定位。</p>
+<p><strong>另一个关键做法：把护栏指标做成&quot;复合告警&quot;</strong>。同时对同一个方向、且<strong>信息来源不同</strong>的多个指标告警（延迟 P95 涨 + 降级触发率涨 + 成本涨）才有说服力。注意&quot;信息来源不同&quot;是硬要求：如果两个指标高度相关（比如 P95 与 P99，相关系数 0.9），联合越界的概率和单个指标几乎一样（代码第四节会给出数值），防护力等于没有。</p>
+<h3 id="h-五违反之后停止规则与发布节奏">五、违反之后：停止规则与发布节奏<a class="anchor" href="#h-五违反之后停止规则与发布节奏" aria-label="本节链接">#</a></h3>
+<p>护栏只有在<strong>连着一个动作</strong>时才存在。没有停止规则的护栏是仪表盘装饰。</p>
+<p>三种停止规则，适用不同场景：</p>
+<ul>
+<li><strong>硬停（hard stop）</strong>：触发即停止实验、回滚。适用于硬约束族。代价是误停。</li>
+<li><strong>软停 / 降级（soft stop）</strong>：触发后不停止，但（a）阻止扩大流量、（b）自动通知、（c）要求人工判断。适用于软约束族的边界情况。</li>
+<li><strong>无停止但记录（observe-only）</strong>：只在报告里记录，实验继续。适用于探索族。</li>
+</ul>
+<p>与之配套的是<strong>灰阶发布（ramp）</strong>：5% → 20% → 50% → 100%。每一档停留多久、看哪些指标、谁批准下一档，都要事先写。灰阶的价值是把&quot;全量事故&quot;变成&quot;小流量事故&quot;，代价是收益到得更慢。</p>
+<p><strong>灰阶节奏必须与指标的沉淀时间匹配</strong>：投诉率需要 7 天沉淀，那么 5% → 20% 这一档就不能只停 1 天；否则你在用&quot;还没沉淀&quot;的数据给下一档签通行证。工程做法是给每个护栏标一个 <code>min_dwell_days</code>，灰阶的推进条件是&quot;所有硬约束已过 min_dwell_days 且无告警&quot;。</p>
+<p><strong>取舍：谁有权推翻护栏。</strong> 这是本节最实际的建议——必须事先写明：</p>
+<ol>
+<li>硬约束族<strong>没有人可以推翻</strong>（只有在修完根因并复审后重新开实验）。</li>
+<li>软约束族可以由<strong>指定角色</strong>（比如产品负责人 + 数据负责人共同）在留档的情况下豁免，豁免理由必须写明业务收益与可接受损伤。</li>
+<li>不留档的豁免会让整个护栏体系在一个季度内失效，因为&quot;上次也放过了&quot;会变成惯例。</li>
+</ol>
+<h3 id="h-六护栏工程失败的五种形态">六、护栏工程失败的五种形态<a class="anchor" href="#h-六护栏工程失败的五种形态" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>测不了就假装通过</strong>：公平性护栏样本不足，报告写成&quot;未发现差异&quot;。<strong>正确写法是&quot;本实验对该子群无检测能力（功效 &lt; 0.3）&quot;。</strong></li>
+<li><strong>只看均值不看尾部分布</strong>：延迟均值涨 2%，P99 涨 60%。用户感知的是尾部。</li>
+<li><strong>护栏与主指标共线</strong>：主指标是&quot;采纳率&quot;，护栏是&quot;采纳数&quot;，两者永远同向，等于没有护栏。<strong>好护栏必须与主指标有独立的信息来源。</strong></li>
+<li><strong>事后才补护栏</strong>：实验做完发现某个指标变差，再把它&quot;加进护栏&quot;并宣布失败——这是事后合理化，统计上无效。护栏必须在<strong>开实验前</strong>注册。</li>
+<li><strong>护栏无人负责</strong>：指标红了没人看。护栏需要 owner、告警通道和响应时限（比如硬约束 15 分钟内有人响应）。</li>
+</ol>
+<p><strong>一个可操作的验收清单</strong>（贴进实验注册模板）：</p>
+<ul>
+<li><input disabled="" type="checkbox"> 每个护栏有类型（硬/软/探索）、方向、阈值、依据、<code>min_dwell_days</code>、owner</li>
+<li><input disabled="" type="checkbox"> 阈值能追溯到具体历史区间 + 决策记录</li>
+<li><input disabled="" type="checkbox"> 软约束族声明了校正方法（Holm 或 BH）与族成员</li>
+<li><input disabled="" type="checkbox"> 硬约束族声明了&quot;不校正&quot;及其理由（错误代价比）</li>
+<li><input disabled="" type="checkbox"> 公平性护栏写了检测能力下限（能测多小的子群）</li>
+<li><input disabled="" type="checkbox"> 每个护栏有对应的停止规则与责任人</li>
+<li><input disabled="" type="checkbox"> 反向指标已列出，且报告中用于解释主指标变化</li>
+</ul>
+<h3 id="h-代码">代码<a class="anchor" href="#h-代码" aria-label="本节链接">#</a></h3>
+<p>⚠️ 以下为<strong>合成数据</strong>，仅用于展示统计量的行为；代码只用标准库，可直接运行。</p>
+<pre data-lang="python"><code class="language-python">import math
+import random
+import statistics
+
+rng = random.Random(23)
+
+# ============================================================
+# 1. 多重护栏的误报：12 个指标各自 95% 检验
+# ============================================================
+def fwer(m, alpha=0.05):
+    return 1 - (1 - alpha) ** m
+
+print(&quot;== 1. 多重护栏的族错误率 ==&quot;)
+for m in (1, 4, 8, 12, 20, 40):
+    print(f&quot;m={m:3d} 个护栏 -&gt; 至少一个误报的概率 = {fwer(m):.3f}&quot;)
+print(&quot;  &lt;- 12 个护栏就有近一半的实验会&#39;有护栏变红&#39;（H0 为真时）&quot;)
+
+# ============================================================
+# 2. 阈值怎么定：从历史分布 + 可承受损失反推
+# ============================================================
+hist_p99 = [rng.gauss(620, 80) for _ in range(120)]     # 120 天历史 P99(ms)
+mu, sd = statistics.mean(hist_p99), statistics.stdev(hist_p99)
+
+
+def phi(x):
+    return 0.5 * (1 + math.erf(x / math.sqrt(2)))
+
+
+print(&quot;\n== 2. 阈值来源 ==&quot;)
+print(f&quot;历史 P99: 均值 {mu:.0f} ms, 标准差 {sd:.0f} ms, &quot;
+      f&quot;P95 分位 {sorted(hist_p99)[int(0.95 * len(hist_p99))]:.0f} ms&quot;)
+for k in (1.0, 2.0, 3.0):
+    thr = mu + k * sd
+    p_false = 1 - phi(k)          # H0（真实无变化）下超过阈值的单侧概率
+    print(f&quot;阈值 = mu+{k:.0f}*sd = {thr:7.0f} ms -&gt; H0 单侧误报率 {p_false:.4f} &quot;
+          f&quot;(约每 {1 / p_false:.0f} 天一次)&quot;)
+print(&quot;  &lt;- &#39;每月能容忍几次误报&#39;直接决定了取几个 sigma&quot;)
+
+# ============================================================
+# 3. 要不要做多重比较校正：分两族算账
+# ------------------------------------------------------------
+# 统一以&quot;一次误报&quot;为 1 个代价单位。两个账面：
+#   误报账面：每个实验的族错误率 FWER = 1-(1-alpha_ind)^m
+#             校正 0.05 -&gt; 0.05 ；不校正 0.05 -&gt; 1-0.95^m
+#             节省 = FWER_raw - 0.05（每实验、每族）
+#   检出账面：漏检一次真实损伤的代价 = c_fn * n_harm（每实验）
+#             检出概率的下降 = Phi(z_{1-a_corr} - lam) - Phi(z_{1-a_raw} - lam)
+#             lam = 真实损伤 / 标准误（信号越强 lam 越大）
+# ------------------------------------------------------------
+def z_one_sided(alpha):
+    # 单侧临界值 z_{1-alpha}：二分法反解 Phi(z) = 1 - alpha
+    lo, hi = -10.0, 10.0
+    for _ in range(200):
+        mid = (lo + hi) / 2
+        if phi(mid) &lt; 1 - alpha:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2
+
+
+def detection(alpha_ind, lam):
+    # 检出概率（单侧）：真实损伤为 lam 个标准误，跨过临界值才算检出
+    return 1 - phi(z_one_sided(alpha_ind) - lam)
+
+
+def correction_ledger(m, lam, c_fn, n_harm, a_raw=0.05):
+    fwer_raw = 1 - (1 - a_raw) ** m
+    saved = (fwer_raw - a_raw) * 1.0                     # 误报账面节省
+    lost = (detection(a_raw, lam) - detection(a_raw / m, lam)) * n_harm * c_fn
+    return fwer_raw, saved, lost, saved - lost
+
+
+print(&quot;\n== 3. 多重比较校正：分两族算账（以一次误报 = 1 单位） ==&quot;)
+print(f&quot;{&#39;m&#39;:&gt;3} {&#39;lam&#39;:&gt;4} {&#39;c_fn&#39;:&gt;6} {&#39;n_harm&#39;:&gt;7} | {&#39;FWER_raw&#39;:&gt;9} &quot;
+      f&quot;{&#39;误报节省&#39;:&gt;9} {&#39;检出损失&#39;:&gt;9} | 结论&quot;)
+cases = [
+    (12, 0.4, 1.0, 1.0, &quot;软约束族：弱信号、损伤只值 1 次误报&quot;),
+    (12, 1.0, 3.0, 1.0, &quot;软约束族：中等信号、损伤值 3 次误报&quot;),
+    (20, 1.0, 3.0, 1.0, &quot;软约束族：护栏很多&quot;),
+    (4, 0.4, 5000.0, 0.02, &quot;硬约束族：漏检一次事故 = 5000 次误报&quot;),
+    (12, 3.1, 5000.0, 0.02, &quot;硬约束族：即使信号很强&quot;),
+]
+for m, lam, c_fn, n_h, desc in cases:
+    fwer_raw, saved, lost, net = correction_ledger(m, lam, c_fn, n_h)
+    verdict = &quot;校正更优&quot; if net &gt; 0 else &quot;不校正更优&quot;
+    print(f&quot;{m:&gt;3} {lam:&gt;4.1f} {c_fn:&gt;6.0f} {n_h:&gt;7.2f} | {fwer_raw:&gt;9.3f} &quot;
+          f&quot;{saved:&gt;9.3f} {lost:&gt;9.3f} | {verdict}  ({desc})&quot;)
+print(&quot;  &lt;- 结论由&#39;两笔账面谁大&#39;决定，与&#39;alpha 越小越严谨&#39;无关：&quot;)
+print(&quot;     软约束族（m 大、损失便宜）校正更优；硬约束族（漏检贵）不校正更优&quot;)
+
+# 4. 非劣性检验：护栏该用的统计形式（单侧）
+# ------------------------------------------------------------
+# H0: p_b - p_a &lt;= -delta_ni；要求单侧置信下界 L &gt; -delta_ni
+# ============================================================
+Z_ONE = z_one_sided(0.05)      # ~1.645
+
+
+def noninferiority(n, p_a, p_b, delta_ni):
+    d = p_b - p_a
+    se = math.sqrt(p_a * (1 - p_a) / n + p_b * (1 - p_b) / n)
+    lo = d - Z_ONE * se
+    return d, lo, lo &gt; -delta_ni
+
+
+print(&quot;\n== 4. 非劣性检验 vs 普通检验 ==&quot;)
+delta_ni = 0.02      # 允许最多差 2 个百分点
+for n, p_a, p_b in [(5000, 0.80, 0.795), (5000, 0.80, 0.780),
+                    (5000, 0.80, 0.760), (20000, 0.80, 0.782)]:
+    d, lo, ok = noninferiority(n, p_a, p_b, delta_ni)
+    se = math.sqrt(p_a * (1 - p_a) / n + p_b * (1 - p_b) / n)
+    zobs = abs(d) / se if se else 0.0
+    print(f&quot;n={n:6d} A={p_a:.3f} B={p_b:.3f} | 差异 {d:+.4f} &quot;
+          f&quot;单侧下界 {lo:+.4f} -&gt; 非劣性={str(ok):5s} | 普通检验显著: {zobs &gt; 1.96}&quot;)
+print(&quot;  &lt;- 第 1 行（差 -0.005）：普通检验不显著，但非劣性成立 —— 这才是&#39;没有实质变差&#39;&quot;)
+print(&quot;     第 2 行（差 -0.020）：普通检验显著且非劣性失败 —— 确实变差了&quot;)
+print(&quot;     护栏要的是&#39;最坏情况在界内&#39;，而不是&#39;没看到差异&#39;&quot;)
+
+# ============================================================
+# 4b. 护栏之间通常正相关 -&gt; 不校正时的真实族错误率其实没那么高
+# ------------------------------------------------------------
+# 用等相关模型模拟：m 个标准正态指标，两两相关系数 rho，各做 alpha=0.05 单侧检验
+# ------------------------------------------------------------
+def fwer_correlated(m, rho, n_sim=200000, alpha=0.05, seed=3):
+    zc = z_one_sided(alpha)
+    r = random.Random(seed)
+    sq = math.sqrt(max(0.0, 1 - rho))
+    hit = 0
+    for _ in range(n_sim):
+        g = r.gauss(0, 1)
+        if any(rho * g + sq * r.gauss(0, 1) &gt; zc for _ in range(m)):
+            hit += 1
+    return hit / n_sim
+
+
+print(&quot;\n== 4b. 相关性把&#39;不校正&#39;的真实族错误率拉低 ==&quot;)
+for m in (4, 12, 20):
+    row = &quot;  &quot;.join(f&quot;rho={rho}: {fwer_correlated(m, rho):.3f}&quot;
+                    for rho in (0.0, 0.3, 0.5, 0.8))
+    print(f&quot;m={m:2d} (独立时 {1 - 0.95 ** m:.3f}) | {row}&quot;)
+print(&quot;  &lt;- 硬约束族的指标高度相关（都是&#39;不安全&#39;的不同侧面），&quot;)
+print(&quot;     不校正的真实族错误率远低于 1-(1-a)^m；校正的收益比以为的更小&quot;)
+
+# 5. 复合告警：只有信息来源不同的指标才提供防护
+# ============================================================
+print(&quot;\n== 5. 复合告警：相关性如何吃掉防护力 ==&quot;)
+p_single = 0.05
+print(f&quot;单指标误报率 {p_single} -&gt; 若两指标独立，联合误报率 {p_single ** 2:.4f}&quot;)
+
+
+def joint_exceed(rho, zcrit=Z_ONE, n_sim=200000, seed=5):
+    # 模拟二元正态（相关系数 rho），统计两个边缘同时超过 zcrit 的比例
+    r = random.Random(seed)
+    hit = 0
+    for _ in range(n_sim):
+        x = r.gauss(0, 1)
+        y = rho * x + math.sqrt(1 - rho ** 2) * r.gauss(0, 1)
+        if x &gt; zcrit and y &gt; zcrit:
+            hit += 1
+    return hit / n_sim
+
+
+for rho in (0.0, 0.3, 0.6, 0.9):
+    print(f&quot;rho={rho:.1f} -&gt; 联合越界概率 = {joint_exceed(rho):.4f}&quot;)
+print(&quot;  &lt;- rho=0.9 时联合越界概率已接近单指标误报率，复合告警几乎不提供额外防护&quot;)
+
+# ============================================================
+# 6. 非劣性所需的样本量（单侧）
+# ============================================================
+def n_noninferiority(p, delta_ni, alpha=0.05, power=0.80):
+    z_a = z_one_sided(alpha)                  # ~1.645
+    z_b = 0.841621234                         # 功效 0.80
+    return 2 * p * (1 - p) * (z_a + z_b) ** 2 / delta_ni ** 2
+
+
+print(&quot;\n== 6. 非劣性检验的样本量（单侧） ==&quot;)
+for p, d in [(0.80, 0.02), (0.80, 0.01), (0.99, 0.005), (0.999, 0.001)]:
+    print(f&quot;基线 {p:.3f}, 非劣性边界 {d:.4f} -&gt; 每组 n≈{n_noninferiority(p, d):,.0f}&quot;)
+print(&quot;  &lt;- 边界收紧一倍，样本量涨四倍；基线越接近 1，能用的绝对边界越小&quot;)
+print(&quot;     安全类指标（基线 0.999）证明&#39;没超过千分之一&#39;就要每组 1 万以上&quot;)</code></pre>
+<p><strong>代码里六个值得注意的点</strong>：</p>
+<ul>
+<li><strong>第 1 段是护栏工程的第一号问题</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0813em;">H</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.0813em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 为真时，12 个护栏有 46% 的概率至少一个变红。所以&quot;今天有个护栏红了&quot;本身几乎不携带信息，必须配合<strong>族的划分</strong>与<strong>复现要求</strong>（隔天再看、换个分群再看）才有意义。</li>
+<li><strong>第 2 段把阈值从&quot;经验&quot;变成&quot;可算&quot;</strong>：取 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7778em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">μ</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2</span><span class="mord mathnormal" style="margin-right:0.0359em;">σ</span></span></span></span> 意味着约每 44 天误报一次（正态假设下）。团队能否接受这个频率是业务判断；一旦接受，阈值就定了，并且可以随历史波动更新。</li>
+<li><strong>第 3 段是本节最反直觉的结论</strong>：校正与否不是一个&quot;严谨程度&quot;的选择，而是两笔账的比较。<strong>误报账面只取决于护栏个数 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">m</span></span></span></span></strong>（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">m</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">12</span></span></span></span> 时 0.41，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">m</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">20</span></span></span></span> 时 0.90），<strong>检出账面取决于 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7306em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.1076em;">f</span><span class="mord mathnormal mtight">n</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0359em;">π</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">harm</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span></strong>。软约束族的损伤只值几次误报，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">m</span></span></span></span> 一大就该校正；硬约束族的漏检值几千次误报，<strong>任何 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">m</span></span></span></span> 下都不该校正</strong>。这也解释了为什么&quot;对所有指标统一 Bonferroni&quot;是一个看起来严谨、实际错误的规范。</li>
+<li><strong>第 4 段区分了两种结论</strong>：第 1 行（差 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">−</span><span class="mord">0.005</span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">5000</span></span></span></span>）里普通检验不显著，但<strong>非劣性成立</strong>——单侧下界 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">−</span><span class="mord">0.0182</span></span></span></span> 高于 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">−</span><span class="mord">0.02</span></span></span></span>，这才是&quot;没有实质变差&quot;的正确表述；第 2 行（差 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">−</span><span class="mord">0.020</span></span></span></span>）普通检验显著且非劣性失败，说明确实变差。<strong>&quot;没看到差异&quot;与&quot;证明差异可接受&quot;是两件不同的事。</strong></li>
+<li><strong>第 5 段量化了&quot;复合告警要选独立的指标&quot;</strong>：相关系数 0.9 时，联合越界概率（0.032）已经接近单指标误报率（0.05），复合几乎不提供额外防护。所以延迟 + 投诉率是好的组合，P95 + P99 是无效的组合。</li>
+<li><strong>第 6 段给出安全护栏的真实成本</strong>：基线 0.999、边界 0.001 时每组需要约 1.2 万样本才够（若把功效提到 0.95 还要翻倍）；证明&quot;违规率没超过千分之一&quot;所需的数据量经常超过实验本身的流量。<strong>正确应对是分层证据</strong>（线上抽样审计 + 离线红队 + 人工复核），而不是假装一个 A/B 能覆盖安全结论。</li>
+</ul>
+<h3 id="h-练习">练习<a class="anchor" href="#h-练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><p><strong>护栏分类</strong>：为一个&quot;把客服工单自动分类并生成回复草稿&quot;的功能，写出至少 10 个指标，并标注每个属于：硬约束族 / 软约束族 / 反向指标。对其中 3 个写出完整阈值行（指标名 / 方向 / 阈值 / 依据 / <code>min_dwell_days</code> / owner / 违反后的动作）。</p>
+</li>
+<li><p><strong>非劣性检验</strong>：主指标是&quot;一次解决率&quot;，基线 0.62，你声明非劣性边界 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0379em;">δ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:-0.0379em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">NI</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.02</span></span></span></span>（允许最多差 2 个百分点）。
+（a）用单侧公式算出每组所需样本量（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.05</span></span></span></span>、功效 0.80）；
+（b）实验结束，处理组 0.615、对照组 0.62（每组 8000），算单侧下界并给出结论；
+（c）如果有人把 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0379em;">δ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:-0.0379em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">NI</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 改成 0.01，样本量变成多少？请解释为什么&quot;把边界定宽一点&quot;是一种需要留档的决策。</p>
+</li>
+<li><p><strong>硬约束族的反直觉</strong>：某团队规定&quot;所有护栏一律用 Bonferroni 校正（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">0.05/</span><span class="mord mathnormal">m</span></span></span></span>）&quot;。
+（a）用本节的期望代价模型说明这在安全护栏上为什么是错的（写出 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7167em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.1076em;">f</span><span class="mord mathnormal mtight">p</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span></span> 与 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7167em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.1076em;">f</span><span class="mord mathnormal mtight">n</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span></span> 的量级假设）；
+（b）给出一个替代方案（哪些护栏校正、哪些不校正、各自的阈值怎么来）；
+（c）说明这个方案在&quot;误报太多导致团队无视告警&quot;这一风险上如何缓解。</p>
+</li>
+<li><p><strong>复合告警</strong>：你有四个延迟类指标（P50/P95/P99/TTFT）和两个体验指标（放弃率、重复提问率）。
+（a）用本节的相关性分析说明哪两个指标不能组成复合告警；
+（b）设计两组复合告警，并说明每组内部的&quot;信息来源不同&quot;体现在哪里；
+（c）如果两个指标都越界但方向不同（一个变好一个变差），你会怎么处理？</p>
+</li>
+<li><p><strong>护栏被业务要求放宽</strong>（开放题）：上线前 6 小时，产品负责人要求把&quot;错误自动回复率&quot;的护栏阈值从 0.5% 放宽到 1.5%，理由是&quot;首周流量小、样本噪声大&quot;。
+（a）这个理由在统计上是否成立？请从&quot;阈值 vs 检验&quot;的角度回答；
+（b）你会提出什么替代方案（提示：灰阶节奏、观察期、min_dwell_days）；
+（c）写出这次豁免的留档内容（至少 5 项）。</p>
+</li>
+<li><p><strong>阈值反推</strong>：某护栏指标历史上均值 12、标准差 3。业务要求&quot;每月误报不超过 2 次&quot;（按 30 天算，每天一次检验）。
+（a）用 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">Φ</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mclose">)</span></span></span></span> 反推需要取几个 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">σ</span></span></span></span>；
+（b）如果该指标的历史标准差本身在缓慢上升（漂移），固定阈值会出什么问题？你会怎么改；
+（c）说明&quot;用滚动窗口重估 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">μ</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">σ</span></span></span></span>&quot;会引入什么新风险（提示：告警被历史稀释）。</p>
+</li>
+</ol>
+<h3 id="h-小结">小结<a class="anchor" href="#h-小结" aria-label="本节链接">#</a></h3>
+<ul>
+<li><strong>三类指标判定逻辑不同</strong>：护栏是<strong>布尔硬阈值</strong>（安全/合规，不校正）、负向指标是<strong>方向 + 区间</strong>（性能/成本，需校正）、反向指标是<strong>诊断读数</strong>（解释主指标变化，不设门禁）。混用会导致&quot;用检验管安全&quot;或&quot;用硬阈值管体验&quot;这两类事故。</li>
+<li><strong>四类护栏的可观测性不同</strong>：安全类靠抽样审计 + 离线红队（分类器有漏报，先测漏报率）；体验类要配对指标且分沉淀时间；性能类必须看分位数、注意成本-延迟耦合；公平性类受子群样本量限制，<strong>必须显式写出检测能力下限</strong>。</li>
+<li><strong>阈值有来源</strong>：历史分布（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">μ</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">σ</span></span></span></span> 或分位数）+ 业务可承受损失。软约束族用非劣性检验（单侧 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.044em;">z</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1.645</span></span></span></span> + 事先声明的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0379em;">δ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:-0.0379em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">NI</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>），并配绝对下限防止低基线抖动。<strong>阈值变更要留档。</strong></li>
+<li><strong>多重护栏的代价要分两笔账</strong>：误报账面只取决于护栏个数 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">m</span></span></span></span>（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">m</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">12</span></span></span></span>、独立时族错误率 46%；<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">m</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">20</span></span></span></span> 时 64%），检出账面取决于 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7306em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.1076em;">f</span><span class="mord mathnormal mtight">n</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0359em;">π</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">harm</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>。软约束族损伤便宜、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">m</span></span></span></span> 一大就该校正；<strong>硬约束族即使信号很强也不该校正</strong>，因为漏检一次的价值差了两个数量级。另外<strong>护栏之间正相关会压低真实族错误率</strong>（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">m</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">12</span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">ρ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.5</span></span></span></span> 时 0.46 → 0.22），既让硬约束族的&quot;不校正&quot;更站得住，也提醒你别把重复信息（P95 与 P99）放进同一个校正族。</li>
+<li><strong>护栏只有连着动作才有意义</strong>：硬停 / 软停 / 仅记录三种规则，配合<strong>灰阶发布节奏与指标沉淀时间对齐</strong>（<code>min_dwell_days</code>），以及&quot;谁有权豁免&quot;的书面约定。不留档的豁免会在一个季度内摧毁整个体系。</li>
+<li><strong>好护栏必须与主指标有独立信息来源</strong>，否则是主指标的换皮。复合告警只在指标相关性低时提供额外防护（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">ρ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.9</span></span></span></span> 时几乎为零）。</li>
+</ul>

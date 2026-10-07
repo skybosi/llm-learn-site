@@ -1,0 +1,936 @@
+<h2 id="h-重排的训练数据从哪来标注弱监督蒸馏与难负样本">重排的训练数据从哪来：标注、弱监督、蒸馏与难负样本<a class="anchor" href="#h-重排的训练数据从哪来标注弱监督蒸馏与难负样本" aria-label="本节链接">#</a></h2>
+<h3 id="h-这一节要解决什么">这一节要解决什么<a class="anchor" href="#h-这一节要解决什么" aria-label="本节链接">#</a></h3>
+<p>前三节把重排器当成了一个<strong>给定的函数</strong>：它读入 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0359em;">q</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">d</span><span class="mclose">)</span></span></span></span>，输出一个分数，我们讨论它的表达能力（第 1 节）、它的质量-延迟前沿（第 2 节）、以及它和融合怎么配合（第 3 节）。但那个函数不是天上掉下来的 —— <strong>它是用某一份数据训练出来的，而那份数据的构造方式，直接决定了它的上限和它的系统性偏差。</strong></p>
+<p>这一节要回答一个常被跳过的问题：</p>
+<blockquote>
+<p><strong>你的重排器的训练标签是怎么来的？这份标签把什么偏差一起教给了模型？</strong></p>
+</blockquote>
+<p>真实项目里标签只有三种来源，每种都有代价，也都有<strong>可测的偏差</strong>：</p>
+<pre><code>① 人工标注   贵、准、慢        → 偏差：标注指南不一致、标注者的&quot;相关&quot;定义漂移、长文档被草读
+② 弱监督     便宜、量大、脏    → 偏差：位置偏置（点击）、把未标注当负例（假负样本）
+③ 蒸馏       便宜、可规模化    → 偏差：把教师的错误与校准一起学走；软标签才保住教师的&quot;暗知识&quot;
+        +
+   负样本挖掘 决定模型把边界画在哪  → 偏差：挖得越狠，假负样本的伤害越大
+        +
+   数据集划分 决定离线指标可信吗    → 偏差：同一文档/同一查询跨 split → 离线虚高、线上崩</code></pre>
+<p>一句话结论先放在这里：</p>
+<blockquote>
+<p><strong>重排器的离线分数不是&quot;模型能力&quot;的度量，而是&quot;模型 × 数据构造&quot;的联合度量。</strong> 在 §4.3 的表四里，同一个模型族在同一个测试集上，只因为<strong>多了一个泄漏特征</strong>，聚合 nDCG 从 0.224 抬到 0.530 —— 而真实泛化（干净子集）从 0.391 掉到 0.078。<strong>指标变好和系统变好，在这里是两件方向相反的事。</strong></p>
+</blockquote>
+<p>本节要回答四个问题：</p>
+<ol>
+<li><strong>三种标签来源的边际收益在哪里饱和？</strong> &quot;再多标 500 条&quot;什么时候不再值得？</li>
+<li><strong>弱监督的位置偏置是怎么被学进去的？逆倾向加权（IPS）在修什么，代价是什么？</strong></li>
+<li><strong>蒸馏的三种监督信号各传递了多少信息？软标签为什么比硬标签值钱 —— 而且要诚实地说清&quot;在什么条件下并不值钱&quot;。</strong></li>
+<li><strong>难负样本挖得越狠越好吗？拐点由哪个可测的量决定？哪三种泄漏最容易把离线指标变成谎言？</strong></li>
+</ol>
+<h3 id="h-一三种标签来源成本质量与它们各自的病">一、三种标签来源：成本、质量与它们各自的病<a class="anchor" href="#h-一三种标签来源成本质量与它们各自的病" aria-label="本节链接">#</a></h3>
+<h4 id="h-11-三种来源的对照">1.1 三种来源的对照<a class="anchor" href="#h-11-三种来源的对照" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>来源</th>
+<th>每条成本量级</th>
+<th>规模能力</th>
+<th>主要偏差</th>
+<th>适用阶段</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>人工标注（grade 0–3）</td>
+<td>高（分钟级/条）</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∼</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">4</span></span></span></span></span></span></span></span></span></span></span></td>
+<td>指南不一致、标注者漂移</td>
+<td>校准集、门禁集、<strong>不可替代的黄金集</strong></td>
+</tr>
+<tr>
+<td>点击 / 行为日志</td>
+<td>极低（本来就产生）</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">6</span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∼</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">9</span></span></span></span></span></span></span></span></span></span></span></td>
+<td><strong>位置偏置</strong>、只覆盖被展示过的候选</td>
+<td>冷启动、大规模预训练</td>
+</tr>
+<tr>
+<td>教师模型蒸馏</td>
+<td>低（一次前向/对）</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">5</span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∼</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">8</span></span></span></span></span></span></span></span></span></span></span></td>
+<td>教师的错误、校准误差、领域盲区</td>
+<td>有强模型可用时的主力</td>
+</tr>
+<tr>
+<td>难负样本挖掘</td>
+<td>低</td>
+<td>同上</td>
+<td><strong>假负样本</strong>、分布偏移</td>
+<td>与上面任一配合</td>
+</tr>
+</tbody></table>
+<p><strong>这里有一个必须说清的分工</strong>：三种来源不是替代关系，而是<strong>分工关系</strong>。它们各自解决的病不同：</p>
+<ul>
+<li>人工标注解决<strong>校准</strong>（&quot;什么叫相关&quot;的定义权）—— 所以它必须留一小份，作为<strong>永远不参与训练</strong>的门禁集；</li>
+<li>弱监督解决<strong>规模</strong>（覆盖长尾查询与长尾文档）；</li>
+<li>蒸馏解决<strong>成本</strong>（把参数量大 10 倍的教师压进可上线的小模型，这正是第 2 节&quot;质量-延迟前沿&quot;里把强档能力压进弱档的那一步）。</li>
+</ul>
+<p><strong>常见的错误是做成了替代关系</strong>：用点击日志训完，就再也不维护人工黄金集。结果是模型的相关性定义完全由&quot;用户点了什么&quot;决定 —— 而用户只点被展示的东西。</p>
+<h4 id="h-12-标注预算的边际收益为什么它很快饱和">1.2 标注预算的边际收益：为什么它很快饱和<a class="anchor" href="#h-12-标注预算的边际收益为什么它很快饱和" aria-label="本节链接">#</a></h4>
+<p>设标注量为 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span>，指标（例如 nDCG@10）的经验曲线几乎总是幂律饱和的形式：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathrm">nDCG</span></span><span class="mopen">(</span><span class="mord mathnormal">n</span><span class="mclose">)</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord"><span class="mord mathrm">nDCG</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">∞</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.0158em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">c</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8213em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mathnormal mtight" style="margin-right:0.0037em;">α</span></span></span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">[</span><span class="mord">0.1</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">0.4</span><span class="mclose">]</span></span></span></span></span></p>
+<p>对它求导，得到<strong>第 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span> 条标注的边际收益</strong>：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:2.0574em;vertical-align:-0.686em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3714em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord" style="margin-right:0.0556em;">∂</span><span class="mord mathnormal">n</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord" style="margin-right:0.0556em;">∂</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathrm">nDCG</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8641em;"></span><span class="mord mathnormal">c</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8641em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mathnormal mtight" style="margin-right:0.0037em;">α</span><span class="mbin mtight">−</span><span class="mord mtight">1</span></span></span></span></span></span></span></span></span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∝</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.938em;"></span><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.938em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mopen mtight">(</span><span class="mord mtight">1</span><span class="mbin mtight">+</span><span class="mord mathnormal mtight" style="margin-right:0.0037em;">α</span><span class="mclose mtight">)</span></span></span></span></span></span></span></span></span></span></span></span></span></p>
+<p>这个式子的工程含义很硬：<strong>边际收益按 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.888em;"></span><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.888em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mopen mtight">(</span><span class="mord mtight">1</span><span class="mbin mtight">+</span><span class="mord mathnormal mtight" style="margin-right:0.0037em;">α</span><span class="mclose mtight">)</span></span></span></span></span></span></span></span></span></span></span></span> 衰减，也就是比 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1/</span><span class="mord mathnormal">n</span></span></span></span> 还快。</strong> 把标注量翻倍，收益只增加 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7713em;"></span><span class="mord"><span class="mord">2</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.7713em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mathnormal mtight" style="margin-right:0.0037em;">α</span></span></span></span></span></span></span></span></span></span></span></span> 倍（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.2</span></span></span></span> 时是 13%）。</p>
+<p>把两边换成钱，就得到一条可执行的判据。令：</p>
+<ul>
+<li><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">lab</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>：单条标注成本；</li>
+<li><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.2222em;">V</span></span></span></span>：指标每提升 1 个点对应的业务价值（可从第 5 章第 4 节的成本-质量前沿里读出）。</li>
+</ul>
+<p>则<strong>继续标注值得做</strong>的条件是：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8641em;"></span><span class="mord mathnormal">c</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8641em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mathnormal mtight" style="margin-right:0.0037em;">α</span><span class="mbin mtight">−</span><span class="mord mtight">1</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:2.0463em;vertical-align:-0.686em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3603em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">1</span><span class="mspace"> </span><span class="mord text"><span class="mord cjk_fallback">点</span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.2222em;">V</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&gt;</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">lab</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span></span></p>
+<p><strong>为什么这个判据比&quot;感觉还需要标注&quot;有用</strong>：它把&quot;标注够不够&quot;变成了三个可测的量（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">c</span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.2222em;">V</span></span></span></span>）。在实践中 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span> 通常由前 200~500 条标注就把 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span> 估出来 —— 因为模型的收益主要来自<strong>覆盖新查询类型</strong>，而不是来自&quot;把同一类查询再多标 100 条&quot;。<strong>当新增标注已经不再引入新的查询类型时，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span> 就已经接近它的下限，此时正确的动作是转向蒸馏或难负样本，而不是继续买标注。</strong></p>
+<p><strong>边界</strong>：幂律饱和的前提是&quot;标注的<strong>分布</strong>不变&quot;。如果新增的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span> 覆盖了此前完全缺失的查询类型（长尾、多语言、表格类），曲线会<strong>重新变陡</strong>。所以判据要按<strong>查询类型分层</strong>算，而不是在总体上算一条曲线 —— 总体的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span> 会把新类型的增益平均掉。</p>
+<h3 id="h-二弱监督位置偏置如何被学进去ips-在修什么">二、弱监督：位置偏置如何被学进去，IPS 在修什么<a class="anchor" href="#h-二弱监督位置偏置如何被学进去ips-在修什么" aria-label="本节链接">#</a></h3>
+<h4 id="h-21-位置偏置的生成模型">2.1 位置偏置的生成模型<a class="anchor" href="#h-21-位置偏置的生成模型" aria-label="本节链接">#</a></h4>
+<p>点击日志最经典的生成模型是<strong>检验模型</strong>（Examination Model，也叫 Position-Based Model）：用户先&quot;看到&quot;某个位置，看到之后才决定点不点。</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="mopen">(</span><span class="mord mathnormal">c</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∣</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">q</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">d</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">pos</span></span><span class="mclose">)</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.3263em;vertical-align:-1.5763em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.75em;"><span style="top:-1.4237em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">相关性</span></span></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.75em;"><span class="svg-align" style="top:-2.102em;"><span class="pstrut" style="height:3em;"></span><span class="stretchy" style="height:0.548em;min-width:1.6em;"><span class="brace-left" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMinYMin slice"><path d="M0 6l6-6h17c12.688 0 19.313.3 20 1 4 4 7.313 8.3 10 13
+ 35.313 51.3 80.813 93.8 136.5 127.5 55.688 33.7 117.188 55.8 184.5 66.5.688
+ 0 2 .3 4 1 18.688 2.7 76 4.3 172 5h399450v120H429l-6-1c-124.688-8-235-61.7
+-331-161C60.687 138.7 32.312 99.3 7 54L0 41V6z"/></svg></span><span class="brace-center" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMidYMin slice"><path d="M199572 214
+c100.7 8.3 195.3 44 280 108 55.3 42 101.7 93 139 153l9 14c2.7-4 5.7-8.7 9-14
+ 53.3-86.7 123.7-153 211-199 66.7-36 137.3-56.3 212-62h199568v120H200432c-178.3
+ 11.7-311.7 78.3-403 201-6 8-9.7 12-11 12-.7.7-6.7 1-18 1s-17.3-.3-18-1c-1.3 0
+-5-4-11-12-44.7-59.3-101.3-106.3-170-141s-145.3-54.3-229-60H0V214z"/></svg></span><span class="brace-right" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMaxYMin slice"><path d="M399994 0l6 6v35l-6 11c-56 104-135.3 181.3-238 232-57.3
+ 28.7-117 45-179 50H-300V214h399897c43.3-7 81-15 113-26 100.7-33 179.7-91 237
+-174 2.7-5 6-9 10-13 .7-1 7.3-1 20-1h17z"/></svg></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathrm">rel</span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0359em;">q</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">d</span><span class="mclose">)</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.898em;"><span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.5763em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:2.3263em;vertical-align:-1.5763em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.75em;"><span style="top:-1.4237em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">被检验概率</span></span></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.75em;"><span class="svg-align" style="top:-2.102em;"><span class="pstrut" style="height:3em;"></span><span class="stretchy" style="height:0.548em;min-width:1.6em;"><span class="brace-left" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMinYMin slice"><path d="M0 6l6-6h17c12.688 0 19.313.3 20 1 4 4 7.313 8.3 10 13
+ 35.313 51.3 80.813 93.8 136.5 127.5 55.688 33.7 117.188 55.8 184.5 66.5.688
+ 0 2 .3 4 1 18.688 2.7 76 4.3 172 5h399450v120H429l-6-1c-124.688-8-235-61.7
+-331-161C60.687 138.7 32.312 99.3 7 54L0 41V6z"/></svg></span><span class="brace-center" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMidYMin slice"><path d="M199572 214
+c100.7 8.3 195.3 44 280 108 55.3 42 101.7 93 139 153l9 14c2.7-4 5.7-8.7 9-14
+ 53.3-86.7 123.7-153 211-199 66.7-36 137.3-56.3 212-62h199568v120H200432c-178.3
+ 11.7-311.7 78.3-403 201-6 8-9.7 12-11 12-.7.7-6.7 1-18 1s-17.3-.3-18-1c-1.3 0
+-5-4-11-12-44.7-59.3-101.3-106.3-170-141s-145.3-54.3-229-60H0V214z"/></svg></span><span class="brace-right" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMaxYMin slice"><path d="M399994 0l6 6v35l-6 11c-56 104-135.3 181.3-238 232-57.3
+ 28.7-117 45-179 50H-300V214h399897c43.3-7 81-15 113-26 100.7-33 179.7-91 237
+-174 2.7-5 6-9 10-13 .7-1 7.3-1 20-1h17z"/></svg></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">e</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord text"><span class="mord">pos</span></span><span class="mclose">)</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.898em;"><span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.5763em;"><span></span></span></span></span></span></span></span></span></span></p>
+<p>其中 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">e</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 随位置单调下降（第 1 位最高）。<strong>这个等式是整个弱监督问题的源头</strong>：它说明&quot;点击&quot;不是&quot;相关&quot;的无偏观测，而是<strong>相关性与曝光机会的乘积</strong>。</p>
+<p>一个常用的参数化是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">e</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord text"><span class="mord">pos</span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord text"><span class="mord">pos</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.0213em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose"><span class="mclose">)</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.7713em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mathnormal mtight" style="margin-right:0.0359em;">η</span></span></span></span></span></span></span></span></span></span></span></span>，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6776em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">η</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> 时首位与第 20 位的曝光率相差 20 倍。</p>
+<h4 id="h-22-朴素训练在优化什么一个偏差项">2.2 朴素训练在优化什么：一个偏差项<a class="anchor" href="#h-22-朴素训练在优化什么一个偏差项" aria-label="本节链接">#</a></h4>
+<p>朴素做法是把点击当标签，最小化</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.1968em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.9468em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal" style="margin-right:0.0077em;">R</span></span><span style="top:-3.2523em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.1667em;"><span class="mord">^</span></span></span></span></span></span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3175em;"><span style="top:-2.55em;margin-left:-0.0077em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">naive</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0278em;">θ</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.5991em;vertical-align:-1.2777em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3214em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">m</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.05em;"><span style="top:-1.8723em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∑</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.2777em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">ℓ</span><span class="mord"><span class="delimsizing size1">(</span></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.1076em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">θ</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0359em;">q</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">d</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord"><span class="delimsizing size1">)</span></span></span></span></span></span></p>
+<p>对它取期望，代入检验模型：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.2968em;vertical-align:-0.35em;"></span><span class="mord mathbb">E</span><span class="mord"><span class="delimsizing size1">[</span></span><span class="mord"><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.9468em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal" style="margin-right:0.0077em;">R</span></span><span style="top:-3.2523em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.1667em;"><span class="mord">^</span></span></span></span></span></span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3175em;"><span style="top:-2.55em;margin-left:-0.0077em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">naive</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord"><span class="delimsizing size1">]</span></span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.5991em;vertical-align:-1.2777em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3214em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">m</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.05em;"><span style="top:-1.8723em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∑</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.2777em;"><span></span></span></span></span></span><span class="mspace"> </span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathbb">E</span><span class="mord"><span class="delimsizing size1">[</span></span><span class="mord">ℓ</span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.1076em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">θ</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mord"><span class="delimsizing size1">]</span></span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel"><span class="mrel"><span class="mord vbox"><span class="thinbox"><span class="rlap"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="inner"><span class="mord"><span class="mrel"></span></span></span><span class="fix"></span></span></span></span></span><span class="mspace nobreak"></span><span class="mrel">=</span></span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.5991em;vertical-align:-1.2777em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3214em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">m</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.05em;"><span style="top:-1.8723em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∑</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.2777em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">ℓ</span><span class="mord"><span class="delimsizing size1">(</span></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.1076em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">θ</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord"><span class="mord mathrm">rel</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord"><span class="delimsizing size1">)</span></span></span></span></span></span></p>
+<p>偏差来自两处，都必须分开看：</p>
+<ol>
+<li><strong>缩放偏差</strong>：所有正例都被乘上了 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">e</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord text"><span class="mord">pos</span></span><span class="mclose">)</span></span></span></span>，深位置的点击被系统性低估 → 模型对&quot;排在后面但相关&quot;的文档学不足。</li>
+<li><strong>混淆偏差（真正致命的那一处）</strong>：日志策略决定谁排在哪。如果日志策略用的是某个<strong>与相关性相关、但不等于相关性</strong>的量（文档长度、历史热度、上一版模型的分数），那么&quot;位置&quot;就成了那个量的代理。模型会把&quot;这个特征导致被点击&quot;学进去 —— <strong>而它学到的是&quot;被展示&quot;，不是&quot;相关&quot;。</strong></li>
+</ol>
+<p>第二处偏差在表一里是可读的：对比 <code>oracle</code> 与 <code>朴素点击训练</code> 的 <code>w_qual</code> 一列，<strong>0.038 → 0.747</strong>。<code>quality</code> 是日志策略用的有噪代理，条件在 (sim, lex) 下<strong>不含任何额外信息</strong>；理想模型应给它接近 0 的权重，而朴素训练给了它 0.747 —— 接近 <code>w_sim</code> 与 <code>w_lex</code> 的量级。结果 nDCG@10 从 0.995 掉到 0.809。</p>
+<h4 id="h-23-逆倾向加权的推导只有两行但必须写对">2.3 逆倾向加权的推导（只有两行，但必须写对）<a class="anchor" href="#h-23-逆倾向加权的推导只有两行但必须写对" aria-label="本节链接">#</a></h4>
+<p>给每条观测乘上权重 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0269em;">w</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:-0.0269em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1/</span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">e</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord"><span class="mord text"><span class="mord">pos</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2175em;"><span style="top:-2.4559em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2441em;"><span></span></span></span></span></span></span><span class="mclose">)</span></span></span></span>，再取期望：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:2.4em;vertical-align:-0.95em;"></span><span class="mord mathbb">E</span><span class="mspace" style="margin-right:-0.1667em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="minner"><span class="mopen delimcenter" style="top:0em;"><span class="delimsizing size3">[</span></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.1076em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">e</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord"><span class="mord text"><span class="mord">pos</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2175em;"><span style="top:-2.4559em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2441em;"><span></span></span></span></span></span></span><span class="mclose">)</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.936em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace"> </span><span class="mord"><span class="delimsizing mult"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.15em;"><span style="top:-3.15em;"><span class="pstrut" style="height:3.8em;"></span><span style="width:0.333em;height:1.8em;"><svg xmlns="http://www.w3.org/2000/svg" width="0.333em" height="1.8em" viewBox="0 0 333 1800"><path d="M145 15 v585 v600 v585 c2.667,10,9.667,15,21,15
+c10,0,16.667,-5,20,-15 v-585 v-600 v-585 c-2.667,-10,-9.667,-15,-21,-15
+c-10,0,-16.667,5,-20,15z M188 15 H145 v585 v600 v585 h43z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.65em;"><span></span></span></span></span></span></span><span class="mspace"> </span><span class="mord mathnormal" style="margin-right:0.0359em;">q</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">d</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">pos</span></span><span class="mclose delimcenter" style="top:0em;"><span class="delimsizing size3">]</span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.363em;vertical-align:-0.936em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.427em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">e</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord text"><span class="mord">pos</span></span><span class="mclose">)</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathrm">rel</span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0359em;">q</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">d</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">e</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord text"><span class="mord">pos</span></span><span class="mclose">)</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.936em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathrm">rel</span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0359em;">q</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">d</span><span class="mclose">)</span></span></span></span></span></p>
+<p>因此加权目标</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.1968em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.9468em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal" style="margin-right:0.0077em;">R</span></span><span style="top:-3.2523em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.1667em;"><span class="mord">^</span></span></span></span></span></span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:-0.0077em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">IPS</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0278em;">θ</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.5991em;vertical-align:-1.2777em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3214em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">m</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.05em;"><span style="top:-1.8723em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∑</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.2777em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.1076em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">e</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord"><span class="mord text"><span class="mord">pos</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2175em;"><span style="top:-2.4559em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2441em;"><span></span></span></span></span></span></span><span class="mclose">)</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.936em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">ℓ</span><span class="mord"><span class="delimsizing size1">(</span></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.1076em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">θ</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0359em;">q</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">d</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord"><span class="delimsizing size1">)</span></span></span></span></span></span></p>
+<p>在期望意义下等于我们真正想要的理想风险 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6887em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0077em;">R</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6887em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mbin mtight">⋆</span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.1901em;vertical-align:-0.345em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8451em;"><span style="top:-2.655em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">m</span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.394em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.345em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop"><span class="mop op-symbol small-op" style="position:relative;top:0em;">∑</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.162em;"><span style="top:-2.4003em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2997em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">ℓ</span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.1076em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">θ</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord"><span class="mord mathrm">rel</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span></span></span></span>。<strong>这就是 IPS 的全部内容</strong>：它不改变损失函数，只改变每条样本的权重，把&quot;曝光机会&quot;这一项除回去。</p>
+<p><strong>三个必须一起说清的边界</strong>：</p>
+<ol>
+<li><strong><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">e</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 必须已知或估计得准。</strong> 实践中 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">e</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 要么来自随机化实验（随机打散一部分流量，直接测各位置的点击率），要么来自一个倾向模型。<strong>倾向模型本身的误差会直接变成偏差</strong>，而它无法用更多数据消除 —— 这是 IPS 最容易被忽略的风险。</li>
+<li><strong>方差爆炸。</strong> 当 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">e</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord text"><span class="mord">pos</span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">→</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0</span></span></span></span>（深位置），<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1/</span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">e</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 会非常巨大，少数几条观测主导整个梯度。<strong>IPS 是无偏的，但不是低方差的。</strong></li>
+<li><strong>未检验样本不是负例。</strong> 没被看到 ≠ 不相关。把未检验样本当负例是另一个独立偏差，IPS 修不了它；正确做法是把它们从损失里剔除（权重 0）或用<strong>交换实验</strong>构造反事实。</li>
+</ol>
+<h4 id="h-24-截断一个有偏但可用的折中">2.4 截断：一个有偏但可用的折中<a class="anchor" href="#h-24-截断一个有偏但可用的折中" aria-label="本节链接">#</a></h4>
+<p>定义截断权重 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0269em;">w</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:-0.0269em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.2em;vertical-align:-0.35em;"></span><span class="mop">min</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="delimsizing size1">(</span></span><span class="mord">1/</span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">e</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord"><span class="mord text"><span class="mord">pos</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2175em;"><span style="top:-2.4559em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2441em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="mord"><span class="delimsizing size1">)</span></span></span></span></span>，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">C</span></span></span></span> 是上限（例如 5 或 10）。截断引入偏差（深位置的正例被相对低估），但换来方差下降。表一实测：</p>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>w_qual</th>
+<th>nDCG@10</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>朴素点击训练</td>
+<td>0.747</td>
+<td>0.809</td>
+</tr>
+<tr>
+<td>IPS（不截断）</td>
+<td>0.546</td>
+<td>0.838</td>
+</tr>
+<tr>
+<td>IPS（截断 5）</td>
+<td>0.583</td>
+<td>0.833</td>
+</tr>
+<tr>
+<td>IPS（截断 10）</td>
+<td>0.545</td>
+<td>0.840</td>
+</tr>
+</tbody></table>
+<p><strong>读数</strong>：IPS 把 <code>w_qual</code> 从 0.747 压到 0.545（方向正确），nDCG 从 0.809 抬到 0.838~0.840。但<strong>即使截断到 10，<code>w_qual</code> 仍显著大于 oracle 的 0.038</strong> —— 这是&quot;无偏低方差不可兼得&quot;的直接体现：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1/</span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">e</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 这个估计量本身的方差让有限样本的拟合仍然偏离。<strong>所以工程上不能把 IPS 当成修复位置偏置的银弹，它只是把偏差压到一个可接受量级；最后的校准仍然要靠人工黄金集。</strong></p>
+<h4 id="h-25-弱监督的可测判据">2.5 弱监督的可测判据<a class="anchor" href="#h-25-弱监督的可测判据" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>要测的量</th>
+<th>怎么测</th>
+<th>判读</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>倾向 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">e</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 的可信度</td>
+<td>随机化实验组的各位置 CTR 曲线 vs 倾向模型预测</td>
+<td>两条曲线偏离 &gt;20% → 倾向模型不可用</td>
+</tr>
+<tr>
+<td>是否发生混淆偏差</td>
+<td>对<strong>日志策略用过的特征</strong>单独看权重</td>
+<td>权重显著大于 0 → 模型在学&quot;被展示&quot;</td>
+</tr>
+<tr>
+<td>IPS 是否方差过大</td>
+<td>权重的 P99 / 中位数</td>
+<td>比值 &gt; 20 → 必须截断或改用交换实验</td>
+</tr>
+<tr>
+<td>与人工黄金集的一致性</td>
+<td>在黄金集上算 nDCG，和点击集上对比</td>
+<td>点击集高、黄金集低 → 典型的混淆偏差</td>
+</tr>
+</tbody></table>
+<h3 id="h-三蒸馏三种监督信号以及软标签值钱的确切条件">三、蒸馏：三种监督信号，以及软标签值钱的<strong>确切条件</strong><a class="anchor" href="#h-三蒸馏三种监督信号以及软标签值钱的确切条件" aria-label="本节链接">#</a></h3>
+<h4 id="h-31-三种监督信号">3.1 三种监督信号<a class="anchor" href="#h-31-三种监督信号" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>信号</th>
+<th>每条样本携带</th>
+<th>对齐的优化目标</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>硬标签</strong>（0/1 或按阈值二值化）</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7719em;vertical-align:-0.136em;"></span><span class="mrel">≤</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> bit</td>
+<td>pointwise 分类</td>
+<td>最低</td>
+</tr>
+<tr>
+<td><strong>软标签</strong>（教师的概率/分数）</td>
+<td>教师的完整后验（含置信度）</td>
+<td>pointwise 回归</td>
+<td>低</td>
+</tr>
+<tr>
+<td><strong>listwise</strong>（查询内归一化后的分布）</td>
+<td>同一查询内<strong>所有候选的相对关系</strong></td>
+<td>直接对齐排序指标</td>
+<td>需同一查询的完整候选列表</td>
+</tr>
+</tbody></table>
+<h4 id="h-32-软标签值钱的确切条件这里必须诚实">3.2 软标签值钱的确切条件（这里必须诚实）<a class="anchor" href="#h-32-软标签值钱的确切条件这里必须诚实" aria-label="本节链接">#</a></h4>
+<p>教科书里&quot;软标签比硬标签好&quot;的标准论证是<strong>暗知识</strong>：教师的输出分布含有类别间的相似性结构，硬标签（one-hot）把它抹掉了。这个论证在<strong>分类</strong>任务上成立。但在我们这里的排序场景，必须把话说准，否则会得出错误的工程结论：</p>
+<blockquote>
+<p><strong>在无限样本 + 正确模型类的极限下，硬标签与软标签会收敛到同一个预测器</strong> —— 因为 logistic 回归对硬标签的极小化点也是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathbb">E</span><span class="mopen">[</span><span class="mord mathnormal" style="margin-right:0.0359em;">y</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∣</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">x</span><span class="mclose">]</span></span></span></span>，而软标签的目标本身就是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathbb">E</span><span class="mopen">[</span><span class="mord text"><span class="mord cjk_fallback">教师输出</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∣</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">x</span><span class="mclose">]</span></span></span></span>。<strong>两者的差别不在极限，在有限样本与目标错配上。</strong></p>
+</blockquote>
+<p>具体到两个机制，都可以测：</p>
+<ol>
+<li><strong>有限样本下的标签噪声。</strong> 硬标签是&quot;对教师的连续判断做了一次伯努利采样&quot;。当教师带着<strong>学生看不见的信息</strong> <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.044em;">z</span></span></span></span> 时，条件在学生的特征上，这个 1 bit 的采样在决策边界附近<strong>方差很大</strong>；软标签给出的是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathbb">E</span><span class="mopen">[</span><span class="mord text"><span class="mord cjk_fallback">教师输出</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∣</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord cjk_fallback">学生特征</span></span><span class="mclose">]</span></span></span></span>，方差小得多。样本越少、教师独有信息越多，这个差距越大。</li>
+<li><strong>目标错配。</strong> 点式硬标签对齐的是&quot;分类边界&quot;，而指标（nDCG）关心的是<strong>查询内的相对次序</strong>。listwise 蒸馏直接对齐后者，因此在中大样本下通常最好。</li>
+</ol>
+<p>表三把第 1 个机制做成了可扫描的量：学生只有 <code>sim/lex</code> 两个特征，教师额外看见一个隐特征 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.044em;">z</span></span></span></span>（强度 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0528em;">β</span></span></span></span>）。<strong>只用 16 个查询训练</strong>（样本饥饿，正是机制 1 会显形的区间）：</p>
+<table>
+<thead>
+<tr>
+<th>教师独有信息 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0528em;">β</span></span></span></span></th>
+<th>硬标签</th>
+<th>软标签</th>
+<th>listwise</th>
+<th>软 − 硬</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>0.0</td>
+<td>1.000</td>
+<td>1.000</td>
+<td>1.000</td>
+<td>0.000</td>
+</tr>
+<tr>
+<td>0.4</td>
+<td>1.000</td>
+<td>1.000</td>
+<td>1.000</td>
+<td>0.000</td>
+</tr>
+<tr>
+<td>0.8</td>
+<td>0.998</td>
+<td>0.999</td>
+<td>0.999</td>
+<td>0.001</td>
+</tr>
+<tr>
+<td>1.6</td>
+<td>0.982</td>
+<td>0.997</td>
+<td>0.998</td>
+<td>0.015</td>
+</tr>
+<tr>
+<td>3.2</td>
+<td>0.949</td>
+<td>0.991</td>
+<td>0.989</td>
+<td><strong>0.042</strong></td>
+</tr>
+</tbody></table>
+<p><strong>逐行读</strong>：</p>
+<ul>
+<li><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0528em;">β</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0</span></span></span></span> 时三者完全相等（1.000）—— <strong>教师没有超出学生的信息时，蒸馏不创造任何价值</strong>。这直接否掉了&quot;用大模型蒸馏一定有用&quot;的说法。</li>
+<li>差距随 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0528em;">β</span></span></span></span> <strong>单调拉开</strong>（0.000 → 0.042）—— 这正是机制 1 的形状：教师独有信息越多，硬标签那一次伯努利采样的噪声越大。</li>
+<li><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0528em;">β</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">3.2</span></span></span></span> 时 listwise（0.989）略低于软标签（0.991）—— 这是样本太少（16 个查询）时 listwise 的查询内归一化放大了方差，是机制 2 的反向边界。</li>
+</ul>
+<p><strong>工程结论</strong>：蒸馏的收益 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4831em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="mopen">(</span><span class="mord text"><span class="mord cjk_fallback">教师超出学生的信息量</span></span><span class="mpunct">,</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord cjk_fallback">标注样本量</span></span><span class="mclose">)</span></span></span></span>。如果教师和学生的特征/领域几乎一样（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0528em;">β</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0</span></span></span></span>），蒸馏只是在复制一个更贵的自己 —— 此时把算力花在难负样本或人工校准上收益更大。</p>
+<h4 id="h-33-忠实度判据学生有没有学歪">3.3 忠实度判据：学生有没有学&quot;歪&quot;<a class="anchor" href="#h-33-忠实度判据学生有没有学歪" aria-label="本节链接">#</a></h4>
+<p>蒸馏必须配三个可测判据，否则你不知道学生学到的是教师的能力还是教师的病：</p>
+<table>
+<thead>
+<tr>
+<th>判据</th>
+<th>定义</th>
+<th>判读</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>一致率</strong></td>
+<td>学生与教师 Top-<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 集合的 Jaccard</td>
+<td>低 → 学生没学到排序能力（不是&quot;学到了新东西&quot;）</td>
+</tr>
+<tr>
+<td><strong>校准偏差</strong></td>
+<td>学生在黄金集上的分数分布 vs 教师</td>
+<td>系统性平移/压缩 → 蒸馏目标（温度、损失）设错</td>
+</tr>
+<tr>
+<td><strong>分层一致率</strong></td>
+<td>按查询类型（单跳/多跳/聚合）分层算一致率</td>
+<td>某类显著低 → 教师在该类也不可靠，蒸馏把盲区放大了</td>
+</tr>
+</tbody></table>
+<p><strong>特别要盯住第三行</strong>：教师在自己的盲区上会给出<strong>自信但错误</strong>的分数，而软标签会把这个自信一起教给学生。<strong>这也是软标签唯一的真实风险</strong> —— 它不是&quot;更多的信息&quot;，而是&quot;教师认为的信息&quot;，两者在教师出错时不相等。</p>
+<h3 id="h-四难负样本硬度谱与假负样本风险">四、难负样本：硬度谱与假负样本风险<a class="anchor" href="#h-四难负样本硬度谱与假负样本风险" aria-label="本节链接">#</a></h3>
+<h4 id="h-41-硬度谱">4.1 硬度谱<a class="anchor" href="#h-41-硬度谱" aria-label="本节链接">#</a></h4>
+<p><strong>硬度</strong>指一个负样本在打分上离正样本有多近。常见的三种定义：</p>
+<ul>
+<li><strong>随机负样本</strong>：从语料随机抽 —— 最易；</li>
+<li><strong>批内负样本</strong>：同一 batch 里其他查询的正例 —— 中等（这是第 1 章第 3 节讨论过的采样偏差来源）；</li>
+<li><strong>挖掘负样本</strong>：用当前模型/教师找出<strong>分数最高但未被标注为正</strong>的候选 —— 最难。</li>
+</ul>
+<p><strong>为什么难负样本有用（机制，不是经验）</strong>：排序损失（pairwise logistic / softmax）的梯度大小由 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0213em;vertical-align:-0.25em;"></span><span class="mord">∣</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.1076em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">θ</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0359em;">q</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">d</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.7713em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mbin mtight">−</span></span></span></span></span></span></span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.0213em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.1076em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">θ</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0359em;">q</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">d</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.7713em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mbin mtight">+</span></span></span></span></span></span></span></span><span class="mclose">)</span><span class="mord">∣</span></span></span></span> 决定。易负样本的分数远低于正样本，梯度接近 0，<strong>几乎不贡献学习信号</strong>；难负样本把边界处的梯度放大，让有限的计算步数花在真正决定 Top-<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 排序的区域。这也解释了为什么难负样本的收益与<strong>候选池的头部</strong>直接相关 —— 而头部正是指标（nDCG@10）唯一看见的部分。</p>
+<h4 id="h-42-挖得越狠越危险假负样本">4.2 挖得越狠越危险：假负样本<a class="anchor" href="#h-42-挖得越狠越危险假负样本" aria-label="本节链接">#</a></h4>
+<p><strong>假负样本</strong>＝被当作负例、其实是相关的候选。它们的来源有三类，都要分开处理：</p>
+<ol>
+<li><strong>未标注但相关</strong>：人工只标了 Top-<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span>，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 之外的候选默认是负例 —— 而它们可能相关；</li>
+<li><strong>标注者漏标</strong>：长文档、多跳证据、需要领域知识的正例被漏掉；</li>
+<li><strong>版本过时</strong>：第 2 章第 4 节的墓碑在这里有一个直接后果 —— <strong>旧版本号相同的文档</strong>在索引里可能仍可被检索到，它与新版本内容相关但不完全一致，很自然地落在&quot;高相似度但未被标注为正&quot;的区间里，于是被挖成难负样本。</li>
+</ol>
+<p><strong>为什么它比&quot;噪声&quot;更坏</strong>：普通标签噪声是对称的，而假负样本是<strong>系统性地</strong>把正样本往低分压，且<strong>恰好集中在决策边界附近</strong>（因为能被挖成&quot;难负样本&quot;的前提就是它们的分数高）。它同时做两件坏事：把边界推高（造成漏召）、把正样本的表示压向负例（造成表示塌缩）。</p>
+<p>表二把硬度与假负样本率放在同一张表里（负样本从 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.707em;vertical-align:-0.0391em;"></span><span class="mord text"><span class="mord">sim</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">[</span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">Δ</span><span class="mclose">)</span></span></span></span> 的区间取；只有 35% 的正例被标注）：</p>
+<table>
+<thead>
+<tr>
+<th>硬度下界 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span></span></span></span></th>
+<th>负样本数</th>
+<th>其中真相关</th>
+<th>假负率</th>
+<th><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0269em;">w</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0269em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.0197em;">l</span><span class="mord mathnormal mtight">e</span><span class="mord mathnormal mtight">x</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord">/</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0269em;">w</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:-0.0269em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">s</span><span class="mord mathnormal mtight">im</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span></th>
+<th>nDCG@10</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>−1.5</td>
+<td>2825</td>
+<td>40</td>
+<td>0.014</td>
+<td>0.40</td>
+<td>0.834</td>
+</tr>
+<tr>
+<td>−1.0</td>
+<td>4440</td>
+<td>165</td>
+<td>0.037</td>
+<td>0.38</td>
+<td>0.829</td>
+</tr>
+<tr>
+<td>−0.5</td>
+<td>5294</td>
+<td>460</td>
+<td>0.087</td>
+<td>0.43</td>
+<td>0.847</td>
+</tr>
+<tr>
+<td>0.0</td>
+<td>4790</td>
+<td>831</td>
+<td>0.173</td>
+<td>0.65</td>
+<td>0.909</td>
+</tr>
+<tr>
+<td><strong>0.4</strong></td>
+<td>3875</td>
+<td>1157</td>
+<td>0.299</td>
+<td>1.22</td>
+<td><strong>0.998</strong></td>
+</tr>
+<tr>
+<td>0.8</td>
+<td>2621</td>
+<td>1137</td>
+<td>0.434</td>
+<td>16.31</td>
+<td>0.718</td>
+</tr>
+<tr>
+<td>1.2</td>
+<td>1448</td>
+<td>840</td>
+<td>0.580</td>
+<td>0.86</td>
+<td>0.246</td>
+</tr>
+<tr>
+<td>1.6</td>
+<td>711</td>
+<td>529</td>
+<td>0.744</td>
+<td>0.33</td>
+<td>0.081</td>
+</tr>
+</tbody></table>
+<p><strong>逐行读（这张表里每一列都在讲一件事）</strong>：</p>
+<ul>
+<li><strong>低硬度端（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7719em;vertical-align:-0.136em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≤</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0</span></span></span></span>）nDCG 在 0.83~0.91 徘徊</strong>：易负样本给出的分离方向不够准（<code>w_lex/w_sim</code> 只有 0.4 左右，即模型几乎只用了 <code>sim</code>），但<strong>不出灾难</strong>。这解释了为什么&quot;只用随机负样本&quot;是一个能跑通、却始终差一截的基线。</li>
+<li><strong>峰值在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.4</span></span></span></span>（nDCG 0.998）</strong>：负样本正好落在决策边界下方，模型被迫用上 <code>lex</code>（比值 1.22 ≈ 真值权重比 1.2）—— <strong>难负样本的价值不是&quot;更难&quot;，而是&quot;迫使模型用上正确的特征&quot;。</strong></li>
+<li><strong><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.8</span></span></span></span> 出现 <code>w_lex/w_sim = 16.31</code> 的畸变</strong>：该区间的负样本在 <code>sim</code> 上已经与正例不可分，模型只能把全部权重压到 <code>lex</code> 上 —— 这是<strong>过拟合到噪声维度</strong>的典型信号，nDCG 掉到 0.718。<strong>这个列（特征权重比）比 nDCG 更早报警</strong>：nDCG 还有 0.718 时，权重比已经畸变到 16。</li>
+<li><strong>假负率 0.58 之后崩溃（0.246 → 0.081）</strong>：此时区间里超过一半是&quot;其实是正例&quot;的候选，损失函数的主要工作是<strong>把正例压下去</strong>，边界被整体推高。</li>
+</ul>
+<h4 id="h-43-拐点判据与处置">4.3 拐点判据与处置<a class="anchor" href="#h-43-拐点判据与处置" aria-label="本节链接">#</a></h4>
+<p><strong>不要用&quot;感觉挖够了&quot;来决定硬度。</strong> 用这三个量：</p>
+<table>
+<thead>
+<tr>
+<th>判据</th>
+<th>定义</th>
+<th>处置</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>假负率估计</td>
+<td>在挖出的负样本里抽样 100 条人工判</td>
+<td>&gt; 0.15 → 必须过滤或降硬度</td>
+</tr>
+<tr>
+<td>特征权重分布</td>
+<td>训练后看各特征权重的相对量级</td>
+<td>某个特征权重畸变（&gt;5× 其他） → 硬度过头</td>
+</tr>
+<tr>
+<td>分层 nDCG</td>
+<td>按&quot;黄金文档原始名次&quot;分桶（1–10 / 11–50 / 50+）</td>
+<td>只有低名次桶涨 → 挖到的是噪声</td>
+</tr>
+</tbody></table>
+<p><strong>四种可组合的处置</strong>：</p>
+<ol>
+<li><strong>交叉批负样本</strong>：用同一 batch 内其他查询的正例当负例 —— 假负率被稀释（同一批里&quot;恰巧相关&quot;的概率极低）；</li>
+<li><strong>教师过滤</strong>：用一个独立的（最好是人工校准过的）cross-encoder 给挖出的负样本打分，把分数超过阈值的剔除 —— 这是最直接的去噪，代价是一次额外的前向；</li>
+<li><strong>硬度混合</strong>：例如 50% 随机 + 50% 挖掘。目的不是&quot;兼顾&quot;，而是让损失里始终有一个<strong>可靠的低硬度成分</strong>，防止边界被假负样本单独推走；</li>
+<li><strong>标签平滑 / 软标签</strong>：把&quot;负例&quot;从 0 改成 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">ϵ</span></span></span></span>（例如 0.1）。<strong>注意这只降低伤害，不消除偏差</strong> —— 它承认&quot;负例可能是正例&quot;，但同时削弱了所有真负例的信号。</li>
+</ol>
+<p><figure><img class="md-img" src="content/courses/rag-systems/assets/chapter-3-figure-04.svg" alt="难度谱：nDCG 峰与假负率" loading="lazy" decoding="async"><figcaption>难度谱：nDCG 峰与假负率</figcaption></figure>
+</p>
+<h3 id="h-五数据集工程三种泄漏以及它们为什么让离线指标变成谎言">五、数据集工程：三种泄漏，以及它们为什么让离线指标变成谎言<a class="anchor" href="#h-五数据集工程三种泄漏以及它们为什么让离线指标变成谎言" aria-label="本节链接">#</a></h3>
+<h4 id="h-51-文档级泄漏兄弟块跨-split">5.1 文档级泄漏：兄弟块跨 split<a class="anchor" href="#h-51-文档级泄漏兄弟块跨-split" aria-label="本节链接">#</a></h4>
+<p><strong>机制</strong>：一份长文档被切成 chunk A 与 chunk B，A 落在训练集、B 落在测试集。对重排器来说，<strong>同一篇文档的另一个 chunk 是近乎完美的答案线索</strong>（它们在语义上几乎等价）。如果任何特征带有&quot;文档级&quot;信息（文档热度、文档整体与训练集的相似度、一个不小心把 doc_id 编码进去的稠密特征、甚至只是<strong>近重复文档的词汇重叠</strong>），那么测试集上&quot;与训练集近重复&quot;的题会被轻松做对 —— <strong>而这不是模型学会了泛化，是它见过答案。</strong></p>
+<p>表四给出了这个效应的完整形状。泄漏特征定义为&quot;该候选与训练侧相关文档的最大余弦 &gt; 0.9&quot;（一个很朴素、很多系统里都会存在的近重复判定）：</p>
+<table>
+<thead>
+<tr>
+<th>特征集</th>
+<th>污染集（leaked）</th>
+<th>干净集（clean）</th>
+<th>聚合（50/50）</th>
+<th>虚高</th>
+<th><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0269em;">w</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0269em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.0197em;">l</span><span class="mord mathnormal mtight">e</span><span class="mord mathnormal mtight" style="margin-right:0.0315em;">ak</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span></th>
+</tr>
+</thead>
+<tbody><tr>
+<td>cos + 泄漏特征</td>
+<td><strong>0.983</strong></td>
+<td><strong>0.078</strong></td>
+<td><strong>0.530</strong></td>
+<td>0.906</td>
+<td>3.433</td>
+</tr>
+<tr>
+<td>只用 cos（去泄漏）</td>
+<td>0.056</td>
+<td>0.391</td>
+<td>0.224</td>
+<td>−0.335</td>
+<td>—</td>
+</tr>
+</tbody></table>
+<p><strong>逐行读</strong>：</p>
+<ul>
+<li><strong>含泄漏特征时，聚合指标（0.530）看起来比去泄漏（0.224）好一倍以上。</strong> 如果只看聚合数字，结论会是&quot;这个特征非常有价值&quot;。</li>
+<li><strong>但把测试集按污染/干净分层，真相立刻反转</strong>：污染集 0.983（靠记忆），干净集只有 <strong>0.078</strong> —— 比随机好不了多少。<strong>去泄漏后干净集反而升到 0.391。</strong></li>
+<li><strong>机制在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0269em;">w</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0269em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.0197em;">l</span><span class="mord mathnormal mtight">e</span><span class="mord mathnormal mtight" style="margin-right:0.0315em;">ak</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">3.433</span></span></span></span> 这个权重上</strong>：模型把泄漏特征当成了最强信号，于是任何&quot;训练集里没见过&quot;的题都被它排到后面。<strong>泄漏不只是让指标虚高，它主动破坏了模型对分布外查询的排序能力。</strong></li>
+<li><strong>污染集的 0.983 有一个特别值得注意的性质</strong>：它是在<strong>同主题、换方面</strong>的查询上取得的（问的是同一篇文档的另一个方面，cos 对不上但证据是同一份）。这正是真实业务里最常见的泄漏形态 —— <strong>不是重复的题，而是同一份资料的另一个问题。</strong></li>
+</ul>
+<h4 id="h-52-版本泄漏墓碑的直接后果">5.2 版本泄漏：墓碑的直接后果<a class="anchor" href="#h-52-版本泄漏墓碑的直接后果" aria-label="本节链接">#</a></h4>
+<p>第 2 章第 4 节的墓碑机制在训练数据里有两处后果，必须分开处理：</p>
+<ol>
+<li><strong>旧版本成为假负样本</strong>：同一 <code>doc_id</code> 的新旧版本在检索时都可能被召回，而标注只标了新版本 → 旧版本被挖成难负样本（§4.2 的第 3 类来源）。</li>
+<li><strong>旧版本成为&quot;捷径&quot;</strong>：如果训练集里留着旧版本的正例，模型会学到&quot;与旧版本措辞相同 = 相关&quot;，而线上用户问的是更新后的问题。</li>
+</ol>
+<p><strong>判据</strong>（可自动跑）：</p>
+<pre><code>① 同一 doc_id 在索引里存在 &gt;1 个活跃版本的比例
+   目标：0（除保留期内的显式多版本需求）
+② 训练集里的版本时间戳集合 vs 线上活跃版本集合的差集大小
+   目标：差集为空；否则必须重建训练集
+③ 挖出的难负样本里，与某个正例同 doc_id 的比例
+   目标：0（这类样本一律剔除，不要靠&quot;降硬度&quot;回避）</code></pre>
+<h4 id="h-53-查询级泄漏与时间泄漏">5.3 查询级泄漏与时间泄漏<a class="anchor" href="#h-53-查询级泄漏与时间泄漏" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>查询级泄漏</strong>：同一查询的改写、同一意图的不同表述、或者同一会话里的连续问题，被分到 train 与 test 两侧。<strong>这会让测试集变成&quot;训练集的重述&quot;</strong>，收益被高估。判据：对查询做归一化（小写 + 去标点）后的 n-gram/MinHash 近重复检测，跨 split 的重复率目标为 0；对语义改写，用查询向量做近重复检测，阈值需要人工看一批样本确定。</li>
+<li><strong>时间泄漏</strong>：用未来的文档训练、用过去的查询测试（或反过来）。对<strong>时效型</strong>语料（新闻、政策、价格），这等于把答案提前给了模型。判据：split 的时间边界必须<strong>早于</strong>测试查询的时间戳（按时间切分，而不是随机切分）。</li>
+</ul>
+<h4 id="h-54-泄漏检测的执行顺序为什么是这个顺序">5.4 泄漏检测的执行顺序（为什么是这个顺序）<a class="anchor" href="#h-54-泄漏检测的执行顺序为什么是这个顺序" aria-label="本节链接">#</a></h4>
+<pre><code>① 内容寻址 chunk_id 去重（最便宜、最彻底：同一内容天然同 id）
+② 按 doc_id 做文档级隔离（同一文档的所有 chunk 只进一个 split）
+③ 按时间切分（时效型语料）
+④ 查询近重复检测（字符级 → 语义级）
+⑤ 分层报告：leaked / clean 两个子集的指标必须分别给</code></pre>
+<p><strong>顺序不能颠倒</strong>：前四步都是&quot;构造上消除&quot;，第五步是&quot;测量上暴露&quot;。<strong>只做第五步不做前四步，得到的是&quot;我知道自己被污染了多少&quot;，而不是&quot;我没被污染&quot;。</strong> 而第 ⑤ 步是唯一能防止 §5.1 那种&quot;聚合数字很好看&quot;的机制 —— <strong>任何单一的聚合离线指标，都必须配一份分层报告才可信。</strong></p>
+<h3 id="h-代码重排训练数据的四个可测问题">代码：重排训练数据的四个可测问题<a class="anchor" href="#h-代码重排训练数据的四个可测问题" aria-label="本节链接">#</a></h3>
+<p>下面的脚本把本节四个机制全部做成可运行的对照实验。⚠️ <strong>全部为合成数据</strong>：它不模拟任何真实语料，只模拟&quot;标签生成过程&quot;本身 —— 因为本节要讲的正是这个过程。</p>
+<pre data-lang="python"><code class="language-python">&quot;&quot;&quot;
+重排器训练数据的四个可测问题（全部为合成数据 ⚠️）：只依赖 numpy。
+  表一 位置偏置：朴素点击训练 vs 逆倾向加权（IPS）
+  表二 难负样本硬度：收益饱和与假负样本率的加速
+  表三 蒸馏：硬标签 / 软标签 / listwise 三种监督信号（分级 nDCG）
+  表四 文档级近重复泄漏：聚合指标被&quot;见过的题&quot;抬高
+&quot;&quot;&quot;
+import numpy as np
+
+
+def sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-x))
+
+
+def ndcg_at(order, gain, k=10):
+    &quot;&quot;&quot;分级 nDCG@k：gain 为逐候选增益（非负实数）。&quot;&quot;&quot;
+    order = np.asarray(order)[:k]
+    g = np.asarray(gain)[order]
+    dcg = float(np.sum(g / np.log2(np.arange(2, len(g) + 2))))
+    ideal = np.sort(np.asarray(gain))[::-1][:k]
+    idcg = float(np.sum(ideal / np.log2(np.arange(2, len(ideal) + 2))))
+    return dcg / idcg if idcg &gt; 0 else 0.0
+
+
+def make_data(n_q=600, n_d=40, seed=0):
+    &quot;&quot;&quot;每查询 n_d 个候选；三个可观测特征 sim / lex / quality，真值由 sim 与 lex 决定。&quot;&quot;&quot;
+    rng = np.random.default_rng(seed)
+    sim = rng.normal(0, 1, (n_q, n_d))
+    lex = 0.2 * sim + rng.normal(0, 1, (n_q, n_d))      # 与 sim 弱相关 -&gt; 单靠 sim 排不好
+    truth = sim + 1.2 * lex
+    thr = np.quantile(truth, 0.75, axis=1, keepdims=True)
+    rel = (truth &gt; thr).astype(float)
+    # 分级增益：只在相关档内分三级（软标签能恢复这部分序，硬标签不能）
+    gain = np.clip(truth - thr, 0, None)
+    gain = gain / (gain.max(axis=1, keepdims=True) + 1e-9) * 3.0
+    # quality 是日志策略用的**有噪代理**，条件在 (sim,lex) 下不含额外信息
+    quality = truth + rng.normal(0, 1.5, (n_q, n_d))
+    return dict(sim=sim, lex=lex, quality=quality, truth=truth, rel=rel,
+                gain=gain, n_q=n_q, n_d=n_d)
+
+
+def feats(d, idx=None, use_quality=True):
+    cols = [d[&quot;sim&quot;], d[&quot;lex&quot;]]
+    if use_quality:
+        cols.append(d[&quot;quality&quot;])
+    cols.append(np.ones_like(d[&quot;sim&quot;]))
+    X = np.stack(cols, axis=-1)
+    return X if idx is None else X[idx]
+
+
+def fit_soft_logreg(X, y, w=None, iters=1500, lr=0.6, l2=1e-3):
+    if w is None:
+        w = np.ones(len(y))
+    w = w / (w.mean() + 1e-12)
+    th = np.zeros(X.shape[1])
+    for _ in range(iters):
+        p = sigmoid(X @ th)
+        th -= lr * ((X * ((p - y) * w)[:, None]).mean(axis=0) + l2 * th)
+    return th
+
+
+def eval_theta(d, th, idx, use_quality=True, graded=False):
+    out = []
+    for i in idx:
+        s = feats(d, i, use_quality) @ th
+        g = d[&quot;gain&quot;][i] if graded else d[&quot;rel&quot;][i]
+        out.append(ndcg_at(np.argsort(-s), g))
+    return float(np.mean(out))
+
+
+# ====================================================== 表一：位置偏置 + IPS
+def clicks_from_policy(d, eta=1.0, seed=1):
+    rng = np.random.default_rng(seed)
+    n_q, n_d = d[&quot;n_q&quot;], d[&quot;n_d&quot;]
+    order = np.argsort(-d[&quot;quality&quot;], axis=1)
+    pos = np.empty_like(order)
+    pos[np.arange(n_q)[:, None], order] = np.arange(n_d)[None, :]
+    prop = 1.0 / (1.0 + pos) ** eta
+    examined = rng.random((n_q, n_d)) &lt; prop
+    return ((d[&quot;rel&quot;] &gt; 0) &amp; examined).astype(float), pos, prop
+
+
+def table_position_bias(d):
+    click, pos, prop = clicks_from_policy(d)
+    tr, te = np.arange(0, d[&quot;n_q&quot;], 2), np.arange(1, d[&quot;n_q&quot;], 2)
+    Xtr, ytr = feats(d, tr).reshape(-1, 4), click[tr].reshape(-1)
+    w_prop = prop[tr].reshape(-1)
+    rows = [(&quot;真实排序（按 truth）&quot;, np.array([1.0, 1.2, 0.0, 0.0]), True)]
+    rows.append((&quot;oracle（真值标签）&quot;,
+                 fit_soft_logreg(Xtr, d[&quot;rel&quot;][tr].reshape(-1)), True))
+    rows.append((&quot;朴素点击训练&quot;, fit_soft_logreg(Xtr, ytr), True))
+    rows.append((&quot;IPS（不截断）&quot;,
+                 fit_soft_logreg(Xtr, ytr, w=1.0 / np.maximum(w_prop, 1e-3)), True))
+    for cap in (5.0, 10.0):
+        rows.append((f&quot;IPS（截断 {cap:.0f}）&quot;,
+                     fit_soft_logreg(Xtr, ytr,
+                                     w=np.minimum(1.0 / np.maximum(w_prop, 1e-3), cap)),
+                     True))
+    print(&quot;=&quot; * 88)
+    print(&quot;表一：位置偏置下训练目标的偏离（特征 = sim / lex / quality，测试半集，nDCG@10）&quot;)
+    print(&quot;=&quot; * 88)
+    print(f&quot;{&#39;训练方案&#39;:&lt;22}{&#39;w_sim&#39;:&gt;8}{&#39;w_lex&#39;:&gt;8}{&#39;w_qual&#39;:&gt;9}{&#39;w_bias&#39;:&gt;9}{&#39;nDCG@10&#39;:&gt;10}&quot;)
+    for name, th, _ in rows:
+        print(f&quot;{name:&lt;22}{th[0]:&gt;8.3f}{th[1]:&gt;8.3f}{th[2]:&gt;9.3f}{th[3]:&gt;9.3f}&quot;
+              f&quot;{eval_theta(d, th, te):&gt;10.3f}&quot;)
+
+
+# ====================================================== 表二：负样本硬度
+def mine(d, tau, delta=0.6, pos_rate=0.35, seed=2):
+    rng = np.random.default_rng(seed)
+    labeled_pos = (d[&quot;rel&quot;] &gt; 0) &amp; (rng.random((d[&quot;n_q&quot;], d[&quot;n_d&quot;])) &lt; pos_rate)
+    band = (d[&quot;sim&quot;] &gt;= tau) &amp; (d[&quot;sim&quot;] &lt; tau + delta)
+    return labeled_pos, band &amp; ~labeled_pos
+
+
+def table_hardness(d):
+    tr, te = np.arange(0, d[&quot;n_q&quot;], 2), np.arange(1, d[&quot;n_q&quot;], 2)
+    print()
+    print(&quot;=&quot; * 88)
+    print(&quot;表二：负样本硬度扫描（带宽 Δ=0.6，正例标注率 0.35，无 quality 特征）&quot;)
+    print(&quot;=&quot; * 88)
+    print(f&quot;{&#39;硬度下界 tau&#39;:&gt;13}{&#39;负样本数&#39;:&gt;10}{&#39;其中真相关&#39;:&gt;12}{&#39;假负率&#39;:&gt;9}&quot;
+          f&quot;{&#39;w_lex/w_sim&#39;:&gt;13}{&#39;nDCG@10&#39;:&gt;10}&quot;)
+    for tau in (-1.5, -1.0, -0.5, 0.0, 0.4, 0.8, 1.2, 1.6):
+        lp, neg = mine(d, tau)
+        X = np.concatenate([feats(d, use_quality=False)[lp],
+                            feats(d, use_quality=False)[neg]], axis=0)
+        y = np.concatenate([np.ones(lp.sum()), np.zeros(neg.sum())])
+        th = fit_soft_logreg(X, y)
+        r = d[&quot;rel&quot;][neg]
+        print(f&quot;{tau:&gt;13.1f}{int(neg.sum()):&gt;10d}{int(r.sum()):&gt;12d}{r.mean():&gt;9.3f}&quot;
+              f&quot;{abs(th[1] / (th[0] + 1e-9)):&gt;13.2f}&quot;
+              f&quot;{eval_theta(d, th, te, use_quality=False):&gt;10.3f}&quot;)
+
+
+# ====================================================== 表三：蒸馏
+def listwise_fit(d, t, idx, iters=400, lr=0.5, l2=1e-3):
+    Xs = [feats(d, i, use_quality=False) for i in idx]
+    tgt = []
+    for i in idx:
+        e = np.exp(t[i] - t[i].max())
+        tgt.append(e / e.sum())
+    th = np.zeros(3)
+    for _ in range(iters):
+        g = np.zeros(3)
+        for X, tg in zip(Xs, tgt):
+            s = X @ th
+            e = np.exp(s - s.max())
+            g += X.T @ (e / e.sum() - tg)
+        th -= lr * (g / len(Xs) + l2 * th)
+    return th
+
+
+def table_distill(d, n_train_q=16, seed=1000):
+    &quot;&quot;&quot;
+    教师比学生多看见一个隐特征 z（学生只有 sim/lex）：
+    硬标签把这份&quot;看不见的信息&quot;压成 1 bit，软标签保留它对置信度的连续影响。
+    &quot;&quot;&quot;
+    tr = np.arange(0, n_train_q * 2, 2)              # 只用 16 个查询训练
+    te = np.arange(1, d[&quot;n_q&quot;], 2)
+    rng = np.random.default_rng(seed)
+    z = rng.normal(0, 1, d[&quot;truth&quot;].shape)           # 教师独有特征
+    print()
+    print(&quot;=&quot; * 88)
+    print(f&quot;表三：蒸馏的监督信号价值（学生只有 sim/lex；训练仅 {len(tr)} 个查询；分级 nDCG@10）&quot;)
+    print(&quot;=&quot; * 88)
+    print(f&quot;{&#39;教师独有信息 beta&#39;:&gt;17}{&#39;硬标签&#39;:&gt;10}{&#39;软标签&#39;:&gt;10}{&#39;listwise&#39;:&gt;11}&quot;
+          f&quot;{&#39;软-硬&#39;:&gt;9}&quot;)
+    for beta in (0.0, 0.4, 0.8, 1.6, 3.2):
+        t = d[&quot;truth&quot;] + beta * z
+        # 硬标签：阈值化 -&gt; 把 z 的作用压成 1 bit
+        y_hard = (t &gt; np.percentile(t, 75)).astype(float)
+        X = feats(d, tr, use_quality=False).reshape(-1, 3)
+        hard = eval_theta(d, fit_soft_logreg(X, y_hard[tr].reshape(-1)),
+                          te, use_quality=False, graded=True)
+        soft = eval_theta(d, fit_soft_logreg(X, sigmoid(t)[tr].reshape(-1)),
+                          te, use_quality=False, graded=True)
+        lst = eval_theta(d, listwise_fit(d, t, tr), te,
+                         use_quality=False, graded=True)
+        print(f&quot;{beta:&gt;17.1f}{hard:&gt;10.3f}{soft:&gt;10.3f}{lst:&gt;11.3f}&quot;
+              f&quot;{soft - hard:&gt;9.3f}&quot;)
+
+
+# ====================================================== 表四：泄漏
+def table_leakage(seed=7, n_topic=16, n_doc=1200, n_qtr=300, n_qte=120, dim=64,
+                  n_train_topic=12, n_neg=12):
+    &quot;&quot;&quot;
+    泄漏机制：同一篇文档的两个 chunk 落在 train / test 两侧。
+    · 训练题：问的是某个方面，黄金块 = 该文档的 chunk A。
+    · 污染的测试题(leaked)：问的是**同一文档的另一个方面**，黄金块 = chunk B（A 的兄弟块）。
+      两句问句的向量不同（cos 对不上），但证据是同一篇文档 —— 这就是泄漏能&quot;喂&quot;给模型的东西。
+    · 干净的测试题(clean)：主题在训练集里从未出现过，没有兄弟块在训练侧。
+    泄漏特征 leakf[d] = 候选与训练侧相关文档的最大余弦（很多系统里的&quot;文档级/热度特征&quot;）。
+    &quot;&quot;&quot;
+    rng = np.random.default_rng(seed)
+    topics = rng.normal(0, 1, (n_topic, dim))
+    dtopic = rng.integers(0, n_topic, n_doc)
+    emb = topics[dtopic] + 0.5 * rng.normal(0, 1, (n_doc, dim))
+    emb /= np.linalg.norm(emb, axis=1, keepdims=True)
+
+    def pick(topic):
+        return int(rng.choice(np.where(dtopic == topic)[0]))
+
+    def qvec(v, s=0.8):
+        q = v + s * rng.normal(0, 1, dim)
+        return q / np.linalg.norm(q)
+
+    # ---- 训练侧
+    gold_tr = np.array([pick(int(rng.integers(0, n_train_topic))) for _ in range(n_qtr)])
+    train_gold = np.unique(gold_tr)
+    sib = emb[train_gold] + 0.05 * rng.normal(0, 1, (len(train_gold), dim))
+    sib /= np.linalg.norm(sib, axis=1, keepdims=True)
+    all_emb = np.vstack([emb, sib])
+    n_all = len(all_emb)
+    sib_of = {int(g): len(emb) + k for k, g in enumerate(train_gold)}
+    # 近重复判定（阈值 0.9）：只有&quot;训练侧出现过同一篇文档&quot;才亮
+    leakf = ((all_emb @ emb[train_gold].T).max(axis=1) &gt; 0.9).astype(float)
+    gold_set = set(int(g) for g in train_gold)
+    print(f&quot;（leakf 亮起比例：兄弟块 {leakf[[sib_of[int(g)] for g in train_gold]].mean():.3f}&quot;
+          f&quot; / 训练黄金块 {leakf[train_gold].mean():.3f}&quot;
+          f&quot; / 其他文档 {leakf[[i for i in range(n_all) if i not in sib_of.values() and i not in gold_set]].mean():.3f}）&quot;)
+
+    # ---- 训练样本：正例 = chunk A，负例 = 随机块
+    Xs, ys = [], []
+    for g in gold_tr:
+        g = int(g)
+        negs = [int(x) for x in rng.choice(n_all, n_neg * 8)
+                if int(x) not in gold_set and int(x) != sib_of.get(g, -1)][:n_neg]
+        pool = [g] + negs
+        q = qvec(emb[g])
+        F = np.stack([all_emb[pool] @ q, leakf[pool], np.ones(len(pool))], axis=1)
+        Xs.append(F)
+        ys.append(np.array([1.0] + [0.0] * len(negs)))
+    X, y = np.concatenate(Xs), np.concatenate(ys)
+
+    # ---- 测试题
+    leaked, clean = [], []
+    for k in range(n_qte):
+        t = int(rng.integers(0, n_train_topic))        # leaked：同主题、换方面
+        same = [int(x) for x in train_gold if dtopic[x] == t]
+        g = int(same[rng.integers(0, len(same))])
+        q = qvec(topics[t], s=1.0)
+        # 干扰项全部来自同一主题（cos 都很高，靠 cos 分不出黄金块）
+        cand = [int(x) for x in np.where(dtopic == t)[0] if int(x) not in gold_set]
+        pool = [sib_of[g]] + [c for c in rng.permutation(cand)][:39]
+        leaked.append((q, pool, sib_of[g]))
+        t2 = int(rng.integers(n_train_topic, n_topic))  # clean：未出现过的主题
+        g2 = pick(t2)
+        q2 = qvec(emb[g2])
+        pool2 = [g2] + [int(x) for x in rng.choice(n_all, 200)
+                        if int(x) not in gold_set][:39]
+        clean.append((q2, pool2, g2))
+
+    print(&quot;=&quot; * 88)
+    print(&quot;表四：兄弟块跨 split 的泄漏（污染测试集 vs 干净测试集，40 候选，nDCG@10）&quot;)
+    print(&quot;=&quot; * 88)
+    print(f&quot;{&#39;特征集&#39;:&lt;24}{&#39;污染集(leaked)&#39;:&gt;16}{&#39;干净集(clean)&#39;:&gt;15}&quot;
+          f&quot;{&#39;聚合(50/50)&#39;:&gt;13}{&#39;虚高&#39;:&gt;9}{&#39;w_leak&#39;:&gt;9}&quot;)
+    for tag, use_leak in ((&quot;cos + 泄漏特征&quot;, True), (&quot;只用 cos（去泄漏）&quot;, False)):
+        w = fit_soft_logreg(X if use_leak else X[:, [0, 2]], y, iters=1200)
+        acc = {}
+        for name, items in ((&quot;leaked&quot;, leaked), (&quot;clean&quot;, clean)):
+            vs = []
+            for q, pool, gold in items:
+                F = np.stack([all_emb[pool] @ q, leakf[pool]] if use_leak else
+                             [all_emb[pool] @ q], axis=-1)
+                s = F @ w[:-1] + w[-1]
+                rel = (np.array(pool)[np.argsort(-s)] == gold).astype(float)
+                vs.append(ndcg_at(np.arange(len(pool)), rel))
+            acc[name] = float(np.mean(vs))
+        agg = 0.5 * (acc[&quot;leaked&quot;] + acc[&quot;clean&quot;])
+        print(f&quot;{tag:&lt;24}{acc[&#39;leaked&#39;]:&gt;16.3f}{acc[&#39;clean&#39;]:&gt;15.3f}{agg:&gt;13.3f}&quot;
+              f&quot;{acc[&#39;leaked&#39;] - acc[&#39;clean&#39;]:&gt;9.3f}&quot;
+              f&quot;{(w[1] if use_leak else float(&#39;nan&#39;)):&gt;9.3f}&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    d = make_data()
+    table_position_bias(d)
+    table_hardness(d)
+    table_distill(d)
+    table_leakage()</code></pre>
+<p><strong>实测输出</strong>（<code>python3</code> 直接运行；语料与标签全部由固定种子合成）：</p>
+<p><strong>表一 —— 位置偏置</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>训练方案</th>
+<th>w_sim</th>
+<th>w_lex</th>
+<th>w_qual</th>
+<th>w_bias</th>
+<th>nDCG@10</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>真实排序（按 truth）</td>
+<td>1.000</td>
+<td>1.200</td>
+<td>0.000</td>
+<td>0.000</td>
+<td><strong>1.000</strong></td>
+</tr>
+<tr>
+<td>oracle（真值标签）</td>
+<td>3.174</td>
+<td>3.779</td>
+<td>0.038</td>
+<td>−3.817</td>
+<td>0.995</td>
+</tr>
+<tr>
+<td>朴素点击训练</td>
+<td>0.535</td>
+<td>0.588</td>
+<td><strong>0.747</strong></td>
+<td>−4.481</td>
+<td><strong>0.809</strong></td>
+</tr>
+<tr>
+<td>IPS（不截断）</td>
+<td>0.555</td>
+<td>0.619</td>
+<td>0.546</td>
+<td>−4.323</td>
+<td>0.838</td>
+</tr>
+<tr>
+<td>IPS（截断 5）</td>
+<td>0.557</td>
+<td>0.615</td>
+<td>0.583</td>
+<td>−4.345</td>
+<td>0.833</td>
+</tr>
+<tr>
+<td>IPS（截断 10）</td>
+<td>0.573</td>
+<td>0.642</td>
+<td>0.545</td>
+<td>−4.369</td>
+<td><strong>0.840</strong></td>
+</tr>
+</tbody></table>
+<p><strong>三处必须读出来的东西</strong>：</p>
+<ul>
+<li><strong><code>w_qual</code> 是本节的核心证据</strong>：真实排序给它 0.000，oracle 给 0.038（数值噪声），<strong>朴素点击训练给 0.747</strong>。这个特征条件在 (sim, lex) 下不含信息 —— 模型学到的 0.747 全部是&quot;日志策略喜欢把它排前面&quot;。</li>
+<li><strong>IPS 方向正确但不彻底</strong>：0.747 → 0.546（不截断）/ 0.545（截断 10），nDCG 0.809 → 0.840。<strong>距离 oracle 的 0.038 仍然很远</strong>，这就是 §2.4 说的方差问题，而不是&quot;IPS 没用&quot;。</li>
+<li><strong>截断不一定让指标变差</strong>：截断 10 的 nDCG（0.840）略高于不截断（0.838），因为它用一点偏差换了明显的方差下降。<strong>&quot;截断会损失无偏性&quot;不等于&quot;截断会更差&quot;</strong> —— 在小样本上它常常更好。</li>
+</ul>
+<p><strong>表二 —— 负样本硬度</strong>：见 §4.2 的表。关键是<strong>峰值出现在 §4.2 假负率 0.299 处</strong>，而<strong>特征权重比（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0269em;">w</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0269em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.0197em;">l</span><span class="mord mathnormal mtight">e</span><span class="mord mathnormal mtight">x</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord">/</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0269em;">w</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:-0.0269em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">s</span><span class="mord mathnormal mtight">im</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>）在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.8</span></span></span></span> 已经畸变到 16.31 时，nDCG 还有 0.718</strong> —— 权重比是比 nDCG 更早的报警器。</p>
+<p><strong>表三 —— 蒸馏</strong>：见 §3.2 的表。<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0528em;">β</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0</span></span></span></span> 时硬标签 = 软标签 = listwise = 1.000；差距只在教师带<strong>学生看不见的信息</strong>时出现（0.000 → 0.042）。</p>
+<p><strong>表四 —— 泄漏</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>特征集</th>
+<th>污染集(leaked)</th>
+<th>干净集(clean)</th>
+<th>聚合(50/50)</th>
+<th>虚高</th>
+<th>w_leak</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>cos + 泄漏特征</td>
+<td><strong>0.983</strong></td>
+<td><strong>0.078</strong></td>
+<td><strong>0.530</strong></td>
+<td>0.906</td>
+<td>3.433</td>
+</tr>
+<tr>
+<td>只用 cos（去泄漏）</td>
+<td>0.056</td>
+<td>0.391</td>
+<td>0.224</td>
+<td>−0.335</td>
+<td>—</td>
+</tr>
+</tbody></table>
+<p><strong>这一张表应该贴在每次模型评审的第一页</strong>：同一个模型族、同一个测试集，只因为多了一个泄漏特征，<strong>聚合指标翻了一倍多，而真实泛化掉到五分之一</strong>。<code>leakf</code> 的亮起比例打印在脚本输出里：兄弟块 0.984 / 训练黄金块 1.000 / 其他文档 0.000 —— <strong>一个&quot;近乎完美&quot;的特征，就是一个近乎完美的泄漏。</strong></p>
+<h3 id="h-练习">练习<a class="anchor" href="#h-练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><p><strong>算你的标注边际收益。</strong> 取你手上任意一个排序/分类模型的学习曲线（没有就用一份公开的），用 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7713em;"></span><span class="mord mathnormal">c</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.7713em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mathnormal mtight" style="margin-right:0.0037em;">α</span></span></span></span></span></span></span></span></span></span></span></span> 拟合出 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span>，然后代入你的单条标注成本 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">lab</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 与业务价值 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.2222em;">V</span></span></span></span>，算出&quot;再标多少条就不值得了&quot;。<strong>要求写出 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span> 的估计区间</strong>，并回答：如果新增的标注覆盖了一个全新查询类型，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span> 会怎么变？</p>
+</li>
+<li><p><strong>实现完整的 IPS 并测量方差。</strong> 在表一的代码上加三件事：(a) 打印权重的 P50/P99 与均值；(b) 把训练查询数从 300 降到 50，观察 IPS 相对朴素的优势如何变化；(c) 故意把倾向模型用错（例如用 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">e</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1/</span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.0641em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord">pos</span></span><span class="mclose"><span class="mclose">)</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">0.5</span></span></span></span></span></span></span></span></span></span></span></span> 而真实是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">η</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span>），测出 nDCG 的损失。<strong>回答：错误倾向的偏差能否用更多数据消除？</strong></p>
+</li>
+<li><p><strong>给表二的硬度扫描加一条&quot;去偏&quot;曲线。</strong> 加一个&quot;教师过滤&quot;处置：把挖出的负样本里 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord text"><span class="mord">rel</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> 的以 80% 概率剔除（模拟一个召回率 0.8 的过滤器），重新跑 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span></span></span></span> 扫描。<strong>要求给出新的峰值位置与新的崩溃点</strong>，并解释峰值为什么向右移动。</p>
+</li>
+<li><p><strong>复现表四并把泄漏特征换掉。</strong> 把 <code>leakf</code> 从&quot;近重复布尔量&quot;换成连续的最大余弦，重跑；再换成&quot;该文档在训练集中出现的次数&quot;。<strong>要求回答：哪一种泄漏特征最难被察觉，为什么？</strong> 提示：看&quot;去泄漏后聚合指标的跌幅&quot;。</p>
+</li>
+<li><p><strong>设计一份泄漏审计脚本（不要求实现全部，要求给出可执行规格）。</strong> 针对一份给定的 chunk 集合与查询集合，写出检测 §5.1–§5.3 三类泄漏的完整流程：每一步的输入、判定量、阈值、以及<strong>发现泄漏后的处置动作</strong>（是删样本、改特征，还是重建 split？）。要求明确区分&quot;构造上消除&quot;与&quot;测量上暴露&quot;两类手段，并说明为什么只做后者不够。</p>
+</li>
+<li><p><strong>写一份&quot;重排器训练数据卡&quot;。</strong> 用一页纸列出你系统的训练数据：来源构成（人工/点击/蒸馏的比例）、标注指南版本、负样本挖掘策略与硬度参数、split 的构造方式（按文档/时间/查询）、以及<strong>已知的三项偏差与各自的缓解手段</strong>。要求每一项都写出一个<strong>可复现的测量命令或判据</strong>，而不是形容词。</p>
+</li>
+<li><p><strong>判断一次&quot;蒸馏该不该做&quot;。</strong> 你有一个 7B 的教师和一个 100M 的学生。设计一个实验测出 §3.2 里的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0528em;">β</span></span></span></span>（教师独有信息量）在你的任务上的量级，并据此决定：把预算花在蒸馏上，还是花在难负样本挖掘上？<strong>要求给出量化依据</strong>（可参考表三中 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0528em;">β</span></span></span></span> 与&quot;软−硬&quot;的对应关系）。</p>
+</li>
+</ol>
+<h3 id="h-小结">小结<a class="anchor" href="#h-小结" aria-label="本节链接">#</a></h3>
+<ul>
+<li><strong>离线分数度量的是&quot;模型 × 数据构造&quot;的联合效果，不是模型能力。</strong> 训练数据的构造方式决定了模型的上限与它的系统性偏差；<strong>偏差不会在评估时自己消失</strong>，只会以&quot;离线好、线上差&quot;的形式回收。</li>
+<li><strong>三种标签来源是分工不是替代</strong>：人工标注解决&quot;什么叫相关&quot;（必须留一份不参与训练的黄金集），弱监督解决规模，蒸馏解决成本。把它们做成替代关系，是相关性定义失控的起点。</li>
+<li><strong>标注预算的边际收益按 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.888em;"></span><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.888em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mopen mtight">(</span><span class="mord mtight">1</span><span class="mbin mtight">+</span><span class="mord mathnormal mtight" style="margin-right:0.0037em;">α</span><span class="mclose mtight">)</span></span></span></span></span></span></span></span></span></span></span></span> 衰减</strong>（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4831em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.1</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∼</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.4</span></span></span></span>），比 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1/</span><span class="mord mathnormal">n</span></span></span></span> 还快。判据是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8532em;vertical-align:-0.0391em;"></span><span class="mord mathnormal">c</span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mathnormal mtight" style="margin-right:0.0037em;">α</span><span class="mbin mtight">−</span><span class="mord mtight">1</span></span></span></span></span></span></span></span></span><span class="mord mathnormal" style="margin-right:0.2222em;">V</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&gt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">lab</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>，且必须<strong>按查询类型分层</strong>算 —— 新增类型会让曲线重新变陡。</li>
+<li><strong>位置偏置的生成模型是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="mopen">(</span><span class="mord mathnormal">c</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord"><span class="mord mathrm">rel</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">e</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord text"><span class="mord">pos</span></span><span class="mclose">)</span></span></span></span></strong>；朴素训练学到的是两处偏差：缩放偏差与<strong>混淆偏差</strong>。IPS 用 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1/</span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">e</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 加权，两行推导即可证明无偏，但代价是方差爆炸与依赖 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">e</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 的正确性。本节实测：<code>w_qual</code> 0.747（朴素）→ 0.545（IPS 截断 10），nDCG 0.809 → 0.840，<strong>而 oracle 是 0.038 / 0.995</strong> —— IPS 把偏差压到可接受量级，不能替代人工校准。</li>
+<li><strong>软标签值钱的确切条件是&quot;教师带有学生看不见的信息 + 样本有限&quot;</strong>。无限样本 + 正确模型类下，硬标签与软标签收敛到同一预测器（都估计 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathbb">E</span><span class="mopen">[</span><span class="mord mathnormal" style="margin-right:0.0359em;">y</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∣</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">x</span><span class="mclose">]</span></span></span></span>）。本节实测：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0528em;">β</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0</span></span></span></span> 时三者完全相同（1.000），<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0528em;">β</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">3.2</span></span></span></span> 且仅 16 个训练查询时，硬标签 0.949、软标签 0.991、listwise 0.989 —— <strong>&quot;用大模型蒸馏一定有用&quot;是错的，要先用 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0528em;">β</span></span></span></span> 测出教师到底多知道什么。</strong> 软标签的唯一真实风险是<strong>把教师的自信错误一起教走</strong>，必须用分层一致率盯住。</li>
+<li><strong>难负样本的价值来自&quot;迫使模型用上正确的特征&quot;，不是来自&quot;更难&quot;</strong>。本节实测的 U 型：峰值在假负率 0.299（nDCG 0.998，特征权重比 1.22 ≈ 真值 1.2），崩溃在 0.58 之后（0.246 → 0.081）。<strong>特征权重比 nDCG 更早报警</strong>（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.8</span></span></span></span> 时权重比已畸变到 16.31，nDCG 还有 0.718）。处置手段四种：交叉批负样本、教师过滤、硬度混合、标签平滑，其中只有前两种真正去偏。</li>
+<li><strong>泄漏的三种形态与顺序</strong>：文档级（兄弟块跨 split，最隐蔽也最普遍）、版本（墓碑的直接后果）、查询级与时间级。检测必须&quot;先构造上消除（内容寻址去重 → 按文档隔离 → 按时间切 → 查询近重复），再测量上暴露（分层报告 leaked/clean）&quot;。<strong>任何单一聚合离线指标都必须配一份分层报告才可信</strong> —— 因为本节实测里，聚合 0.530 的配置在干净集上只有 0.078，而去泄漏的配置聚合只有 0.224、干净集却有 0.391。</li>
+<li><strong>一句话</strong>：<strong>重排器的质量上限由&quot;标签里有多少信息&quot;决定，而它的系统性失效由&quot;标签里混进了什么&quot;决定。前者靠标注与蒸馏的边际收益算，后者靠三个可测量（假负率、特征权重分布、分层指标）盯。</strong></li>
+</ul>
+<blockquote>
+<p>下一节：到这里，&quot;给定一个查询，怎么把它想要的东西找回来并排好&quot;这条链路已经完整了：切分、索引、混合、重排、融合，以及重排器自己的训练数据。<strong>但整条链路都建立在一个假设上 —— 用户写下的那句话足以定位答案。</strong> 真实的查询有三类缺陷（词汇缺口、意图欠定、组合性），它们的处方完全不同：补词汇、补上下文、补结构。选错类别，投入的算力会完全无效 —— 而分类本身是可测的。下一节把查询本身当作变量。</p>
+</blockquote>

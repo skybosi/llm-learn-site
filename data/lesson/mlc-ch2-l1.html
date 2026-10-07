@@ -1,0 +1,272 @@
+<h2 id="h-图捕获三条路torchscript--torchdynamo--fx">图捕获三条路：TorchScript / TorchDynamo / FX<a class="anchor" href="#h-图捕获三条路torchscript--torchdynamo--fx" aria-label="本节链接">#</a></h2>
+<p>第 1 章的全景里第一环是<strong>捕获（capture）</strong>：把 Python 模型变成一张编译器能读的图。它看似只是&quot;记下算子&quot;，其实每个前端都在回答同一个清单——<strong>哪些算子执行了、输入是谁、结论在什么条件下成立</strong>。三家答案差别极大：同一段 <code>if</code>，有的前端捕获期就把它定型成一条路，有的变成一条必须事后核对的假设，还有的干脆说&quot;这里不编译&quot;。本课用真实 CPython 字节码对上三者的取材范围。</p>
+<p><figure><img class="md-img" src="content/courses/ml-compilers/assets/chapter-2-figure-01.svg" alt="三条捕获路线：取材范围与代价" loading="lazy" decoding="async"><figcaption>三条捕获路线：取材范围与代价</figcaption></figure>
+</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-捕获的三步取材派发收尾">1. 捕获的三步：取材、派发、收尾<a class="anchor" href="#h-1-捕获的三步取材派发收尾" aria-label="本节链接">#</a></h4>
+<p>任何图捕获都能拆成三步：</p>
+<table>
+<thead>
+<tr>
+<th>步骤</th>
+<th>要回答的问题</th>
+<th>出错的样子</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>取材</td>
+<td>编译器的输入是源码、字节码，还是&quot;运行时真正发生的调用&quot;</td>
+<td>看到了没执行的分支 / 漏掉了动态派发</td>
+</tr>
+<tr>
+<td>派发</td>
+<td>谁把一次算子调用变成 IR 里的一个节点</td>
+<td>记录不到算子（走不到该方法）/ 重复记录</td>
+</tr>
+<tr>
+<td>收尾</td>
+<td>这次捕获的结论在什么条件下还能用</td>
+<td>没有条件，于是换一种输入就悄悄算错</td>
+</tr>
+</tbody></table>
+<p>术语先立住：<strong>计算图（computation graph）</strong>是&quot;算子节点 + 张量边&quot;的有向无环图；<strong>IR（intermediate representation）</strong>是编译器内部的数据结构；<strong>guard（守卫）</strong>是&quot;这份结果只在这些条件下可用&quot;的断言。</p>
+<h4 id="h-2-路线-atorchscript--在源码层面做子集检查">2. 路线 A：TorchScript —— 在源码层面做子集检查<a class="anchor" href="#h-2-路线-atorchscript--在源码层面做子集检查" aria-label="本节链接">#</a></h4>
+<p>TorchScript 的 <code>torch.jit.script</code> 把 Python 源码重解析成自己的 IR，所以要为&quot;这段 Python 属不属于可编译子集&quot;给出静态答案：<code>.item()</code>（张量→Python 标量）、<code>print</code>（副作用）、迭代次数依赖运行时值的 <code>while</code>，都得显式处理或拒绝。好处是<strong>不依赖一次实际执行</strong>（可导出、可无输入编译）；代价是子集追不上 Python 生态，这也是重心后来转向动态捕获的原因之一。</p>
+<h4 id="h-3-路线-bfx--一次符号跟踪路径即图">3. 路线 B：FX —— 一次符号跟踪，路径即图<a class="anchor" href="#h-3-路线-bfx--一次符号跟踪路径即图" aria-label="本节链接">#</a></h4>
+<p><code>torch.fx.symbolic_trace</code> 用<strong>符号代理（Proxy）</strong>做单次跟踪：把示例输入换成会记录调用的代理对象，真跑一遍函数，每次算子调用写成一个节点——本课路线 A 就是它。弱点也在这&quot;单次&quot;上：<code>if</code> 是原生 Python 控制流，<strong>跟踪期走哪条路，图里就只有哪条路</strong>，事后没人提醒你&quot;这张图只在另一次成立&quot;。</p>
+<h4 id="h-4-路线-ctorchdynamo--在字节码层逐条派发">4. 路线 C：TorchDynamo —— 在字节码层逐条派发<a class="anchor" href="#h-4-路线-ctorchdynamo--在字节码层逐条派发" aria-label="本节链接">#</a></h4>
+<p>TorchDynamo 取的材不是源码，而是 CPython 的<strong>字节码（bytecode）</strong>：它挂上求值循环的 frame 钩子，在函数即将执行时接管指令派发，一边按运行时真值走控制流，一边把张量相关指令记成 FX 图。相比源码方案它多看见两样东西：<strong>运行时真值</strong>（所以走得对分支），以及<strong>该分支本次成立这件事本身</strong>——后者记成 guard，下次不成立就重编译（第 3 课）。代价是只能在真正执行时捕获：产物是三件套（图、guard、运行时状态）；遇到无法安全接管的语义时，函数只能被切成若干段（第 4 课）。</p>
+<h4 id="h-5-三条路的对照表">5. 三条路的对照表<a class="anchor" href="#h-5-三条路的对照表" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>TorchScript</th>
+<th>FX</th>
+<th>TorchDynamo</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>取材</td>
+<td>Python 源码 / 子集 AST</td>
+<td>一次符号跟踪的调用序列</td>
+<td>CPython 字节码 + 运行时真值</td>
+</tr>
+<tr>
+<td>控制流</td>
+<td>静态分析，可保留</td>
+<td>烧进图（当场定型）</td>
+<td>按真值走，记 guard</td>
+</tr>
+<tr>
+<td>需要样例输入</td>
+<td>不需要</td>
+<td>需要</td>
+<td>不需要（在真实执行时捕获）</td>
+</tr>
+<tr>
+<td>未知算子</td>
+<td>编译期报错或走子图</td>
+<td>记录成 call_function 节点</td>
+<td>按图断裂处理</td>
+</tr>
+<tr>
+<td>典型代价</td>
+<td>子集覆盖不足</td>
+<td>无 guard，换输入即错</td>
+<td>运行时捕获开销 + 重编译</td>
+</tr>
+</tbody></table>
+<h4 id="h-6-常见坑">6. 常见坑<a class="anchor" href="#h-6-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>把 trace 当成&quot;分析&quot;</strong>：trace 只是&quot;跑一遍并记录&quot;，不证明普遍性；没有 guard 的图只是一个样例的执行记录而已。</li>
+<li><strong>以为 <code>torch.jit.trace</code> 与 <code>symbolic_trace</code> 是一回事</strong>：前者用真实张量跑、记数值路径，后者用代理对象跑、记调用序列，二者都不记控制流条件。</li>
+<li><strong>忽略 guard 的粒度</strong>：guard 可细到 <code>x.shape[0] == 4</code>；细粒度换精确，也换频繁重编译（第 3 课的账）。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面这段只依赖标准库（python3.10 与 python3.14 都逐字跑过，输出一致）：<code>Proxy</code> 是 FX 式记录代理；<code>run_bytecode</code> 是手工版 Dynamo，逐条读真实字节码、按运行时真值选路，并把用到的条件记成 <code>guard</code>；<code>script_check</code> 是 TorchScript 式子集检查器。</p>
+<pre data-lang="python"><code class="language-python"># ===== 三条捕获路线的可打印骨架：tracer / 字节码前端 / 子集检查器 =====
+# 只依赖标准库；本机验证：python3.10（输出与 3.14 一致）
+import ast, dis, inspect
+
+# ---------- 0. 统一 IR：节点 = (op, args)；args 里 str/float = 叶子，V = 前面节点的引用 ----------
+GRAPHS = []                                                  # 本演示同时只有一个活跃图
+
+class Graph:
+    def __init__(self): self.nodes = []; GRAPHS.append(self)   # nodes[i] = (op, [arg, ...])
+    def emit(self, op, *args):
+        self.nodes.append((op, list(args))); return V(op, len(self.nodes) - 1)
+    def ops(self): return [op for op, _ in self.nodes]
+    def dump(self):
+        L = []
+        for i, (op, args) in enumerate(self.nodes):
+            a = &#39;, &#39;.join(f&#39;%{x.id}&#39; if isinstance(x, V) and x.id is not None else repr(x)
+                          for x in args)
+            L.append(f&#39;  %{i} = {op}({a})&#39;)
+        return &#39;\n&#39;.join(L)
+
+class V:
+    &quot;&quot;&quot;IR 里一个值：id 是节点编号；算子重载只负责建节点，不负责算数。&quot;&quot;&quot;
+    def __init__(self, op, i): self.op, self.id = op, i
+    def __add__(self, o):  return _mk(&#39;add&#39;, self, o)
+    def __radd__(self, o): return _mk(&#39;add&#39;, o, self)
+    def __sub__(self, o):  return _mk(&#39;sub&#39;, self, o)
+    def __rsub__(self, o): return _mk(&#39;sub&#39;, o, self)
+    def __mul__(self, o):  return _mk(&#39;mul&#39;, self, o)
+    def __rmul__(self, o): return _mk(&#39;mul&#39;, o, self)
+    def __gt__(self, o):   return _mk(&#39;gt&#39;, self, o)
+    def __repr__(self):    return f&#39;%{self.id}&#39;
+
+def _mk(op, a, b):
+    for v in (a, b):                                         # 找到这次运算所属的图
+        if isinstance(v, Proxy): return v.g.emit(op, a, b)
+    return GRAPHS[-1].emit(op, a, b)                         # 图到图之间的运算（简化）
+
+class Proxy(V):
+    &quot;&quot;&quot;路线 B（FX 式）的输入代理：只是个&quot;原样记录&quot;的值。&quot;&quot;&quot;
+    def __init__(self, g, name): self.g, self.name, self.id = g, name, None
+    def __repr__(self): return self.name
+
+# ---------- 1. 路线 A：FX 式 tracer —— 喂数据跑一遍，算子调用被记成节点 ----------
+def fn(x, flag):                       # 同一份 Python 函数：赋值与 if 都是原生 Python 控制流
+    a = x + 1.0
+    if flag &gt; 0:
+        b = a * 2.0
+    else:
+        b = a - 3.0
+    return b
+
+def trace(flag):
+    g = Graph()
+    return g, fn(Proxy(g, &#39;x&#39;), flag)  # 走哪条路，图里就只有哪条路
+
+# ---------- 2. 路线 B：字节码前端 —— 解释 CPython 字节码，分支按运行时真值走 ----------
+BIN10 = {&#39;BINARY_ADD&#39;: &#39;add&#39;, &#39;BINARY_SUBTRACT&#39;: &#39;sub&#39;, &#39;BINARY_MULTIPLY&#39;: &#39;mul&#39;,
+         &#39;BINARY_TRUE_DIVIDE&#39;: &#39;div&#39;, &#39;BINARY_POWER&#39;: &#39;pow&#39;}
+BINSYM = {&#39;NB_ADD&#39;: &#39;add&#39;, &#39;NB_SUBTRACT&#39;: &#39;sub&#39;, &#39;NB_MULTIPLY&#39;: &#39;mul&#39;,
+          &#39;NB_TRUE_DIVIDE&#39;: &#39;div&#39;, &#39;NB_POWER&#39;: &#39;pow&#39;}
+
+def binop_name(ins):
+    &quot;&quot;&quot;3.11 及以前算术是独立指令；3.12 起合并成 BINARY_OP，arg 是操作编号。&quot;&quot;&quot;
+    if ins.opname in BIN10: return BIN10[ins.opname]
+    nb = getattr(dis, &#39;_nb_ops&#39;, [])
+    return BINSYM.get(nb[ins.arg][0] if ins.arg &lt; len(nb) else &#39;?&#39;, f&#39;op{ins.arg}&#39;)
+
+def run_bytecode(func, **args):
+    &quot;&quot;&quot;极简字节码前端：算术/比较/跳转/返回记成节点。与 TorchDynamo 的差别只在&quot;谁逐条派发&quot;
+    ——Dynamo 挂的是 CPython 求值循环的 frame 钩子，这里我们手工走一遍同样的字节码。&quot;&quot;&quot;
+    co, instrs, g = func.__code__, list(dis.get_instructions(func)), Graph()
+    consts, env, stack = co.co_consts, dict(args), []
+    idx = {ins.offset: k for k, ins in enumerate(instrs)}    # 3.10 跳转目标是绝对字节偏移
+    def jump(ins):
+        return idx.get(ins.argval, ins.arg if isinstance(ins.arg, int) else 0)
+    i = 0
+    while i &lt; len(instrs):
+        ins = instrs[i]; op, arg = ins.opname, ins.arg
+        if op in (&#39;LOAD_FAST&#39;, &#39;LOAD_FAST_BORROW&#39;, &#39;LOAD_FAST_CHECK&#39;):
+            stack.append(env.setdefault(co.co_varnames[arg], co.co_varnames[arg]))
+        elif op == &#39;LOAD_CONST&#39;:      stack.append(consts[arg])
+        elif op == &#39;LOAD_SMALL_INT&#39;:  stack.append(arg)
+        elif op in BIN10 or op == &#39;BINARY_OP&#39;:
+            b, a = stack.pop(), stack.pop()
+            stack.append(g.emit(binop_name(ins), a, b))
+        elif op == &#39;COMPARE_OP&#39;:                             # argrepr 形如 &quot;bool(&gt;)&quot; 或 &quot;&gt;&quot;
+            b, a = stack.pop(), stack.pop()
+            if isinstance(a, V) or isinstance(b, V):         # 含张量 → 记节点，条件由 guard 承担
+                stack.append(g.emit(&#39;gt&#39; if &#39;&gt;&#39; in ins.argrepr else &#39;lt&#39;, a, b))
+            else:                                            # 全是 Python 值 → 在捕获期直接算掉
+                stack.append(bool(a &gt; b) if &#39;&gt;&#39; in ins.argrepr else bool(a &lt; b))
+        elif op.startswith(&#39;POP_JUMP&#39;) and &#39;IF_FALSE&#39; in op:
+            v = stack.pop()
+            g.emit(&#39;guard&#39;, &#39;T&#39; if v else &#39;F&#39;, &#39;命中分支&#39;)    # 这个条件只有本次为真，必须记下来
+            if isinstance(v, bool):                           # Python 真值 → 按它选路
+                if not v: i = jump(ins); continue
+            else:                                             # 张量条件：真前端必须在这里断裂
+                g.emit(&#39;break&#39;, &#39;条件依赖张量值&#39;); break
+        elif op == &#39;STORE_FAST&#39;:
+            env[co.co_varnames[arg]] = stack.pop(); g.emit(&#39;store&#39;, co.co_varnames[arg])
+        elif op == &#39;RETURN_VALUE&#39;:
+            return g, stack.pop()
+        i += 1
+    raise RuntimeError(&#39;没有 RETURN_VALUE&#39;)
+
+# ---------- 3. 路线 C：TorchScript 式子集检查器 ----------
+UNSUPPORTED_CALLS = {&#39;item&#39;: &#39;张量→Python 标量&#39;, &#39;print&#39;: &#39;有副作用&#39;, &#39;open&#39;: &#39;I/O 副作用&#39;}
+UNSUPPORTED_NODES = (ast.Import, ast.ImportFrom, ast.While, ast.Try, ast.Global, ast.Nonlocal)
+
+def script_check(func):
+    tree = ast.parse(inspect.getsource(func)) if inspect.isfunction(func) else func
+    bad = []
+    for node in ast.walk(tree):
+        if isinstance(node, UNSUPPORTED_NODES):
+            bad.append(type(node).__name__)
+        if isinstance(node, ast.Call) and getattr(node.func, &#39;attr&#39;, &#39;&#39;) in UNSUPPORTED_CALLS:
+            bad.append(f&#39;{node.func.attr}() ← {UNSUPPORTED_CALLS[node.func.attr]}&#39;)
+    return bad
+
+def leaky(x, thresh):
+    s = x.item()
+    print(s)
+    while s &gt; 0:
+        s = s - thresh
+    return x
+
+if __name__ == &#39;__main__&#39;:
+    print(&#39;--- A：FX 式 tracer（同一函数，两条真值路径）---&#39;)
+    for flag in (1, -1):
+        g, out = trace(flag)
+        print(f&#39;flag={flag:&gt;2} → 节点 {g.ops()}，输出 = {out}&#39;)
+    print(&#39;--- B：字节码前端（分支按运行时真值走，并在图里留下 guard）---&#39;)
+    for flag in (True, False):
+        g, out = run_bytecode(fn, x=Proxy(Graph(), &#39;x&#39;), flag=flag)
+        print(f&#39;flag={flag!s:&lt;5} →&#39;)
+        print(g.dump())
+    print(&#39;--- C：子集检查器 ---&#39;)
+    print(&#39;fn     →&#39;, script_check(fn) or &#39;整图可编译&#39;)
+    print(&#39;leaky  →&#39;, script_check(leaky))</code></pre>
+<p>实际输出（python3.10.16，与 python3.14.5 输出一致）：</p>
+<pre data-lang="text"><code class="language-text">--- A：FX 式 tracer（同一函数，两条真值路径）---
+flag= 1 → 节点 [&#39;add&#39;, &#39;mul&#39;]，输出 = %1
+flag=-1 → 节点 [&#39;add&#39;, &#39;sub&#39;]，输出 = %1
+--- B：字节码前端（分支按运行时真值走，并在图里留下 guard）---
+flag=True  →
+  %0 = add(x, 1.0)
+  %1 = store(&#39;a&#39;)
+  %2 = guard(&#39;T&#39;, &#39;命中分支&#39;)
+  %3 = mul(%0, 2.0)
+  %4 = store(&#39;b&#39;)
+flag=False →
+  %0 = add(x, 1.0)
+  %1 = store(&#39;a&#39;)
+  %2 = guard(&#39;F&#39;, &#39;命中分支&#39;)
+  %3 = sub(%0, 3.0)
+  %4 = store(&#39;b&#39;)
+--- C：子集检查器 ---
+fn     → 整图可编译
+leaky  → [&#39;While&#39;, &#39;item() ← 张量→Python 标量&#39;]</code></pre>
+<p>三处对照值得逐条读：</p>
+<ol>
+<li><strong>路线 A 的图随输入变</strong>：<code>flag=1</code> 得 <code>[&#39;add&#39;,&#39;mul&#39;]</code>，<code>flag=-1</code> 得 <code>[&#39;add&#39;,&#39;sub&#39;]</code>，两张图都不告诉你&quot;另一条分支存在&quot;——这正是 <code>torch.fx.symbolic_trace</code> 面对标量控制流的行为。</li>
+<li><strong>路线 B 多留一个 <code>guard</code> 节点</strong>：它记的是&quot;本次 <code>flag &gt; 0</code> 成立&quot;；没有 guard，编译器就没资格复用这张图。</li>
+<li><strong>路线 C 的两条诊断</strong>：<code>item()</code> 把张量降成 Python 标量，<code>while</code> 的迭代次数依赖运行时值，按子集规则都该在编译期拒掉。</li>
+</ol>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选，需自备能装 torch 的环境（本机未装 torch，故不列为必跑）----
+# 同一条差异用官方工具看：TORCH_LOGS=graph_breaks python3 demo.py
+# demo.py 里写一个带 .item() 或标量 if 的函数，分别用 torch.compile 与 torch.jit.script 包一次：
+# 前者打印&quot;在哪里断&quot;，后者在编译期直接报子集错误。只想看图不跑 GPU：torch.fx.symbolic_trace 的结果可 print。
+# 没有 torch 不影响本课：上面的 Python 版已把三条路的分工跑通。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：给 <code>run_bytecode</code> 加&quot;常量折叠&quot;：<code>BINARY_OP</code> 两个操作数都是 Python 数值时直接算结果、不建节点；用两个 flag 各跑一遍，说明它为什么不影响正确性。</li>
+<li><strong>解释</strong>：路线 A 的两张图为何&quot;各自都对、合起来错&quot;？什么输入会拿到错误答案？</li>
+<li><strong>对比/验证</strong>：把 <code>if flag &gt; 0</code> 换成 <code>if x.sum() &gt; 0</code>（张量条件），用两条路线各跑一遍。路线 B 会在 <code>guard</code> 后记一个 <code>break</code> 节点——它与 <code>while</code> 被拒绝是否同一类原因？</li>
+<li><strong>思考</strong>：路线 A 想补上&quot;另一条分支&quot;，除了加 guard，还能用多组输入各捕获一次再合并？列出代价。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>PyTorch 官方文档, <em>torch.compiler</em>（捕获→图→后端编译的整体流程，<code>torch.compile</code> 的入口与语义）：<a href="https://docs.pytorch.org/docs/stable/torch.compiler.html" target="_blank" rel="noopener noreferrer">https://docs.pytorch.org/docs/stable/torch.compiler.html</a></li>
+<li>PyTorch 官方文档, <em>torch.fx</em>（符号跟踪、<code>Proxy</code> 与 <code>GraphModule</code>，本课路线 A 的现实版本）：<a href="https://docs.pytorch.org/docs/stable/fx.html" target="_blank" rel="noopener noreferrer">https://docs.pytorch.org/docs/stable/fx.html</a></li>
+<li>PyTorch 官方文档, <em>torch.jit / TorchScript</em>（script 与 trace 两种前端、可编译子集的边界）：<a href="https://docs.pytorch.org/docs/stable/jit.html" target="_blank" rel="noopener noreferrer">https://docs.pytorch.org/docs/stable/jit.html</a></li>
+<li>PyTorch 官方文档, <em>torch.compiler_dynamo_deepdive</em>（Dynamo 在字节码层拦截与改写、guard 的产生位置）：<a href="https://docs.pytorch.org/docs/stable/torch.compiler_dynamo_deepdive.html" target="_blank" rel="noopener noreferrer">https://docs.pytorch.org/docs/stable/torch.compiler_dynamo_deepdive.html</a></li>
+</ul>
+<p><a href="#/l/mlc-ch2-l2">下一课：算子级 IR 与分解（decomposition）的取舍</a></p>

@@ -1,0 +1,117 @@
+<h2 id="h-结果与复盘rag-问答系统">结果与复盘（RAG 问答系统）<a class="anchor" href="#h-结果与复盘rag-问答系统" aria-label="本节链接">#</a></h2>
+<p>RAG 项目最容易&quot;看着能聊、其实答错&quot;，所以本课的重点是<strong>把质量量化</strong>：评估引用准确性、对比 chunk 策略，并准备好面试话术与常见坑。做完本课，你手上会有一张&quot;可复现的评估表&quot;和一套&quot;可对答的优化理由&quot;。</p>
+<h3 id="h-一目标与步骤">一、目标与步骤<a class="anchor" href="#h-一目标与步骤" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>构造评测集</strong>：准备一组带&quot;金标准答案&quot;的问题。</li>
+<li><strong>检索质量评估</strong>：命中率 Hit@k、MRR。</li>
+<li><strong>引用准确性与忠实度评估</strong>：用 RAGAS + 人工核对。</li>
+<li><strong>chunk 策略对比实验</strong>：256 / 512 / 1024 的量化结论。</li>
+<li><strong>面试话术</strong>：预演高频追问。</li>
+</ol>
+<h3 id="h-二代码骨架与实现指导">二、代码骨架与实现指导<a class="anchor" href="#h-二代码骨架与实现指导" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-构造评测集本项目的测试集">1. 构造评测集（本项目的&quot;测试集&quot;）<a class="anchor" href="#h-1-构造评测集本项目的测试集" aria-label="本节链接">#</a></h4>
+<p>评测集是你项目可信度的地基。人工写 30~50 个<strong>有明确事实答案</strong>的问题，每条标注金标准片段：</p>
+<pre data-lang="python"><code class="language-python"># data/eval_set.json 结构示例
+# [{&quot;question&quot;: &quot;框架支持哪几种向量库？&quot;, &quot;gold_snippet&quot;: &quot;支持 Chroma、FAISS、Pinecone 等&quot;},
+#  {&quot;question&quot;: &quot;切块的默认 overlap 是多少？&quot;, &quot;gold_snippet&quot;: &quot;默认 overlap 为 64&quot;}]
+
+import json
+eval_set = json.load(open(&quot;data/eval_set.json&quot;, encoding=&quot;utf-8&quot;))
+print(f&quot;评测问题 {len(eval_set)} 条&quot;)</code></pre>
+<p>要点：问题要<strong>来自文档、答案唯一</strong>，覆盖&quot;精确数值、章节概念、跨段综合&quot;三类，才能测出 RAG 的真实短板。</p>
+<h4 id="h-2-检索质量命中率与-mrr">2. 检索质量：命中率与 MRR<a class="anchor" href="#h-2-检索质量命中率与-mrr" aria-label="本节链接">#</a></h4>
+<pre data-lang="python"><code class="language-python">def hit_rate(retriever, eval_set, k=5):
+    hits = 0
+    for item in eval_set:
+        nodes = retriever.retrieve(item[&quot;question&quot;])[:k]
+        # 命中：检索到的任一节点包含金标准答案的关键词/片段
+        if any(item[&quot;gold_snippet&quot;] in n.text for n in nodes):
+            hits += 1
+    return hits / len(eval_set)
+
+def mrr(retriever, eval_set, k=5):
+    &quot;&quot;&quot;平均倒数排名：答案片段排得越靠前，得分越高。&quot;&quot;&quot;
+    scores = []
+    for item in eval_set:
+        nodes = retriever.retrieve(item[&quot;question&quot;])[:k]
+        for rank, n in enumerate(nodes, start=1):
+            if item[&quot;gold_snippet&quot;] in n.text:
+                scores.append(1 / rank)
+                break
+        else:
+            scores.append(0.0)
+    return sum(scores) / len(scores)
+
+print(&quot;Hit@5:&quot;, hit_rate(mmr_retriever, eval_set))
+print(&quot;MRR@5:&quot;, mrr(mmr_retriever, eval_set))</code></pre>
+<blockquote>
+<p>注意 <code>gold_snippet in n.text</code> 是<strong>精确子串</strong>匹配，简单但严格；更鲁棒可用&quot;答案关键词集合的交集比&quot;。面试时说明你用了哪种、有何局限即可。</p>
+</blockquote>
+<h4 id="h-3-引用准确性与忠实度ragas">3. 引用准确性与忠实度（RAGAS）<a class="anchor" href="#h-3-引用准确性与忠实度ragas" aria-label="本节链接">#</a></h4>
+<p>RAGAS 提供 <code>faithfulness</code>（答案是否可由上下文推出）与 <code>context_precision</code> 等指标：</p>
+<pre data-lang="python"><code class="language-python">from ragas import evaluate
+from ragas.metrics import faithfulness, context_precision, answer_relevancy
+from datasets import Dataset
+
+# 把 (question, answer, retrieved_contexts) 组织成数据集
+samples = []
+for item in eval_set:
+    out = answer(item[&quot;question&quot;])
+    samples.append({
+        &quot;question&quot;: item[&quot;question&quot;],
+        &quot;answer&quot;: out[&quot;answer&quot;],
+        &quot;contexts&quot;: [n.text for n in out.get(&quot;retrieved_nodes&quot;, [])],
+    })
+ds = Dataset.from_list(samples)
+score = evaluate(ds, metrics=[faithfulness, context_precision, answer_relevancy])
+print(score)</code></pre>
+<p>人工核对的<strong>引用准确率</strong>（citation accuracy）单独做：随机抽 30 条回答，逐条判断&quot;每个 [来源N] 是否真的支持该结论&quot;，<code>正确引用数 / 总引用数</code> 即为引用准确率。<strong>机器指标 + 人工抽查</strong>结合，才可信。</p>
+<h4 id="h-4-chunk-策略对比实验">4. chunk 策略对比实验<a class="anchor" href="#h-4-chunk-策略对比实验" aria-label="本节链接">#</a></h4>
+<p>把切块大小当作变量，其余固定，跑一遍指标，得到&quot;用数据说话&quot;的结论：</p>
+<pre data-lang="python"><code class="language-python">results = []
+for size, overlap in [(256, 32), (512, 64), (1024, 128)]:
+    nodes = chunk_documents(documents, chunk_size=size, overlap=overlap)
+    idx = build_index(nodes)          # 复用 lesson-02 的建索引函数
+    r = idx.as_retriever(similarity_top_k=5)
+    results.append({
+        &quot;chunk&quot;: f&quot;{size}/{overlap}&quot;,
+        &quot;hit@5&quot;: hit_rate(r, eval_set),
+        &quot;mrr&quot;: mrr(r, eval_set),
+        &quot;node_count&quot;: len(nodes),
+    })
+
+import pandas as pd
+print(pd.DataFrame(results).to_markdown(index=False))</code></pre>
+<p>预期方向：块太小命中率低（信息被切散）、块太大命中率高但生成时上下文噪声大；<code>512/64</code> 通常在中文文档上取到较好的&quot;命中率 × 忠实度&quot;平衡。<strong>你的具体数据会因语料不同而异，结论必须来自你的实验，而不是抄结论。</strong></p>
+<p><figure><img class="md-img" src="content/courses/ai-projects/assets/chapter-2-figure-03.svg" alt="chunk 策略对比与评估指标" loading="lazy" decoding="async"><figcaption>chunk 策略对比与评估指标</figcaption></figure>
+</p>
+<h4 id="h-5-报告收尾">5. 报告收尾<a class="anchor" href="#h-5-报告收尾" aria-label="本节链接">#</a></h4>
+<p>README 五段式：问题 → 架构 → 实现 → 评估（贴对比表 + RAGAS 分数）→ 反思（切块/检索/生成各一处可改进点）。配一张架构图和一张对比表图，即可作为作品集页面。</p>
+<h3 id="h-三面试话术">三、面试话术<a class="anchor" href="#h-三面试话术" aria-label="本节链接">#</a></h3>
+<p><strong>Q1：RAG 和微调你选哪个？为什么这个项目用 RAG？</strong>
+答：RAG 解决的是&quot;基于外部事实、可追溯、易更新&quot;的问答，微调解决的是&quot;稳定格式/风格/领域习惯&quot;。我的语料会持续更新，且客户要求每个答案可查证，所以用 RAG 更合适；同时我保留了提示词与生成端可替换的接口，未来若要固化回答风格，再考虑微调。关键判断是<strong>知识的更新频率与可追溯需求</strong>。</p>
+<p><strong>Q2：你怎么防止模型&quot;一本正经地胡说&quot;？</strong>
+答：三层。第一，提示词强制&quot;只用参考资料、逐句引用、不知道就说不知道&quot;；第二，检索侧多召回 + 相似度阈值过滤，减少&quot;喂错料&quot;；第三，评估侧用 RAGAS 忠实度 + 人工核对引用准确率，把幻觉变成可量化、可回归的指标。我无法保证零幻觉，但我能<strong>测出幻觉率并持续压低它</strong>。</p>
+<p><strong>Q3：chunk 大小你是怎么定的？</strong>
+答：不是拍脑袋，是做了 256/512/1024 的对比实验。结论是 512 在&quot;命中率 × 忠实度&quot;上最平衡：256 把完整答案切散导致命中率下降，1024 命中率高但把无关内容塞进上下文、稀释了 embedding 语义并抬高生成噪声。overlap 取 64 是为了避免把关键句从边界切断。</p>
+<p><strong>Q4：如果用户问的问题答案在两个不同文档里，你的系统怎么办？</strong>
+答：我的检索会跨文档召回多个片段，提示词要求&quot;综合多来源并分别标注 [来源N]&quot;；但这正是当前系统的已知短板——跨段综合问题的正确率低于单事实问题，我已在复盘里把它列为下一步要做的&quot;查询改写 + 重排序&quot;方向。</p>
+<p><strong>Q5：embedding 为什么用 bge 而不是 OpenAI？</strong>
+答：三点——中文检索效果、可本地部署不依赖外部 API、成本与隐私。若追求更高召回，可换 <code>bge-large</code> 或加 rerank 模型，那是下一步的性价比权衡。</p>
+<h3 id="h-四常见坑复盘清单">四、常见坑（复盘清单）<a class="anchor" href="#h-四常见坑复盘清单" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>无评测集就上线</strong>：只能&quot;目测&quot;，无法回归，改一处不知道是变好还是变坏。</li>
+<li><strong>chunk 太大或太小</strong>：前者噪声多、后者信息断裂，都要靠实验验证。</li>
+<li><strong>只看相似度、不看重排</strong>：召回 5 条几乎重复的片段，生成端&quot;巧妇难为无米之炊&quot;。</li>
+<li><strong>提示词不强制引用</strong>：模型自由发挥，幻觉无法追责，引用准确率无从谈起。</li>
+<li><strong>把机器指标当真理</strong>：RAGAS 分数不等于真实质量，必须辅以人工抽查。</li>
+<li><strong>忽略元数据</strong>：不存来源文件名/页码，最后&quot;答对了但说不出出处&quot;，引用变成摆设。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>RAGAS 评估框架文档：<a href="https://docs.ragas.io/" target="_blank" rel="noopener noreferrer">https://docs.ragas.io/</a></li>
+<li>LlamaIndex 评估模块：<a href="https://docs.llamaindex.ai/en/stable/module_guides/evaluating/" target="_blank" rel="noopener noreferrer">https://docs.llamaindex.ai/en/stable/module_guides/evaluating/</a></li>
+<li>《Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks》（RAG 原始论文）：<a href="https://arxiv.org/abs/2005.11401" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2005.11401</a></li>
+<li>BGE Embedding（通用嵌入基准）：<a href="https://huggingface.co/BAAI/bge-small-zh-v1.5" target="_blank" rel="noopener noreferrer">https://huggingface.co/BAAI/bge-small-zh-v1.5</a></li>
+</ul>
+<p><a href="#/l/proj-ch3-l1">下一课：项目规划</a></p>

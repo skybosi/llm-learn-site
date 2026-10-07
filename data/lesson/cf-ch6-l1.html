@@ -1,0 +1,303 @@
+<h2 id="h-指令选择树覆盖tiling-的另一种视角">指令选择：树覆盖（tiling 的另一种视角）<a class="anchor" href="#h-指令选择树覆盖tiling-的另一种视角" aria-label="本节链接">#</a></h2>
+<p>第 5 章交到后端手上的 IR 已经语义正确，但 IR 与目标机指令并不一一对应：一句 <code>t1 = a + b</code> 可能是 <code>add r, r, r</code>，可能是 <code>add r, r, #3</code>，还可能是&quot;取数、加法、存回&quot;三条。定下这层对应关系的动作叫<strong>指令选择</strong>（instruction selection），它最经典的模型是把表达式看成树、用指令模板去<strong>覆盖</strong>（tiling）整棵树。本课讲清这个模型，并把它与 GPU 里同名的那个 tiling 对齐。</p>
+<p><figure><img class="md-img" src="content/courses/compiler-foundations/assets/chapter-6-figure-01.svg" alt="树覆盖：用指令模板把 IR 表达式树盖满" loading="lazy" decoding="async"><figcaption>树覆盖：用指令模板把 IR 表达式树盖满</figcaption></figure>
+</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-覆盖ir-是树指令是模板">1. 覆盖：IR 是树，指令是模板<a class="anchor" href="#h-1-覆盖ir-是树指令是模板" aria-label="本节链接">#</a></h4>
+<p>表达式部分天然是一棵树（第 4 课）。每条目标指令都可以写成一条<strong>改写规则</strong>：左边是一小棵模式树，右边是这条指令——<code>add dst, src, #imm</code> 对应&quot;<code>add(X, 常量)</code>&quot;，<code>madd</code> 对应&quot;<code>add(mul(X,Y), Z)</code>&quot;。指令选择于是变成一道拼图题：给整棵 IR 树选一组<strong>互不重叠、恰好盖满</strong>的模板。这就是 tiling（铺砖）。</p>
+<p>tiling 在 GPU 课里的含义是&quot;数据分块&quot;，两者结构同构：</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>覆盖式 tiling（本课）</th>
+<th>数据式 tiling（CUDA 第 4 章）</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>被盖的东西</td>
+<td>IR 表达式树 / 指令 DAG</td>
+<td>迭代空间（张量分块）</td>
+</tr>
+<tr>
+<td>砖块</td>
+<td>指令模板 + 成本</td>
+<td>数据块 + 复用距离</td>
+</tr>
+<tr>
+<td>优化目标</td>
+<td>指令数 / 总成本最小</td>
+<td>访存次数 / 带宽最小</td>
+</tr>
+<tr>
+<td>主要约束</td>
+<td>模板依赖、寄存器压力</td>
+<td>共享内存容量、线程数</td>
+</tr>
+</tbody></table>
+<p>最后一列值得留意：两种 tiling 都受<strong>资源上限</strong>约束——那边是共享内存，这边是寄存器。</p>
+<h4 id="h-2-模板的粒度">2. 模板的粒度<a class="anchor" href="#h-2-模板的粒度" aria-label="本节链接">#</a></h4>
+<p>模板可细可宽：<strong>细<strong>（一节点一指令，<code>ldr r, [x_a]</code>）；</strong>中<strong>（把常量折进指令，<code>add r, x, #3</code> 省掉一次 <code>mov</code>）；</strong>宽</strong>（<code>madd</code> 一次盖住 <code>add(mul(a,b),c)</code>，或带移位的 <code>add r, r, r, lsl #k</code>）。</p>
+<p>直觉上&quot;盖得越多越省&quot;，但成本不按节点数线性摊薄：真实的宽指令往往吞吐更差或延迟更长。更要紧的是，<strong>一条指令盖住的子树越大，同时需要的操作数寄存器越多</strong>——这正是下一课寄存器压力的来源。所以指令选择不是&quot;挑最大的模板&quot;就完事。</p>
+<h4 id="h-3-贪心最大覆盖与动态规划">3. 贪心最大覆盖与动态规划<a class="anchor" href="#h-3-贪心最大覆盖与动态规划" aria-label="本节链接">#</a></h4>
+<p><strong>贪心最大覆盖</strong>（maximal munch）：从根往下走，每次挑&quot;盖住节点最多&quot;的模板，剩余子操作数递归处理。实现简单，缺点是决策依据是<strong>面积</strong>而非<strong>成本</strong>。</p>
+<p><strong>动态规划</strong>：自底向上求 <code>cost(v) = min(模板成本 + Σ 各子操作数成本)</code>，在树形 IR 上是多项式时间（龙书第 8 章 §8.11 的动态规划代码生成）。它挑的是总成本最小，因此能处理&quot;宽指令看着省、实际更贵&quot;的情形。</p>
+<p>还有一条相关结论：若目标机指令都是&quot;寄存器-寄存器&quot;形式、每条最多产生一个寄存器结果，那么用 Ershov 数 / Sethi–Ullman 标注可以同时得到<strong>最优求值顺序</strong>与<strong>最少寄存器数</strong>。这解释了早期 RISC 机器为什么敢用最简单的覆盖策略：成本高度统一时，面积就近似等于成本。</p>
+<h4 id="h-4-真实编译器怎么做">4. 真实编译器怎么做<a class="anchor" href="#h-4-真实编译器怎么做" aria-label="本节链接">#</a></h4>
+<p>LLVM 把指令选择放在后端第一阶段的头一步，产物是&quot;目标指令的 DAG + 虚拟寄存器&quot;，文档明确要求这一步使用<strong>最优的模式匹配选择器</strong>（&quot;模式展开 + 反复 peephole&quot;的替代设计要慢得多）。模板用 TableGen 描述：经典路径是 SelectionDAG，新路径 GlobalISel 把这一阶段拆成多步。CISC 后端还会把寻址模式当模板，一条 <code>mov rax, [rbx + rcx*8]</code> 同时完成移位、加法与取数。</p>
+<h4 id="h-5-常见坑">5. 常见坑<a class="anchor" href="#h-5-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>拿节点数当成本</strong>：宽指令盖得多但可能更贵；同理，立即数范围这类前提必须写进模板校验，否则会生成非法指令。</li>
+<li><strong>先选完再想寄存器</strong>：tile 越大、活跃值越多，可能选完才发现必须溢出，收益被抵消（第 2 课）。</li>
+<li><strong>只按树选、忽略共享</strong>：同一子表达式出现两次会被算两遍；DAG 覆盖能共享但其一般形式是 NP-hard，实践做法是&quot;树覆盖 + 局部合并&quot;。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面这段纯 Python（无第三方依赖）实现同一套模板的两种覆盖策略，并自动枚举小树搜出&quot;贪心不是最优&quot;的反例。目标机是<strong>本课自定义的玩具机器</strong>：指令形状参考 AArch64，成本是自定的小整数，<strong>不代表任何真实机器的数字</strong>。其中 <code>wide_fma</code> 是刻意放进来的&quot;宽指令&quot;（盖 5 个节点、成本 5），对应真实机器上&quot;省了一条取数、但本身更慢&quot;的复合指令。</p>
+<pre data-lang="python"><code class="language-python"># ---- 指令选择：树覆盖（tiling）的两种做法 ----
+# 纯 Python，无第三方依赖。
+# 目标机是&quot;本课自定义的玩具机器&quot;：成本只为对比算法，不代表任何真实机器的数字。
+# 指令形状参考 AArch64 的常见形态（add/mul/madd/lsl/带移位的 add）。
+
+# ---------- 1. 输入 IR：表达式树 ----------
+def Var(n): return (&#39;var&#39;, n)
+def Num(v): return (&#39;num&#39;, v)
+def Add(a, b): return (&#39;add&#39;, a, b)
+def Mul(a, b): return (&#39;mul&#39;, a, b)
+
+def size(t):
+    return 1 if t[0] in (&#39;var&#39;, &#39;num&#39;) else 1 + size(t[1]) + size(t[2])
+
+def render(t):
+    if t[0] == &#39;var&#39;: return t[1]
+    if t[0] == &#39;num&#39;: return str(t[1])
+    return f&#39;({render(t[1])} {&quot;+&quot; if t[0] == &quot;add&quot; else &quot;*&quot;} {render(t[2])})&#39;
+
+# ---------- 2. 指令模板：模板里的大写字母 = 必须先算进寄存器的子树 ----------
+def pow2(n): return isinstance(n, int) and n &gt; 0 and (n &amp; (n - 1)) == 0
+def log2(n):
+    k = 0
+    while (1 &lt;&lt; k) &lt; n: k += 1
+    return k
+
+# (名字, 模板, 成本, 发射函数(dst, regs, binds), 额外校验(binds))
+RULES = [
+    # 注意规则顺序：纯&quot;面积优先&quot;的贪心在同尺寸模板上按此顺序 tie-break
+    (&#39;add_rr&#39;,  (&#39;add&#39;, &#39;A&#39;, &#39;B&#39;),                        1,
+     lambda d, r, b: f&#39;add   {d}, {r[&quot;A&quot;]}, {r[&quot;B&quot;]}&#39;,                       lambda b: True),
+    (&#39;add_imm&#39;, (&#39;add&#39;, &#39;A&#39;, (&#39;num&#39;, &#39;B&#39;)),               1,
+     lambda d, r, b: f&#39;add   {d}, {r[&quot;A&quot;]}, #{b[&quot;B&quot;]}&#39;,                      lambda b: True),
+    (&#39;mul_rr&#39;,  (&#39;mul&#39;, &#39;A&#39;, &#39;B&#39;),                        3,
+     lambda d, r, b: f&#39;mul   {d}, {r[&quot;A&quot;]}, {r[&quot;B&quot;]}&#39;,                       lambda b: True),
+    (&#39;lsl_imm&#39;, (&#39;mul&#39;, &#39;A&#39;, (&#39;num&#39;, &#39;B&#39;)),               1,
+     lambda d, r, b: f&#39;lsl   {d}, {r[&quot;A&quot;]}, #{log2(b[&quot;B&quot;])}&#39;,                lambda b: pow2(b[&#39;B&#39;])),
+    (&#39;madd&#39;,    (&#39;add&#39;, (&#39;mul&#39;, &#39;A&#39;, &#39;B&#39;), &#39;C&#39;),          1,
+     lambda d, r, b: f&#39;madd  {d}, {r[&quot;A&quot;]}, {r[&quot;B&quot;]}, {r[&quot;C&quot;]}&#39;,             lambda b: True),
+    (&#39;add_lsl&#39;, (&#39;add&#39;, &#39;A&#39;, (&#39;mul&#39;, &#39;B&#39;, (&#39;num&#39;, &#39;C&#39;))), 1,
+     lambda d, r, b: f&#39;add   {d}, {r[&quot;A&quot;]}, {r[&quot;B&quot;]}, lsl #{log2(b[&quot;C&quot;])}&#39;,  lambda b: pow2(b[&#39;C&#39;])),
+    # &quot;宽指令&quot;：盖住的节点多，但单条成本高（真实机器上的对应物：带内存操作数、
+    # 需要额外地址生成的复合指令）—— 它的存在就是为了暴露&quot;面积 ≠ 成本&quot;
+    (&#39;wide_fma&#39;, (&#39;add&#39;, (&#39;mul&#39;, &#39;A&#39;, &#39;B&#39;), (&#39;mul&#39;, &#39;C&#39;, &#39;D&#39;)), 5,
+     lambda d, r, b: f&#39;fma   {d}, {r[&quot;A&quot;]}, {r[&quot;B&quot;]}, {r[&quot;C&quot;]}, {r[&quot;D&quot;]}&#39;,  lambda b: True),
+]
+
+def match(pat, t, b):
+    &quot;&quot;&quot;模板匹配：大写字符串是通配符，绑到子树；常量子模式只绑值&quot;&quot;&quot;
+    if isinstance(pat, str):
+        if pat in b: return b[pat] == t
+        b[pat] = t
+        return True
+    if pat[0] != t[0]: return False
+    if pat[0] in (&#39;var&#39;, &#39;num&#39;):
+        b[pat[1]] = t[1]
+        return True
+    return match(pat[1], t[1], b) and match(pat[2], t[2], b)
+
+def holes(pat):
+    &quot;&quot;&quot;模板里&quot;必须算进寄存器&quot;的位置（常量子模式不算）&quot;&quot;&quot;
+    out = []
+    def walk(p):
+        if isinstance(p, str): out.append(p); return
+        if p[0] in (&#39;var&#39;, &#39;num&#39;): return
+        walk(p[1]); walk(p[2])
+    walk(pat)
+    return out
+
+def pat_size(pat):
+    if isinstance(pat, str): return 0
+    if pat[0] in (&#39;var&#39;, &#39;num&#39;): return 0
+    return 1 + pat_size(pat[1]) + pat_size(pat[2])
+
+def applicable(t):
+    if t[0] in (&#39;var&#39;, &#39;num&#39;): return []          # 叶子由 ldr / mov 直接处理，成本 1
+    rs = []
+    for i, (name, pat, cost, emit, guard) in enumerate(RULES):
+        b = {}
+        if match(pat, t, b) and guard(b):
+            rs.append((i, name, pat, cost, emit, b))
+    return rs
+
+# ---------- 3. 贪心最大覆盖（maximal munch） ----------
+def greedy_rule(t, use_cost_tiebreak):
+    cands = applicable(t)
+    if not cands: raise KeyError(f&#39;没有模板能盖住 {t}&#39;)
+    key = (lambda c: (pat_size(c[2]), -c[0])) if not use_cost_tiebreak \
+        else (lambda c: (pat_size(c[2]), -c[3], -c[0]))
+    return max(cands, key=key)
+
+# ---------- 4. 动态规划最优覆盖：cost(v) = min(模板成本 + 各子操作数成本) ----------
+def dp_rule(t, memo):
+    if t in memo: return memo[t]
+    if t[0] in (&#39;var&#39;, &#39;num&#39;):
+        memo[t] = (1, None)                        # 一条 ldr / mov
+        return memo[t]
+    best = None
+    for i, name, pat, cost, emit, b in applicable(t):
+        total = cost + sum(dp_rule(b[h], memo)[0] for h in holes(pat))
+        if best is None or total &lt; best[0]:
+            best = (total, (i, name, pat, cost, emit, b))
+    memo[t] = best
+    return best
+
+# ---------- 5. 按覆盖结果发射指令 ----------
+class Emitter:
+    def __init__(self):
+        self.code, self.n = [], 0
+    def reg(self):
+        self.n += 1
+        return f&#39;x{self.n}&#39;
+    def emit(self, t, choose):
+        if t[0] in (&#39;var&#39;, &#39;num&#39;):                 # 叶子：一条取数指令
+            dst = self.reg()
+            self.code.append((f&#39;ldr   {dst}, [x_{t[1]}]&#39; if t[0] == &#39;var&#39;
+                              else f&#39;mov   {dst}, #{t[1]}&#39;, 1))
+            return dst
+        _, name, pat, cost, f, b = choose(t)
+        regs = {h: self.emit(b[h], choose) for h in holes(pat)}   # 先子后父
+        dst = self.reg()
+        self.code.append((f(dst, regs, b), cost))
+        return dst
+
+def run(t, which):
+    em = Emitter()
+    if which == &#39;dp&#39;:
+        memo = {}
+        em.emit(t, lambda x: dp_rule(x, memo)[1])
+    elif which == &#39;greedy&#39;:
+        em.emit(t, lambda x: greedy_rule(x, False))
+    else:
+        em.emit(t, lambda x: greedy_rule(x, True))
+    return em.code, sum(c for _, c in em.code)
+
+# ---------- 6. 枚举小树，自动搜&quot;贪心不是最优&quot;的反例 ----------
+def all_trees(n, leaves):
+    &quot;&quot;&quot;内部节点恰为 n 个的所有表达式树&quot;&quot;&quot;
+    if n == 0: return list(leaves)
+    out = []
+    for k in range(n):
+        for l in all_trees(k, leaves):
+            for r in all_trees(n - 1 - k, leaves):
+                out.append((&#39;add&#39;, l, r)); out.append((&#39;mul&#39;, l, r))
+    return out
+
+if __name__ == &#39;__main__&#39;:
+    print(&#39;=== 例 1：s = a*b + (c+3)*d ===&#39;)
+    tree = Add(Mul(Var(&#39;a&#39;), Var(&#39;b&#39;)), Mul(Add(Var(&#39;c&#39;), Num(3)), Var(&#39;d&#39;)))
+    print(&#39;IR：&#39;, render(tree), f&#39;（{size(tree)} 个节点）&#39;)
+    for which, label in ((&#39;greedy&#39;, &#39;贪心：面积优先&#39;), (&#39;greedy_cost&#39;, &#39;贪心：面积优先+成本 tie-break&#39;),
+                         (&#39;dp&#39;, &#39;DP：最小成本&#39;)):
+        code, cost = run(tree, which)
+        print(f&#39;\n--- {label}：{len(code)} 条指令，总成本 {cost} ---&#39;)
+        for text, c in code:
+            print(f&#39;    {text:&lt;34} (成本 {c})&#39;)
+
+    print(&#39;\n=== 例 2：s = (a*b) + (c*d)（宽指令 vs 拆开） ===&#39;)
+    tree2 = Add(Mul(Var(&#39;a&#39;), Var(&#39;b&#39;)), Mul(Var(&#39;c&#39;), Var(&#39;d&#39;)))
+    print(&#39;IR：&#39;, render(tree2), f&#39;（{size(tree2)} 个节点）&#39;)
+    for which, label in ((&#39;greedy&#39;, &#39;贪心：面积优先&#39;), (&#39;dp&#39;, &#39;DP：最小成本&#39;)):
+        code, cost = run(tree2, which)
+        print(f&#39;  {label}: 成本 {cost} → &#39; + &#39; | &#39;.join(x.strip() for x, _ in code))
+
+    print(&#39;\n=== 反例搜索：内部节点 ≤ 4 个的全部小树 ===&#39;)
+    for which, label in ((&#39;greedy&#39;, &#39;面积优先贪心&#39;), (&#39;greedy_cost&#39;, &#39;面积+成本 tie-break 贪心&#39;)):
+        bad, total = None, 0
+        for n in range(1, 5):
+            for t in all_trees(n, [Var(&#39;a&#39;), Var(&#39;b&#39;), Num(4)]):
+                total += 1
+                cg, _ = run(t, which); cd, _ = run(t, &#39;dp&#39;)
+                sg, sd = sum(c for _, c in cg), sum(c for _, c in cd)
+                if sg &gt; sd and (bad is None or sg - sd &gt; bad[0]):
+                    bad = (sg - sd, render(t), cg, cd, sg, sd)
+        print(f&#39;  {label}：检查 {total} 棵树；&#39;, end=&#39;&#39;)
+        if bad:
+            _, r, cg, cd, sg, sd = bad
+            print(f&#39;最差反例 {r}（贪心 {sg} &gt; DP {sd}）&#39;)
+            print(&#39;    贪心：&#39;, &#39; | &#39;.join(x.strip() for x, _ in cg))
+            print(&#39;    DP  ：&#39;, &#39; | &#39;.join(x.strip() for x, _ in cd))
+        else:
+            print(&#39;未发现反例&#39;)</code></pre>
+<p>运行结果（本机 Python 3.14 实跑，输出原样粘贴）：</p>
+<pre><code>=== 例 1：s = a*b + (c+3)*d ===
+IR： ((a * b) + ((c + 3) * d)) （9 个节点）
+
+--- 贪心：面积优先：7 条指令，总成本 11 ---
+    ldr   x1, [x_a]                    (成本 1)
+    ldr   x2, [x_b]                    (成本 1)
+    ldr   x3, [x_c]                    (成本 1)
+    mov   x4, #3                       (成本 1)
+    add   x5, x3, x4                   (成本 1)
+    ldr   x6, [x_d]                    (成本 1)
+    fma   x7, x1, x2, x5, x6           (成本 5)
+
+--- 贪心：面积优先+成本 tie-break：7 条指令，总成本 11 ---
+    ldr   x1, [x_a]                    (成本 1)
+    ldr   x2, [x_b]                    (成本 1)
+    ldr   x3, [x_c]                    (成本 1)
+    mov   x4, #3                       (成本 1)
+    add   x5, x3, x4                   (成本 1)
+    ldr   x6, [x_d]                    (成本 1)
+    fma   x7, x1, x2, x5, x6           (成本 5)
+
+--- DP：最小成本：7 条指令，总成本 9 ---
+    ldr   x1, [x_a]                    (成本 1)
+    ldr   x2, [x_b]                    (成本 1)
+    ldr   x3, [x_c]                    (成本 1)
+    add   x4, x3, #3                   (成本 1)
+    ldr   x5, [x_d]                    (成本 1)
+    mul   x6, x4, x5                   (成本 3)
+    madd  x7, x1, x2, x6               (成本 1)
+
+=== 例 2：s = (a*b) + (c*d)（宽指令 vs 拆开） ===
+IR： ((a * b) + (c * d)) （7 个节点）
+  贪心：面积优先: 成本 9 → ldr   x1, [x_a] | ldr   x2, [x_b] | ldr   x3, [x_c] | ldr   x4, [x_d] | fma   x5, x1, x2, x3, x4
+  DP：最小成本: 成本 8 → ldr   x1, [x_a] | ldr   x2, [x_b] | ldr   x3, [x_c] | ldr   x4, [x_d] | mul   x5, x3, x4 | madd  x6, x1, x2, x5
+
+=== 反例搜索：内部节点 ≤ 4 个的全部小树 ===
+  面积优先贪心：检查 57906 棵树；最差反例 ((((a * 4) * 4) * 4) * 4)（贪心 17 &gt; DP 5）
+    贪心： ldr   x1, [x_a] | mov   x2, #4 | mul   x3, x1, x2 | mov   x4, #4 | mul   x5, x3, x4 | mov   x6, #4 | mul   x7, x5, x6 | mov   x8, #4 | mul   x9, x7, x8
+    DP  ： ldr   x1, [x_a] | lsl   x2, x1, #2 | lsl   x3, x2, #2 | lsl   x4, x3, #2 | lsl   x5, x4, #2
+  面积+成本 tie-break 贪心：检查 57906 棵树；最差反例 ((a * 4) + ((a + 4) * 4))（贪心 11 &gt; DP 5）
+    贪心： ldr   x1, [x_a] | mov   x2, #4 | ldr   x3, [x_a] | mov   x4, #4 | add   x5, x3, x4 | mov   x6, #4 | fma   x7, x1, x2, x5, x6
+    DP  ： ldr   x1, [x_a] | lsl   x2, x1, #2 | ldr   x3, [x_a] | add   x4, x3, #4 | add   x5, x2, x4, lsl #2</code></pre>
+<p>输出里有三件事值得盯住：① 例 1 三种策略都是 7 条指令，但贪心版是&quot;6 条取数 + 成本 5 的 <code>fma</code>&quot;，DP 版把 <code>c+3</code> 折成立即数并用 <code>madd</code> 收掉乘加，总成本 9 对 11；② 面积优先的贪心在 <code>((((a*4)*4)*4)*4)</code> 上拿到成本 17（<code>mul_rr</code> 与 <code>lsl_imm</code> 同尺寸时按规则表顺序选中了贵的），DP 用移位链只要 5；③ 加上&quot;同尺寸选更便宜&quot;的 tie-break 后最差反例降到 11，仍输给 DP——<code>wide_fma</code> 的<strong>面积</strong>压过了成本判断。</p>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选（需本机有 clang/LLVM）：看真实编译器选了什么 ----
+# 把下面内容存为 demo.c：
+#   int dot(int a, int b, int c, int d) { return a*b + c*d; }
+# 然后：
+#   clang -O2 -S demo.c -o -            # 看是否出现 madd / 带移位的 add
+#   clang -O2 -emit-llvm -S demo.c -o - # 中端 IR 里仍是一条 mul 一条 mul 一条 add
+# 没有 clang 不影响本课：上面的 Python 版把&quot;模板匹配 + 两种覆盖策略&quot;完整跑通了。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：给 <code>RULES</code> 加一条 <code>sub_imm</code>（<code>sub(X, 常量)</code>，成本 1），再跑反例搜索，看&quot;面积优先贪心&quot;的最差反例是否变化，并解释原因。</li>
+<li><strong>解释</strong>：为什么 DP 在树形 IR 上是多项式时间，而同样的思想搬到 DAG 上就变成 NP-hard？提示：树上的子问题是什么，DAG 上的子问题又是什么？</li>
+<li><strong>对比/验证</strong>：把 <code>wide_fma</code> 的成本从 5 改成 3，重跑例 2。贪心与 DP 的结论一致吗？这说明&quot;成本模型&quot;与&quot;覆盖算法&quot;各自对结果负什么责任？</li>
+<li><strong>思考</strong>：如果一条模板要求固定的物理寄存器（例如除法只能用指定寄存器），覆盖阶段该怎么表达？提示：LLVM 文档把这类情形称为 fixed register，并说明指令选择器需要插入搬运。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Aho, Lam, Sethi, Ullman, <em>Compilers: Principles, Techniques, and Tools</em>（龙书）第 8 章「Code Generation」（树重写式指令选择与动态规划代码生成）：<a href="https://suif.stanford.edu/dragonbook/" target="_blank" rel="noopener noreferrer">https://suif.stanford.edu/dragonbook/</a></li>
+<li>LLVM 官方文档《The LLVM Target-Independent Code Generator》（后端阶段划分、Instruction Selection 要求最优模式匹配选择器、虚拟寄存器与 SelectionDAG）：<a href="https://llvm.org/docs/CodeGenerator.html" target="_blank" rel="noopener noreferrer">https://llvm.org/docs/CodeGenerator.html</a></li>
+<li>LLVM GlobalISel 文档「InstructionSelect」（IRTranslator → Legalizer → RegBankSelect → InstructionSelect 的新路线）：<a href="https://llvm.org/docs/GlobalISel/InstructionSelect.html" target="_blank" rel="noopener noreferrer">https://llvm.org/docs/GlobalISel/InstructionSelect.html</a></li>
+<li>Sethi, Ullman, <em>The Generation of Optimal Code for Arithmetic Expressions</em>, JACM 17(4), 1970（Ershov 数 / Sethi–Ullman 标注与最少寄存器数）：<a href="https://dl.acm.org/doi/10.1145/321607.321620" target="_blank" rel="noopener noreferrer">https://dl.acm.org/doi/10.1145/321607.321620</a></li>
+</ul>
+<p><a href="#/l/cf-ch6-l2">下一课：寄存器分配：图着色、溢出与重写</a></p>

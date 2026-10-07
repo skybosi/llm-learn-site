@@ -1,0 +1,139 @@
+<h2 id="h-零样本能力">零样本能力<a class="anchor" href="#h-零样本能力" aria-label="本节链接">#</a></h2>
+<p>前两课我们建立了 CLIP 的对齐机制。现在到了收获的时刻：<strong>CLIP 最令人震撼的能力——零样本（zero-shot）分类</strong>。一个从未在 ImageNet 上训练过的模型，凭什么能在 ImageNet 的 1000 个类别上做到和有监督 ResNet-50 相当甚至更好的准确率？这一课就把它的原理、实现和边界彻底讲清楚。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-什么是零样本不训练直接读标签">1. 什么是零样本：不训练，直接&quot;读标签&quot;<a class="anchor" href="#h-1-什么是零样本不训练直接读标签" aria-label="本节链接">#</a></h4>
+<p>传统分类模型要识别&quot;斑马&quot;，必须先见过几千张标注为&quot;斑马&quot;的图片。零样本的意思是：<strong>模型没见过任何一张标注了&quot;斑马&quot;的训练图，却能识别斑马</strong>。CLIP 之所以能做到，是因为它学到的不是&quot;图 → 1000 个类别编号&quot;的分类器，而是&quot;图 ↔ 文本&quot;的双向对齐。识别一个新类别时，你只需要做一件事——<strong>把这个类别的名字写成一句话</strong>，然后看哪句话和图片最匹配。</p>
+<h4 id="h-2-零样本分类的完整流程">2. 零样本分类的完整流程<a class="anchor" href="#h-2-零样本分类的完整流程" aria-label="本节链接">#</a></h4>
+<p>给定一张待分类的图 x，和 K 个候选类别 {c₁, …, c_K}：</p>
+<ol>
+<li><strong>构造文本</strong>：把每个类别名填入一个 prompt 模板，例如 <code>&quot;a photo of a {class}&quot;</code>，得到 K 个句子。</li>
+<li><strong>文本编码</strong>：用文本编码器把 K 个句子编码成 K 个归一化向量 t₁…t_K。</li>
+<li><strong>图像编码</strong>：用图像编码器把 x 编码成归一化向量 i。</li>
+<li><strong>算相似度</strong>：计算 i 与每个 t_k 的余弦相似度。</li>
+<li><strong>归一化输出</strong>：对 K 个相似度做 softmax，取概率最大的类别作为预测。</li>
+</ol>
+<p><figure><img class="md-img" src="content/courses/multimodal-diffusion/assets/chapter-4-figure-05.svg" alt="零样本分类流程：模板嵌入 → 相似度 → softmax" loading="lazy" decoding="async"><figcaption>零样本分类流程：模板嵌入 → 相似度 → softmax</figcaption></figure>
+</p>
+<p>整个过程<strong>没有任何训练、没有梯度更新</strong>，模型完全复用预训练时学到的对齐。你只需要决定&quot;用什么话描述这个类别&quot;。</p>
+<h4 id="h-3-prompt-模板与-prompt-ensembling措辞很关键">3. prompt 模板与 prompt ensembling：措辞很关键<a class="anchor" href="#h-3-prompt-模板与-prompt-ensembling措辞很关键" aria-label="本节链接">#</a></h4>
+<p>零样本效果对措辞极其敏感。原论文发现，同样的类别，用 <code>&quot;a photo of a {class}&quot;</code> 和直接写 <code>&quot;{class}&quot;</code> 分类准确率能差好几个百分点。更妙的是，<strong>把多个模板的结果取平均</strong>（prompt ensembling）还能进一步稳定提升。</p>
+<p>原论文为 ImageNet 准备了约 80 个模板，覆盖多种表达方式：</p>
+<ul>
+<li><code>&quot;a photo of a {class}, a type of {something}.&quot;</code></li>
+<li><code>&quot;a blurry photo of a {class}.&quot;</code></li>
+<li><code>&quot;a good photo of the {class}.&quot;</code></li>
+<li><code>&quot;an origami {class}.&quot;</code></li>
+</ul>
+<p>做法是：每个模板各编码一次，把同一类别的所有模板向量<strong>先取平均</strong>得到该类的代表向量，再与图像向量算相似度。这样能降低单个模板措辞带来的偶然偏差，让分类更稳健。</p>
+<p><figure><img class="md-img" src="content/courses/multimodal-diffusion/assets/chapter-4-figure-06.svg" alt="prompt ensembling：多个模板向量取平均" loading="lazy" decoding="async"><figcaption>prompt ensembling：多个模板向量取平均</figcaption></figure>
+</p>
+<blockquote>
+<p>这也引出了后来被广泛研究的&quot;prompt 工程&quot;方向：既然措辞如此重要，与其手工写模板，不如让模型学习最优模板（Context Optimization / CoOp）或让软提示在视觉侧工作。CLIP 是这一切的起点。</p>
+</blockquote>
+<h4 id="h-4-为什么零样本真的有效">4. 为什么零样本真的有效<a class="anchor" href="#h-4-为什么零样本真的有效" aria-label="本节链接">#</a></h4>
+<p>零样本能力不是魔法，它来自三件事的叠加：</p>
+<ol>
+<li><strong>监督信号是语言</strong>：语言天然覆盖了远超任何单一数据集的类别空间。&quot;斑马&quot;&quot;斑马线&quot;&quot;斑马纹蛋糕&quot;这些概念在文本里都出现过，模型在预训练时就已经见过它们的语言侧，只是从没把它们和特定图片绑定成分类任务。</li>
+<li><strong>学习的是表征而非分类头</strong>：分类器会把表征&quot;烧死&quot;在固定类别上；对比学习保留了一个通用的语义空间，任何能写进模板的概念都可以即插即用。</li>
+<li><strong>规模带来的鲁棒性</strong>：4 亿对数据的多样分布让模型对图像风格、背景、视角的偏移更不敏感，因此在分布偏移严重的测试集（如 ImageNet 的素描版、对抗版）上，零样本 CLIP 的相对优势比标准 ImageNet 上更明显。</li>
+</ol>
+<h4 id="h-5-零样本的短板诚实看待边界">5. 零样本的短板：诚实看待边界<a class="anchor" href="#h-5-零样本的短板诚实看待边界" aria-label="本节链接">#</a></h4>
+<p>零样本并非万能，原论文也明确列出了失败案例，理解它们同样重要：</p>
+<ul>
+<li><strong>细粒度与计数</strong>：区分&quot;哈士奇 vs 阿拉斯加&quot;、数出图片里有几只羊，CLIP 表现平平。</li>
+<li><strong>结构化与空间关系</strong>：&quot;红球在蓝球左边&quot;这类需要精确几何推理的任务，纯双塔结构吃力。</li>
+<li><strong>离分布概念</strong>：对某些特定数据集（如 MNIST 手写数字）CLIP 的零样本准确率很低，因为它预训练数据里几乎没有这种风格。</li>
+<li><strong>对模板的依赖</strong>：同一个类别换种说法结果就变，说明对齐还不够&quot;确定&quot;，仍依赖语言侧的措辞。</li>
+</ul>
+<p>这些短板，恰恰是第五章多模态大模型（LLaVA 等）要解决的问题——用大语言模型的推理能力去补 CLIP 不擅长的部分。</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<h4 id="h-示例-1零样本图像分类">示例 1：零样本图像分类<a class="anchor" href="#h-示例-1零样本图像分类" aria-label="本节链接">#</a></h4>
+<p>下面用 CLIP 对一张图做零样本分类，完整复现上面的流程。</p>
+<pre data-lang="python"><code class="language-python">from transformers import CLIPProcessor, CLIPModel
+from PIL import Image
+import torch
+
+model = CLIPModel.from_pretrained(&quot;openai/clip-vit-base-patch32&quot;)
+processor = CLIPProcessor.from_pretrained(&quot;openai/clip-vit-base-patch32&quot;)
+
+# 候选类别——模型从未针对这些类做过分类训练
+classes = [&quot;cat&quot;, &quot;dog&quot;, &quot;car&quot;, &quot;airplane&quot;, &quot;banana&quot;]
+template = &quot;a photo of a {}&quot;          # prompt 模板
+texts = [template.format(c) for c in classes]
+
+# 用一张占位图演示; 实际替换为你的图片路径
+image = Image.new(&quot;RGB&quot;, (224, 224), color=(100, 90, 80))
+
+inputs = processor(text=texts, images=image, return_tensors=&quot;pt&quot;, padding=True)
+with torch.no_grad():
+    out = model(**inputs)
+
+# 图像向量与各类文本向量的余弦相似度
+logits = out.image_embeds @ out.text_embeds.T   # (1, K)
+probs = logits.softmax(dim=-1)[0]
+
+# 按概率从高到低打印结果
+for c, p in sorted(zip(classes, probs.tolist()), key=lambda t: -t[1]):
+    print(f&quot;{c:10s} {p:.4f}&quot;)
+print(&quot;预测类别：&quot;, classes[torch.argmax(probs).item()])</code></pre>
+<h4 id="h-示例-2prompt-ensembling-提升稳定性">示例 2：prompt ensembling 提升稳定性<a class="anchor" href="#h-示例-2prompt-ensembling-提升稳定性" aria-label="本节链接">#</a></h4>
+<p>我们用多个模板对同一组类别编码，并对比&quot;单模板&quot;与&quot;多模板平均&quot;的差异。</p>
+<pre data-lang="python"><code class="language-python">from transformers import CLIPProcessor, CLIPModel
+from PIL import Image
+import torch
+
+model = CLIPModel.from_pretrained(&quot;openai/clip-vit-base-patch32&quot;)
+processor = CLIPProcessor.from_pretrained(&quot;openai/clip-vit-base-patch32&quot;)
+
+classes = [&quot;cat&quot;, &quot;dog&quot;, &quot;car&quot;]
+templates = [
+    &quot;a photo of a {}.&quot;,
+    &quot;a blurry photo of a {}.&quot;,
+    &quot;a good photo of the {}.&quot;,
+    &quot;an origami {}.&quot;,
+]
+image = Image.new(&quot;RGB&quot;, (224, 224), color=(110, 100, 90))
+
+# 图像向量只需算一次
+img_inputs = processor(images=image, return_tensors=&quot;pt&quot;)
+with torch.no_grad():
+    img_emb = model.get_image_features(**img_inputs)
+    img_emb = img_emb / img_emb.norm(dim=-1, keepdim=True)
+
+# 单模板结果
+single_texts = [templates[0].format(c) for c in classes]
+with torch.no_grad():
+    single_emb = model.get_text_features(**processor(text=single_texts, return_tensors=&quot;pt&quot;, padding=True))
+    single_emb = single_emb / single_emb.norm(dim=-1, keepdim=True)
+single_probs = (img_emb @ single_emb.T).softmax(dim=-1)[0]
+
+# 多模板平均: 对每个类别, 把所有模板的文本向量取平均
+all_emb = []
+for c in classes:
+    per_template = [t.format(c) for t in templates]
+    with torch.no_grad():
+        emb = model.get_text_features(**processor(text=per_template, return_tensors=&quot;pt&quot;, padding=True))
+        emb = emb / emb.norm(dim=-1, keepdim=True)
+    all_emb.append(emb.mean(dim=0, keepdim=True))   # 同类多模板取平均
+mean_emb = torch.cat(all_emb, dim=0)
+
+mean_probs = (img_emb @ mean_emb.T).softmax(dim=-1)[0]
+
+print(&quot;单模板概率：&quot;, dict(zip(classes, single_probs.tolist())))
+print(&quot;多模板平均概率：&quot;, dict(zip(classes, mean_probs.tolist())))</code></pre>
+<p><code>emb.mean(dim=0)</code> 那一行是 ensembling 的核心：多个措辞在嵌入空间里&quot;投票&quot;，平均后的类代表向量更接近该类的语义中心，受单个模板措辞偏差的影响更小。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>流程复述</strong>：不看代码，用自己的话写出零样本分类的 5 个步骤，并标出每一步用到了 CLIP 的哪个组件。</li>
+<li><strong>动手实验</strong>：在示例 1 中加入一个与图片无关但措辞相近的类别（例如把 &quot;banana&quot; 换成 &quot;banana peel&quot;），观察概率分布如何变化，并解释为什么措辞如此重要。</li>
+<li><strong>动手实验</strong>：把示例 2 的模板数量从 4 个扩展到 10 个（自行编写措辞），记录平均概率的变化。模板越多，结果一定越好吗？可能存在什么反例？</li>
+<li><strong>思考题</strong>：为什么 CLIP 在&quot;分布偏移的 ImageNet 变体&quot;上相对有监督模型的优势更明显？结合前两课学到的&quot;通用表征 vs 固定分类器&quot;来解释。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>CLIP 原论文：<a href="https://arxiv.org/abs/2103.00020" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2103.00020</a></li>
+<li>OpenAI CLIP 官方介绍：<a href="https://openai.com/research/clip" target="_blank" rel="noopener noreferrer">https://openai.com/research/clip</a></li>
+<li>CoOp 论文（Learning to Prompt for Vision-Language Models）：<a href="https://arxiv.org/abs/2109.01134" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2109.01134</a></li>
+<li>Hugging Face CLIP 文档：<a href="https://huggingface.co/docs/transformers/model_doc/clip" target="_blank" rel="noopener noreferrer">https://huggingface.co/docs/transformers/model_doc/clip</a></li>
+</ul>
+<p><a href="#/l/mm-ch5-l1">下一课：图文理解（LLaVA 等）</a></p>

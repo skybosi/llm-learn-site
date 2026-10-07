@@ -1,0 +1,105 @@
+<h2 id="h-训练问题">训练问题<a class="anchor" href="#h-训练问题" aria-label="本节链接">#</a></h2>
+<p>RNN 结构看起来很优雅，但真训练起来，会撞上一个出了名的大坑：<strong>梯度消失</strong>和<strong>梯度爆炸</strong>。这俩问题让普通 RNN 记不住长序列里的早期信息，也就处理不好&quot;长距离依赖&quot;。这一课我们把 RNN 的反向传播（BPTT）拆开看，搞懂坑是怎么来的、怎么缓解，为下一章 LSTM/GRU 的登场铺路。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-bptt沿时间反向传播">1. BPTT：沿时间反向传播<a class="anchor" href="#h-1-bptt沿时间反向传播" aria-label="本节链接">#</a></h4>
+<p>RNN 的反向传播有个专门的名字——<strong>随时间反向传播（Backpropagation Through Time, BPTT）</strong>。它的思路并不神秘：把 RNN 沿时间轴展开成一条链后，它就像一层层堆叠的网络，梯度从最后一个时间步，顺着链<strong>一步步往回传</strong>。</p>
+<p>因为每一步都复用同一个权重 <code>Wₕₕ</code>，所以 <code>Wₕₕ</code> 的梯度是<strong>所有时间步贡献的累加</strong>。具体来说，损失对早期隐藏状态 <code>hₜ</code> 的梯度，会经过一连串 <code>Wₕₕ</code> 的连乘才能传到更早的 <code>h₀</code>。问题就出在这个连乘上。</p>
+<p><figure><img class="md-img" src="content/courses/deep-learning-architectures/assets/chapter-4-figure-05.svg" alt="RNN 沿时间展开后梯度逐层回传的示意" loading="lazy" decoding="async"><figcaption>RNN 沿时间展开后梯度逐层回传的示意</figcaption></figure>
+</p>
+<h4 id="h-2-梯度消失与梯度爆炸连乘的代价">2. 梯度消失与梯度爆炸：连乘的代价<a class="anchor" href="#h-2-梯度消失与梯度爆炸连乘的代价" aria-label="本节链接">#</a></h4>
+<p>粗略地说，误差从时间步 <code>T</code> 传到时间步 <code>1</code>，中间要乘上 <code>T-1</code> 次 <code>Wₕₕ</code> 相关的项。假设每一步的放大倍数约为 <code>λ</code>，那么梯度就大致按 <code>λ^(T-1)</code> 缩放：</p>
+<ul>
+<li>若 <code>λ &lt; 1</code>：<code>λ^(T-1)</code> 随序列变长<strong>指数级趋近 0</strong> → <strong>梯度消失</strong>。早期时间步几乎收不到更新信号，网络&quot;记不住&quot;很久以前的信息。</li>
+<li>若 <code>λ &gt; 1</code>：<code>λ^(T-1)</code> <strong>指数级爆炸</strong> → <strong>梯度爆炸</strong>。参数更新一步蹿得老远，损失变成 <code>NaN</code>，训练直接崩溃。</li>
+</ul>
+<p>梯度爆炸很好识别——损失曲线突然飙到 <code>inf</code>/<code>NaN</code>；梯度消失则更隐蔽——损失下降得特别慢，甚至看起来&quot;学不动了&quot;，但模型其实在偷懒，只会利用最近几步的信息。</p>
+<p><figure><img class="md-img" src="content/courses/deep-learning-architectures/assets/chapter-4-figure-06.svg" alt="梯度沿时间步指数级消失或爆炸的示意" loading="lazy" decoding="async"><figcaption>梯度沿时间步指数级消失或爆炸的示意</figcaption></figure>
+</p>
+<h4 id="h-3-缓解手段">3. 缓解手段<a class="anchor" href="#h-3-缓解手段" aria-label="本节链接">#</a></h4>
+<p>针对这两个问题，工程上有几招标准应对：</p>
+<ul>
+<li><strong>梯度裁剪（gradient clipping）</strong>：对付<strong>爆炸</strong>最直接有效。每次反向传播后，检查整个模型梯度的范数，若超过阈值，就按比例把梯度整体缩回去，方向不变、只限步长。PyTorch 里一行 <code>torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)</code> 就搞定。</li>
+<li><strong>更好的激活与初始化</strong>：用 ReLU 族激活、合理的权重初始化（如 Xavier），能减轻梯度消失，但治标不治本。</li>
+<li><strong>换门控结构</strong>：这是治本的方向。LSTM、GRU 通过&quot;门&quot;让信息可以在长时间里近乎无损地传递，从根本上绕过连乘消失的问题——这正是下一章的主角。</li>
+<li><strong>截断 BPTT</strong>：训练超长序列时，只往回传播固定的若干步（比如 50 步），既省显存又避免梯度在超长链上失控。</li>
+</ul>
+<h4 id="h-4-为什么记不住是致命伤">4. 为什么&quot;记不住&quot;是致命伤<a class="anchor" href="#h-4-为什么记不住是致命伤" aria-label="本节链接">#</a></h4>
+<p>试想一个句子：&quot;我把昨天买的、放在厨房柜子上的那本书，送给了朋友。&quot; 当模型读到句尾要判断&quot;送&quot;的对象时，需要追溯到开头的&quot;我&quot;。普通 RNN 的梯度经过这么长的链早就衰减没了，模型学不到这种跨越几十步的依赖，只能靠猜。语言里这种&quot;长距离依赖&quot;俯拾皆是，所以 RNN 很快就被 LSTM/GRU 取代了——但理解了 RNN 的坑，你才能真正体会门控结构的价值。</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面用一个字符级 RNN 训练小任务，直观演示两件事：① 梯度范数会如何随训练波动，② 加梯度裁剪后训练更稳。我们用 RNN 预测一个简单周期序列的下一个字符，重点观察&quot;梯度&quot;与&quot;损失&quot;的数值，而非追求精度。</p>
+<pre data-lang="python"><code class="language-python">import torch
+import torch.nn as nn
+from torch.nn.utils import clip_grad_norm_
+
+torch.manual_seed(0)
+
+# 造一个确定性的小语料：反复重复 &quot;abc&quot;
+text = &quot;abc&quot; * 200
+chars = sorted(set(text))               # 只有 &#39;a&#39;,&#39;b&#39;,&#39;c&#39;
+char2idx = {c: i for i, c in enumerate(chars)}
+data = torch.tensor([char2idx[c] for c in text])
+
+class CharRNN(nn.Module):
+    def __init__(self, vocab_size, hidden_size):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, 8)
+        self.rnn = nn.RNN(8, hidden_size, batch_first=True)
+        self.fc = nn.Linear(hidden_size, vocab_size)
+
+    def forward(self, x):
+        # x: (batch, seq_len) -&gt; embed -&gt; (batch, seq_len, 8)
+        out, _ = self.rnn(self.embed(x))
+        # 每个时间步都预测&quot;下一个字符&quot;，取全部时间步输出
+        return self.fc(out)             # (batch, seq_len, vocab_size)
+
+def make_batches(data, batch_size, seq_len):
+    &quot;&quot;&quot;把一维语料切成 (batch, seq_len) 的输入和错开一位的目标。&quot;&quot;&quot;
+    inputs, targets = [], []
+    for i in range(0, len(data) - seq_len, seq_len):
+        inputs.append(data[i:i + seq_len])
+        targets.append(data[i + 1:i + seq_len + 1])
+        if len(inputs) == batch_size:
+            break
+    return torch.stack(inputs), torch.stack(targets)
+
+model = CharRNN(len(chars), hidden_size=16)
+loss_fn = nn.CrossEntropyLoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+
+# 对比：是否开启梯度裁剪
+for use_clip in [False, True]:
+    torch.manual_seed(0)
+    model = CharRNN(len(chars), 16)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+    print(f&quot;\n=== 梯度裁剪: {use_clip} ===&quot;)
+    for step in range(300):
+        x, y = make_batches(data, batch_size=8, seq_len=16)
+        logits = model(x)                       # (8, 16, 3)
+        loss = loss_fn(logits.reshape(-1, len(chars)), y.reshape(-1))
+        optimizer.zero_grad()
+        loss.backward()
+
+        if use_clip:
+            clip_grad_norm_(model.parameters(), max_norm=1.0)   # 裁剪梯度
+
+        # 统计当前梯度的总范数（只看第一个参数的梯度，作为示意）
+        grad_norm = model.rnn.weight_ih_l0.grad.norm().item()
+        optimizer.step()
+
+        if step % 100 == 0:
+            print(f&quot;step {step:3d} | loss={loss.item():.4f} | grad_norm={grad_norm:.4f}&quot;)</code></pre>
+<p>运行后你会看到：不裁剪时 <code>grad_norm</code> 可能在某些步明显偏大（本例序列短，未必爆炸，但能观察到范数波动）；开启裁剪后，范数被牢牢压在 <code>max_norm=1.0</code> 以内，更新更稳。把这个小例子换成更长的序列、更深的网络，裁剪的价值会更明显。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>把 <code>max_norm</code> 改成 <code>0.1</code> 和 <code>10.0</code>，观察 <code>grad_norm</code> 的上限和损失下降速度分别怎么变化，说说阈值设太小会怎样。</li>
+<li>把序列长度 <code>seq_len</code> 从 16 逐步加大到 64、128，观察不做裁剪时的 <code>grad_norm</code> 如何变化，并解释原因。</li>
+<li>试着故意调大学习率（如 <code>lr=1.0</code>）且<strong>不裁剪</strong>，运行几次，看损失会不会出现 <code>NaN</code>；再开启裁剪对比。</li>
+<li>思考：梯度裁剪为什么能压住爆炸却救不了消失？梯度消失的&quot;症状&quot;在损失曲线上通常长什么样？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>PyTorch 官方文档 · clip_grad_norm_：<a href="https://pytorch.org/docs/stable/generated/torch.nn.utils.clip_grad_norm_.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/docs/stable/generated/torch.nn.utils.clip_grad_norm_.html</a></li>
+<li>斯坦福 CS231n · RNN 中的梯度流与长距离依赖：<a href="https://cs231n.github.io/rnn/" target="_blank" rel="noopener noreferrer">https://cs231n.github.io/rnn/</a></li>
+<li>深度学习（Ian Goodfellow 等）· 序列建模中的梯度消失：<a href="https://www.deeplearningbook.org/contents/rnn.html" target="_blank" rel="noopener noreferrer">https://www.deeplearningbook.org/contents/rnn.html</a></li>
+</ul>
+<p><a href="#/l/dl-ch5-l1">下一课：LSTM</a></p>

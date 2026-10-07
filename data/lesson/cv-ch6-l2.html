@@ -1,0 +1,142 @@
+<h2 id="h-检测分割实战实现">检测/分割实战实现<a class="anchor" href="#h-检测分割实战实现" aria-label="本节链接">#</a></h2>
+<p>上一课我们把项目规划清楚了：任务形式、数据、基线、指标都定了下来。这一课进入实现阶段，把&quot;检测 + 分割&quot;的模型真正跑起来。我们以 Mask R-CNN 为例（它是两阶段检测 + 实例分割的经典范式，你在前面章节已经学过它的原理），用 <code>detectron2</code> 和 PyTorch 两种方式走通&quot;数据 → 模型 → 训练 → 推理&quot;的完整流水线。重点是让你掌握<strong>工业化实现的关键细节</strong>：数据如何喂给模型、损失如何组织、训练循环里有哪些容易踩的坑。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-实现一个检测分割模型要搭哪几块">1. 实现一个检测分割模型，要搭哪几块<a class="anchor" href="#h-1-实现一个检测分割模型要搭哪几块" aria-label="本节链接">#</a></h4>
+<p>无论用哪个框架，一个检测分割训练流水线都由四块组成：</p>
+<ol>
+<li><strong>数据加载</strong>：把图片和标注读成模型需要的张量格式。检测要 <code>boxes + labels</code>，实例分割还要 <code>masks</code>。</li>
+<li><strong>模型</strong>：骨干（backbone）+ 区域提议（RPN）+ 检测/分割头（RoI 头）。Mask R-CNN 在 Faster R-CNN 基础上加了一个并行的 mask 分支，为每个检测框预测一个二值掩码。</li>
+<li><strong>损失</strong>：检测是多任务学习，损失是几项的加权和——RPN 的分类/回归损失 + RoI 头的分类/回归损失 + mask 的逐像素二值交叉熵损失。</li>
+<li><strong>训练循环</strong>：前向 → 算损失 → 反向 → 优化器更新，外加学习率调度、梯度裁剪、checkpoint 保存。</li>
+</ol>
+<p><figure><img class="md-img" src="content/courses/cv-advanced/assets/chapter-6-figure-03.svg" alt="检测/分割训练流水线：数据加载 → 骨干特征 → RPN 提议 → RoI 检测/分割头 → 多任务损失" loading="lazy" decoding="async"><figcaption>检测/分割训练流水线：数据加载 → 骨干特征 → RPN 提议 → RoI 检测/分割头 → 多任务损失</figcaption></figure>
+</p>
+<h4 id="h-2-多任务损失几项损失是怎么合成一个数的">2. 多任务损失：几项损失是怎么&quot;合成一个数&quot;的<a class="anchor" href="#h-2-多任务损失几项损失是怎么合成一个数的" aria-label="本节链接">#</a></h4>
+<p>Mask R-CNN 的总损失是多项的加权和，这是理解它训练行为的核心：</p>
+<pre><code>总损失 = L_rpn_cls + L_rpn_box + L_roi_cls + L_roi_box + L_mask</code></pre>
+<ul>
+<li><strong>分类损失</strong>：交叉熵，判断&quot;这个框是什么类别、是不是前景&quot;；</li>
+<li><strong>回归损失</strong>：smooth L1，让框的位置更准；</li>
+<li><strong>mask 损失</strong>：逐像素二值交叉熵，让掩码贴合物体轮廓。</li>
+</ul>
+<p>多任务损失的一个经典陷阱是<strong>各项量纲不一致、收敛速度不同</strong>，直接相加可能导致某一项主导。工程上常对各项设权重（detectron2 里就有 <code>MODEL.MASK_ON</code>、<code>LOSS_WEIGHTS</code> 这类配置）或用自适应加权，来平衡各任务。</p>
+<h4 id="h-3-数据增强与过拟合的博弈">3. 数据增强与&quot;过拟合&quot;的博弈<a class="anchor" href="#h-3-数据增强与过拟合的博弈" aria-label="本节链接">#</a></h4>
+<p>检测分割对数据增强特别敏感，因为框和掩码必须和图像<strong>同步变换</strong>：</p>
+<ul>
+<li><strong>几何增强</strong>（随机翻转、随机裁剪、缩放）：图像和框/掩码要一起变，裁剪时还要处理&quot;目标被切掉一半&quot;的情况；</li>
+<li><strong>色彩增强</strong>（亮度、对比度、饱和度抖动）：只变图像，不变标注；</li>
+<li><strong>马赛克/复制粘贴（Copy-Paste）</strong>：把小目标粘贴到别处，缓解小目标稀少问题。</li>
+</ul>
+<p>小数据集上，强增强几乎是&quot;免费的精度提升&quot;；但增强过猛也会引入假目标、破坏真实分布，需要配合验证集观察。</p>
+<h4 id="h-4-用-vit-骨干--自监督预训练把前几章串起来">4. 用 ViT 骨干 + 自监督预训练：把前几章串起来<a class="anchor" href="#h-4-用-vit-骨干--自监督预训练把前几章串起来" aria-label="本节链接">#</a></h4>
+<p>这是本课的&quot;进阶加分项&quot;，也是把第 4、5 章学到的内容落地的机会：</p>
+<ul>
+<li>把骨干从 ResNet 换成 <strong>Swin</strong>（第 4 章），检测分割精度通常有明显提升，代价是显存和推理变慢；</li>
+<li>数据稀缺时，先用 <strong>MAE 自监督预训练</strong>（第 5 章）在无标注图像上训练骨干，再接到检测头微调，往往能显著提升小数据场景的精度。</li>
+</ul>
+<p>骨架模型的结构示意如下，注意骨干和头的&quot;可插拔&quot;关系——换骨干不影响头的设计：</p>
+<p><figure><img class="md-img" src="content/courses/cv-advanced/assets/chapter-6-figure-04.svg" alt="可插拔结构：ResNet 或 Swin 骨干 + RPN + RoI 检测头 + 并行 mask 头" loading="lazy" decoding="async"><figcaption>可插拔结构：ResNet 或 Swin 骨干 + RPN + RoI 检测头 + 并行 mask 头</figcaption></figure>
+</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>先用 <code>detectron2</code> 走一个&quot;最短路径&quot;，把配置、训练、推理串起来（代码是示意骨架，注释说明每步在做什么）：</p>
+<pre data-lang="python"><code class="language-python"># 假设已安装 detectron2；这里展示配置与训练的最小骨架
+from detectron2.config import get_cfg
+from detectron2.engine import DefaultTrainer
+from detectron2.data import DatasetCatalog, MetadataCatalog
+from detectron2.data.datasets import register_coco_instances
+
+# 1) 注册 COCO 格式数据集（detectron2 会自动处理 boxes/labels/masks）
+register_coco_instances(
+    &quot;pcb_train&quot;, {}, &quot;path/to/train.json&quot;, &quot;path/to/train_images&quot;)
+register_coco_instances(
+    &quot;pcb_val&quot;, {}, &quot;path/to/val.json&quot;, &quot;path/to/val_images&quot;)
+
+# 2) 用 Mask R-CNN + ResNet50 作为基线配置
+cfg = get_cfg()
+cfg.merge_from_file(
+    &quot;detectron2/configs/COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml&quot;)
+cfg.DATASETS.TRAIN = (&quot;pcb_train&quot;,)
+cfg.DATASETS.TEST = (&quot;pcb_val&quot;,)
+cfg.DATALOADER.NUM_WORKERS = 2
+cfg.MODEL.WEIGHTS = &quot;detectron2://ImageNetPretrained/MSRA/R-50.pkl&quot;  # 预训练骨干
+cfg.SOLVER.IMS_PER_BATCH = 4
+cfg.SOLVER.BASE_LR = 0.001
+cfg.SOLVER.MAX_ITER = 5000
+cfg.MODEL.ROI_HEADS.NUM_CLASSES = 4       # 你的缺陷类别数
+cfg.MODEL.ROI_HEADS.BATCH_SIZE_PER_IMAGE = 128
+cfg.OUTPUT_DIR = &quot;./output/pcb_baseline&quot;
+
+# 3) 训练
+trainer = DefaultTrainer(cfg)
+trainer.resume_or_load(resume=False)
+trainer.train()
+
+# 4) 推理 + 可视化（把预测框和掩码画到图上）
+from detectron2.engine import DefaultPredictor
+from detectron2.utils.visualizer import Visualizer, ColorMode
+
+cfg.MODEL.WEIGHTS = &quot;./output/pcb_baseline/model_final.pth&quot;
+predictor = DefaultPredictor(cfg)
+# ...（省略：读图、predictor(img)、Visualizer 画框/掩码并保存）</code></pre>
+<p>用 <code>detectron2</code> 的优点是：数据集注册、多任务损失、学习率调度、评估脚本全都内置，你只需改配置。缺点是它帮你&quot;藏&quot;起了很多细节。为了真正理解流水线，再看一段<strong>纯 PyTorch</strong> 的最小训练循环骨架，把&quot;多任务损失 → 反向 → 更新&quot;的链路摊开：</p>
+<pre data-lang="python"><code class="language-python">import torch
+import torch.nn as nn
+
+
+class DummyDetSegModel(nn.Module):
+    &quot;&quot;&quot;极简骨架：演示检测/分割多任务损失的组织方式，不做真实检测。&quot;&quot;&quot;
+    def __init__(self, num_classes=4):
+        super().__init__()
+        self.backbone = nn.Conv2d(3, 64, 3, padding=1)      # 假骨干
+        self.cls_head = nn.Linear(64, num_classes)          # 分类头
+        self.box_head = nn.Linear(64, 4)                    # 回归头（4 个坐标）
+        self.mask_head = nn.Conv2d(64, 1, 1)                # mask 头
+
+    def forward(self, x):
+        feat = self.backbone(x)                            # (B, 64, H, W)
+        logits = self.cls_head(feat.mean(dim=(2, 3)))      # 全局池化后分类
+        boxes = self.box_head(feat.mean(dim=(2, 3)))       # 回归框
+        mask = self.mask_head(feat)                        # 分割掩码
+        return logits, boxes, mask
+
+
+model = DummyDetSegModel()
+optimizer = torch.optim.SGD(model.parameters(), lr=1e-3)
+
+# 造一批假数据和假目标
+x = torch.randn(2, 3, 32, 32)
+y_cls = torch.randint(0, 4, (2,))                 # 真类别
+y_box = torch.randn(2, 4)                         # 真框坐标
+y_mask = torch.randint(0, 2, (2, 1, 32, 32)).float()  # 真掩码（0/1）
+
+# 一次训练步：前向 → 多任务损失 → 反向 → 更新
+logits, boxes, mask = model(x)
+loss_cls = nn.functional.cross_entropy(logits, y_cls)
+loss_box = nn.functional.smooth_l1_loss(boxes, y_box)      # 回归常用 smooth L1
+loss_mask = nn.functional.binary_cross_entropy_with_logits(mask, y_mask)
+
+# 多任务损失加权求和（权重是可调超参）
+total_loss = loss_cls + 1.0 * loss_box + 0.5 * loss_mask
+optimizer.zero_grad()
+total_loss.backward()
+optimizer.step()
+
+print(f&quot;cls={loss_cls.item():.3f} box={loss_box.item():.3f} &quot;
+      f&quot;mask={loss_mask.item():.3f} total={total_loss.item():.3f}&quot;)</code></pre>
+<p>运行后你会看到四项损失各自的值和一个加权后的总损失。这个&quot;多任务损失如何合成一个数&quot;的过程，正是 Mask R-CNN 训练循环的心脏——<code>detectron2</code> 内部做的事，本质上就是这段代码的放大版。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>用 <code>detectron2</code> 在 COCO 的一个子集（如只取 3 个类别）上跑通 Mask R-CNN 训练，观察 tensorboard 里各项损失曲线的下降速度和量级，找出哪一项损失最难收敛。</li>
+<li>把上面纯 PyTorch 骨架里的 <code>smooth_l1_loss</code> 换成 <code>mse_loss</code>，对比两者对&quot;框坐标异常值&quot;的鲁棒性差异，并说明为什么检测回归偏好 smooth L1。</li>
+<li>修改 mask 损失的权重（<code>0.5</code> → <code>2.0</code>），训练几十步观察 mask 分支损失的变化，讨论&quot;多任务损失的权重该不该调、怎么调&quot;。</li>
+<li>动手做一次&quot;骨干可插拔&quot;：在 <code>detectron2</code> 配置里把骨干从 ResNet50 换成 Swin-T（或注册自定义骨干），比较检测精度和训练显存的变化，验证第 4 章学的分层 Transformer 在下游任务上的收益。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>论文《Mask R-CNN》（检测 + 实例分割范式）：<a href="https://arxiv.org/abs/1703.06870" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1703.06870</a></li>
+<li>Detectron2 文档与教程：<a href="https://detectron2.readthedocs.io/" target="_blank" rel="noopener noreferrer">https://detectron2.readthedocs.io/</a></li>
+<li>MMDetection 文档：<a href="https://mmdetection.readthedocs.io/" target="_blank" rel="noopener noreferrer">https://mmdetection.readthedocs.io/</a></li>
+<li>论文《Simple Copy-Paste is a Strong Data Augmentation Method》（数据增强）：<a href="https://arxiv.org/abs/2012.07177" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2012.07177</a></li>
+<li>论文《Swin Transformer》（作为检测骨干）：<a href="https://arxiv.org/abs/2103.14030" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2103.14030</a></li>
+</ul>
+<p><a href="#/l/cv-ch6-l3">下一课：结果评估与复盘</a></p>

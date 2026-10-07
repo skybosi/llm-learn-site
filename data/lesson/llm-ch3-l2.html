@@ -1,0 +1,118 @@
+<h2 id="h-bert-架构">BERT 架构<a class="anchor" href="#h-bert-架构" aria-label="本节链接">#</a></h2>
+<p>上一课讲了 BERT&quot;做什么&quot;（填空），这一课讲 BERT&quot;长什么样&quot;。BERT 是<strong>仅编码器（encoder-only）</strong>的 Transformer：堆叠多层双向自注意力，靠 <code>[CLS]</code>、<code>[SEP]</code> 两个特殊 token 组织输入，用&quot;词嵌入 + 分段嵌入 + 位置嵌入&quot;三者相加作为输入表示。我们会逐一拆解这些零件，对照 BERT_base / BERT_large 的参数，并亲手跑一遍前向，把论文里的框图变成可观测的张量。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-整体结构双向的编码器堆栈">1. 整体结构：双向的编码器堆栈<a class="anchor" href="#h-1-整体结构双向的编码器堆栈" aria-label="本节链接">#</a></h4>
+<p>BERT 复用原始 Transformer 的<strong>编码器</strong>部分，去掉了解码器与交叉注意力，所以每个位置都能<strong>同时看到整句的所有位置</strong>（双向、无因果掩码）。数据流如下：</p>
+<pre><code>输入表示（词 + 分段 + 位置嵌入之和）
+   → 堆叠 N 个编码器块（多头自注意力 + 前馈，残差 + LayerNorm）
+   → 每个位置输出一个上下文表示
+   → [CLS] 位置的表示常被当作&quot;整句&quot;的摘要，供下游任务使用</code></pre>
+<p>和 GPT 的一个关键差别是归一化位置：BERT 沿用原始 Transformer 的 <strong>post-LN</strong>（子层之后归一化），而 GPT-2 之后改用 pre-LN。另一个差别是注意力<strong>没有因果掩码</strong>，因此能双向理解——这是它能做&quot;填空&quot;（MLM）的结构基础。</p>
+<h4 id="h-2-输入表示三种嵌入相加">2. 输入表示：三种嵌入相加<a class="anchor" href="#h-2-输入表示三种嵌入相加" aria-label="本节链接">#</a></h4>
+<p>BERT 的每个输入 token 被表示成三个嵌入<strong>逐元素相加</strong>：</p>
+<pre><code>输入向量 = 词嵌入(token) + 分段嵌入(segment) + 位置嵌入(position)</code></pre>
+<ul>
+<li><strong>词嵌入（Token Embeddings）</strong>：由 WordPiece 子词算法得到的词表（约 3 万个 token）查表而来；</li>
+<li><strong>分段嵌入（Segment Embeddings）</strong>：标记 token 属于&quot;第一句&quot;还是&quot;第二句&quot;（值为 0/1），用于支持下一句预测这类双句任务；</li>
+<li><strong>位置嵌入（Position Embeddings）</strong>：<strong>可学习的</strong>绝对位置编码（BERT 不用正弦函数），最多 512 个位置。</li>
+</ul>
+<p>三者相加后，再过一层 LayerNorm 与 Dropout，得到送入编码器的向量。这里&quot;分段嵌入&quot;是 BERT 区别于 GPT 的显著点——GPT 是单句自回归，不需要区分两个句子。</p>
+<h4 id="h-3-两个特殊-tokencls-与-sep">3. 两个特殊 token：<code>[CLS]</code> 与 <code>[SEP]</code><a class="anchor" href="#h-3-两个特殊-tokencls-与-sep" aria-label="本节链接">#</a></h4>
+<p>BERT 的每个输入序列都被包裹上两个特殊符号：</p>
+<ul>
+<li><strong><code>[CLS]</code></strong>（classification）：放在句首。经过编码后，<code>[CLS]</code> 位置的输出向量被训练成&quot;整句语义的聚合表示&quot;，分类任务就直接在它上面接一个线性头；</li>
+<li><strong><code>[SEP]</code></strong>（separator）：放在句尾，以及两个句子之间，用来分隔句 A 与句 B。</li>
+</ul>
+<p>于是输入格式通常是 <code>[CLS] 句A [SEP] 句B [SEP]</code>。这是 BERT 支持&quot;单句任务 + 双句任务&quot;的关键设计。</p>
+<h4 id="h-4-编码器块与-bert_base--bert_large">4. 编码器块与 BERT_base / BERT_large<a class="anchor" href="#h-4-编码器块与-bert_base--bert_large" aria-label="本节链接">#</a></h4>
+<p>每个编码器块和标准 Transformer 编码器一致：<strong>多头自注意力 + 前馈网络</strong>，各带残差连接与 LayerNorm（post-LN）。前馈网络的中间维度是 <code>4 × hidden_size</code>，激活用 GELU。</p>
+<p>BERT 发布时给了两个规格：</p>
+<table>
+<thead>
+<tr>
+<th>规格</th>
+<th>参数量</th>
+<th>层数</th>
+<th>隐藏维</th>
+<th>注意力头数</th>
+<th>总参数</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>BERT_base</td>
+<td>约 1.1 亿</td>
+<td>12</td>
+<td>768</td>
+<td>12</td>
+<td>110M</td>
+</tr>
+<tr>
+<td>BERT_large</td>
+<td>约 3.4 亿</td>
+<td>24</td>
+<td>1024</td>
+<td>16</td>
+<td>340M</td>
+</tr>
+</tbody></table>
+<p><code>base</code> 适合快速实验与微调，<code>large</code> 精度更高但更吃资源。两者的<strong>结构完全相同</strong>，只是宽度与深度不同——又一次印证了&quot;架构复用、规模调节&quot;的设计哲学。</p>
+<p><figure><img class="md-img" src="content/courses/llm-foundations/assets/chapter-3-figure-03.svg" alt="BERT 架构与输入表示（词/分段/位置三种嵌入相加）示意" loading="lazy" decoding="async"><figcaption>BERT 架构与输入表示（词/分段/位置三种嵌入相加）示意</figcaption></figure>
+</p>
+<h4 id="h-5-输出每个位置的表示--cls-聚合">5. 输出：每个位置的表示 + <code>[CLS]</code> 聚合<a class="anchor" href="#h-5-输出每个位置的表示--cls-聚合" aria-label="本节链接">#</a></h4>
+<p>编码完成后，BERT 输出<strong>每个位置</strong>的上下文表示 <code>last_hidden_state</code>（形状 <code>[batch, 长度, hidden]</code>）。此外还额外输出一个 <strong><code>pooler_output</code></strong>：把 <code>[CLS]</code> 位置的表示过一个线性层 + tanh，作为&quot;整句级&quot;的聚合向量。下游任务按需取用：</p>
+<ul>
+<li><strong>token 级任务</strong>（如命名实体识别、问答）用每个位置的表示；</li>
+<li><strong>句子级任务</strong>（如情感分类、句子对判断）用 <code>[CLS]</code> 的表示。</li>
+</ul>
+<p><figure><img class="md-img" src="content/courses/llm-foundations/assets/chapter-3-figure-04.svg" alt="BERT_base 与 BERT_large 的规格对比示意" loading="lazy" decoding="async"><figcaption>BERT_base 与 BERT_large 的规格对比示意</figcaption></figure>
+</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>先用 Hugging Face 读 BERT 的配置，把参数表变成可打印的数字。</p>
+<pre data-lang="python"><code class="language-python">from transformers import BertConfig, BertModel
+
+cfg = BertConfig.from_pretrained(&quot;bert-base-uncased&quot;)
+print(&quot;隐藏维 hidden_size        =&quot;, cfg.hidden_size)
+print(&quot;层数 num_hidden_layers     =&quot;, cfg.num_hidden_layers)
+print(&quot;注意力头 num_attention_heads=&quot;, cfg.num_attention_heads)
+print(&quot;词表 vocab_size            =&quot;, cfg.vocab_size)
+print(&quot;最大位置 max_position_embeddings =&quot;, cfg.max_position_embeddings)
+
+model = BertModel.from_pretrained(&quot;bert-base-uncased&quot;)
+params = sum(p.numel() for p in model.parameters())
+print(&quot;总参数量 =&quot;, f&quot;{params/1e6:.1f}M&quot;)
+
+# 三种嵌入都在 model.embeddings 里，逐项看清
+print(&quot;\n嵌入模块结构:&quot;)
+print(model.embeddings)</code></pre>
+<p>你会看到 <code>embeddings</code> 里依次是 <code>word_embeddings</code>、<code>position_embeddings</code>、<code>token_type_embeddings</code>（即分段嵌入）以及 LayerNorm/Dropout——正是&quot;三种嵌入相加&quot;的具象化。</p>
+<p>再跑一次前向，看 <code>[CLS]</code> 与 <code>[SEP]</code> 如何出现、两种输出各是什么形状：</p>
+<pre data-lang="python"><code class="language-python">import torch
+from transformers import BertTokenizer
+
+tok = BertTokenizer.from_pretrained(&quot;bert-base-uncased&quot;)
+text = &quot;Hello, my dog is cute&quot;
+inputs = tok(text, return_tensors=&quot;pt&quot;)
+
+print(&quot;input_ids       :&quot;, inputs[&quot;input_ids&quot;].tolist())
+print(&quot;token_type_ids  :&quot;, inputs[&quot;token_type_ids&quot;].tolist())  # 单句全为 0
+print(&quot;解码回 token    :&quot;, tok.convert_ids_to_tokens(inputs[&quot;input_ids&quot;][0]))
+
+with torch.no_grad():
+    out = model(**inputs)
+print(&quot;\nlast_hidden_state 形状:&quot;, out.last_hidden_state.shape)  # [1, T, 768]
+print(&quot;pooler_output      形状:&quot;, out.pooler_output.shape)       # [1, 768]</code></pre>
+<p><code>input_ids</code> 里开头的 <code>101</code> 是 <code>[CLS]</code>、结尾的 <code>102</code> 是 <code>[SEP]</code>。<code>last_hidden_state</code> 的每一行是<strong>对应 token 的上下文表示</strong>，而 <code>pooler_output</code> 是 <code>[CLS]</code> 表示经过线性 + tanh 后的&quot;整句摘要&quot;。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>用 <code>BertConfig</code> 实例化 <code>bert-large-uncased</code>，打印它的 <code>hidden_size / num_hidden_layers / num_attention_heads</code>，对照上表验证 base 与 large 的差异。</li>
+<li>输入两个句子 <code>(&quot;Hello&quot;, &quot;my dog is cute&quot;)</code>（作为 pair），观察 <code>token_type_ids</code> 的变化，指出哪些 token 属于&quot;第二句&quot;，并说明 <code>[SEP]</code> 出现了几次。</li>
+<li>在 <code>model.embeddings</code> 上分别打印 <code>word_embeddings</code>、<code>position_embeddings</code>、<code>token_type_embeddings</code> 三个权重的形状，解释为什么前两者形状相同、第三个形状不同（提示：分段只有 0/1 两种）。</li>
+<li>思考题：BERT 为什么用 <code>[CLS]</code> 位置的输出作为&quot;整句表示&quot;，而不是把所有位置求平均？结合&quot;这个位置被专门训练来聚合句子信息&quot;来回答。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Devlin et al., <em>BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding</em>：<a href="https://arxiv.org/abs/1810.04805" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1810.04805</a></li>
+<li>Hugging Face Transformers 文档 · BERT：<a href="https://huggingface.co/docs/transformers/model_doc/bert" target="_blank" rel="noopener noreferrer">https://huggingface.co/docs/transformers/model_doc/bert</a></li>
+<li>Vaswani et al., <em>Attention Is All You Need</em>（原始 Transformer）：<a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1706.03762</a></li>
+</ul>
+<p><a href="#/l/llm-ch3-l3">下一课：预训练任务</a></p>

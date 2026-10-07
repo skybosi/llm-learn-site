@@ -1,0 +1,88 @@
+<h2 id="h-显存与吞吐调优">显存与吞吐调优<a class="anchor" href="#h-显存与吞吐调优" aria-label="本节链接">#</a></h2>
+<p>服务能跑起来只是及格线，这一课把单卡&quot;榨干&quot;。显存和吞吐在单卡上是一对可以<strong>通过参数调配的权衡</strong>：显存分给 KV Cache 越多，能同时接的请求越多、吞吐越高，但留给激活的空间越少、越容易 OOM。调优的本质是<strong>先算清显存账，再在&quot;不 OOM&quot;的边界内把吞吐推到最大</strong>。学完本课，你应当能独立估算一个模型 + 配置的显存占用，并用 <code>gpu-memory-utilization</code>、<code>max-num-seqs</code>、<code>max-model-len</code> 三个旋钮把单卡吞吐调上去。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-显存都去哪了">1. 显存都去哪了<a class="anchor" href="#h-1-显存都去哪了" aria-label="本节链接">#</a></h4>
+<p>一次推理的显存占用由四块构成：</p>
+<pre><code>显存占用 ≈ 权重 + KV Cache + 激活/中间结果 + 碎片/运行时开销</code></pre>
+<ul>
+<li><strong>权重</strong>：加载后固定不变，FP16 约 2 字节/参数，INT4 约 0.5 字节/参数；</li>
+<li><strong>KV Cache</strong>：随&quot;并发序列数 × 序列长度&quot;增长，是吞吐调优的核心变量；</li>
+<li><strong>激活/中间结果</strong>：prefill 时随批量大小波动，通常几十 MB 到几百 MB；</li>
+<li><strong>碎片/开销</strong>：CUDA 上下文、通信缓冲、分页管理，经验上留 10–15% 余量。</li>
+</ul>
+<h4 id="h-2-kv-cache-估算调优的钥匙">2. KV Cache 估算：调优的钥匙<a class="anchor" href="#h-2-kv-cache-估算调优的钥匙" aria-label="本节链接">#</a></h4>
+<p>KV Cache 每个 token 占用：</p>
+<pre><code>每 token KV 字节 = 2(K和V) × 层数 × KV头数 × 头维度 × 精度字节数</code></pre>
+<p>以 Qwen2.5-7B（28 层、GQA 4 个 KV 头、头维度 128、FP16）为例：</p>
+<pre><code>每 token KV = 2 × 28 × 4 × 128 × 2 字节 = 57344 字节 ≈ 56 KB</code></pre>
+<p>那么&quot;并发 128 条序列、每条最长 8192 token&quot;的 KV Cache 上限：</p>
+<pre><code>128 × 8192 × 56 KB ≈ 56 GB   ← 这已经是 7B 模型的主战场</code></pre>
+<p><strong>结论：长上下文 + 高并发的 KV Cache 往往比权重本身还大</strong>，这就是为什么不能只按权重大小选卡。</p>
+<h4 id="h-3-三个调优旋钮">3. 三个调优旋钮<a class="anchor" href="#h-3-三个调优旋钮" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong><code>--gpu-memory-utilization</code></strong>：显存池上限（默认 0.9）。调大能装更多 KV Cache，但太接近 100% 易 OOM，建议 0.85–0.95；</li>
+<li><strong><code>--max-num-seqs</code></strong>：同时处理的序列数上限。调大提高批内并行、吞吐上升，但单请求排队可能变长、KV Cache 占用变多；</li>
+<li><strong><code>--max-model-len</code></strong>：单序列最大长度。调小能显著省 KV Cache、提吞吐，但超长输入会被截断或报错。</li>
+</ul>
+<p>调优方向一句话：<strong>在满足业务最大上下文的前提下，把 <code>max-model-len</code> 压到必要值，把 <code>max-num-seqs</code> 提到显存允许的上限，再微调 <code>gpu-memory-utilization</code> 兜底</strong>。</p>
+<h4 id="h-4-换卡换量化的断点式收益">4. 换卡/换量化的&quot;断点式&quot;收益<a class="anchor" href="#h-4-换卡换量化的断点式收益" aria-label="本节链接">#</a></h4>
+<p>参数微调是&quot;渐进式&quot;收益，而<strong>换量化（FP16→AWQ 4-bit）或换卡（24G→80G）是&quot;断点式&quot;收益</strong>：权重或显存直接砍半/翻倍，KV Cache 容量随之跳变。所以调优顺序应是：先做选型级的量化/换卡决策，再用三个旋钮做精细榨取。</p>
+<p><figure><img class="md-img" src="content/courses/llm-deployment-practice/assets/chapter-2-figure-03.svg" alt="显存构成与吞吐权衡：一张堆叠条形图展示权重、KV Cache、激活、碎片四块的显存占用，旁边三个旋钮图标（gpu-memory-utilization / max-num-seqs / max-model-len），下方一条&quot;吞吐 vs 并发&quot;曲线标注拐点与 OOM 边界" loading="lazy" decoding="async"><figcaption>显存构成与吞吐权衡：一张堆叠条形图展示权重、KV Cache、激活、碎片四块的显存占用，旁边三个旋钮图标（gpu-memory-utilization / max-num-seqs / max-model-len），下方一条&quot;吞吐 vs 并发&quot;曲线标注拐点与 OOM 边界</figcaption></figure>
+</p>
+<h3 id="h-二可运行示例">二、可运行示例<a class="anchor" href="#h-二可运行示例" aria-label="本节链接">#</a></h3>
+<h4 id="h-示例-1显存估算脚本">示例 1：显存估算脚本<a class="anchor" href="#h-示例-1显存估算脚本" aria-label="本节链接">#</a></h4>
+<pre data-lang="python"><code class="language-python"># -*- coding: utf-8 -*-
+# 显存估算：权重 + KV Cache + 余量，判断配置是否装得下
+
+def estimate_vram(params_b, quant_bits, layers, kv_heads, head_dim,
+                  max_num_seqs, max_model_len, dtype_bytes=2, overhead=0.15):
+    &quot;&quot;&quot;quant_bits: 权重位宽(16/8/4); 返回各块显存(GB)。&quot;&quot;&quot;
+    weight_gb = params_b * quant_bits / 8 * 1e9 / 1e9          # 权重 GB
+    per_token_kv = 2 * layers * kv_heads * head_dim * dtype_bytes
+    kv_gb = max_num_seqs * max_model_len * per_token_kv / 1e9  # KV Cache GB
+    act_gb = 0.5                                               # 激活/中间结果粗估
+    total = weight_gb + kv_gb + act_gb
+    with_overhead = total * (1 + overhead)
+    return dict(weight=weight_gb, kv=kv_gb, act=act_gb,
+                total=total, with_overhead=with_overhead)
+
+# 场景 A：7B FP16，128 并发，8192 上下文
+a = estimate_vram(7, 16, layers=28, kv_heads=4, head_dim=128,
+                  max_num_seqs=128, max_model_len=8192)
+# 场景 B：7B AWQ 4-bit，同样配置
+b = estimate_vram(7, 4, layers=28, kv_heads=4, head_dim=128,
+                  max_num_seqs=128, max_model_len=8192)
+for name, r in [(&quot;7B FP16&quot;, a), (&quot;7B AWQ4&quot;, b)]:
+    print(f&quot;{name}: 权重={r[&#39;weight&#39;]:.1f}GB KV={r[&#39;kv&#39;]:.1f}GB 激活={r[&#39;act&#39;]:.1f}GB &quot;
+          f&quot;合计={r[&#39;total&#39;]:.1f}GB 含余量={r[&#39;with_overhead&#39;]:.1f}GB&quot;)
+print(&quot;判断：7B FP16 需约 74GB(含余量) -&gt; 80G 卡可跑，24G 卡必 OOM；AWQ4 则 24G 卡可跑&quot;)</code></pre>
+<p>运行后你会发现：<strong>FP16 的 KV Cache（约 56GB）是权重的 4 倍</strong>，量化只砍权重、不砍 KV Cache。想真正扩大并发，还得压 <code>max_model_len</code> 或用更省 KV 的量化（如 KV 量化、FP8 KV）。</p>
+<h4 id="h-示例-2三旋钮调优对比">示例 2：三旋钮调优对比<a class="anchor" href="#h-示例-2三旋钮调优对比" aria-label="本节链接">#</a></h4>
+<pre data-lang="bash"><code class="language-bash"># 基线：默认保守配置
+vllm serve Qwen/Qwen2.5-7B-Instruct --host 0.0.0.0 --port 8000 \
+    --gpu-memory-utilization 0.9 --max-model-len 8192 --max-num-seqs 128
+
+# 调优 1：压上下文到业务真实需要的 2048，释放 KV Cache 给并发
+vllm serve Qwen/Qwen2.5-7B-Instruct --host 0.0.0.0 --port 8000 \
+    --gpu-memory-utilization 0.95 --max-model-len 2048 --max-num-seqs 256
+
+# 调优 2：加载 AWQ 量化，权重减半，进一步加大并发
+vllm serve Qwen/Qwen2.5-7B-Instruct-AWQ --host 0.0.0.0 --port 8000 \
+    --quantization awq --gpu-memory-utilization 0.95 \
+    --max-model-len 2048 --max-num-seqs 512</code></pre>
+<p>用上一课的压测脚本对三套配置分别扫 QPS，记录&quot;P99 TTFT≤2s 时的最大吞吐&quot;。典型结果：调优 1 比基线吞吐提升 40–80%，调优 2 再提升 30–50%——<strong>省出来的显存都变成了吞吐</strong>。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>改模型参数</strong>：把示例 1 换成 13B（40 层、8 个 KV 头），重算显存，判断 24G 卡在 FP16 和 AWQ4 下分别能否装下、能开多大 <code>max-num-seqs</code>。</li>
+<li><strong>找 OOM 边界</strong>：在示例 2 的调优 2 基础上，把 <code>max-num-seqs</code> 一路加到 1024，观察是否 OOM 或吞吐不再上升，解释为什么&quot;并发不是越大越好&quot;。</li>
+<li><strong>KV 量化</strong>：查 vLLM 文档里 KV Cache 量化的参数（如 <code>--kv-cache-dtype fp8</code>），说明它能怎样在几乎不掉吞吐的前提下进一步扩大 KV Cache。</li>
+<li><strong>写调优清单</strong>：为一个&quot;上下文 ≤ 2048、峰值 64 并发&quot;的客服场景，写一份完整的 vLLM 启动参数清单，并标注每个参数选值的理由。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>vLLM 文档 · 引擎参数（显存/序列/长度）：<a href="https://docs.vllm.ai/en/latest/serving/engine_args.html" target="_blank" rel="noopener noreferrer">https://docs.vllm.ai/en/latest/serving/engine_args.html</a></li>
+<li>vLLM 文档 · KV Cache 量化：<a href="https://docs.vllm.ai/en/latest/features/quantization/fp8_kv.html" target="_blank" rel="noopener noreferrer">https://docs.vllm.ai/en/latest/features/quantization/fp8_kv.html</a></li>
+<li>Hugging Face · LLM 显存与 KV Cache 分析：<a href="https://huggingface.co/blog/optimize-llm" target="_blank" rel="noopener noreferrer">https://huggingface.co/blog/optimize-llm</a></li>
+<li>NVIDIA · nvidia-smi 显存监控：<a href="https://developer.nvidia.com/nvidia-system-management-interface" target="_blank" rel="noopener noreferrer">https://developer.nvidia.com/nvidia-system-management-interface</a></li>
+</ul>
+<p><a href="#/l/deploy-ch3-l1">下一课：张量并行配置</a></p>

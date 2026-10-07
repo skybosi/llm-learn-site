@@ -1,0 +1,579 @@
+<h3 id="h-这一节要解决什么">这一节要解决什么<a class="anchor" href="#h-这一节要解决什么" aria-label="本节链接">#</a></h3>
+<p>第 1 节给了指标树，第 2 节给了治理。这一节把两者合成一个<strong>可运行的完整案例</strong>：一个 RAG 客服助手的评测方案。</p>
+<p>案例的要求是明确的：</p>
+<ol>
+<li><strong>能跑</strong>：代码是可执行的（纯标准库），从合成评测集构造到报告输出端到端打通。</li>
+<li><strong>能决策</strong>：流水线的输出直接连着发布门禁的决策规则，而不是一堆数字。</li>
+<li><strong>能复现</strong>：所有随机性都有种子，所有阈值都在配置里，所有版本的指纹都打印出来。</li>
+<li><strong>能承认边界</strong>：显式写出这个方案<strong>测不出什么</strong>、<strong>在什么情况下会给出错误结论</strong>。</li>
+</ol>
+<p>案例不是&quot;标准答案&quot;，而是一个<strong>可以照着改造的骨架</strong>。如果你把它的结构、阈值位置、报告字段原样搬走，只把场景常量换成你的，就已经比大多数团队的评测方案完整。</p>
+<h3 id="h-一场景与决策">一、场景与决策<a class="anchor" href="#h-一场景与决策" aria-label="本节链接">#</a></h3>
+<p><strong>场景</strong>：客服问答助手。用户提问 → 系统检索知识库 → 模型生成回答 → 在会话中展示。</p>
+<table>
+<thead>
+<tr>
+<th>项</th>
+<th>设定</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>部署能力</td>
+<td><strong>只读</strong>知识库，<strong>无写操作</strong>，无工具调用 → 攻击面矩阵里是&quot;含间接输入 + 只读&quot;（第 5 章）</td>
+</tr>
+<tr>
+<td>主决策</td>
+<td>(1) 每月模型选型；(2) 每次改动过回归门禁；(3) 发布前 go/no-go</td>
+</tr>
+<tr>
+<td>失败代价</td>
+<td>事实错误（给出错误政策）代价高；拒答代价中（用户转人工）；延迟代价中</td>
+</tr>
+<tr>
+<td>约束</td>
+<td>P95 延迟 ≤ 600 ms；单次成本 ≤ 1.2× 基线；安全违规率上界 ≤ 1%（95% 置信）</td>
+</tr>
+</tbody></table>
+<p><strong>为什么先把这三行写出来</strong>：因为它决定了后面所有取舍。<strong>只读无工具</strong>意味着第 5 章的四类攻击里&quot;工具滥用&quot;不适用，测试预算可以压在&quot;检索内容注入&quot;上；<strong>事实错误代价高</strong>意味着忠实性（faithfulness）是硬约束而不是可加权项。</p>
+<h3 id="h-二指标树本案例的实例化">二、指标树（本案例的实例化）<a class="anchor" href="#h-二指标树本案例的实例化" aria-label="本节链接">#</a></h3>
+<pre><code>决策：go/no-go 发布
+  目标：首答解决率 ↑（月度）｜反指标：转人工率、平均回答长度
+  代理：离线回答正确率（分层加权）｜桥接假设：离线判对 → 线上能解决
+  代理：judge 忠实性胜率｜桥接假设：judge 能识别&quot;回答是否只基于检索内容&quot;
+  子系统：检索 recall@5、引用命中率、澄清率
+约束（硬）：忠实性 ≥ 0.95、安全违规率上界 ≤ 1%、P95 ≤ 600 ms、成本 ≤ 1.2×
+
+决策：回归门禁
+  主指标：离线正确率（冻结集，高功效）
+  约束：忠实性、拒答率（不许大幅上升）、平均长度（不许大幅上升）
+
+决策：模型选型
+  主指标：离线正确率（配对比较 + 置信区间）
+  约束：同发布门禁</code></pre>
+<p><strong>注意约束在多处复用</strong>：同一组硬约束同时服务于三个决策，只在主指标与样本量上不同。<strong>这是减少维护面的关键</strong>：约束集是全局的，主指标按决策配置。</p>
+<p><figure><img class="md-img" src="content/courses/llm-evaluation/assets/chapter-6-figure-02.svg" alt="指标树的四层：从决策倒推" loading="lazy" decoding="async"><figcaption>指标树的四层：从决策倒推</figcaption></figure>
+</p>
+<h3 id="h-三评测集合成">三、评测集（合成）<a class="anchor" href="#h-三评测集合成" aria-label="本节链接">#</a></h3>
+<p>案例用合成评测集，因为它必须能在任何机器上跑起来。合成数据的构造方式如下（⚠️ 明确标注：<strong>这是合成数据，不是真实业务数据</strong>）：</p>
+<ul>
+<li><strong>200 道题</strong>，三层：简单 40%、中等 40%、困难 20%。</li>
+<li>每题带 <code>id</code>、<code>layer</code>、<code>reference</code>、<code>must_contain</code>（关键事实点）、<code>forbidden</code>（禁止出现的内容）。</li>
+<li>用<strong>三个&quot;模型&quot;</strong>（真实水平 0.62 / 0.70 / 0.76）模拟候选，每个模型的每题正确与否由伯努利抽样决定。</li>
+<li>用<strong>一个&quot;judge&quot;</strong>判定忠实性，它有约 90% 的召回与 3% 的误报（第 4 章的校准问题在这里以参数形式出现）。</li>
+<li>用<strong>确定性规则</strong>判安全（是否命中 forbidden），以体现&quot;判定可程序化&quot;。</li>
+</ul>
+<p><strong>为什么这样构造</strong>：因为它让每一个环节的偏差都可控可见——你可以改 <code>judge_recall</code> 看结论如何被判定器带偏（第 5 章第 3 节的教训），也可以改层权重看总体分数如何被分布错位影响（第 3 章第 1 节）。</p>
+<h3 id="h-四流水线七步">四、流水线（七步）<a class="anchor" href="#h-四流水线七步" aria-label="本节链接">#</a></h3>
+<pre><code>① 构造评测集 + 计算指纹
+② 对每个候选模型跑离线评分（分层）
+③ 计算硬约束（忠实性、安全上界、延迟、成本）
+④ 分层报告 + bootstrap 置信区间（按题配对）
+⑤ 应用决策规则（go / no-go / 需要更多数据）
+⑥ 输出报告（含指纹、版本、区间、判据）
+⑦ 记录未决问题（无法回答的问题清单）</code></pre>
+<p>每一步都对应前五章的一个技术点：</p>
+<table>
+<thead>
+<tr>
+<th>步骤</th>
+<th>对应章节</th>
+<th>关键点</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>①</td>
+<td>第 2 章第 4 节</td>
+<td>分层 + 指纹 + 不可变性</td>
+</tr>
+<tr>
+<td>②</td>
+<td>第 1 章第 3 节</td>
+<td>配对比较、分层加权</td>
+</tr>
+<tr>
+<td>③</td>
+<td>第 3 章第 3 节</td>
+<td>硬约束（不是加权）</td>
+</tr>
+<tr>
+<td>④</td>
+<td>第 2 章第 3 节 / 第 3 章第 2 节</td>
+<td>配对 bootstrap、置信区间</td>
+</tr>
+<tr>
+<td>⑤</td>
+<td>第 3 章第 4 节</td>
+<td>决策规则、MDE、未归因</td>
+</tr>
+<tr>
+<td>⑥</td>
+<td>第 5 章第 3 节</td>
+<td>条件句结论、最小字段集</td>
+</tr>
+<tr>
+<td>⑦</td>
+<td>全课程</td>
+<td>边界与失效条件</td>
+</tr>
+</tbody></table>
+<h3 id="h-五决策记录adr-风格">五、决策记录（ADR 风格）<a class="anchor" href="#h-五决策记录adr-风格" aria-label="本节链接">#</a></h3>
+<p><strong>决策记录的价值</strong>：它让后人知道&quot;为什么不是另一种做法&quot;。下面是本案例的四条关键决策。</p>
+<p><strong>ADR-1：为什么用配对 bootstrap 而不是独立两样本检验？</strong></p>
+<ul>
+<li>决策：所有模型对比都用&quot;同一批题上的配对差 + 按题 bootstrap 置信区间&quot;。</li>
+<li>理由：同一批题上的两个模型得分高度相关（题目难度），配对能消掉题目难度方差（第 1 章第 3 节）；按题 bootstrap 同时处理&quot;题目异质性&quot;与&quot;指标非线性&quot;。</li>
+<li>拒掉的替代方案：独立两样本 t 检验（忽略配对，CI 宽 1.2~2 倍）；McNemar（只适用于 0/1，本案例的加权分数不适用）。</li>
+<li>代价：实现稍复杂；必须保存逐题结果（不能只存汇总）。</li>
+</ul>
+<p><strong>ADR-2：为什么忠实性是硬约束而不是加权项？</strong></p>
+<ul>
+<li>决策：忠实性 ≥ 0.95 作为不可谈判的约束；正确率作为被最大化的主指标。</li>
+<li>理由：事实错误的代价不对称——用&quot;正确率 +3 点&quot;补偿&quot;忠实性掉 5 点&quot;在业务上不可接受（第 6 章第 1 节的加权求和缺陷）。</li>
+<li>拒掉的替代方案：把忠实性放进加权分（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0269em;">w</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.3</span></span></span></span>）；让业务方&quot;看情况决定&quot;。</li>
+<li>代价：出现&quot;正确率高但忠实性 0.94&quot;的候选时会被直接拒绝，即使它可能整体更好。<strong>这是刻意选择的保守。</strong></li>
+</ul>
+<p><strong>ADR-3：为什么安全判定用程序化规则而不是 judge？</strong></p>
+<ul>
+<li>决策：安全违规用 <code>forbidden</code> 列表的程序化匹配；judge 只用于忠实性。</li>
+<li>理由：安全结论要报<strong>风险上界</strong>（第 5 章第 3 节），而上界的可靠性依赖判定的漏报率。judge 的漏报率不可控且会漂移；程序化规则的漏报率可以被单独测量（用人工抽检校准）。</li>
+<li>拒掉的替代方案：用 judge 判安全（便宜但漏报率未知）；纯人工（成本不支持月度运行）。</li>
+<li>代价：程序化规则只能抓&quot;字符串级&quot;违规，<strong>语义级违规会漏</strong>——这个漏洞被记进第 8 节的失效清单。</li>
+</ul>
+<p><strong>ADR-4：为什么报告里必须给 MDE？</strong></p>
+<ul>
+<li>决策：每次报告都给出&quot;本次实验能检出的最小效应&quot;（MDE）。</li>
+<li>理由：不显著有两种解释（没效应 / 测不出），只有 MDE 能区分（第 3 章第 4 节）。</li>
+<li>拒掉的替代方案：只报 p 值或&quot;未达显著&quot;。</li>
+<li>代价：需要在设计阶段固定样本量；如果中途加题，MDE 要重算并说明。</li>
+</ul>
+<h3 id="h-六失败分析三条走不通的路径">六、失败分析：三条走不通的路径<a class="anchor" href="#h-六失败分析三条走不通的路径" aria-label="本节链接">#</a></h3>
+<p>写方案时被否决或试过失败的做法，比成功路径更有信息量。本案例记录了三条。</p>
+<p><strong>失败 1：用 judge 胜率作为主指标。</strong></p>
+<ul>
+<li>现象：两个候选的 judge 胜率差 8 个点，但离线正确率只差 0.3 个点，且胜率差与&quot;平均回答长度差&quot;高度相关（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5782em;vertical-align:-0.0391em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&gt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.6</span></span></span></span>）。</li>
+<li>诊断：长度偏差主导（第 4 章第 1 节）。judge 在&quot;更长=更完整&quot;的启发式下系统偏向长回答。</li>
+<li>处置：主指标换成&quot;分层加权的离线正确率&quot;（可程序化判定，无长度偏差）；judge 只保留用于忠实性，且加长度回归作为常规诊断。</li>
+<li>教训：<strong>judge 适合测&quot;是否忠实/是否满足约束&quot;，不适合测&quot;整体更好&quot;</strong>——后者太容易被表面特征主导。</li>
+</ul>
+<p><strong>失败 2：把 test-frozen 用在每日迭代上。</strong></p>
+<ul>
+<li>现象：一个月内 test-frozen 的分数涨了 6 个点，但上线后线上指标没动。</li>
+<li>诊断：开发循环把 frozen 集当 dev 集用（高频开箱 + 直接看着失败样本调 prompt）→ 选择增益 + 过拟合（第 6 章第 2 节第 4 段）。</li>
+<li>处置：重建 frozen 集（MAJOR 版本），把旧集整体降级为 dev；引入开箱配额与留痕。</li>
+<li>教训：<strong>纪律失效不是靠提醒解决的，要靠流程（权限 + 配额 + 留痕）</strong>。</li>
+</ul>
+<p><strong>失败 3：只报总体 ASR，导致安全结论被误读。</strong></p>
+<ul>
+<li>现象：报告写&quot;越狱成功率 3%，风险低&quot;，但独立红队发现注入类攻击的成功率是 22%。</li>
+<li>诊断：总体平均掩盖了分层结构（第 5 章第 2 节的 L5 层）。</li>
+<li>处置：安全结论改为&quot;最坏类别的上界 + 分层结果&quot;，且必须附参照系与用例集版本。</li>
+<li>教训：<strong>平均是给管理层看的，分层是给决策用的</strong>——安全报告必须给后者。</li>
+</ul>
+<h3 id="h-七边界与失效条件本节的核心交付">七、边界与失效条件（本节的核心交付）<a class="anchor" href="#h-七边界与失效条件本节的核心交付" aria-label="本节链接">#</a></h3>
+<p>这一节是整门课的收敛点：<strong>一个评测方案的价值，一半在于它明确说了自己测不出什么。</strong></p>
+<h4 id="h-无法回答的问题本方案的结构性盲区">无法回答的问题（本方案的结构性盲区）<a class="anchor" href="#h-无法回答的问题本方案的结构性盲区" aria-label="本节链接">#</a></h4>
+<ol>
+<li><strong>多轮对话的体验</strong>：评测集是单轮的。多轮澄清、上下文丢失、跨会话记忆都不在覆盖范围内。</li>
+<li><strong>线上分布的真实对齐</strong>：合成评测集的层权重是假设的，不是从线上流量测出来的。<strong>权重错了，总体分数就错了</strong>（第 3 章第 1 节的分解）。</li>
+<li><strong>长期影响</strong>：满意度、留存、信任这些指标需要数周沉淀，本方案的月度频率无法覆盖。</li>
+<li><strong>语义级安全违规</strong>：程序化 <code>forbidden</code> 匹配漏掉改写、暗示、分片表述。</li>
+<li><strong>攻击者的自适应</strong>：用例集是固定的，对手会针对防护更新而迁移（第 5 章的时效性）。</li>
+<li><strong>成本的真实构成</strong>：案例的成本模型是&quot;token 数 × 单价&quot;，忽略了缓存命中、批处理效率、重试。</li>
+<li><strong>收益归因</strong>：本方案测&quot;改动是否让分数变化&quot;，不测&quot;分数变化是否转化成业务收益&quot;（那是第 3 章第 4 节的落差归因问题）。</li>
+</ol>
+<h4 id="h-会给出错误结论的条件">会给出错误结论的条件<a class="anchor" href="#h-会给出错误结论的条件" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>条件</th>
+<th>会怎样错</th>
+<th>检测方式</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>评测集被用于训练/调参</td>
+<td>分数虚高，且虚高幅度随时间增长</td>
+<td>诱饵串探针（每月）、开箱记录</td>
+</tr>
+<tr>
+<td>judge 版本或 prompt 变化</td>
+<td>&quot;分数变化&quot;其实是判定变化（第 5 章第 3 节：可达 20% 以上）</td>
+<td>判定协议哈希 + 人工复核一致率</td>
+</tr>
+<tr>
+<td>层权重与线上流量偏离</td>
+<td>总体分数偏离真实效果（偏差 = <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mop op-symbol small-op" style="position:relative;top:0em;">∑</span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0269em;">w</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0269em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0315em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0359em;">q</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0315em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mord"><span class="mord">Δ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0315em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>）</td>
+<td>季度性用线上抽样重估权重</td>
+</tr>
+<tr>
+<td>题目饱和</td>
+<td>方差压缩，模型间差异被抹平</td>
+<td>每月项目分析（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">D</span></span></span></span>、题目间方差占比）</td>
+</tr>
+<tr>
+<td>判定器漏报率漂移</td>
+<td>安全上界失真</td>
+<td>人工抽检（≥5%）+ 漏报率估计</td>
+</tr>
+<tr>
+<td>样本量不足</td>
+<td>&quot;不显著&quot;被当成&quot;无效应&quot;</td>
+<td>报告必给 MDE</td>
+</tr>
+<tr>
+<td>单次采样</td>
+<td>生成随机性被当成模型差异</td>
+<td>每题多采样取平均/多数投票</td>
+</tr>
+<tr>
+<td>延迟与成本测量点变化</td>
+<td>约束判定翻转</td>
+<td>测量点写进配置并版本化</td>
+</tr>
+</tbody></table>
+<h4 id="h-使用本方案前必须替换的假设">使用本方案前必须替换的假设<a class="anchor" href="#h-使用本方案前必须替换的假设" aria-label="本节链接">#</a></h4>
+<ul>
+<li>层权重（必须替换为从线上流量测出的真实权重）。</li>
+<li>三个&quot;模型&quot;的能力参数（合成）。</li>
+<li>judge 的召回/误报率（必须替换为你自己的校准结果）。</li>
+<li>阈值（0.95 / 1% / 600 ms / 1.2×）——这些是案例设定，不是通用建议。</li>
+<li>安全 <code>forbidden</code> 列表（必须按你的业务与合规要求重建）。</li>
+</ul>
+<h3 id="h-代码">代码<a class="anchor" href="#h-代码" aria-label="本节链接">#</a></h3>
+<p>⚠️ 以下为<strong>合成数据</strong>的完整流水线，可端到端运行（纯标准库）。它不含任何真实业务数据。</p>
+<pre data-lang="python"><code class="language-python">import hashlib
+import json
+import math
+import random
+import statistics
+
+CFG = {
+    &quot;n_items&quot;: 200,
+    &quot;layer_weights_online&quot;: {&quot;简单&quot;: 0.20, &quot;中等&quot;: 0.45, &quot;困难&quot;: 0.35},
+    # skill 是 [0,1] 的能力参数；p_correct = skill - 0.35 * difficulty
+    &quot;models&quot;: {&quot;M_base&quot;: 0.78, &quot;M_cand&quot;: 0.90, &quot;M_risky&quot;: 0.93},
+    # 忠实性的&quot;真相&quot;参数与 judge 的检测参数是分开的（第 4 章：判定器只是仪器）
+    &quot;faith_true&quot;: {&quot;M_base&quot;: (0.998, 0.93), &quot;M_cand&quot;: (0.998, 0.96),
+                   &quot;M_risky&quot;: (0.995, 0.95)},
+    &quot;judge_recall&quot;: 0.75,
+    &quot;judge_fpr&quot;: 0.02,
+    &quot;faith_floor&quot;: 0.95,
+    &quot;safety_upper_bound&quot;: 0.01,
+    &quot;latency_p95_limit&quot;: 600.0,
+    &quot;cost_ratio_limit&quot;: 1.20,
+    # 安全单独用更大的红队评测片（第 5 章：200 题支撑不了 1% 的上界结论）
+    &quot;safety_slice&quot;: {&quot;n&quot;: 3000, &quot;rates&quot;: {&quot;M_base&quot;: 0.0003, &quot;M_cand&quot;: 0.0030,
+                                          &quot;M_risky&quot;: 0.0080}},
+    &quot;bootstrap&quot;: 2000,
+    &quot;seed&quot;: 20260922,
+}
+
+# ------------------------------------------------------------
+# ① 构造合成评测集 + 指纹
+# ------------------------------------------------------------
+def build_eval_set(n, seed):
+    r = random.Random(seed)
+    layers = ([&quot;简单&quot;] * int(n * 0.40) + [&quot;中等&quot;] * int(n * 0.40)
+              + [&quot;困难&quot;] * (n - int(n * 0.40) - int(n * 0.40)))
+    r.shuffle(layers)
+    items = []
+    for i, layer in enumerate(layers):
+        items.append({
+            &quot;id&quot;: f&quot;q{i:03d}&quot;,
+            &quot;layer&quot;: layer,
+            &quot;reference&quot;: f&quot;ref-{i}&quot;,
+            &quot;must_contain&quot;: [f&quot;fact-{i}-a&quot;, f&quot;fact-{i}-b&quot;],
+            &quot;forbidden&quot;: [f&quot;bad-{i}&quot;],
+            # 合成：题目难度参数（用于生成模型行为）
+            &quot;difficulty&quot;: {&quot;简单&quot;: 0.25, &quot;中等&quot;: 0.55, &quot;困难&quot;: 0.85}[layer],
+        })
+    return items
+
+
+def fingerprint(items):
+    h = hashlib.sha256()
+    for it in items:
+        h.update(json.dumps({&quot;id&quot;: it[&quot;id&quot;], &quot;layer&quot;: it[&quot;layer&quot;],
+                             &quot;reference&quot;: it[&quot;reference&quot;],
+                             &quot;must_contain&quot;: it[&quot;must_contain&quot;],
+                             &quot;forbidden&quot;: it[&quot;forbidden&quot;]},
+                            ensure_ascii=False, sort_keys=True).encode(&quot;utf-8&quot;))
+    return h.hexdigest()[:12]
+
+
+ITEMS = build_eval_set(CFG[&quot;n_items&quot;], CFG[&quot;seed&quot;])
+FP = fingerprint(ITEMS)
+print(&quot;=&quot; * 68)
+print(&quot;评测集指纹:&quot;, FP, &quot;| 题量:&quot;, len(ITEMS))
+print(&quot;层分布:&quot;, {L: sum(1 for it in ITEMS if it[&quot;layer&quot;] == L)
+                for L in (&quot;简单&quot;, &quot;中等&quot;, &quot;困难&quot;)})
+
+
+# ------------------------------------------------------------
+# ② 离线评分（合成模型行为）
+# ------------------------------------------------------------
+def run_model(items, name, seed):
+    # 返回逐题结果：correct / faithful / safe / latency_ms / cost / answer_len
+    r = random.Random(seed)
+    skill = CFG[&quot;models&quot;][name]
+    f_correct, f_wrong = CFG[&quot;faith_true&quot;][name]
+    rows = []
+    for it in items:
+        # 合成：能力越强越可能答对；题目难度越高越难
+        p_correct = max(0.02, min(0.98, skill - 0.35 * it[&quot;difficulty&quot;]))
+        correct = 1 if r.random() &lt; p_correct else 0
+        # 忠实性&quot;真相&quot;：答对时几乎必定忠实；答错时可能编造（不忠实）
+        p_faith_true = f_correct if correct else f_wrong
+        truly_faithful = 1 if r.random() &lt; p_faith_true else 0
+        # judge 只是仪器：以 recall 捕获&quot;不忠实&quot;，以 fpr 误报
+        if truly_faithful == 0:
+            faithful_obs = 0 if r.random() &lt; CFG[&quot;judge_recall&quot;] else 1
+        else:
+            faithful_obs = 0 if r.random() &lt; CFG[&quot;judge_fpr&quot;] else 1
+        safe = 1                                  # 安全由独立红队片评估
+        latency = max(60.0, r.gauss(360.0 + 80.0 * (skill - 0.85), 55.0))
+        cost = 0.010 + 0.004 * r.random() + 0.010 * correct
+        answer_len = max(40.0, r.gauss(200.0 + 80.0 * correct, 40.0))
+        rows.append({&quot;id&quot;: it[&quot;id&quot;], &quot;layer&quot;: it[&quot;layer&quot;], &quot;correct&quot;: correct,
+                     &quot;faithful&quot;: faithful_obs, &quot;safe&quot;: safe,
+                     &quot;latency&quot;: latency, &quot;cost&quot;: cost, &quot;answer_len&quot;: answer_len})
+    return rows
+
+
+def run_safety_slice(n, rate, seed):
+    # 安全单独评测：更大样本，专测违规率上界
+    r = random.Random(seed)
+    return sum(1 for _ in range(n) if r.random() &lt; rate)
+
+
+def layered_accuracy(rows, weights):
+    # 按线上权重计算的加权正确率
+    acc = 0.0
+    wsum = 0.0
+    for layer, w in weights.items():
+        sub = [r for r in rows if r[&quot;layer&quot;] == layer]
+        if not sub or w == 0:
+            continue
+        acc += w * (sum(r[&quot;correct&quot;] for r in sub) / len(sub))
+        wsum += w
+    return acc / wsum if wsum else 0.0
+
+
+def wilson_upper(k, n, z=1.959963985):
+    if n == 0:
+        return 1.0
+    p = k / n
+    d = 1 + z * z / n
+    c = (p + z * z / (2 * n)) / d
+    h = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / d
+    return min(1.0, c + h)
+
+
+def summarize(rows, weights, safety_k=None, safety_n=None):
+    n = len(rows)
+    lats = sorted(r[&quot;latency&quot;] for r in rows)
+    out = {
+        &quot;n&quot;: n,
+        &quot;acc_weighted&quot;: layered_accuracy(rows, weights),
+        &quot;faith_rate&quot;: sum(r[&quot;faithful&quot;] for r in rows) / n,
+        &quot;lat_p95&quot;: lats[int(0.95 * (n - 1))],
+        &quot;cost_mean&quot;: statistics.mean(r[&quot;cost&quot;] for r in rows),
+        &quot;len_mean&quot;: statistics.mean(r[&quot;answer_len&quot;] for r in rows),
+    }
+    if safety_n is not None:
+        out[&quot;safety_k&quot;] = safety_k
+        out[&quot;safety_n&quot;] = safety_n
+        out[&quot;safety_rate&quot;] = safety_k / safety_n
+        out[&quot;safety_upper&quot;] = wilson_upper(safety_k, safety_n)
+    return out
+
+
+results = {}
+safety = {}
+print(&quot;\n&quot; + &quot;=&quot; * 68)
+print(&quot;② 离线评分（合成模型）+ 独立安全片（n=%d）&quot; % CFG[&quot;safety_slice&quot;][&quot;n&quot;])
+for i, name in enumerate(CFG[&quot;models&quot;]):
+    results[name] = run_model(ITEMS, name, CFG[&quot;seed&quot;] + 100 + i)
+    safety[name] = run_safety_slice(CFG[&quot;safety_slice&quot;][&quot;n&quot;],
+                                    CFG[&quot;safety_slice&quot;][&quot;rates&quot;][name],
+                                    CFG[&quot;seed&quot;] + 900 + i)
+
+BASE = &quot;M_base&quot;
+base_cost = statistics.mean(r[&quot;cost&quot;] for r in results[BASE])
+SUMS = {}
+for name, rows in results.items():
+    s = summarize(rows, CFG[&quot;layer_weights_online&quot;],
+                  safety_k=safety[name], safety_n=CFG[&quot;safety_slice&quot;][&quot;n&quot;])
+    SUMS[name] = s
+    print(f&quot;  {name:8s} 加权正确率 {s[&#39;acc_weighted&#39;]:.4f} | &quot;
+          f&quot;忠实性 {s[&#39;faith_rate&#39;]:.4f} | 违规率 {s[&#39;safety_rate&#39;]:.4f} &quot;
+          f&quot;(上界 {s[&#39;safety_upper&#39;]:.4f}) | P95 {s[&#39;lat_p95&#39;]:.0f} ms | &quot;
+          f&quot;成本比 {s[&#39;cost_mean&#39;]/base_cost:.2f}x&quot;)
+
+
+# ------------------------------------------------------------
+# ③ 硬约束检查
+# ------------------------------------------------------------
+def check_constraints(s, base_cost):
+    checks = [
+        (&quot;忠实性 &gt;= %.2f&quot; % CFG[&quot;faith_floor&quot;],
+         s[&quot;faith_rate&quot;] &gt;= CFG[&quot;faith_floor&quot;]),
+        (&quot;安全上界 &lt;= %.1f%%&quot; % (CFG[&quot;safety_upper_bound&quot;] * 100),
+         s[&quot;safety_upper&quot;] &lt;= CFG[&quot;safety_upper_bound&quot;]),
+        (&quot;P95 &lt;= %.0f ms&quot; % CFG[&quot;latency_p95_limit&quot;],
+         s[&quot;lat_p95&quot;] &lt;= CFG[&quot;latency_p95_limit&quot;]),
+        (&quot;成本比 &lt;= %.2fx&quot; % CFG[&quot;cost_ratio_limit&quot;],
+         s[&quot;cost_mean&quot;] / base_cost &lt;= CFG[&quot;cost_ratio_limit&quot;]),
+    ]
+    return checks
+
+
+print(&quot;\n&quot; + &quot;=&quot; * 68)
+print(&quot;③ 硬约束检查（含独立安全片的上界）&quot;)
+CONSTRAINTS = {}
+for name in results:
+    checks = check_constraints(SUMS[name], base_cost)
+    CONSTRAINTS[name] = checks
+    passed = all(ok for _, ok in checks)
+    detail = &quot;, &quot;.join(f&quot;{n}:{&#39;✓&#39; if ok else &#39;✗&#39;}&quot; for n, ok in checks)
+    print(f&quot;  {name:8s} {&#39;通过&#39; if passed else &#39;拒绝&#39;}  ({detail})&quot;)
+
+
+# ------------------------------------------------------------
+# ④ 配对 bootstrap：候选 vs 基线
+# ------------------------------------------------------------
+def paired_bootstrap_ci(rows_a, rows_b, weights, n_boot, seed):
+    # 按题配对重采样，返回加权正确率差的中位数与 2.5%/97.5% 分位
+    r = random.Random(seed)
+    idx = list(range(len(rows_a)))
+    diffs = []
+    for _ in range(n_boot):
+        pick = [r.choice(idx) for _ in idx]
+        acc_a = 0.0
+        acc_b = 0.0
+        wsum = 0.0
+        for layer, w in weights.items():
+            sub = [i for i in pick if rows_a[i][&quot;layer&quot;] == layer]
+            if not sub:
+                continue
+            acc_a += w * (sum(rows_a[i][&quot;correct&quot;] for i in sub) / len(sub))
+            acc_b += w * (sum(rows_b[i][&quot;correct&quot;] for i in sub) / len(sub))
+            wsum += w
+        if wsum:
+            diffs.append((acc_a - acc_b) / wsum)
+    diffs.sort()
+    return (statistics.median(diffs), diffs[int(0.025 * n_boot)],
+            diffs[int(0.975 * n_boot)])
+
+
+def mde(p, n, alpha=0.05, power=0.80):
+    z_a, z_b = 1.959963985, 0.841621234
+    return math.sqrt(2 * p * (1 - p) * (z_a + z_b) ** 2 / n)
+
+
+print(&quot;\n&quot; + &quot;=&quot; * 68)
+print(&quot;④ 配对 bootstrap（vs 基线 %s）&quot; % BASE)
+n_items = len(ITEMS)
+base_acc = SUMS[BASE][&quot;acc_weighted&quot;]
+print(f&quot;  MDE（单组 n={n_items}, 基线 p={base_acc:.2f}）= &quot;
+      f&quot;{mde(base_acc, n_items):.4f}&quot;)
+for name in CFG[&quot;models&quot;]:
+    if name == BASE:
+        continue
+    med, lo, hi = paired_bootstrap_ci(results[name], results[BASE],
+                                      CFG[&quot;layer_weights_online&quot;],
+                                      CFG[&quot;bootstrap&quot;], CFG[&quot;seed&quot;] + 7)
+    verdict = (&quot;显著更优&quot; if lo &gt; 0 else
+               &quot;显著更差&quot; if hi &lt; 0 else &quot;不显著（区间含 0）&quot;)
+    print(f&quot;  {name:8s} 加权正确率差 {med:+.4f}  95% CI [{lo:+.4f}, {hi:+.4f}]  &quot;
+          f&quot;-&gt; {verdict}&quot;)
+
+
+# ------------------------------------------------------------
+# ⑤ 决策规则 + ⑥ 报告
+# ------------------------------------------------------------
+def decide(cand_rows, base_rows, base_cost, cand_summary, cand_checks):
+    s = cand_summary
+    ok = all(flag for _, flag in cand_checks)
+    med, lo, hi = paired_bootstrap_ci(cand_rows, base_rows,
+                                      CFG[&quot;layer_weights_online&quot;],
+                                      CFG[&quot;bootstrap&quot;], CFG[&quot;seed&quot;] + 7)
+    mde_v = mde(SUMS[BASE][&quot;acc_weighted&quot;], len(cand_rows))
+    if not ok:
+        return &quot;NO-GO（硬约束未通过）&quot;, s, med, lo, hi, mde_v
+    if lo &gt; 0 and med &gt; mde_v * 0.25:
+        return &quot;GO（约束通过 + 配对显著 + 效应大于 MDE/4）&quot;, s, med, lo, hi, mde_v
+    if lo &gt; 0:
+        return &quot;GO-受限（显著但效应接近 MDE，建议小流量灰阶）&quot;, s, med, lo, hi, mde_v
+    return &quot;HOLD（约束通过但未见显著提升：需更多数据或换方向）&quot;, s, med, lo, hi, mde_v
+
+
+print(&quot;\n&quot; + &quot;=&quot; * 68)
+print(&quot;⑤⑥ 决策与报告&quot;)
+for name in CFG[&quot;models&quot;]:
+    if name == BASE:
+        continue
+    verdict, s, med, lo, hi, mde_v = decide(
+        results[name], results[BASE], base_cost, SUMS[name], CONSTRAINTS[name])
+    print(f&quot;\n  候选 {name}&quot;)
+    print(f&quot;    判决: {verdict}&quot;)
+    print(f&quot;    加权正确率 {s[&#39;acc_weighted&#39;]:.4f}（配对差 {med:+.4f}, &quot;
+          f&quot;CI [{lo:+.4f}, {hi:+.4f}], MDE {mde_v:.4f}）&quot;)
+    print(f&quot;    忠实性 {s[&#39;faith_rate&#39;]:.4f} | 安全上界 {s[&#39;safety_upper&#39;]:.4f} | &quot;
+          f&quot;P95 {s[&#39;lat_p95&#39;]:.0f} ms | 成本比 {s[&#39;cost_mean&#39;]/base_cost:.2f}x&quot;)
+    print(f&quot;    分层正确率: &quot; + &quot; &quot;.join(
+        f&quot;{L}={sum(r[&#39;correct&#39;] for r in results[name] if r[&#39;layer&#39;]==L)/max(1,sum(1 for r in results[name] if r[&#39;layer&#39;]==L)):.2f}&quot;
+        for L in (&quot;简单&quot;, &quot;中等&quot;, &quot;困难&quot;)))
+    print(f&quot;    评测集指纹 {FP} | 声明: 结论仅适用于该指纹 + 本判定协议 + 当日模型快照&quot;)</code></pre>
+<p><strong>代码里六个值得注意的点</strong>：</p>
+<ul>
+<li><strong>① 指纹与层分布一起打印</strong>：报告的第一行就是&quot;这批数字算在什么数据上&quot;。<strong>任何没有指纹的评测报告都是不可复现的</strong>（第 6 章第 2 节）。</li>
+<li><strong>② 分层加权正确率</strong>：<code>layer_weights_online</code> 是&quot;线上流量权重&quot;，<code>summarize</code> 同时给加权与分层结果。注意这里如果用等权（40/40/20）会得到不同的排序——<strong>这正是第 3 章第 1 节 <code>sum((w-q)*Δ)</code> 的实例</strong>。</li>
+<li><strong>③ 硬约束是布尔检查，不进入任何加权分</strong>：忠实性 0.95、安全上界 1%、P95 600 ms、成本 1.2×。<strong>注意安全用的是 <code>wilson_upper</code>（上界）而不是点估计</strong>——这正是第 5 章第 3 节的纪律。</li>
+<li><strong>④ 配对 bootstrap 按题重采样</strong>：同一个下标同时决定两个模型的样本（配对），所以题目难度方差被消掉。本案例里候选与基线的加权正确率差是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">+</span><span class="mord">0.118</span></span></span></span>、CI <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">[</span><span class="mord">+</span><span class="mord">0.011</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">+</span><span class="mord">0.222</span><span class="mclose">]</span></span></span></span> —— <strong>CI 宽度（约 0.21）接近未配对设计的一半</strong>，这就是 ADR-1 选择配对的实际收益。<strong>MDE 一起报</strong>（本例 0.138），用于解释&quot;不显著&quot;。</li>
+<li><strong>⑤ 决策规则写成可执行函数</strong>：约束 → 显著性 → 效应量 vs MDE/4 的三段判断。本案例的输出正好覆盖了三种判决：<code>M_cand</code> 约束通过且配对显著（CI 下界 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">+</span><span class="mord">0.011</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&gt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0</span></span></span></span>）→ <strong>GO</strong>；<code>M_risky</code> 正确率更高（0.720）但安全上界 0.0135 超出 1% → <strong>NO-GO</strong>；若某个候选约束通过但区间含 0，就会得到 <strong>HOLD</strong>。<strong><code>HOLD</code> 是一个正式结论</strong>，不是&quot;没结果&quot;——它明确说了&quot;约束通过但没有证据支持提升&quot;。<strong>注意 <code>M_risky</code> 这个例子：它是三个候选里&quot;离线分数最高&quot;的那个，却被硬约束直接否决——这正是加权求和会犯的错。</strong></li>
+<li><strong>⑥ 报告以&quot;声明&quot;结尾</strong>：结论被限定在&quot;该指纹 + 该判定协议 + 当日快照&quot;三个条件下。<strong>这是第 5 章&quot;条件句结论&quot;纪律在质量评测上的直接套用。</strong> 另外注意本案例把<strong>安全放进独立的 3000 条红队片</strong>而不是那 200 条正确率题：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">200</span></span></span></span>、0 次违规时的上界是 0.0013，但<strong>如果换成 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">200</span></span></span></span> 里出现 1 次违规，上界会跳到 0.019</strong> —— 200 题的规模根本支撑不了&quot;违规率 ≤1%&quot;这类结论（第 5 章第 3 节的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4831em;"></span><span class="mord mathnormal">n</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">3/</span><span class="mord mathnormal">p</span></span></span></span>）。</li>
+</ul>
+<h3 id="h-练习">练习<a class="anchor" href="#h-练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><p><strong>改造场景</strong>：把案例改成&quot;内部代码审查助手&quot;（读 diff、给评论、可调用静态检查工具）。
+（a）改写指标树（注意新增&quot;工具调用正确性&quot;这一子系统指标）；
+（b）硬约束要改哪几项？为什么？
+（c）安全部分：第 5 章的攻击面矩阵里它落在哪个格子？因此要补哪类用例？</p>
+</li>
+<li><p><strong>权重敏感性</strong>：把 <code>layer_weights_online</code> 改成等权（40/40/20），重跑流水线。
+（a）三个候选的排序是否变化？
+（b）用第 3 章第 1 节的分解式解释变化来源；
+（c）如果线上真实权重未知，你会怎么报告这个不确定性？</p>
+</li>
+<li><p><strong>判定器漂移</strong>：把 <code>judge_recall</code> 从 0.90 改成 0.70，其他不变。
+（a）忠实性判定与最终判决分别怎么变？
+（b）用第 5 章第 3 节的&quot;判定器伪造改进&quot;框架解释这个现象；
+（c）写出一条能防止这类问题的流程要求。</p>
+</li>
+<li><p><strong>MDE 与决策</strong>：当前 200 题的 MDE 是多少？
+（a）如果把题量降到 80，MDE 变成多少？这时&quot;候选 M_cand 显著更优&quot;的判决还成立吗？
+（b）如果业务要求&quot;必须检出 1 个点的提升&quot;，需要多少题？
+（c）在题量固定为 200 的前提下，还有哪些手段能提高检出能力（提示：配对、降低生成随机性、多采样）？</p>
+</li>
+<li><p><strong>边界补充</strong>：第 7 节列了 7 项&quot;无法回答的问题&quot;。
+（a）再补 3 项（hint：考虑多语言、长尾问题、用户滥用、数据新鲜度）；
+（b）为每一项写出&quot;如果业务真的需要这个答案，该怎么另建评测&quot;；
+（c）从中挑出你认为最可能在未来 3 个月里造成错误决策的那一项，并说明为什么。</p>
+</li>
+<li><p><strong>写一份 ADR</strong>（开放题）：你的团队决定&quot;不做人工评测，全部用 judge 代替&quot;。
+（a）用第 4 章第 3 节的校准结论评估这个决定的边界；
+（b）写出这个决定会在什么条件下失效，以及触发复核的信号；
+（c）把结论写成一条 ADR（决策 / 理由 / 拒掉的替代方案 / 代价）。</p>
+</li>
+</ol>
+<h3 id="h-小结">小结<a class="anchor" href="#h-小结" aria-label="本节链接">#</a></h3>
+<ul>
+<li><strong>方案从决策开始</strong>：本案例三个决策（选型 / 回归门禁 / go-no-go）共用一组<strong>全局硬约束</strong>，只在主指标与样本量上不同。<strong>约束集全局、主指标按决策配置</strong>，是减少维护面的关键。</li>
+<li><strong>硬约束不进加权分</strong>：事实正确性代价高 → 忠实性设硬约束；安全用<strong>上界</strong>判定；延迟与成本设上限。<strong>加权求和允许一处收益补偿另一处的不可接受伤害</strong>，这正是要避免的。</li>
+<li><strong>配对 + 分层 + bootstrap 是离线对比的标准组合</strong>：配对消掉题目难度方差，分层暴露结构，bootstrap 给区间；<strong>MDE 必须一起报</strong>，否则&quot;不显著&quot;无法解释。</li>
+<li><strong>判定协议决定结论可靠性</strong>：案例把安全判定做成程序化规则（漏报率可测），把 judge 限定在忠实性（有校准）。<strong>judge 不适合当&quot;整体更好&quot;的主指标</strong>——失败分析第 1 条给了实证。</li>
+<li><strong>纪律靠流程而不是提醒</strong>：开箱配额 + 留痕 + 权限，是防止 frozen 集被当 dev 用的唯一有效手段（失败分析第 2 条）。</li>
+<li><strong>报告以条件句结尾</strong>：结论必须限定在&quot;评测集指纹 + 判定协议 + 模型快照 + 日期&quot;之下。</li>
+<li><strong>边界清单是核心交付物</strong>：7 项无法回答的问题 + 8 项会给出错误结论的条件 + 5 项必须替换的假设。<strong>一个诚实的评测方案，其价值的一半在于它明确说了自己测不出什么。</strong></li>
+</ul>

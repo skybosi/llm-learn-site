@@ -1,0 +1,233 @@
+<h2 id="h-内存规划与融合的联合决策">内存规划与融合的联合决策<a class="anchor" href="#h-内存规划与融合的联合决策" aria-label="本节链接">#</a></h2>
+<p>第 4 章第 3 课把 512-token Transformer 层的中间池峰值从 96.0 KiB 压到 42.0 KiB；本章前三课又删掉中间张量、把 10 个内核收成 8 个。两件事单独看都对，却<strong>互为输入</strong>：融合改变了&quot;要规划的对象集合&quot;，内存规划的结果又决定融合值不值。顺序错了就白算——先做内存规划再融合，已融掉的张量仍会被分配、被算进峰值。本课把两者放进同一个决策循环，用一组可对照的数字说明耦合在哪里。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-融合对内存规划做了两件事">1. 融合对内存规划做了两件事<a class="anchor" href="#h-1-融合对内存规划做了两件事" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>删掉张量</strong>：被融进消费者的中间值不再需要缓冲。本课场景里 <code>mid</code>（24.0 KiB）与 <code>attn</code>（6.0 KiB）消失，中间张量总量 96.0 → 66.0 KiB。</li>
+<li><strong>改写生命周期</strong>：簇的输入必须在簇执行时还活着（簇把多个张量的生死合成一个区间）。所以融合<strong>不一定</strong>让张量活得更短：簇的输出常要活到原末成员的最后一次读。</li>
+</ul>
+<h4 id="h-2-省下的张量--省下的峰值">2. 省下的张量 ≠ 省下的峰值<a class="anchor" href="#h-2-省下的张量--省下的峰值" aria-label="本节链接">#</a></h4>
+<p>这是本课最反直觉的一处。代码实测：融合后&quot;不复用峰值&quot;从 96.0 降到 66.0 KiB（这是简单的求和减少），但&quot;复用 + 原地写回&quot;的峰值<strong>仍然是 42.0 KiB</strong>。原因在输出的第 3 节：峰值时刻在世的张量是 <code>[&#39;mid+act&#39;, &#39;out&#39;]</code>（融合后）与 <code>[&#39;act&#39;, &#39;out&#39;]</code>（融合前）——<code>attn</code> 与 <code>mid</code> 的消失并未改变&quot;此刻同时在世多少&quot;。<strong>融合省流量是确定的账，省多少峰值必须重跑分配器才知道</strong>，不能拿被删掉的张量大小去减峰值。</p>
+<h4 id="h-3-与原地写回的相互作用">3. 与原地写回的相互作用<a class="anchor" href="#h-3-与原地写回的相互作用" aria-label="本节链接">#</a></h4>
+<p>第 4 章第 3 课的原地写回清单是 <code>[(&#39;v&#39;,&#39;h&#39;), (&#39;attn&#39;,&#39;q&#39;), (&#39;p&#39;,&#39;attn&#39;), (&#39;o&#39;,&#39;p&#39;), (&#39;act&#39;,&#39;mid&#39;), (&#39;out&#39;,&#39;act&#39;)]</code>；本课把 <code>mid→act</code>、<code>attn→p</code> 融合之后，同一份清单变成 <code>[(&#39;v&#39;,&#39;h&#39;), (&#39;attn+p&#39;,&#39;q&#39;), (&#39;o&#39;,&#39;attn+p&#39;), (&#39;out&#39;,&#39;mid+act&#39;)]</code>。两处变化值得注意：<strong>&quot;act 原地写进 mid&quot;这条决策随 <code>mid</code> 一起消失了</strong>；而新的原地对出现在簇的输出上。实践含义：原地写回与融合都会引入别名，两者叠加时&quot;谁覆盖谁、什么时候可以覆盖&quot;必须用同一份生命周期表判定，不能各算一份。</p>
+<h4 id="h-4-联合目标与搜索">4. 联合目标与搜索<a class="anchor" href="#h-4-联合目标与搜索" aria-label="本节链接">#</a></h4>
+<p>两个指标同时存在时，决策就不再是&quot;能融就融&quot;。一个可用的目标函数是加权和：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord text"><span class="mord">score</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7778em;vertical-align:-0.0833em;"></span><span class="mord text"><span class="mord">traffic</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.4445em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord text"><span class="mord">peak</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0528em;">β</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">kernel</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span></span></p>
+<p>三个权重按部署目标定：显存紧张时调大 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span>，启动开销敏感（小 batch、端侧）时调大 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0528em;">β</span></span></span></span>。本课代码做<strong>枚举式评估</strong>：第 1 节逐个算候选（含不合法理由），第 2 节把&quot;接受全部合法点链融合&quot;与&quot;复用 / 原地写回&quot;组合成五张方案。工业编译器通常再加一层搜索：按收益排序逐个试，每接受一个就把生命周期、峰值、内核数重算一遍，收益为零或与已有融合重叠就拒绝。这是贪心，不保证全局最优，但比枚举全组合可行——练习 3 让你补上这层搜索。</p>
+<h4 id="h-5-决策要进编译缓存">5. 决策要进编译缓存<a class="anchor" href="#h-5-决策要进编译缓存" aria-label="本节链接">#</a></h4>
+<p>融合决策依赖形状（tile、生命周期、原地合法性都可能随 shape 变化），必须与第 2 章的编译键绑在一起：守卫命中就复用上次的融合方案与内存布局，守卫失败就整条重编译。把融合决策当作&quot;编译期一次性、可缓存的产物&quot;，否则省下的带宽会被决策开销吃掉。</p>
+<p><figure><img class="md-img" src="content/courses/ml-compilers/assets/chapter-5-figure-04.svg" alt="融合与内存规划互为输入：删张量不等于降峰值，要按流量、峰值、内核数联合打分并随编译键缓存" loading="lazy" decoding="async"><figcaption>融合与内存规划互为输入：删张量不等于降峰值，要按流量、峰值、内核数联合打分并随编译键缓存</figcaption></figure>
+</p>
+<h4 id="h-6-常见坑">6. 常见坑<a class="anchor" href="#h-6-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>先后各算一遍</strong>：内存规划 → 融合，或融合 → 内存规划，都只做了一次单向传递，得到的峰值/流量与联立结果不一致。</li>
+<li><strong>把删除的张量从峰值里再减一次</strong>：峰值是&quot;同时在世的最大值&quot;，不是求和，删掉的张量未必在峰值时刻。</li>
+<li><strong>忽略别名交互</strong>：融合簇的输出与原地写回的目标可能是同一块缓冲，别名冲突要靠生命周期表统一判定。</li>
+<li><strong>只优化一个指标</strong>：融合降流量但抬寄存器（上一课）；复用降峰值但可能让某个输入活得更久。三个指标要一起看。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>纯 Python（无第三方依赖），场景与第 4 章第 3 节一致（512-token Transformer 层、1 元素 = 4 字节），分配器同为贪心首次适配。第 1 节逐个评估候选（含不合法原因），第 2 节把融合 × 复用 × 原地写回放进同一张表，第 3 节打印&quot;峰值时刻谁在世&quot;，第 4 节对比融合前后的原地写回清单。</p>
+<pre data-lang="python"><code class="language-python"># ---- 第 4 课示例：融合与内存规划的联立决策（纯 Python，无第三方依赖）----
+# 场景沿用第 4 课第 3 节的 512-token Transformer 层；1 元素 = 4 字节（fp32）
+KiB = lambda elems: elems * 4 / 1024
+
+OPS = [(&#39;h&#39;,    [&#39;x&#39;],        1536), (&#39;q&#39;,    [&#39;h&#39;, &#39;Wq&#39;],  1536),
+       (&#39;k&#39;,    [&#39;h&#39;, &#39;Wk&#39;],  1536), (&#39;v&#39;,    [&#39;h&#39;, &#39;Wv&#39;],  1536),
+       (&#39;attn&#39;, [&#39;q&#39;, &#39;k&#39;],   1536), (&#39;p&#39;,    [&#39;attn&#39;],     1536),
+       (&#39;o&#39;,    [&#39;p&#39;, &#39;v&#39;],   1536), (&#39;mid&#39;,  [&#39;o&#39;, &#39;W1&#39;],   6144),
+       (&#39;act&#39;,  [&#39;mid&#39;],      6144), (&#39;out&#39;,  [&#39;act&#39;, &#39;W2&#39;], 1536)]
+PARAMS = {&#39;x&#39;: 1536, &#39;Wq&#39;: 2304, &#39;Wk&#39;: 2304, &#39;Wv&#39;: 2304, &#39;W1&#39;: 18432, &#39;W2&#39;: 6144}
+SEQ = [o for o, _, _ in OPS]
+SIZE = {o: s for o, d, s in OPS}
+DEPS = {o: list(d) for o, d, s in OPS}
+
+class Cluster:
+    &quot;&quot;&quot;融合簇：成员之间的中间张量不落地；输入 = 成员的外部输入；输出 = 末成员输出。&quot;&quot;&quot;
+    def __init__(self, members):
+        self.members, self.name = members, &#39;+&#39;.join(members)
+        inner = set(members)
+        self.deps = [d for m in members for d in DEPS[m] if d not in inner]
+        self.size = SIZE[members[-1]]
+
+def build(fused_pairs):
+    &quot;&quot;&quot;fused_pairs：[(生产者, 消费者)]，只支持执行序里相邻的点链。&quot;&quot;&quot;
+    producer_of = {c: p for p, c in fused_pairs}
+    order, i = [], 0
+    while i &lt; len(SEQ):
+        members = [SEQ[i]]
+        while i + 1 &lt; len(SEQ) and producer_of.get(SEQ[i + 1]) == members[-1]:
+            members.append(SEQ[i + 1]); i += 1
+        order.append(Cluster(members)); i += 1
+    return order
+
+def analyze(order):
+    owner = {m: c.name for c in order for m in c.members}
+    readers = {c.name: [] for c in order}
+    for c in order:
+        for d in c.deps:
+            readers.setdefault(owner.get(d, d), []).append(c.name)
+    pos = {c.name: t for t, c in enumerate(order)}
+    spans = {}
+    for t, c in enumerate(order):
+        last = max([pos[r] for r in readers.get(c.name, []) if r in pos] + [t])
+        spans[c.name] = (t, last)
+    return owner, readers, spans
+
+def traffic(order, owner):
+    &quot;&quot;&quot;DRAM 流量（元素数）：每个张量写一次；每个读它的内核读一次；参数按读次数计。&quot;&quot;&quot;
+    moved = sum(c.size for c in order)                       # 写
+    for c in order:
+        for d in c.deps:
+            src = next((x for x in order if x.name == owner.get(d, d)), None)
+            moved += src.size if (src is not None and d in owner) else PARAMS.get(d, 0)
+    return moved
+
+def peak_greedy(order, spans, inplace=False):
+    &quot;&quot;&quot;第 4 课第 3 节的贪心首次适配；inplace 允许&quot;输入最后一读&quot;原地写回。&quot;&quot;&quot;
+    owner = {m: c.name for c in order for m in c.members}
+    size = {c.name: c.size for c in order}
+    last_read = {}
+    for t, c in enumerate(order):
+        for d in c.deps:
+            last_read[d] = t; last_read[owner.get(d, d)] = t
+    taken, high, table, used = [], 0, {}, []
+    for t, c in enumerate(order):
+        need = size[c.name]
+        if inplace:
+            for d in c.deps:
+                k = owner.get(d, d)
+                if last_read.get(d) == t and k in size and size[k] &gt;= need and k in table:
+                    table[c.name] = table[k]; used.append((c.name, k)); need = None; break
+        if need is None: continue
+        active = [(a, b) for a, b, rel in taken if rel &gt;= t]
+        free, end = [], 0
+        for a, b in sorted(active):
+            if a &gt; end: free.append((end, a - end))
+            end = max(end, b)
+        if end &lt; high: free.append((end, high - end))
+        off = next((a for a, sz in free if sz &gt;= need), None)
+        if off is None: off, high = high, high + need
+        taken.append((off, off + need, spans[c.name][1])); table[c.name] = (off, need)
+    return high, used, table
+
+def report(tag, fused_pairs, inplace):
+    order = build(fused_pairs)
+    owner, readers, spans = analyze(order)
+    moved = traffic(order, owner)
+    pk, used, table = peak_greedy(order, spans, inplace)
+    print(f&#39;  {tag:&lt;24}{sum(c.size for c in order) * 4 / 1024:&gt;9.1f}{pk * 4 / 1024:&gt;12.1f}&#39;
+          f&#39;{moved * 4 / 1024:&gt;11.1f}{len(order):&gt;7}&#39;)
+    return order, spans, table, used, moved, pk
+
+def peak_live(order, spans, table):
+    hi = max(off + sz for off, sz in table.values())
+    t_hi = max(t for t, c in enumerate(order) if table[c.name][0] + table[c.name][1] &gt;= hi)
+    live = [c.name for c in order if table[c.name][0] + table[c.name][1] &gt;= hi
+            and spans[c.name][0] &lt;= t_hi &lt;= spans[c.name][1]]
+    return hi, t_hi, sorted(live)
+
+print(&#39;=== 0. 场景：512-token Transformer 层（沿用第 4 课第 3 节）===&#39;)
+o0 = build([]); own0, rd0, sp0 = analyze(o0)
+print(f&#39;  中间张量 {len(o0)} 个共 {KiB(sum(c.size for c in o0)):.1f} KiB；&#39;
+      f&#39;参数池 {KiB(sum(PARAMS.values())):.1f} KiB（常驻，不参与复用）&#39;)
+base_moved = traffic(o0, own0)
+print(f&#39;  不融合 + 不复用：峰值 {KiB(sum(c.size for c in o0)):.1f} KiB，流量 {KiB(base_moved):.1f} KiB&#39;)
+
+print(&#39;\n=== 1. 候选逐一评估：融掉一个生产者，就省掉它的&quot;写一次 + 读一次&quot; ===&#39;)
+CAND = [(&#39;mid&#39;,  &#39;act&#39;, True,  &#39;点链：act = gelu(mid)&#39;),
+        (&#39;attn&#39;, &#39;p&#39;,   True,  &#39;点链：p = softmax(attn)&#39;),
+        (&#39;act&#39;,  &#39;out&#39;, False, &#39;不透明算子：out = act @ W2（矩阵乘）&#39;),
+        (&#39;p&#39;,    &#39;o&#39;,   False, &#39;不透明算子：o = p @ v（矩阵乘）&#39;),
+        (&#39;h&#39;,    &#39;q&#39;,   False, &#39;h 有 3 个消费者：融进 q 就要为 k/v 重算或保留&#39;)]
+print(f&#39;  {&quot;候选&quot;:&lt;11}{&quot;判定&quot;:&lt;5}{&quot;省流量&quot;:&gt;12}{&quot;内核&quot;:&gt;7}   依据&#39;)
+for p, c, legal, why in CAND:
+    if legal:
+        o = build([(p, c)]); own, rd, sp = analyze(o)
+        saved = f&#39;{KiB(base_moved - traffic(o, own)):.2f} KiB&#39;
+        kn = f&#39;{len(o0)}→{len(o)}&#39;
+    else:
+        saved, kn = &#39;—（不合法）&#39;, &#39;—&#39;
+    print(f&#39;  {p + &quot;→&quot; + c:&lt;11}{&quot;可融&quot; if legal else &quot;拒绝&quot;:&lt;6}{saved:&gt;12}{kn:&gt;7}   {why}&#39;)
+
+print(&#39;\n=== 2. 联合决策：融合 × 复用 × 原地写回，三个指标一起算 ===&#39;)
+print(f&#39;  {&quot;方案&quot;:&lt;24}{&quot;不复用峰值&quot;:&gt;9}{&quot;复用峰值&quot;:&gt;12}{&quot;流量&quot;:&gt;11}{&quot;内核&quot;:&gt;7}&#39;)
+print(f&#39;  {&quot;&quot;:&lt;24}{&quot;KiB&quot;:&gt;9}{&quot;KiB&quot;:&gt;12}{&quot;KiB&quot;:&gt;11}&#39;)
+FUSE = [(&#39;mid&#39;, &#39;act&#39;), (&#39;attn&#39;, &#39;p&#39;)]
+report(&#39;A 不融合 + 不复用&#39;, [], False)
+oB, spB, tbB, usedB, mB, pB = report(&#39;B 不融合 + 复用 + 原地&#39;, [], True)
+report(&#39;C 只融合，不复用&#39;, FUSE, False)
+report(&#39;D 融合 + 复用&#39;, FUSE, False)
+oE, spE, tbE, usedE, mE, pE = report(&#39;E 融合 + 复用 + 原地&#39;, FUSE, True)
+
+print(&#39;\n=== 3. 峰值时刻谁在世：省掉的张量 ≠ 省下的峰值 ===&#39;)
+for tag, order, sp, tb in [(&#39;不融合&#39;, oB, spB, tbB), (&#39;融合后&#39;, oE, spE, tbE)]:
+    hi, t_hi, live = peak_live(order, sp, tb)
+    print(f&#39;  {tag:&lt;4} 峰值 {KiB(hi):5.1f} KiB，出现在第 {t_hi} 步，此刻在世：{live}&#39;)
+print(&#39;  attn 与 mid 已经不存在了，但峰值仍由&quot;此刻同时在世的张量&quot;决定：&#39;)
+print(&#39;  融合省流量是确定的（省掉一次写 + 一次读），省多少峰值必须重跑分配器才知道。&#39;)
+
+print(&#39;\n=== 4. 为什么必须联立：融合改变了&quot;要规划的对象&quot; ===&#39;)
+print(f&#39;  不融合时可原地写回的对：{usedB}&#39;)
+print(f&#39;  融合后可原地写回的对：{usedE}&#39;)
+print(f&#39;  融合掉的张量 [&quot;attn&quot;, &quot;mid&quot;] 已不存在，&quot;act 原地写进 mid&quot; 这条决策随之作废：&#39;)
+print(f&#39;  峰值 {KiB(pB):.1f} → {KiB(pE):.1f} KiB，流量 {KiB(mB):.1f} → {KiB(mE):.1f} KiB，内核 10 → 8。&#39;)
+print(&#39;  先做内存规划再融合，会为已经不存在的张量分配内存、并把它算进峰值——两件事必须一起算。&#39;)</code></pre>
+<p>本机实跑输出（Python 3.14，无第三方依赖）：</p>
+<pre data-lang="text"><code class="language-text">=== 0. 场景：512-token Transformer 层（沿用第 4 课第 3 节）===
+  中间张量 10 个共 96.0 KiB；参数池 129.0 KiB（常驻，不参与复用）
+  不融合 + 不复用：峰值 96.0 KiB，流量 327.0 KiB
+
+=== 1. 候选逐一评估：融掉一个生产者，就省掉它的&quot;写一次 + 读一次&quot; ===
+  候选         判定            省流量     内核   依据
+  mid→act    可融       48.00 KiB   10→9   点链：act = gelu(mid)
+  attn→p     可融       12.00 KiB   10→9   点链：p = softmax(attn)
+  act→out    拒绝          —（不合法）      —   不透明算子：out = act @ W2（矩阵乘）
+  p→o        拒绝          —（不合法）      —   不透明算子：o = p @ v（矩阵乘）
+  h→q        拒绝          —（不合法）      —   h 有 3 个消费者：融进 q 就要为 k/v 重算或保留
+
+=== 2. 联合决策：融合 × 复用 × 原地写回，三个指标一起算 ===
+  方案                          不复用峰值        复用峰值         流量     内核
+                                KiB         KiB        KiB
+  A 不融合 + 不复用                  96.0        48.0      327.0     10
+  B 不融合 + 复用 + 原地              96.0        42.0      327.0     10
+  C 只融合，不复用                    66.0        48.0      267.0      8
+  D 融合 + 复用                    66.0        48.0      267.0      8
+  E 融合 + 复用 + 原地               66.0        42.0      267.0      8
+
+=== 3. 峰值时刻谁在世：省掉的张量 ≠ 省下的峰值 ===
+  不融合  峰值  42.0 KiB，出现在第 9 步，此刻在世：[&#39;act&#39;, &#39;out&#39;]
+  融合后  峰值  42.0 KiB，出现在第 7 步，此刻在世：[&#39;mid+act&#39;, &#39;out&#39;]
+  attn 与 mid 已经不存在了，但峰值仍由&quot;此刻同时在世的张量&quot;决定：
+  融合省流量是确定的（省掉一次写 + 一次读），省多少峰值必须重跑分配器才知道。
+
+=== 4. 为什么必须联立：融合改变了&quot;要规划的对象&quot; ===
+  不融合时可原地写回的对：[(&#39;v&#39;, &#39;h&#39;), (&#39;attn&#39;, &#39;q&#39;), (&#39;p&#39;, &#39;attn&#39;), (&#39;o&#39;, &#39;p&#39;), (&#39;act&#39;, &#39;mid&#39;), (&#39;out&#39;, &#39;act&#39;)]
+  融合后可原地写回的对：[(&#39;v&#39;, &#39;h&#39;), (&#39;attn+p&#39;, &#39;q&#39;), (&#39;o&#39;, &#39;attn+p&#39;), (&#39;out&#39;, &#39;mid+act&#39;)]
+  融合掉的张量 [&quot;attn&quot;, &quot;mid&quot;] 已不存在，&quot;act 原地写进 mid&quot; 这条决策随之作废：
+  峰值 42.0 → 42.0 KiB，流量 327.0 → 267.0 KiB，内核 10 → 8。
+  先做内存规划再融合，会为已经不存在的张量分配内存、并把它算进峰值——两件事必须一起算。</code></pre>
+<p>四处可核对的结论：<strong>流量从 327.0 降到 267.0 KiB（省 18.3%，其中 <code>mid→act</code> 一刀省 48.00 KiB、<code>attn→p</code> 省 12.00 KiB）</strong>，按 512 个 token 折算约 0.64 KiB/token；<strong>内核 10 → 8</strong>；<strong>复用峰值 42.0 KiB 一动不动</strong>——融合删掉的是 <code>attn</code> 与 <code>mid</code>，而峰值由 <code>mid+act</code> 与 <code>out</code> 的并发决定；<strong>原地写回清单被重写</strong>（6 对变 4 对，<code>act ← mid</code> 随 <code>mid</code> 消失）。</p>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选，需自备 GPU 或云上按需：把&quot;融合 + 内存规划&quot;的联合结果对到真框架上 ----
+# PyTorch 侧可读到的内存统计（口径以官方文档为准）：
+#   python3 -c &quot;import torch; print(torch.cuda.memory_stats().keys())&quot;   # allocated / reserved / 峰值
+# 观察编译器把哪些算子融掉、又复用了哪些缓冲：
+#   TORCH_LOGS=output_code python3 your_model.py 2&gt;&amp;1 | grep -E &quot;cpp_fused|triton_|empty_strided|reuse&quot;
+# 若要在 MLIR 里看同一条链的&quot;融合 + 缓冲复用&quot;两级改写：
+#   mlir-opt model.mlir -pass-pipeline=&#39;builtin.module(func.func(linalg-fuse-elementwise-ops))&#39;
+#   # 再走 bufferization 观察 alloc/dealloc 是否被折叠（具体 pipeline 以 MLIR 官方文档为准）
+# 没有 GPU 也能完成本课：上面的纯 Python 版本已经把流量、峰值、内核数与原地清单算完了。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：在 <code>OPS</code> 里给 <code>p</code> 后面插一个逐元素节点 <code>scale</code>（<code>[&#39;p&#39;]</code>，1536 元素），把融合候选从 <code>attn→p</code> 扩成 <code>attn→p→scale</code> 三段链，重跑第 2 节的五张方案，观察流量与峰值各变化多少，并解释为什么两者幅度不同。</li>
+<li><strong>解释</strong>：为什么&quot;只融合，不复用&quot;（方案 C）的峰值（48.0 KiB）比&quot;不融合 + 复用&quot;（方案 B 的 42.0 KiB）更高？把两个方案的峰值时刻在世张量列出来对照。</li>
+<li><strong>对比/验证</strong>：在 <code>CAND</code> 上实现一个贪心接受循环（按省流量排序，每接受一个候选就重算流量、峰值、内核数），再把目标函数 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">scor</span><span class="mord mathnormal">e</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">t</span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="mord mathnormal">a</span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="mord mathnormal">i</span><span class="mord mathnormal">c</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.4445em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span><span class="mord mathnormal">e</span><span class="mord mathnormal" style="margin-right:0.0315em;">ak</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0528em;">β</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.0315em;">k</span><span class="mord mathnormal mtight" style="margin-right:0.0278em;">er</span><span class="mord mathnormal mtight">n</span><span class="mord mathnormal mtight">e</span><span class="mord mathnormal mtight" style="margin-right:0.0197em;">l</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 写成代码，令 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span> 从 0 增到很大，观察被选中的候选集合是否改变；给出一个 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span> 的临界值并解释它的物理含义。</li>
+<li><strong>思考</strong>：训练场景下激活要活到反向（第 4 章第 3 节提过），融合的收益与内存规划的空间都会变。如果只允许你改一处，你会先做融合还是先做内存复用？给出判据（提示：分别对流量与峰值求偏导，看哪个更接近瓶颈）。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Tianqi Chen et al., <em>TVM: An Automated End-to-End Optimizing Compiler for Deep Learning</em>（OSDI&#39;18；算子融合与静态内存规划同为图级优化，二者在同一趟编译里决定）：<a href="https://www.usenix.org/conference/osdi18/presentation/chen" target="_blank" rel="noopener noreferrer">https://www.usenix.org/conference/osdi18/presentation/chen</a></li>
+<li>Apache TVM 设计文档（<code>relax.FuseOps</code> + <code>relax.FuseTIR</code> 融合流水线与内存规划在编译流水线中的位置）：<a href="https://tvm.apache.org/docs/arch/index.html" target="_blank" rel="noopener noreferrer">https://tvm.apache.org/docs/arch/index.html</a></li>
+<li>PyTorch 源码 <em>torch/_inductor/scheduler.py</em>（融合决策与 <code>can_fusion_increase_peak_memory</code> 这类显存约束：本课&quot;融合不能只看流量&quot;的工业对应物）：<a href="https://github.com/pytorch/pytorch/blob/main/torch/_inductor/scheduler.py" target="_blank" rel="noopener noreferrer">https://github.com/pytorch/pytorch/blob/main/torch/_inductor/scheduler.py</a></li>
+<li>Lianmin Zheng et al., <em>The Deep Learning Compiler: A Comprehensive Survey</em>（内存分配与复用优化的分类，以及&quot;生命周期分析 → 偏移分配&quot;的流程）：<a href="https://arxiv.org/abs/2002.03794" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2002.03794</a></li>
+</ul>
+<p><a href="#/l/mlc-ch6-l1">下一章：算法-调度分离：Halide / TVM 的核心思想</a></p>

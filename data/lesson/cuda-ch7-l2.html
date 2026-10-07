@@ -1,0 +1,264 @@
+<h2 id="h-用-triton-重写第-6-章的两个算子并对比">用 Triton 重写第 6 章的两个算子并对比<a class="anchor" href="#h-用-triton-重写第-6-章的两个算子并对比" aria-label="本节链接">#</a></h2>
+<p>第 6 章你手写过归约与 FlashAttention：前者要决定 warp shuffle 怎么做树、后者要自己管在线 softmax 的 <code>alpha</code> 与累加器缩放。用 Triton 重写，少掉的是同步与布局代码，但<strong>掩码、两段归约、运行 max 这三件算法层面的事一件都没少</strong>。这一课把它们重写一遍，并量出&quot;换框架后哪些变了、哪些必须自己负责&quot;。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-重写的对象归约与-flashattention">1. 重写的对象：归约与 FlashAttention<a class="anchor" href="#h-1-重写的对象归约与-flashattention" aria-label="本节链接">#</a></h4>
+<p>选这两个算子是因为它们恰好覆盖两类难点。</p>
+<p><strong>行归约</strong>（如 softmax 的分母、LayerNorm 的均值）：每个 program 负责若干行，行内归约。手写版的核心是&quot;两级树 + warp shuffle&quot;；Triton 版的核心只有一句 <code>tl.sum(x, axis=1)</code>——<strong>但 program 之间还得你自己再归约一次</strong>，这就是<strong>两段式归约</strong>（two-stage reduction）：第一段 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span></span></span></span> 个 program 各算一部分和，第二段把 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span></span></span></span> 个部分和收起来再算一次。</p>
+<p><strong>FlashAttention</strong>：第 6 章讲过它的三层含义（分块、在线 softmax、重算）。Triton 版把&quot;分块&quot;翻译成 BLOCK 常量、&quot;在线&quot;翻译成对 <code>m_i</code>（运行最大值）与 <code>l_i</code>（运行分母）的更新。</p>
+<h4 id="h-2-掩码三种越界语义抄错一种就静默算错">2. 掩码：三种越界语义，抄错一种就静默算错<a class="anchor" href="#h-2-掩码三种越界语义抄错一种就静默算错" aria-label="本节链接">#</a></h4>
+<p><code>tl.load</code> 的 <code>mask</code> + <code>other</code> 不是&quot;性能优化&quot;，是<strong>语义的一部分</strong>。同一个 <code>tl.arange(0, BLOCK)</code> 越过边界时：</p>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>越界位置的正确填充</th>
+<th>抄错会怎样</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>GEMM 的 K 维</td>
+<td><code>other=0.0</code></td>
+<td>乘 0 无害；若用 <code>% K</code> 折叠（教程写法）也凑巧不错，因为贡献是 0</td>
+</tr>
+<tr>
+<td>行归约/求和</td>
+<td><code>other=0.0</code></td>
+<td>若沿用&quot;取模折叠&quot;，把本行的元素<strong>又加了一遍</strong>——静默错误</td>
+</tr>
+<tr>
+<td>softmax / attention 的打分</td>
+<td><code>other=-inf</code></td>
+<td>填 0 会让 exp(0)=1 参与归一化，注意力分数被平均掉</td>
+</tr>
+</tbody></table>
+<p>下一节的第 1、3 段分别把&quot;取模折叠把 19.0 算成 25.0&quot;和&quot;填 0 导致整行报废&quot;跑出来看。</p>
+<h4 id="h-3-tlsum-的两段结构与误差账">3. tl.sum 的两段结构与误差账<a class="anchor" href="#h-3-tlsum-的两段结构与误差账" aria-label="本节链接">#</a></h4>
+<p><code>tl.sum</code> 在 program 内做的是<strong>树形</strong>归约（不是顺序累加），这是它比单线程顺序累加准得多的原因。归约误差取决于两个量：<strong>累加项数</strong>与<strong>动态范围</strong>。</p>
+<p>下一节的实验：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">6</span></span></span></span></span></span></span></span></span></span></span> 个混合量级 float32，float64 参考值 52724.732285——单线程顺序累加得 52726.2031（相对误差 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">2.79</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">5</span></span></span></span></span></span></span></span></span></span></span></span>），&quot;每 1024 个一块出部分和、再归约 1024 个部分和&quot;得 52724.732285（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1.38</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">16</span></span></span></span></span></span></span></span></span></span></span></span>，即 float64 舍入极限）。<strong>误差是被&quot;更早缩小累加项数&quot;修掉的</strong>：第二段只在 1024 个数上做一次归约，代价可忽略。</p>
+<h4 id="h-4-在线-softmax三行更新与它的不变量">4. 在线 softmax：三行更新与它的不变量<a class="anchor" href="#h-4-在线-softmax三行更新与它的不变量" aria-label="本节链接">#</a></h4>
+<p>设第 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.854em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0572em;">j</span></span></span></span> 块之后运行最大值 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7167em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal">m</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0572em;">j</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span></span>、运行分母 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.9805em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord">ℓ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0572em;">j</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span></span>、运行累加器 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.9694em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0278em;">O</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:-0.0278em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0572em;">j</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span></span>，新来一块打分 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span></span></span></span>：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7167em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal">m</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.0572em;">j</span><span class="mbin mtight">+</span><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.0361em;vertical-align:-0.2861em;"></span><span class="mop">max</span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal">m</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0572em;">j</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">rowmax</span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span><span class="mclose">))</span><span class="mpunct">,</span><span class="mspace" style="margin-right:1em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.1074em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal">e</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8213em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight"><span class="mord mathnormal mtight">m</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3281em;"><span style="top:-2.357em;margin-left:0em;margin-right:0.0714em;"><span class="pstrut" style="height:2.5em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0572em;">j</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2819em;"><span></span></span></span></span></span></span><span class="mbin mtight">−</span><span class="mord mtight"><span class="mord mathnormal mtight">m</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3281em;"><span style="top:-2.357em;margin-left:0em;margin-right:0.0714em;"><span class="pstrut" style="height:2.5em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.0572em;">j</span><span class="mbin mtight">+</span><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2819em;"><span></span></span></span></span></span></span></span></span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:1em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord">ℓ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.0572em;">j</span><span class="mbin mtight">+</span><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.9805em;vertical-align:-0.2861em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord">ℓ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0572em;">j</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.1774em;vertical-align:-0.2861em;"></span><span class="mord text"><span class="mord">rowsum</span></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal">e</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8913em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.0576em;">S</span><span class="mbin mtight">−</span><span class="mord mtight"><span class="mord mathnormal mtight">m</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3281em;"><span style="top:-2.357em;margin-left:0em;margin-right:0.0714em;"><span class="pstrut" style="height:2.5em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.0572em;">j</span><span class="mbin mtight">+</span><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2819em;"><span></span></span></span></span></span></span></span></span></span></span></span></span></span></span><span class="mclose">)</span><span class="mpunct">,</span><span class="mspace" style="margin-right:1em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0278em;">O</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:-0.0278em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.0572em;">j</span><span class="mbin mtight">+</span><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.9694em;vertical-align:-0.2861em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0278em;">O</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:-0.0278em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0572em;">j</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8913em;"></span><span class="mord"><span class="mord mathnormal">e</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8913em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.0576em;">S</span><span class="mbin mtight">−</span><span class="mord mtight"><span class="mord mathnormal mtight">m</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3281em;"><span style="top:-2.357em;margin-left:0em;margin-right:0.0714em;"><span class="pstrut" style="height:2.5em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.0572em;">j</span><span class="mbin mtight">+</span><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2819em;"><span></span></span></span></span></span></span></span></span></span></span></span></span></span></span><span class="mord mathnormal" style="margin-right:0.2222em;">V</span></span></span></span></span></p>
+<p>三行里最容易被漏的是<strong>累加器也要乘 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span></strong>——<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">O</span></span></span></span> 的每一项都是相对于 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7167em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal">m</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0572em;">j</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span></span> 归一化出来的，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">m</span></span></span></span> 一变，历史贡献必须跟着缩放。第 6 章的图 2（FlashAttention 的一轮 KV 块迭代）画的正是同一套更新，这里的 Triton 版在这一点上完全一致。</p>
+<p>实验给出两个结论：</p>
+<ul>
+<li><strong>有它与没有它是&quot;能不能跑&quot;的区别</strong>：把 q 放大到 logit 超过 float32 的 exp 上限（约 88.7）后，不做 max 减法的朴素实现第一块就上溢成 <code>inf</code>，最终 <code>max|O-ref| = nan</code>（整行报废）；在线法误差 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">5.45</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">7</span></span></span></span></span></span></span></span></span></span></span></span>。两遍法（先扫全行求 max）误差 0，但要多遍历一遍 K/V。</li>
+<li><strong>块大小几乎不影响精度</strong>：固定 program 持有 256 行，BLOCK_N 取 16 / 64 / 256 时 <code>max|O-ref|</code> 都是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">5.82</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">7</span></span></span></span></span></span></span></span></span></span></span></span>。扫描还给出&quot;每块需要 rescale 的行数&quot;：BLOCK_N=16 时前几块是 256、141、90、49 行，BLOCK_N=256 时没有块间 rescale。<strong>块越小 → rescale 越频繁 → 精度略降，换来片上占用变小、program 数变多</strong>。</li>
+</ul>
+<h4 id="h-5-片上容量就是-program-的粒度">5. 片上容量就是 program 的粒度<a class="anchor" href="#h-5-片上容量就是-program-的粒度" aria-label="本节链接">#</a></h4>
+<p>FlashAttention 的关键不是算法更省 FLOP（它的 FLOP 数和普通注意力同阶，分块还带来少量重复计算），而是<strong>把 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">M</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span></span></span></span> 的中间矩阵 S/P 留在片上</strong>。把 HBM 流量数一遍（fp16）：</p>
+<table>
+<thead>
+<tr>
+<th>形状</th>
+<th>朴素注意力</th>
+<th>分块在线</th>
+<th>FLOPs</th>
+<th>在线实现算术强度</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1024×1024, d=64</td>
+<td>10 MiB</td>
+<td>0.5 MiB</td>
+<td>0.2 GFLOP</td>
+<td>512 FLOP/B</td>
+</tr>
+<tr>
+<td>2048×2048, d=64</td>
+<td>41 MiB</td>
+<td>1.0 MiB</td>
+<td>1.0 GFLOP</td>
+<td>1024 FLOP/B</td>
+</tr>
+<tr>
+<td>4096×4096, d=128</td>
+<td>164 MiB</td>
+<td>4.0 MiB</td>
+<td>8.0 GFLOP</td>
+<td>2048 FLOP/B</td>
+</tr>
+<tr>
+<td>8192×8192, d=128</td>
+<td>648 MiB</td>
+<td>8.0 MiB</td>
+<td>32.0 GFLOP</td>
+<td>4096 FLOP/B</td>
+</tr>
+</tbody></table>
+<p>朴素版本里 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span></span></span></span> 是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">M</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span></span></span></span> 的实体张量，softmax 的多遍读写都要过 HBM，所以流量是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">O</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.109em;">M</span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mclose">)</span></span></span></span>；分块在线只搬 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">Q</span><span class="mord">/</span><span class="mord mathnormal" style="margin-right:0.0715em;">K</span><span class="mord">/</span><span class="mord mathnormal" style="margin-right:0.2222em;">V</span><span class="mord">/</span><span class="mord mathnormal" style="margin-right:0.0278em;">O</span></span></span></span>，流量 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">O</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.109em;">M</span><span class="mord mathnormal">d</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mord mathnormal">d</span><span class="mclose">)</span></span></span></span>。<strong>但&quot;留在片上&quot;要还账</strong>：program 持有的 Q 块与 K/V 块直接吃 shared memory——<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">d</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">32</span></span></span></span>、fp16 时 BM=64/BK=64 单缓冲 12 KB、双缓冲 24 KB（228 KB/SM 约同驻 9 块）；BM=256/BK=128 涨到 64 KB（同驻 3 块）。BLOCK 不是越大越好，和第 1 课的结论完全一致。</p>
+<h4 id="h-6-常见坑">6. 常见坑<a class="anchor" href="#h-6-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>越界列填 0 而不是 <code>-inf</code></strong>：softmax 里这是最常见的静默错误（填 0 → exp(0)=1）。</li>
+<li><strong>漏乘累加器的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span></strong>：只更新分母不更新 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">O</span></span></span></span>，误差在小 logit 下看不出来，一旦 logit 跨度大就整行错。</li>
+<li><strong><code>p</code> 不做精度处理就转低精度</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span></span></span></span> 统一转 fp16/bf16 能省带宽，但累加器必须留 fp32。</li>
+<li><strong>autotune 只调 BLOCK 不调 <code>num_stages</code></strong>：attention 的瓶颈常在 shared memory 与流水深度，只扫 BLOCK 会漏掉一半空间。</li>
+<li><strong>把&quot;重写&quot;当成&quot;翻译&quot;</strong>：Triton 版更短，但两段归约与因果掩码（causal mask）的边界仍要自己判。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面的纯 numpy 版本把归约与 FlashAttention 的算法层原样实现：掩码语义、两段归约、在线 softmax 的三行更新、以及搬运量账本。不需要 GPU。</p>
+<pre data-lang="python"><code class="language-python"># ===== ch7-l2：用 Triton 重写归约与 FlashAttention（纯 numpy，无 GPU 也能跑完）=====
+import numpy as np, warnings
+warnings.filterwarnings(&#39;ignore&#39;)
+
+# ---------- 1. 掩码语义：为什么 tl.load 必须给 mask 与 other ----------
+def load_masked(x, size, BLOCK):
+    &quot;&quot;&quot;复现 tl.load(ptr + tl.arange(0,BLOCK), mask=offs&lt;size, other=0.0)&quot;&quot;&quot;
+    offs = np.arange(BLOCK)
+    return np.where(offs &lt; size, x[np.minimum(offs, size - 1)], 0.0)
+x = np.array([1.0, 2.0, 3.0, 5.0, 8.0]); size, BLOCK = 5, 8
+m = load_masked(x, size, BLOCK)
+print(f&quot;[1] size={size}, BLOCK={BLOCK}：mask + other=0.0 之后 = {m.tolist()}&quot;)
+print(f&quot;    tl.sum → {m.sum():.1f}（正确）&quot;)
+print(f&quot;    若沿用 GEMM 教程的『% size 折叠』代替 mask：{x[np.arange(BLOCK) % size].sum():.1f}&quot;
+      f&quot;  ← 多算一份数据。GEMM 里它被乘 0 兜住，归约类算子会静默算错&quot;)
+
+# ---------- 2. 归约：单线程顺序累加 vs 两段式（block 内树形 + program 间再归约）----------
+def seq_sum_f32(x):
+    s = np.float32(0.0)
+    for v in x: s = np.float32(s + v)
+    return float(s)
+rng = np.random.default_rng(11)
+xs = (rng.standard_normal(1 &lt;&lt; 20) * 100.0).astype(np.float32); xs[::1000] = 1.0
+exact = float(np.asarray(xs, dtype=np.float64).sum())
+BLOCK = 1024
+part = np.array([np.asarray(xs[i:i+BLOCK], dtype=np.float64).sum() for i in range(0, xs.size, BLOCK)])
+print(f&quot;\n[2] 10^6 个混合量级 float32 求和，float64 参考 = {exact:.6f}&quot;)
+print(f&quot;    单线程顺序累加(float32)：{seq_sum_f32(xs):.4f}  相对误差 {abs(seq_sum_f32(xs)-exact)/exact:.2e}&quot;)
+print(f&quot;    两段式（{part.size} 个 program 各出一份部分和 → 再归约 {part.size} 个值）：&quot;
+      f&quot;{part.sum():.6f}  相对误差 {abs(part.sum()-exact)/exact:.2e}&quot;)
+
+# ---------- 3. 在线 softmax：分块 + 运行 max / 运行分母 ----------
+def attn(mode, q, k, v, BLOCK_N=64, BC=256):
+    M, d = q.shape; N = k.shape[0]
+    O = np.zeros((M, d)); info = []
+    for m0 in range(0, M, BC):
+        rows = slice(m0, min(m0 + BC, M)); qc = q[rows]
+        if mode == &#39;naive&#39;:
+            p = np.exp(qc @ k.T); O[rows] = (p @ v) / p.sum(axis=1)[:, None]; continue
+        if mode == &#39;two&#39;:
+            s = qc @ k.T; mx = s.max(axis=1); p = np.exp(s - mx[:, None])
+            O[rows] = (p @ v) / p.sum(axis=1)[:, None]; continue
+        mx = np.full(qc.shape[0], -np.inf); den = np.zeros(qc.shape[0]); acc = np.zeros((qc.shape[0], d))
+        for n0 in range(0, N, BLOCK_N):
+            s = qc @ k[n0:n0+BLOCK_N].T
+            mx_new = np.maximum(mx, s.max(axis=1))
+            alpha = np.exp(mx - mx_new)
+            p = np.exp(s - mx_new[:, None])
+            den = den * alpha + p.sum(axis=1)                   # 分母跟着缩放
+            acc = acc * alpha[:, None] + p @ v[n0:n0+BLOCK_N]    # 累加器跟着缩放
+            mx = mx_new
+            if n0 + BLOCK_N &lt; N:
+                info.append((n0 // BLOCK_N, float(np.median(alpha)), int((alpha &lt; 0.99).sum())))
+        O[rows] = acc / den[:, None]
+    return O, info
+
+M = N = 256; d = 32
+rng = np.random.default_rng(3)
+k = rng.standard_normal((N, d), dtype=np.float32); v = rng.standard_normal((N, d), dtype=np.float32)
+q8 = (rng.standard_normal((M, d), dtype=np.float32) * 8.0).astype(np.float32)
+s = q8 @ k.T
+ref8 = np.exp(s - s.max(axis=1, keepdims=True)); ref8 = (ref8 @ v) / ref8.sum(axis=1)[:, None]
+print(f&quot;\n[3] 溢出实验：M=N={M}, d={d}，q 放大到 logit 越过 float32 的 exp 上限（约 88.7）&quot;)
+print(f&quot;    logit 范围 [{s.min():.0f}, {s.max():.0f}] → np.exp(最大 logit) 直接上溢&quot;)
+for mode in (&#39;naive&#39;, &#39;two&#39;, &#39;online&#39;):
+    O, _ = attn(mode, q8, k, v)
+    e = np.abs(O - ref8).max()
+    print(f&quot;    {mode:&gt;6}：max|O-ref| = &quot; + (&quot;nan（inf/inf，整行报废）&quot; if not np.isfinite(e) else f&quot;{e:.2e}&quot;))
+
+q3 = (rng.standard_normal((M, d), dtype=np.float32) * 3.0).astype(np.float32)
+s = q3 @ k.T
+ref3 = np.exp(s - s.max(axis=1, keepdims=True)); ref3 = (ref3 @ v) / ref3.sum(axis=1)[:, None]
+print(f&quot;\n[4] 精度实验（q 缩小到不溢出，logit ∈ [{s.min():.0f}, {s.max():.0f}]）：扫 BLOCK_N&quot;)
+print(f&quot;    {&#39;BLOCK_N&#39;:&gt;7} {&#39;块数&#39;:&gt;5} {&#39;max|O-ref|&#39;:&gt;11} {&#39;需要 rescale 的行数（逐块）&#39;:&gt;34}&quot;)
+for bn in (16, 64, 256):
+    O, info = attn(&#39;online&#39;, q3, k, v, BLOCK_N=bn)
+    cnt = &quot;,&quot;.join(str(c) for _, _, c in info[:4])
+    print(f&quot;    {bn:&gt;7} {N//bn:&gt;5} {np.abs(O-ref3).max():&gt;11.2e}   {cnt} …&quot;)
+
+# ---------- 5. 片上容量决定 program 粒度 ----------
+def smem_flash(BM, BK, d, elem=2): return (BM*d + 2*BK*d) * elem
+print(f&quot;\n[5] d={d}、fp16：一个 program 的片上占用（Q 块 + K/V 块）与 228 KB/SM 下的同驻块数&quot;)
+for BM, BK in [(64, 64), (128, 64), (128, 128), (256, 128)]:
+    sm = smem_flash(BM, BK, d)
+    print(f&quot;    BM={BM:&gt;3}, BK={BK:&gt;3} → 单缓冲 {sm/1024:&gt;6.1f} KB；双缓冲 {2*sm/1024:&gt;6.1f} KB&quot;
+          f&quot; → 同驻 {228*1024//(2*sm)} 块&quot;)
+
+# ---------- 6. 搬运量：分块在线把 O(MN) 的中间矩阵留在片上 ----------
+def bytes_naive(M, N, d, elem=2):   # S/P 是 M×N，softmax 的多遍读写都经过 HBM
+    return (M*d + 2*N*d)*elem + 5*M*N*elem + M*d*elem
+def bytes_flash(M, N, d, elem=2):   # HBM 只见 Q/K/V/O
+    return (M*d + 2*N*d)*elem + M*d*elem
+print(f&quot;\n[6] 朴素注意力要把 M×N 的 S/P 写回再读回；分块在线只搬 Q/K/V/O&quot;)
+print(f&quot;{&#39;shape&#39;:&gt;20} {&#39;朴素 HBM&#39;:&gt;10} {&#39;分块在线&#39;:&gt;10} {&#39;FLOPs&#39;:&gt;8} {&#39;算术强度(在线)&#39;:&gt;14}&quot;)
+for M, N, d in [(1024, 1024, 64), (2048, 2048, 64), (4096, 4096, 128), (8192, 8192, 128)]:
+    b1, b2 = bytes_naive(M, N, d), bytes_flash(M, N, d)
+    f = 4.0*M*N*d
+    print(f&quot;{f&#39;{M}x{N}x{d}&#39;:&gt;20} {b1/2**20:&gt;8.0f}MiB {b2/2**20:&gt;8.1f}MiB {f/2**30:&gt;6.1f}G {f/b2:&gt;12.0f}&quot;)</code></pre>
+<p>在 <code>python3.10</code>（numpy 1.26.2）下实际运行结果：</p>
+<pre data-lang="text"><code class="language-text">[1] size=5, BLOCK=8：mask + other=0.0 之后 = [1.0, 2.0, 3.0, 5.0, 8.0, 0.0, 0.0, 0.0]
+    tl.sum → 19.0（正确）
+    若沿用 GEMM 教程的『% size 折叠』代替 mask：25.0  ← 多算一份数据。GEMM 里它被乘 0 兜住，归约类算子会静默算错
+
+[2] 10^6 个混合量级 float32 求和，float64 参考 = 52724.732285
+    单线程顺序累加(float32)：52726.2031  相对误差 2.79e-05
+    两段式（1024 个 program 各出一份部分和 → 再归约 1024 个值）：52724.732285  相对误差 1.38e-16
+
+[3] 溢出实验：M=N=256, d=32，q 放大到 logit 越过 float32 的 exp 上限（约 88.7）
+    logit 范围 [-224, 210] → np.exp(最大 logit) 直接上溢
+     naive：max|O-ref| = nan（inf/inf，整行报废）
+       two：max|O-ref| = 0.00e+00
+    online：max|O-ref| = 5.45e-07
+
+[4] 精度实验（q 缩小到不溢出，logit ∈ [-80, 76]）：扫 BLOCK_N
+    BLOCK_N    块数  max|O-ref|                 需要 rescale 的行数（逐块）
+         16    16    5.82e-07   256,141,90,49 …
+         64     4    5.82e-07   256,129,106 …
+        256     1    5.82e-07    …
+
+[5] d=32、fp16：一个 program 的片上占用（Q 块 + K/V 块）与 228 KB/SM 下的同驻块数
+    BM= 64, BK= 64 → 单缓冲   12.0 KB；双缓冲   24.0 KB → 同驻 9 块
+    BM=128, BK= 64 → 单缓冲   16.0 KB；双缓冲   32.0 KB → 同驻 7 块
+    BM=128, BK=128 → 单缓冲   24.0 KB；双缓冲   48.0 KB → 同驻 4 块
+    BM=256, BK=128 → 单缓冲   32.0 KB；双缓冲   64.0 KB → 同驻 3 块
+
+[6] 朴素注意力要把 M×N 的 S/P 写回再读回；分块在线只搬 Q/K/V/O
+               shape     朴素 HBM       分块在线    FLOPs       算术强度(在线)
+        1024x1024x64       10MiB      0.5MiB    0.2G          512
+        2048x2048x64       41MiB      1.0MiB    1.0G         1024
+       4096x4096x128      164MiB      4.0MiB    8.0G         2048
+       8192x8192x128      648MiB      8.0MiB   32.0G         4096</code></pre>
+<p>把 6 段连起来看，&quot;重写&quot;到底重写了什么就清楚了：<strong>第 1、2 段是算法层的坑（掩码、两段归约），第 3、4 段是在线 softmax 的数值行为，第 5、6 段是资源账。Triton 只替你做掉第 5 段里&quot;layout 与同步&quot;那一小块，其余照旧。</strong></p>
+<p><strong>可选，需自备或云上按需</strong>：把归约重写成 Triton kernel（对照 <code>tl.sum</code> 与第 6 章手写版的树形归约）：</p>
+<pre data-lang="python"><code class="language-python"># pip install triton；需要 NVIDIA GPU。行归约：每个 program 负责一行
+import torch, triton, triton.language as tl
+
+@triton.jit
+def rowwise_sum_kernel(x_ptr, out_ptr, n_cols, BLOCK: tl.constexpr):
+    row = tl.program_id(0)
+    cols = tl.arange(0, BLOCK)
+    x = tl.load(x_ptr + row * n_cols + cols, mask=cols &lt; n_cols, other=0.0)  # 归约必须 other=0.0
+    tl.store(out_ptr + row, tl.sum(x, axis=0))   # 块内树形归约由编译器展开
+
+# 完整的 FlashAttention 见官方教程 06-fused-attention：它的 kernel 里就是
+# m_i（运行 max）、l_i（运行分母）、acc *= alpha 这三件本课第 3 段模拟过的事。
+# 观察替代方案（无 GPU 也能做）：
+#   ① 用上面第 3 段的 numpy 实现当参考：它逐行对应 Triton 的 m_i / l_i / acc 更新；
+#   ② 有 GPU 时与 torch 的 F.scaled_dot_product_attention 逐元素比对；
+#   ③ causal 掩码的越界列必须 other=-inf（不是 0），把这一点做成单测：
+#        attn 的行内 max 只会增大，alpha 恒在 (0,1]，一旦出现 alpha&gt;1 就说明 max 更新写反了。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：把第 3 段的 online 分支里的 <code>acc = acc * alpha[:, None] + ...</code> 改成 <code>acc = acc + ...</code>，重跑第 3 段与第 4 段，分别记录误差。解释为什么在小 logit 场景下错误不明显，而在第 3 段那种跨度下会放大。</li>
+<li><strong>解释</strong>：为什么两段式归约能把相对误差从 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">2.79</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">5</span></span></span></span></span></span></span></span></span></span></span></span> 压到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1.38</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">16</span></span></span></span></span></span></span></span></span></span></span></span>？提示：从&quot;浮点加法不满足结合律&quot;与&quot;累加项数&quot;两个角度回答，并说明第一段的 BLOCK 取小或取大各有什么影响。</li>
+<li><strong>对比/验证</strong>：把第 4 段的 BLOCK_N 从 16 扫到 256，记录&quot;需要 rescale 的行数&quot;总和与误差。再把它和第 6 章的 CUDA 版实现（分块 + 在线 softmax）对照：哪些量在两者中同名同义、哪些量只存在于 Triton 侧。</li>
+<li><strong>思考</strong>：分块在线注意力的 FLOP 数与朴素实现同阶，分块还引入了块边界的重复计算，为什么它仍然更快？如果要给&quot;值不值得重写&quot;下一个判据，你会用第 3 章讲的哪个量来表述？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Triton, <em>Tutorials · Fused Softmax</em>（行归约的 mask/<code>other=-inf</code>、<code>tl.max</code>/<code>tl.sum</code> 与 <code>num_warps</code> 的用法）：<a href="https://triton-lang.org/main/getting-started/tutorials/02-fused-softmax.html" target="_blank" rel="noopener noreferrer">https://triton-lang.org/main/getting-started/tutorials/02-fused-softmax.html</a></li>
+<li>Triton, <em>Tutorials · Fused Attention</em>（FlashAttention 的 Triton 实现：运行 max/分母、<code>acc</code> 的 rescaled 更新、causal 掩码）：<a href="https://triton-lang.org/main/getting-started/tutorials/06-fused-attention.html" target="_blank" rel="noopener noreferrer">https://triton-lang.org/main/getting-started/tutorials/06-fused-attention.html</a></li>
+<li>Ashish Vaswani 等, <em>Attention Is All You Need</em>（注意力与 softmax 的原始定义）：<a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1706.03762</a></li>
+<li>Tri Dao 等, <em>FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness</em>（分块 + 在线 softmax + 重算，本课&quot;留在片上&quot;的原始动机）：<a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2205.14135</a></li>
+<li>NVIDIA, <em>CUDA C++ Best Practices Guide</em> §9.2「Bandwidth」（理论/有效带宽口径，本课搬运量账本沿用同一套算法）：<a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#bandwidth" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#bandwidth</a></li>
+</ul>
+<p><a href="#/l/cuda-ch7-l3">下一课：CUTLASS / cuBLAS：什么时候该用库而不是手写</a></p>

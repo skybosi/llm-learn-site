@@ -1,0 +1,258 @@
+<h2 id="h-profiling-实战用-ncu-定位瓶颈并给出优化前后数据">Profiling 实战：用 ncu 定位瓶颈并给出优化前后数据<a class="anchor" href="#h-profiling-实战用-ncu-定位瓶颈并给出优化前后数据" aria-label="本节链接">#</a></h2>
+<p>第 7 章结束时你手上已有 GEMM、Attention、Triton 三套实现，但&quot;下一个该优化哪个&quot;仍只能靠感觉。差别在于：<strong>没有假设就不要开 profiler</strong>。本课把 profile 变成能产出结论的动作——先用 nsys 找到值得看的 kernel，再用 ncu 拿到搬运量与 SOL（Speed Of Light，相对理论峰值的达成率），最后把优化前后写成一张可逐项复核的表。</p>
+<p><figure><img class="md-img" src="content/courses/gpu-cuda-kernels/assets/chapter-8-figure-01.svg" alt="从 SOL 到下一步动作：profiling 的六步闭环" loading="lazy" decoding="async"><figcaption>从 SOL 到下一步动作：profiling 的六步闭环</figcaption></figure>
+</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-三问法进-profiler-之前先写下预测">1. 三问法：进 profiler 之前先写下预测<a class="anchor" href="#h-1-三问法进-profiler-之前先写下预测" aria-label="本节链接">#</a></h4>
+<p>开 ncu 之前必须能用一句话回答三个问题，否则拿到的是几百个指标而不是结论：<strong>这个 kernel 的时间由哪个资源决定？</strong>（用第 1 章的算术强度 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">A</span><span class="mord mathnormal" style="margin-right:0.0785em;">I</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord">FLOPs</span></span><span class="mord">/</span><span class="mord text"><span class="mord cjk_fallback">搬运字节</span></span></span></span></span> 与拐点比大小）；<strong>离该资源上限还差多少？</strong>（即 SOL，必须给数字）；<strong>下一步动作是什么？</strong>（减字节、提合并度、提 occupancy，还是收手）。</p>
+<p>价值在于<strong>预测错了才有信息量</strong>：预测&quot;GEMM 1024³ fp32 要搬 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord">2</span><span class="mord mathnormal" style="margin-right:0.109em;">M</span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mord mathnormal" style="margin-right:0.0715em;">K</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">8.6</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">9</span></span></span></span></span></span></span></span></span></span></span> 字节、带宽打满约 4.3 ms&quot;，实测 5.1 ms 说明带宽只到八成，该查合并度与 L2 复用；实测 50 ms 则说明瓶颈根本不是带宽。</p>
+<p><figure><img class="md-img" src="content/courses/gpu-cuda-kernels/assets/chapter-8-figure-03.svg" alt="三问法：时间由哪个资源决定、离上限差多少、下一步做什么" loading="lazy" decoding="async"><figcaption>三问法：时间由哪个资源决定、离上限差多少、下一步做什么</figcaption></figure>
+</p>
+<h4 id="h-2-ncu-与-nsys-的分工一个看全局一个看单个-kernel">2. ncu 与 nsys 的分工：一个看全局，一个看单个 kernel<a class="anchor" href="#h-2-ncu-与-nsys-的分工一个看全局一个看单个-kernel" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Nsight Systems（nsys）</th>
+<th>Nsight Compute（ncu）</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>粒度</td>
+<td>整个程序时间线：kernel、memcpy、同步、CPU 段</td>
+<td>单个 kernel 内部的资源使用</td>
+</tr>
+<tr>
+<td>采集</td>
+<td>单遍采集，不刷 cache</td>
+<td>默认<strong>重放</strong> kernel，多趟采集</td>
+</tr>
+<tr>
+<td>时钟</td>
+<td>不锁频</td>
+<td><strong>默认锁 SM 频率</strong></td>
+</tr>
+<tr>
+<td>发射</td>
+<td>不串行化</td>
+<td><strong>默认串行化</strong> kernel 发射</td>
+</tr>
+<tr>
+<td>回答</td>
+<td>哪个 kernel / 哪段代码值得看</td>
+<td>这个 kernel 卡在哪、还剩多少</td>
+</tr>
+</tbody></table>
+<p>顺序是 <strong>nsys 缩小范围 → ncu 深挖</strong>；同一 kernel 在两条命令下时长常有出入，原因就是上表后三行——跨工具比数字前必须先统一这三条（见 §5）。</p>
+<h4 id="h-3-读-sol-段两条吞吐决定下一步动作">3. 读 SOL 段：两条吞吐决定下一步动作<a class="anchor" href="#h-3-读-sol-段两条吞吐决定下一步动作" aria-label="本节链接">#</a></h4>
+<p><code>SpeedOfLight</code>（界面名 &quot;GPU Speed Of Light Throughput&quot;）给出 Compute 与 Memory 两条吞吐，都是&quot;相对理论最大值的百分比&quot;。名称规律是<strong>基名 + 后缀</strong>：<code>sm__throughput</code> 只是基名、不能直接取值，<code>sm__throughput.avg.pct_of_peak_sustained_elapsed</code> 才可求值（分母是 elapsed cycle），<code>..._sustained_active</code> 的分母则是单元 active cycle——报告里必须写清用了哪个。</p>
+<table>
+<thead>
+<tr>
+<th>Compute 吞吐</th>
+<th>Memory 吞吐</th>
+<th>结论与动作</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>低</td>
+<td>低</td>
+<td>延迟受限 → 查 occupancy、stall 原因</td>
+</tr>
+<tr>
+<td>高</td>
+<td>低</td>
+<td>算力受限 → 减指令数、提 ILP、考虑 Tensor Core 路径</td>
+</tr>
+<tr>
+<td>低</td>
+<td>高</td>
+<td>带宽受限 → 减搬运字节（tiling/融合）或提合并度</td>
+</tr>
+<tr>
+<td>高</td>
+<td>高</td>
+<td>接近硬件上限 → 收益递减，收手并写结论</td>
+</tr>
+</tbody></table>
+<p>两段补充细节：<code>MemoryWorkloadAnalysis</code> 回答&quot;字节从哪来、浪费在哪&quot;，<code>LaunchStats</code> 回答&quot;配置是否合理&quot;。Roofline 图（<code>SpeedOfLight_Hierarchical*RooflineChart</code>）把两条屋顶与当前算术强度画在一起，适合一眼判断该减字节还是减指令。</p>
+<h4 id="h-4-有效带宽-vs-实际带宽浪费率才是可行动的数字">4. 有效带宽 vs 实际带宽：浪费率才是可行动的数字<a class="anchor" href="#h-4-有效带宽-vs-实际带宽浪费率才是可行动的数字" aria-label="本节链接">#</a></h4>
+<p>Best Practices Guide 的有效带宽定义（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0502em;">B</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0502em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">r</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0502em;">B</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0502em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0269em;">w</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 为每次 kernel 读/写字节数）：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord text"><span class="mord">Effective bandwidth</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.1771em;vertical-align:-0.686em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.4911em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord text"><span class="mord">time</span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mopen">(</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0502em;">B</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0502em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">r</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0502em;">B</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0502em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0269em;">w</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">÷</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">9</span></span></span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:1em;"></span><span class="mopen">(</span><span class="mord text"><span class="mord">GB/s</span></span><span class="mclose">)</span></span></span></span></span></p>
+<p>它用的是<strong>算法要求搬的字节</strong>；硬件真正搬的字节（含没用上的扇区）更大，官方直接把两者之差定义为 coalescing 不理想造成的浪费：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord cjk_fallback">浪费率</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord cjk_fallback">实际带宽</span></span><span class="mord">/</span><span class="mord text"><span class="mord cjk_fallback">有效带宽</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span>。</p>
+<p>第 3 章给过口径：访存事务的最小单位是 32 字节的<strong>扇区（sector）</strong>，L1/L2 cache line 是 128 字节 = 4 个扇区。浪费率无非三种来源：跨步访问只用一个扇区里的几个字节、边界不对齐使事务数翻倍、L2 复用不足。三者动作完全不同，单看时长区分不了——<strong>报文节数，不要只报时长</strong>。</p>
+<h4 id="h-5-测量的卫生五条会影响结论的默认行为">5. 测量的卫生：五条会影响结论的默认行为<a class="anchor" href="#h-5-测量的卫生五条会影响结论的默认行为" aria-label="本节链接">#</a></h4>
+<ol>
+<li><strong>cache 被刷</strong>：ncu 默认在重放各趟间刷掉全部 GPU cache，测到的是冷 cache 数字；对象高度依赖 cache 时，官方建议改用 <code>--replay-mode application --cache-control none</code>。</li>
+<li><strong>频率被锁 / 发射被串行化</strong>：要与 nsys 对比，官方建议先用 <code>nvidia-smi</code> 外部锁频、再给 ncu 加 <code>--clock-control none</code>；本该并发的多个 kernel 也会被排开，此时时长不代表真实场景。</li>
+<li><strong>开销被计入</strong>：依赖 software patching 的指标会给 kernel 执行引入显著开销；ncu 文档明确说明，profiling 时用 host 计时器或 CUDA event 反推 kernel 时长是不可能的——要时长就用 <code>gpu__time_duration</code>。</li>
+<li><strong>采集范围要收窄</strong>：不给 <code>--set</code>/<code>--section</code>/<code>--metrics</code> 时只采 basic 集合，很多指标是空的；<code>--set full</code> 采全部段但更慢。先用 <code>--list-sets</code>、<code>--list-sections</code> 看本机有什么，再用 <code>--kernel-name</code>、<code>--launch-count</code> 压住重放次数。</li>
+</ol>
+<p><strong>指标名一律用本机清单核对</strong>：示例 CSV 的列名是示意名，真名要用 <code>ncu --query-metrics</code> 在本机确认（<code>--query-metrics-mode suffix --metrics sm__throughput</code> 可列出该基名全部后缀）；抄别人的指标名是最常见的翻车方式。</p>
+<h4 id="h-6-常见坑">6. 常见坑<a class="anchor" href="#h-6-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>只报时长不报字节</strong>：时长受频率、并发、cache 状态影响，字节数不会。</li>
+<li><strong>把 SOL 100% 当目标</strong>：分母假设了理想访存模式，达不到不等于代码差。</li>
+<li><strong>拿一次运行下结论</strong>：机器噪声与降频都会影响结果，屋顶要多测几次取最优值。</li>
+<li><strong>把 basic 集合当 full 集合</strong>：没加 <code>--set full</code> 时该段根本没采，却得出&quot;没有 bank conflict&quot;。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面这段纯标准库代码把方法固化成工具：<strong>解析 ncu CSV → 自己从原始字节与时长算 SOL → 与 ncu 报的百分比交叉核对 → 输出优化前后账本与浪费率</strong>：</p>
+<pre data-lang="python"><code class="language-python"># ===== 本课示例：把 ncu 报告变成瓶颈结论 =====
+# 依赖：仅标准库。直接 python3 l1.py 即可运行（无 GPU 也能跑）。
+import csv
+import io
+import re
+
+# ---------- 1. 一段 ncu CSV 导出片段 ----------
+# 说明：CSV 的列名由&quot;你实际采了哪些指标&quot;决定，ncu 版本与架构不同则名字不同。
+# 下面这些列名是为了让解析器可运行而写的示意名；真实名字请用
+#   ncu --query-metrics | grep -E &#39;dram|throughput|registers|duration&#39;
+# 在你自己机器上确认，再把 parse_ncu_csv 里的键名换成它。
+NCU_CSV = &#39;&#39;&#39;&quot;ID&quot;,&quot;Kernel Name&quot;,&quot;gpu__time_duration.sum&quot;,&quot;dram__bytes_read.sum&quot;,&quot;dram__bytes_write.sum&quot;,&quot;sm__throughput.avg.pct_of_peak_sustained_elapsed&quot;,&quot;dram__throughput.avg.pct_of_peak_sustained_elapsed&quot;,&quot;launch__registers_per_thread&quot;,&quot;sm__warps_active.avg.pct_of_peak_sustained_active&quot;,&quot;l1tex__data_bank_conflicts_pipe_lsu.sum&quot;
+&quot;0&quot;,&quot;gemm_naive(float*, float*, float*)&quot;,&quot;5.10 ms&quot;,&quot;8,589,934,592&quot;,&quot;4,194,304&quot;,&quot;2.2 %&quot;,&quot;84.3 %&quot;,&quot;24&quot;,&quot;62.5 %&quot;,&quot;131072&quot;
+&quot;1&quot;,&quot;gemm_tiled(float*, float*, float*)&quot;,&quot;195.0 us&quot;,&quot;268,435,456&quot;,&quot;4,194,304&quot;,&quot;55.1 %&quot;,&quot;70.2 %&quot;,&quot;96&quot;,&quot;50.0 %&quot;,&quot;2097152&quot;
+&#39;&#39;&#39;
+
+UNIT = {&quot;s&quot;: 1e0, &quot;ms&quot;: 1e-3, &quot;us&quot;: 1e-6, &quot;ns&quot;: 1e-9}
+
+def parse_value(raw):
+    &quot;&quot;&quot;把 ncu 的值转成 (数, 单位)：&#39;5.10 ms&#39;-&gt;(5.10,&#39;ms&#39;)；&#39;84.3 %&#39;-&gt;(84.3,&#39;%&#39;)。&quot;&quot;&quot;
+    raw = raw.strip().replace(&quot;,&quot;, &quot;&quot;)
+    m = re.match(r&quot;^(-?[\d.]+(?:[eE][-+]?\d+)?)\s*([a-zA-Z%]*)$&quot;, raw)
+    return (float(m.group(1)), m.group(2)) if m else (float(&quot;nan&quot;), &quot;&quot;)
+
+def parse_ncu_csv(text):
+    &quot;&quot;&quot;ncu CSV -&gt; {kernel: 秒/字节/百分数}。跳过 ==PROF== 等非数据行。&quot;&quot;&quot;
+    body = &quot;\n&quot;.join(l for l in text.splitlines() if not l.startswith(&quot;==PROF==&quot;))
+    out = []
+    for r in csv.DictReader(io.StringIO(body)):
+        v = {k: parse_value(x) for k, x in r.items() if k and x}
+        dur, unit = v.get(&quot;gpu__time_duration.sum&quot;, (float(&quot;nan&quot;), &quot;&quot;))
+        out.append({
+            &quot;kernel&quot;: r[&quot;Kernel Name&quot;].split(&quot;(&quot;)[0],
+            &quot;seconds&quot;: dur * UNIT.get(unit, float(&quot;nan&quot;)),
+            &quot;bytes&quot;: int(v.get(&quot;dram__bytes_read.sum&quot;, (0, &quot;&quot;))[0]
+                         + v.get(&quot;dram__bytes_write.sum&quot;, (0, &quot;&quot;))[0]),
+            &quot;sm_pct&quot;: v.get(&quot;sm__throughput.avg.pct_of_peak_sustained_elapsed&quot;, (0, &quot;&quot;))[0],
+            &quot;dram_pct&quot;: v.get(&quot;dram__throughput.avg.pct_of_peak_sustained_elapsed&quot;, (0, &quot;&quot;))[0],
+            &quot;regs&quot;: int(v.get(&quot;launch__registers_per_thread&quot;, (0, &quot;&quot;))[0]),
+            &quot;occ_pct&quot;: v.get(&quot;sm__warps_active.avg.pct_of_peak_sustained_active&quot;, (0, &quot;&quot;))[0],
+        })
+    return out
+
+# ---------- 2. 三问定位：算力打满还是带宽打满？还剩多少？ ----------
+def sol_report(row, flops, peak_gbs, peak_tflops):
+    &quot;&quot;&quot;peak_gbs / peak_tflops 必须来自自己显卡的官方规格，本函数不做任何假设。&quot;&quot;&quot;
+    t = row[&quot;seconds&quot;]
+    floor_mem, floor_cmp = row[&quot;bytes&quot;] / (peak_gbs * 1e9), flops / (peak_tflops * 1e12)
+    ai = flops / row[&quot;bytes&quot;]                             # 算术强度 FLOP/Byte
+    balance = peak_tflops * 1e12 / (peak_gbs * 1e9)       # 机器拐点 FLOP/Byte
+    floor = max(floor_mem, floor_cmp)
+    return {
+        &quot;kernel&quot;: row[&quot;kernel&quot;], &quot;seconds&quot;: t, &quot;bytes&quot;: row[&quot;bytes&quot;],
+        &quot;ach_gbs&quot;: row[&quot;bytes&quot;] / t / 1e9,                # 有效带宽 (Br+Bw)/t
+        &quot;sol_mem_pct&quot;: 100 * floor_mem / t, &quot;sol_cmp_pct&quot;: 100 * floor_cmp / t,
+        &quot;ai&quot;: ai, &quot;balance&quot;: balance, &quot;floor_s&quot;: floor,
+        &quot;bound&quot;: &quot;memory-bound&quot; if ai &lt; balance else &quot;compute-bound&quot;,
+        &quot;ceiling_x&quot;: t / floor,
+    }
+
+M = N = K = 1024
+FLOPS = 2 * M * N * K
+PEAK_GBS, PEAK_TFLOPS = 2000.0, 20.0   # 占位示例：请替换为你显卡官方规格的数字
+rows = parse_ncu_csv(NCU_CSV)
+print(f&quot;GEMM {M}x{N}x{K} fp32：FLOPs = {FLOPS:,}；假设峰值 带宽 {PEAK_GBS:.0f} GB/s、&quot;
+      f&quot;fp32 算力 {PEAK_TFLOPS:.0f} TFLOP/s（占位，请换成官方规格）&quot;)
+print(f&quot;机器拐点 = 算力/带宽 = {PEAK_TFLOPS*1e3/PEAK_GBS:.1f} FLOP/Byte\n&quot;)
+hdr = (f&quot;{&#39;kernel&#39;:&lt;12}{&#39;时长(ms)&#39;:&gt;10}{&#39;DRAM 字节&#39;:&gt;18}{&#39;有效带宽GB/s&#39;:&gt;13}{&#39;带宽SOL&#39;:&gt;9}&quot;
+       f&quot;{&#39;算力SOL&#39;:&gt;9}{&#39;AI&#39;:&gt;8}{&#39;瓶颈&#39;:&gt;14}{&#39;还能快&#39;:&gt;8}&quot;)
+print(hdr); print(&quot;-&quot; * len(hdr))
+rep = {}
+for r in rows:
+    s = sol_report(r, FLOPS, PEAK_GBS, PEAK_TFLOPS); rep[r[&quot;kernel&quot;]] = s
+    print(f&quot;{s[&#39;kernel&#39;]:&lt;12}{s[&#39;seconds&#39;]*1e3:&gt;10.3f}{s[&#39;bytes&#39;]:&gt;18,}{s[&#39;ach_gbs&#39;]:&gt;13.1f}&quot;
+          f&quot;{s[&#39;sol_mem_pct&#39;]:&gt;8.1f}%{s[&#39;sol_cmp_pct&#39;]:&gt;8.1f}%{s[&#39;ai&#39;]:&gt;8.2f}{s[&#39;bound&#39;]:&gt;16}&quot;
+          f&quot;{s[&#39;ceiling_x&#39;]:&gt;7.2f}x&quot;)
+
+# ---------- 3. 交叉核对：自己算出的 SOL 与 ncu 报的百分比是否一致 ----------
+print(&quot;\n[核对] 从原始字节/时长算出的 SOL  vs  ncu 直接报的百分比（差 &lt; 1 个百分点说明解释一致）&quot;)
+for r in rows:
+    s = rep[r[&quot;kernel&quot;]]
+    print(f&quot;  {s[&#39;kernel&#39;]:&lt;12} 带宽 {s[&#39;sol_mem_pct&#39;]:6.1f}% vs {r[&#39;dram_pct&#39;]:6.1f}%   &quot;
+          f&quot;算力 {s[&#39;sol_cmp_pct&#39;]:6.1f}% vs {r[&#39;sm_pct&#39;]:6.1f}%   &quot;
+          f&quot;寄存器 {r[&#39;regs&#39;]:&gt;3}  达成 occupancy {r[&#39;occ_pct&#39;]:.1f}%&quot;)
+
+# ---------- 4. 优化前后账本：倍数从哪来、还剩多少 ----------
+before, after = rep[&quot;gemm_naive&quot;], rep[&quot;gemm_tiled&quot;]
+print(f&quot;\n[账本] 时长 {before[&#39;seconds&#39;]*1e3:.3f} ms -&gt; {after[&#39;seconds&#39;]*1e3:.3f} ms = &quot;
+      f&quot;{before[&#39;seconds&#39;]/after[&#39;seconds&#39;]:.1f}x&quot;)
+print(f&quot;       DRAM 字节 {before[&#39;bytes&#39;]:,} -&gt; {after[&#39;bytes&#39;]:,} = 降到 &quot;
+      f&quot;1/{before[&#39;bytes&#39;]/after[&#39;bytes&#39;]:.0f}&quot;)
+print(f&quot;       有效带宽 {before[&#39;ach_gbs&#39;]:.0f} -&gt; {after[&#39;ach_gbs&#39;]:.0f} GB/s&quot;
+      f&quot;（提高 {after[&#39;ach_gbs&#39;]/before[&#39;ach_gbs&#39;]:.2f}x）&quot;)
+print(f&quot;       带宽 SOL {before[&#39;sol_mem_pct&#39;]:.1f}% -&gt; {after[&#39;sol_mem_pct&#39;]:.1f}%：&quot;
+      f&quot;{&#39;还没打满，仍有空间&#39; if after[&#39;sol_mem_pct&#39;] &lt; 85 else &#39;已接近带宽上限&#39;}&quot;)
+print(f&quot;       下一站上限 {after[&#39;floor_s&#39;]*1e3:.3f} ms（带宽地板），当前还有 {after[&#39;ceiling_x&#39;]:.2f}x&quot;)
+
+# ---------- 5. 带宽浪费率：请求的 vs 实际搬的（对齐 BPG §9.2.3） ----------
+def wasted(requested_bytes, actual_bytes):
+    return 100 * (actual_bytes / requested_bytes - 1)
+
+req_naive = 2 * M * N * K * 4 + M * N * 4      # 算法请求：读 A/B 各 MNK 次 + 写 C
+req_tiled = int(req_naive / 32)                # 分块后请求量降到 1/T（见第 4 章）
+print(&quot;\n[浪费率] actual/requested - 1 = 合并访存与 L2 复用没吃到的部分&quot;)
+for name, req in ((&quot;gemm_naive&quot;, req_naive), (&quot;gemm_tiled&quot;, req_tiled)):
+    print(f&quot;  {name:&lt;12} 请求 {req:&gt;15,} B  实际 {rep[name][&#39;bytes&#39;]:&gt;15,} B  &quot;
+          f&quot;浪费 {wasted(req, rep[name][&#39;bytes&#39;]):+7.1f}%&quot;)</code></pre>
+<p>在 <code>python3</code>（仅标准库，本机用 python3.10 验证）下实际运行结果：</p>
+<pre data-lang="text"><code class="language-text">GEMM 1024x1024x1024 fp32：FLOPs = 2,147,483,648；假设峰值 带宽 2000 GB/s、fp32 算力 20 TFLOP/s（占位，请换成官方规格）
+机器拐点 = 算力/带宽 = 10.0 FLOP/Byte
+
+kernel          时长(ms)           DRAM 字节     有效带宽GB/s    带宽SOL    算力SOL      AI            瓶颈     还能快
+-----------------------------------------------------------------------------------------------------
+gemm_naive       5.100     8,594,128,896       1685.1    84.3%     2.1%    0.25    memory-bound   1.19x
+gemm_tiled       0.195       272,629,760       1398.1    69.9%    55.1%    7.88    memory-bound   1.43x
+
+[核对] 从原始字节/时长算出的 SOL  vs  ncu 直接报的百分比（差 &lt; 1 个百分点说明解释一致）
+  gemm_naive   带宽   84.3% vs   84.3%   算力    2.1% vs    2.2%   寄存器  24  达成 occupancy 62.5%
+  gemm_tiled   带宽   69.9% vs   70.2%   算力   55.1% vs   55.1%   寄存器  96  达成 occupancy 50.0%
+
+[账本] 时长 5.100 ms -&gt; 0.195 ms = 26.2x
+       DRAM 字节 8,594,128,896 -&gt; 272,629,760 = 降到 1/32
+       有效带宽 1685 -&gt; 1398 GB/s（提高 0.83x）
+       带宽 SOL 84.3% -&gt; 69.9%：还没打满，仍有空间
+       下一站上限 0.136 ms（带宽地板），当前还有 1.43x
+
+[浪费率] actual/requested - 1 = 合并访存与 L2 复用没吃到的部分
+  gemm_naive   请求   8,594,128,896 B  实际   8,594,128,896 B  浪费    +0.0%
+  gemm_tiled   请求     268,566,528 B  实际     272,629,760 B  浪费    +1.5%</code></pre>
+<p>三处结论值得盯住：自己算出的 SOL 与 ncu 报的百分比<strong>一致到 1 个百分点以内</strong>，说明&quot;SOL 就是达成率&quot;不是比喻；优化后<strong>有效带宽反而降了</strong>（1685 → 1398 GB/s）却快了 26 倍，因为时长由实际搬运量决定——这正是&quot;只报带宽会骗人、必须报字节&quot;的例证；分块版<strong>还剩 1.43 倍</strong>且带宽 SOL 只有七成，下一步看 occupancy 与指令数（寄存器 24 → 96，达成 occupancy 62.5% → 50%）。</p>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选，需要 GPU（云上按需开一台单卡实例即可，本课不需要多卡）----
+# 1) 先列出本机有哪些集合 / 段 / 指标，不要抄别人的指标名：
+#   ncu --list-sets ; ncu --list-sections
+#   ncu --query-metrics | grep -E &#39;dram__|gpu__time_duration|launch__registers&#39; | head
+# 2) 只采目标 kernel 的三次发射，先落报告文件再导出 CSV：
+#   ncu --set full --kernel-name regex:gemm --launch-skip 5 --launch-count 3 \
+#       --export /tmp/gemm_profile ./gemm
+#   ncu --import /tmp/gemm_profile.ncu-rep --csv --page details &gt; ncu.csv
+# 3) 想让 ncu 与 nsys 的数字可比：外部先锁频，再关掉 ncu 的锁频与刷 cache：
+#   nvidia-smi -lgc &lt;你卡支持的核心频率&gt;   # 具体取值以 nvidia-smi -q -d CLOCK 为准
+#   ncu --clock-control none --replay-mode application --cache-control none \
+#       --kernel-name regex:gemm ./gemm
+# 没有 GPU 不影响本课：上面的 Python 已把&quot;读字节、算 SOL、写账本&quot;跑通，
+# 有 GPU 时只要把 ncu 导出的 CSV 喂给同一个 parse_ncu_csv() 即可。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：扩展 <code>parse_ncu_csv</code> 支持 <code>--page raw</code> 的多行格式，并把读、写字节分开报出，说明两者为什么要分开看。</li>
+<li><strong>解释</strong>：<code>gemm_tiled</code> 算术强度 7.88 低于机器拐点 10.0，故判 memory-bound，但它的算力 SOL 已达 55.1%。说明&quot;算力 SOL 过半却仍判 memory-bound&quot;是否矛盾，并指出下一步该动哪个量。</li>
+<li><strong>对比/验证</strong>：把 <code>PEAK_GBS</code> 依次设为真实规格的一半、真实规格、明显高于真实值，观察&quot;还能快&quot;一列的变化，解释屋顶取值失真为什么会产出假结论。</li>
+<li><strong>思考</strong>：本次 profile 里 <code>gemm_tiled</code> 的 bank conflict 计数比 <code>gemm_naive</code> 高一个数量级，整体却快 26 倍。为什么单一指标（哪怕冲突数）不能当结论用？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>NVIDIA, <em>Nsight Compute — Profiling Guide</em>（<code>SpeedOfLight</code>/<code>MemoryWorkloadAnalysis</code>/<code>LaunchStats</code>/Roofline 段定义、&quot;基名+后缀&quot;命名规则、basic 与 <code>--set full</code> 集合、Metrics Structure 中 sector=32 字节、cache line=128 字节的口径）：<a href="https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html</a></li>
+<li>NVIDIA, <em>Nsight Compute CLI 文档</em>（<code>--list-sets</code>/<code>--list-sections</code>/<code>--section</code>/<code>--kernel-name</code>/<code>--launch-count</code>/<code>--csv</code>/<code>--export</code>/<code>--query-metrics</code> 等选项与过滤用法）：<a href="https://docs.nvidia.com/nsight-compute/NsightComputeCli/index.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/nsight-compute/NsightComputeCli/index.html</a></li>
+<li>NVIDIA, <em>CUDA C++ Best Practices Guide</em> §9.2「Bandwidth」与 §9.2.3「Throughput Reported by Visual Profiler」（有效带宽公式 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">((</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0502em;">B</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0502em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">r</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.0641em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0502em;">B</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0502em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0269em;">w</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mord">/1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">9</span></span></span></span></span></span></span></span><span class="mclose">)</span><span class="mord">/</span><span class="mord mathnormal">t</span></span></span></span>、&quot;请求带宽 vs 实际带宽&quot;的浪费率口径）：<a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#bandwidth" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#bandwidth</a></li>
+</ul>
+<p><a href="#/l/cuda-ch8-l2">下一课：与框架衔接：自定义算子、CUDA Graphs、动态 shape</a></p>

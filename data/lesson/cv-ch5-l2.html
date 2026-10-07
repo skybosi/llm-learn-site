@@ -1,0 +1,118 @@
+<h2 id="h-掩码自编码器-mae">掩码自编码器 MAE<a class="anchor" href="#h-掩码自编码器-mae" aria-label="本节链接">#</a></h2>
+<p>上一课讲的对比学习，是&quot;把正样本拉近、负样本推远&quot;。这一课换一条完全不同的自监督路线——<strong>掩码自编码</strong>。它的灵感来自 NLP 的 BERT：把输入的一部分盖住，让模型去猜被盖住的内容。把&quot;掩码重建&quot;搬到视觉上，就是掩码自编码器 MAE（Masked Autoencoder）。MAE 的精髓在于一个乍看浪费的设计：<strong>掩掉 75% 的补丁</strong>。为什么盖得越多反而越好？为什么图像和文本在这里表现如此不同？搞清楚这些，你就理解了自监督学习里&quot;信号冗余&quot;这个关键概念。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-从-bert-到盖图猜图">1. 从 BERT 到&quot;盖图猜图&quot;<a class="anchor" href="#h-1-从-bert-到盖图猜图" aria-label="本节链接">#</a></h4>
+<p>BERT 的做法是：随机遮住句子里的一些词，让模型根据上下文预测被遮住的词。因为词是离散的符号，一个词遮掉了，靠上下文往往猜不回来，所以 BERT 通常只遮 15%。MAE 把这个思路搬到了图像上：随机遮住一部分补丁，让模型根据剩下的补丁，重建出被遮住的像素。</p>
+<p>但图像和文本有一个根本差异——<strong>空间冗余</strong>。一个词遮掉，语义就缺了一块；而图像里一块 <code>16×16</code> 的补丁，往往和周围高度相关（天空的一角、草地的一角）。遮得少，模型用&quot;插值&quot;就能糊弄过去，学不到深层语义。MAE 因此反直觉地把掩码比例拉到 <strong>75%</strong>：只留 1/4 的补丁给模型看，逼它必须理解全局结构和语义，才能把剩下 3/4 的内容猜出来。</p>
+<p><figure><img class="md-img" src="content/courses/cv-advanced/assets/chapter-5-figure-03.svg" alt="MAE 架构：随机掩掉 75% 补丁，编码器只看可见补丁，轻量解码器重建整张图" loading="lazy" decoding="async"><figcaption>MAE 架构：随机掩掉 75% 补丁，编码器只看可见补丁，轻量解码器重建整张图</figcaption></figure>
+</p>
+<h4 id="h-2-非对称设计重编码器--轻解码器">2. 非对称设计：重编码器 + 轻解码器<a class="anchor" href="#h-2-非对称设计重编码器--轻解码器" aria-label="本节链接">#</a></h4>
+<p>MAE 的第二个关键设计是&quot;非对称&quot;：</p>
+<ul>
+<li><strong>编码器只处理可见补丁</strong>（25% 的那些）。被掩掉的补丁根本不进编码器，所以计算量、显存都大幅下降，能让编码器做得又大又深——这正是能训练大模型的前提。</li>
+<li><strong>解码器很轻</strong>（只有几层），它的输入是&quot;可见补丁的编码 + 被掩位置的共享掩码 token&quot;，输出重建的像素。解码器只在预训练时用，训练完就丢掉，下游只用编码器。</li>
+</ul>
+<p>这个分工很聪明：编码器负责&quot;看懂&quot;，只需要处理 25% 的补丁就能高效学习；解码器负责&quot;画出来&quot;，是临时的、用完即弃的。非对称让整个预训练既便宜又能撑起大模型。</p>
+<h4 id="h-3-重建目标归一化像素的-mse">3. 重建目标：归一化像素的 MSE<a class="anchor" href="#h-3-重建目标归一化像素的-mse" aria-label="本节链接">#</a></h4>
+<p>MAE 的损失是在被掩补丁上做<strong>像素级的均方误差（MSE）</strong>，比较&quot;重建像素&quot;和&quot;真实像素&quot;。一个重要的细节是：MAE 先对每个补丁的像素做<strong>归一化</strong>（减去均值、除以标准差），再在归一化后的空间里算 MSE。为什么？因为如果不归一化，模型会去学&quot;平均颜色&quot;这种和内容无关的东西；归一化后，模型被迫去重建补丁的<strong>纹理和结构</strong>（对比度、边缘），这些才是更有迁移价值的视觉特征。</p>
+<p>这里有个和对比学习的呼应：对比学习靠&quot;增强不变性&quot;学特征，MAE 靠&quot;重建高频细节&quot;学特征。两条路得到的东西有重叠也有互补，第 3 课我们会正面比较它们。</p>
+<h4 id="h-4-预训练之后怎么用">4. 预训练之后怎么用<a class="anchor" href="#h-4-预训练之后怎么用" aria-label="本节链接">#</a></h4>
+<p>MAE 预训练完，拿到的是编码器（通常基于 ViT）。要把它用于下游任务，主要有两种评估方式：</p>
+<ul>
+<li><strong>微调（fine-tuning）</strong>：在编码器后接任务头（分类头、检测头），用有标签数据端到端微调。这是 MAE 主打的用法，效果最好。</li>
+<li><strong>线性探测（linear probing）</strong>：冻结编码器，只在上面训练一个线性分类器。它衡量的是&quot;特征本身的可分性&quot;，更严格，MAE 在线性探测上的优势比对比学习更明显。</li>
+</ul>
+<p>理解这两种评估方式的区别很重要，下一课讲&quot;自监督 vs 监督&quot;时，几乎所有公平比较都建立在这套评估协议之上。</p>
+<p><figure><img class="md-img" src="content/courses/cv-advanced/assets/chapter-5-figure-04.svg" alt="MAE 重建效果：左列原图、中列掩掉 75% 后的可见补丁、右列重建结果" loading="lazy" decoding="async"><figcaption>MAE 重建效果：左列原图、中列掩掉 75% 后的可见补丁、右列重建结果</figcaption></figure>
+</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>先实现 MAE 最核心的&quot;随机掩码&quot;逻辑，直观看到 75% 掩码率下图像还剩多少信息：</p>
+<pre data-lang="python"><code class="language-python">import torch
+
+torch.manual_seed(0)
+
+
+def random_masking(x, mask_ratio=0.75):
+    &quot;&quot;&quot;x: (N, L, D) 的补丁序列。随机掩掉 mask_ratio 比例的补丁。&quot;&quot;&quot;
+    N, L, D = x.shape
+    len_keep = int(L * (1 - mask_ratio))          # 保留的补丁数
+
+    # 每个样本独立地生成随机噪声，按噪声大小选出保留的补丁
+    noise = torch.rand(N, L, device=x.device)     # (N, L)
+    ids_shuffle = torch.argsort(noise, dim=1)     # 打乱顺序的索引
+    ids_keep = ids_shuffle[:, :len_keep]          # 保留前 len_keep 个
+
+    x_kept = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
+    return x_kept, ids_keep, ids_shuffle
+
+
+# 一张图切成的 196 个补丁，每个 64 维
+x = torch.randn(2, 196, 64)
+x_kept, ids_keep, ids_shuffle = random_masking(x, mask_ratio=0.75)
+
+print(&quot;原始补丁数: 196&quot;)
+print(&quot;保留补丁数:&quot;, x_kept.shape[1])   # 应为 49，即 25%
+print(&quot;掩掉的补丁数:&quot;, 196 - x_kept.shape[1])</code></pre>
+<p>可以看到，<code>196</code> 个补丁只保留 <code>49</code> 个进编码器，其余 <code>147</code> 个被掩掉。编码器只算这 49 个 token，计算量直接降到原来的 1/4——这就是 MAE 能&quot;用大模型做预训练还便宜&quot;的底气。</p>
+<p>接着写一个极简的&quot;重建 + 归一化 MSE 损失&quot;，体会重建目标的含义：</p>
+<pre data-lang="python"><code class="language-python">import torch.nn.functional as F
+
+
+def patch_norm_mse(pred, target):
+    &quot;&quot;&quot;在归一化后的像素空间里算 MSE。pred/target: (B, num_masked, patch_pixels)。&quot;&quot;&quot;
+    # 对每个补丁的像素做实例归一化：减均值、除标准差
+    mean = target.mean(dim=-1, keepdim=True)
+    var = target.var(dim=-1, keepdim=True).clamp(min=1e-6)
+    target_norm = (target - mean) / var.sqrt()
+    pred_norm = (pred - mean) / var.sqrt()
+    return F.mse_loss(pred_norm, target_norm)
+
+
+# 模拟 8 个被掩补丁，每个补丁 16*16*3 = 768 维像素
+pred = torch.randn(8, 768)
+target = torch.randn(8, 768)
+print(&quot;归一化 MSE 损失:&quot;, patch_norm_mse(pred, target).item())</code></pre>
+<p>最后用一个完整但极简的 ViT 编码器 + 轻量解码器骨架，串起&quot;掩码 → 编码 → 重建&quot;的端到端数据流：</p>
+<pre data-lang="python"><code class="language-python">import torch.nn as nn
+
+class MAESkeleton(nn.Module):
+    &quot;&quot;&quot;只展示 MAE 的结构骨架，不做真实训练。&quot;&quot;&quot;
+    def __init__(self, patch_dim=768, enc_dim=64, dec_dim=32, mask_ratio=0.75):
+        super().__init__()
+        self.mask_ratio = mask_ratio
+        self.encoder = nn.Linear(patch_dim, enc_dim)         # 简化编码器
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, dec_dim))
+        self.decoder = nn.Linear(enc_dim, dec_dim)           # 简化解码器
+        self.recon_head = nn.Linear(dec_dim, patch_dim)      # 重建像素
+
+    def forward(self, patches):
+        # patches: (B, L, patch_dim)
+        x_kept, ids_keep, ids_shuffle = random_masking(patches, self.mask_ratio)
+        enc = self.encoder(x_kept)                            # 只编码可见补丁
+
+        # 解码：把可见补丁的编码和被掩位置拼回原顺序（此处简化为直接重建可见部分）
+        dec = self.decoder(enc)
+        recon = self.recon_head(dec)
+        return recon, x_kept
+
+
+m = MAESkeleton()
+recon, kept = m(torch.randn(2, 196, 768))
+print(&quot;可见补丁:&quot;, kept.shape)      # (2, 49, 768)
+print(&quot;重建输出:&quot;, recon.shape)     # (2, 49, 768) —— 真实 MAE 会重建全部 196 个补丁</code></pre>
+<p>真实 MAE 比这复杂：它会把被掩位置的 <code>mask_token</code> 补回原序列再喂给解码器，最终输出全部 <code>196</code> 个补丁的重建，只对被掩的那 <code>147</code> 个算损失。上面骨架刻意做了简化，但&quot;只编码可见补丁&quot;这个最省算力的核心已经体现出来了。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>把 <code>mask_ratio</code> 分别设为 0.3、0.75、0.9，打印保留补丁数，并解释为什么 MAE 在 0.75 附近表现最好，而 0.9 会太极端、0.3 又太&quot;容易&quot;。</li>
+<li>用 <code>timm</code> 加载一个预训练 ViT，实现一个最小 MAE：编码器取 ViT 的补丁嵌入 + 前几层，解码器用一个两三层的小 MLP，在 CIFAR-10 或 STL-10 上做掩码重建预训练，可视化前几个 epoch 的重建效果。</li>
+<li>比较两种损失：直接用原始像素算 MSE，和用归一化像素算 MSE。在同一批数据上分别训练几十步，观察重建图是&quot;糊成一团平均色&quot;还是&quot;保留了纹理结构&quot;，并解释原因。</li>
+<li>思考：MAE 只重建被掩的 75%，为什么就能让编码器学到全局语义？如果改为重建&quot;随机选的任意补丁&quot;而非&quot;被掩补丁&quot;，会有什么不同？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>论文《Masked Autoencoders Are Scalable Vision Learners》（MAE）：<a href="https://arxiv.org/abs/2111.06377" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2111.06377</a></li>
+<li>论文《BERT: Pre-training of Deep Bidirectional Transformers》（掩码预训练思想来源）：<a href="https://arxiv.org/abs/1810.04805" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1810.04805</a></li>
+<li>论文《BEiT: BERT Pre-Training of Image Transformers》（掩码图像建模另一支）：<a href="https://arxiv.org/abs/2106.08254" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2106.08254</a></li>
+<li>论文《An Image is Worth 16x16 Words》（ViT，MAE 编码器的骨架）：<a href="https://arxiv.org/abs/2010.11929" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2010.11929</a></li>
+</ul>
+<p><a href="#/l/cv-ch5-l3">下一课：自监督 vs 监督</a></p>

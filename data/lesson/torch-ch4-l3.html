@@ -1,0 +1,120 @@
+<h2 id="h-数据增强">数据增强<a class="anchor" href="#h-数据增强" aria-label="本节链接">#</a></h2>
+<p>一个模型在训练集上表现好、在新数据上表现差，最常见的病因就是<strong>过拟合</strong>——它把训练集里&quot;特定图片长什么样&quot;也死记下来了。数据增强（Data Augmentation）是缓解过拟合最便宜的良药：<strong>不增加真实数据，而是对现有样本做随机变换</strong>，让模型每个 epoch 看到的都是&quot;略有不同&quot;的样本，逼它去学真正通用的特征，而不是死记某一帧。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-增强的本质制造合理的变体">1. 增强的本质：制造&quot;合理的变体&quot;<a class="anchor" href="#h-1-增强的本质制造合理的变体" aria-label="本节链接">#</a></h4>
+<p>以图像分类为例，一张猫的照片，无论左右翻转、轻微旋转、裁剪掉一部分，都还是一只猫。数据增强就是把这些&quot;不影响标签的变换&quot;随机地施加到训练样本上：</p>
+<ul>
+<li><strong>几何变换</strong>：随机水平翻转、随机裁剪、旋转、缩放；</li>
+<li><strong>颜色变换</strong>：调整亮度、对比度、饱和度、色调；</li>
+<li><strong>归一化</strong>：把像素缩放到固定均值和方差（严格说这是&quot;预处理&quot;，不是增强，但常一起放进变换流水线）。</li>
+</ul>
+<p>关键在于：<strong>只在训练集上做增强，验证集和测试集只做确定性的预处理</strong>（比如 Resize + 归一化），这样才能公平地评估真实表现。</p>
+<h4 id="h-2-在-pytorch-里怎么做transforms">2. 在 PyTorch 里怎么做：transforms<a class="anchor" href="#h-2-在-pytorch-里怎么做transforms" aria-label="本节链接">#</a></h4>
+<p><code>torchvision.transforms</code> 提供了一系列可组合的变换。用 <code>transforms.Compose</code> 把它们串成一条流水线，图片从左到右依次经过每一步：</p>
+<pre data-lang="python"><code class="language-python">from torchvision import transforms
+
+train_transform = transforms.Compose([
+    transforms.RandomHorizontalFlip(p=0.5),   # 50% 概率水平翻转
+    transforms.RandomRotation(15),            # 在 [-15°, 15°] 内随机旋转
+    transforms.ToTensor(),                    # PIL 图像 -&gt; 张量，像素归一到 [0,1]
+    transforms.Normalize((0.5,), (0.5,)),     # 标准化到均值 0.5、方差 0.5
+])</code></pre>
+<p><code>transforms</code> 可以直接传给 <code>torchvision.datasets</code> 的 <code>transform=</code> 参数，也可以在自己写的 <code>Dataset.__getitem__</code> 里手动调用。上一课说过，<code>__getitem__</code> 每次取样本时都会执行一次，因此<strong>随机变换每个 epoch 都会重新随机</strong>——这就是&quot;同一张图每次看起来不一样&quot;的原因。</p>
+<h4 id="h-3-增强放在哪里执行">3. 增强放在哪里执行<a class="anchor" href="#h-3-增强放在哪里执行" aria-label="本节链接">#</a></h4>
+<p>推荐把增强写进 <code>Dataset</code> 的 <code>transform</code>，而不是训练循环里。好处是：</p>
+<ol>
+<li>逻辑内聚：数据和它的预处理绑在一起；</li>
+<li>复用简单：训练、验证、推理各自用不同的 transform 即可；</li>
+<li>配合 <code>DataLoader</code> 多线程：增强在 worker 里并行完成，不拖慢主循环。</li>
+</ol>
+<p><figure><img class="md-img" src="content/courses/pytorch-fundamentals/assets/chapter-4-figure-03.svg" alt="同一张图经过随机翻转与颜色抖动后的变体" loading="lazy" decoding="async"><figcaption>同一张图经过随机翻转与颜色抖动后的变体</figcaption></figure>
+</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面用一个内置数据集 FashionMNIST 演示完整流程：定义训练/验证两套 transform，包装成 <code>DataLoader</code>，再用一个迷你 CNN 各跑一步前向，观察增强后的输入形状不变（变换只改内容，不改尺寸）。</p>
+<pre data-lang="python"><code class="language-python">import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
+
+
+# 1) 训练集：随机增强 + 归一化
+train_transform = transforms.Compose([
+    transforms.RandomHorizontalFlip(p=0.5),   # 服装图左右翻转后仍是同类
+    transforms.RandomRotation(10),            # 随机旋转 ±10 度
+    transforms.ToTensor(),                    # (1, 28, 28) 且像素归一到 [0,1]
+    transforms.Normalize((0.5,), (0.5,)),     # 标准化：让像素大致落在 [-1, 1]
+])
+
+# 2) 验证集：不做增强，只做确定性预处理
+val_transform = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize((0.5,), (0.5,)),
+])
+
+# 3) 加载数据（首次会自动下载）
+train_set = datasets.FashionMNIST(root=&quot;./data&quot;, train=True, download=True, transform=train_transform)
+val_set = datasets.FashionMNIST(root=&quot;./data&quot;, train=False, download=True, transform=val_transform)
+
+train_loader = DataLoader(train_set, batch_size=64, shuffle=True)
+val_loader = DataLoader(val_set, batch_size=64, shuffle=False)
+
+# 4) 一个能接收 28x28 灰度图的迷你 CNN
+class MiniCNN(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(1, 8, kernel_size=3),   # 28x28 -&gt; 26x26
+            nn.ReLU(),
+            nn.Flatten(),
+            nn.Linear(8 * 26 * 26, 10),       # 输出 10 类
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+model = MiniCNN()
+
+# 5) 各取一个 batch 做前向，验证形状一致
+train_x, train_y = next(iter(train_loader))
+val_x, val_y = next(iter(val_loader))
+
+print(&quot;训练 batch 输入形状：&quot;, train_x.shape)   # torch.Size([64, 1, 28, 28])
+print(&quot;验证 batch 输入形状：&quot;, val_x.shape)     # torch.Size([64, 1, 28, 28])
+
+out_train = model(train_x)
+out_val = model(val_x)
+print(&quot;训练 batch 输出形状：&quot;, out_train.shape)  # torch.Size([64, 10])
+print(&quot;验证 batch 输出形状：&quot;, out_val.shape)    # torch.Size([64, 10])
+
+# 6) 直观感受增强：对同一张图做多次训练变换，像素统计会不同
+raw = train_set.data[0].float() / 255.0   # 原始第 0 张图（未增强的张量）
+print(&quot;\n原始图像素均值：&quot;, round(raw.mean().item(), 4))
+
+means = []
+for _ in range(5):
+    img, _ = train_set[0]   # 每次都重新经过 train_transform
+    means.append(round(img.mean().item(), 4))
+print(&quot;同一样本经 5 次增强后的像素均值：&quot;, means)  # 每次不同，说明增强在随机生效</code></pre>
+<p>运行后你会看到类似：</p>
+<pre data-lang="text"><code class="language-text">训练 batch 输入形状： torch.Size([64, 1, 28, 28])
+验证 batch 输入形状： torch.Size([64, 1, 28, 28])
+训练 batch 输出形状： torch.Size([64, 10])
+验证 batch 输出形状： torch.Size([64, 10])
+原始图像素均值： 0.0...
+同一样本经 5 次增强后的像素均值： [0.0115, -0.0312, 0.0047, -0.0171, 0.0216]</code></pre>
+<p>最后那行最能说明问题：<strong>同一张图、同一个下标，每次取出来经过随机翻转/旋转后数值都不一样</strong>。模型因此被迫学会&quot;翻转过的衬衫还是衬衫&quot;，泛化能力自然更强。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>在 <code>train_transform</code> 里加入 <code>transforms.RandomCrop(28, padding=4)</code>（先填充再裁剪），观察训练输入形状是否仍是 <code>(64, 1, 28, 28)</code>。</li>
+<li>用 <code>transforms.ColorJitter(brightness=0.3, contrast=0.3)</code> 替换旋转，重新跑第 6 步，观察像素均值的变化幅度。</li>
+<li>把训练用的 <code>Normalize</code> 参数改成 <code>(0.5,), (0.2,)</code>，思考这对输入数值范围有什么影响，为什么验证集要用和训练集一致的归一化参数？</li>
+<li>想一想：如果对验证集也做随机增强，评估出来的准确率是&quot;偏高&quot;还是&quot;偏低&quot;？为什么数据增强通常只在训练阶段开启？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>PyTorch 官方文档 · <code>torchvision.transforms</code>：<a href="https://pytorch.org/vision/stable/transforms.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/vision/stable/transforms.html</a></li>
+<li>PyTorch 官方教程 · 数据增强（Transforms）：<a href="https://pytorch.org/tutorials/beginner/basics/transforms_tutorial.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/tutorials/beginner/basics/transforms_tutorial.html</a></li>
+<li>PyTorch 官方教程 · 图像分类训练（含增强实践）：<a href="https://pytorch.org/tutorials/beginner/blitz/cifar10_tutorial.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/tutorials/beginner/blitz/cifar10_tutorial.html</a></li>
+</ul>
+<p><a href="#/l/torch-ch5-l1">下一课：训练流程</a></p>

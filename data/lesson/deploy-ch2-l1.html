@@ -1,0 +1,101 @@
+<h2 id="h-环境准备与量化">环境准备与量化<a class="anchor" href="#h-环境准备与量化" aria-label="本节链接">#</a></h2>
+<p>从这一章开始动手。部署第一步不是敲启动命令，而是把环境搭对、把模型&quot;压缩&quot;到能上卡的程度。环境准备三件事——<strong>驱动/CUDA、容器/运行时、模型权重</strong>；量化则是把上一章的选型落到磁盘上，产出真正能加载的量化文件。学完本课，你应当能在干净机器上装好 vLLM，并把一个 7B 模型量化成 AWQ 4-bit 或 GGUF，且能解释每一步在做什么。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-环境准备三步">1. 环境准备三步<a class="anchor" href="#h-1-环境准备三步" aria-label="本节链接">#</a></h4>
+<p><strong>第一步：驱动与 CUDA</strong>。GPU 推理需要 NVIDIA 驱动 + CUDA 运行库。验证命令：</p>
+<pre data-lang="bash"><code class="language-bash">nvidia-smi                      # 看驱动、显卡型号、显存、CUDA 版本
+nvcc --version                  # 看 CUDA 工具链版本（若只跑推理，驱动够用即可）</code></pre>
+<p>经验：<strong>先看 <code>nvidia-smi</code> 右上角的 CUDA 版本，让 Python 库的 CUDA 版本 ≤ 驱动支持的版本</strong>。比如驱动支持 CUDA 12.x，就装 cu124 的 PyTorch。</p>
+<p><strong>第二步：容器或虚拟环境</strong>。生产环境强烈推荐 Docker（隔离 + 可复现），需要装 NVIDIA Container Toolkit：</p>
+<pre data-lang="bash"><code class="language-bash">docker --version
+docker run --rm --gpus all nvidia/cuda:12.4.0-base-ubuntu22.04 nvidia-smi   # 验证容器内能看到 GPU</code></pre>
+<p>本机开发则用 conda/venv 建独立环境，避免污染系统 Python。</p>
+<p><strong>第三步：模型权重</strong>。从 Hugging Face 下载，或用国内镜像加速：</p>
+<pre data-lang="bash"><code class="language-bash">pip install -U &quot;huggingface_hub[cli]&quot;
+HF_ENDPOINT=https://hf-mirror.com huggingface-cli download Qwen/Qwen2.5-7B-Instruct --local-dir ./Qwen2.5-7B-Instruct</code></pre>
+<h4 id="h-2-装-vllm">2. 装 vLLM<a class="anchor" href="#h-2-装-vllm" aria-label="本节链接">#</a></h4>
+<pre data-lang="bash"><code class="language-bash">pip install vllm        # 官方 wheel 已内置对应 CUDA，通常无需自装 CUDA
+python -c &quot;import vllm; print(vllm.__version__)&quot;   # 验证</code></pre>
+<p>装完后 <code>vllm serve --help</code> 能列出全部启动参数，说明环境就绪。</p>
+<h4 id="h-3-量化把选型落到磁盘">3. 量化：把选型落到磁盘<a class="anchor" href="#h-3-量化把选型落到磁盘" aria-label="本节链接">#</a></h4>
+<p>上一章选了量化方案，这里动手产出量化文件。两条主流路径：</p>
+<ul>
+<li><strong>AWQ（4-bit，GPU 在线推理）</strong>：用 AutoAWQ 对模型做一次激活感知量化，产出 <code>model.safetensors</code>（约原 FP16 的 1/4 大小）；</li>
+<li><strong>GGUF（端侧/CPU）</strong>：先转成 GGUF FP16，再用 <code>llama-quantize</code> 量化成 Q4_K_M 等档位，供 llama.cpp 加载。</li>
+</ul>
+<p>量化要点：<strong>量化是一次性的离线重写权重，推理时只加载、不再训练</strong>，所以量化成本要算&quot;一次付出、长期收益&quot;。4-bit 会牺牲一点精度（通常 &lt;1% 的下游指标下降），换来显存减半以上。</p>
+<h4 id="h-4-量化前先想清楚为什么量">4. 量化前先想清楚&quot;为什么量&quot;<a class="anchor" href="#h-4-量化前先想清楚为什么量" aria-label="本节链接">#</a></h4>
+<p>量化收益排序：<strong>省显存（可装更大模型/更大批）&gt; 提吞吐（访存减少）&gt; 省磁盘</strong>。如果你只是&quot;7B 跑在 80G 卡上&quot;，量化收益有限；但如果是&quot;70B 想塞进单张 80G&quot;，量化几乎是唯一选择。别为了量化而量化。</p>
+<p><figure><img class="md-img" src="content/courses/llm-deployment-practice/assets/chapter-2-figure-01.svg" alt="环境准备与量化流程：左侧三个步骤（nvidia-smi 检查驱动 → Docker/venv 建环境 → 下载权重），右侧量化分支（AWQ 4-bit 与 GGUF Q4_K_M 两条路径），中间标&quot;验证：import vllm 通过&quot;" loading="lazy" decoding="async"><figcaption>环境准备与量化流程：左侧三个步骤（nvidia-smi 检查驱动 → Docker/venv 建环境 → 下载权重），右侧量化分支（AWQ 4-bit 与 GGUF Q4_K_M 两条路径），中间标&quot;验证：import vllm 通过&quot;</figcaption></figure>
+</p>
+<h3 id="h-二可运行示例">二、可运行示例<a class="anchor" href="#h-二可运行示例" aria-label="本节链接">#</a></h3>
+<h4 id="h-示例-1一条命令序列完成环境准备">示例 1：一条命令序列完成环境准备<a class="anchor" href="#h-示例-1一条命令序列完成环境准备" aria-label="本节链接">#</a></h4>
+<pre data-lang="bash"><code class="language-bash"># ---- 1. 检查 GPU 与驱动 ----
+nvidia-smi                        # 应看到显卡型号 + 驱动支持的 CUDA 版本
+
+# ---- 2. 建虚拟环境（conda 示例） ----
+conda create -n llm python=3.11 -y
+conda activate llm
+
+# ---- 3. 装推理引擎 ----
+pip install -U vllm               # 内置 CUDA，免手动装
+
+# ---- 4. 下载模型（用国内镜像加速） ----
+pip install -U &quot;huggingface_hub[cli]&quot;
+HF_ENDPOINT=https://hf-mirror.com huggingface-cli download \
+    Qwen/Qwen2.5-7B-Instruct --local-dir ./Qwen2.5-7B-Instruct
+
+# ---- 5. 验证环境 ----
+python -c &quot;import vllm; print(&#39;vLLM&#39;, vllm.__version__, &#39;就绪&#39;)&quot;</code></pre>
+<h4 id="h-示例-2autoawq-量化-7b-模型为-4-bit">示例 2：AutoAWQ 量化 7B 模型为 4-bit<a class="anchor" href="#h-示例-2autoawq-量化-7b-模型为-4-bit" aria-label="本节链接">#</a></h4>
+<pre data-lang="python"><code class="language-python"># -*- coding: utf-8 -*-
+# 用 AutoAWQ 把 Qwen2.5-7B 量化为 AWQ 4-bit，产出可被 vLLM 加载的 safetensors
+from awq import AutoAWQForCausalLM
+from transformers import AutoTokenizer
+
+model_path = &quot;./Qwen2.5-7B-Instruct&quot;     # 已下载的原始权重
+quant_path = &quot;./Qwen2.5-7B-Instruct-AWQ&quot; # 量化输出目录
+
+quant_config = {
+    &quot;zero_point&quot;: True,   # 是否用零点（群组量化偏移）
+    &quot;q_group_size&quot;: 128,  # 每 128 个权重共享一个缩放因子
+    &quot;w_bit&quot;: 4,           # 4-bit 量化
+    &quot;version&quot;: &quot;GEMM&quot;,    # GEMM 内核，vLLM/TensorRT-LLM 兼容
+}
+
+# 加载原始模型并量化（AWQ 会跑一小批校准数据，耗时约几分钟）
+model = AutoAWQForCausalLM.from_pretrained(model_path)
+tokenizer = AutoTokenizer.from_pretrained(model_path)
+model.quantize(tokenizer, quant_config=quant_config)
+
+# 保存量化权重 + 分词器 + 量化配置
+model.save_quantized(quant_path)
+tokenizer.save_pretrained(quant_path)
+print(f&quot;量化完成，输出目录：{quant_path}&quot;)
+print(f&quot;提示：磁盘大小约从 14GB(FP16) 降到 4GB(4-bit)&quot;)</code></pre>
+<h4 id="h-示例-3gguf-量化llamacpp-路径">示例 3：GGUF 量化（llama.cpp 路径）<a class="anchor" href="#h-示例-3gguf-量化llamacpp-路径" aria-label="本节链接">#</a></h4>
+<pre data-lang="bash"><code class="language-bash"># 1. 转换脚本：把 HF 权重转成 GGUF FP16
+python llama.cpp/convert_hf_to_gguf.py ./Qwen2.5-7B-Instruct \
+    --outfile Qwen2.5-7B-Instruct-f16.gguf
+
+# 2. 量化到 Q4_K_M（约 4.3 bit 混合精度，端侧常用档）
+./llama-quantize Qwen2.5-7B-Instruct-f16.gguf Qwen2.5-7B-Instruct-Q4_K_M.gguf Q4_K_M
+
+# 3. 看文件大小对比（示例数值）
+#   FP16 约 14.3GB  -&gt;  Q4_K_M 约 4.7GB，缩小约 67%</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>补验证</strong>：在示例 1 的命令序列后加一条&quot;用 <code>vllm serve --help | head</code> 检查启动参数&quot;的验证命令，并解释为什么这能证明环境完整。</li>
+<li><strong>量化对比</strong>：把示例 2 的 <code>q_group_size</code> 改成 64 和 256，分别跑量化，观察输出大小与速度差异，说明群组大小对&quot;精度-体积&quot;权衡的影响。</li>
+<li><strong>算磁盘收益</strong>：70B 模型 FP16 约 140GB，估算 AWQ 4-bit 与 GGUF Q4_K_M 后的体积，并说明为什么离线传输/端侧分发场景特别在意这个数字。</li>
+<li><strong>排查练习</strong>：<code>python -c &quot;import vllm&quot;</code> 报 CUDA 版本不匹配时，写出你的排查顺序（先看 <code>nvidia-smi</code> 的 CUDA 版本 → 再看 wheel 的 cu 版本 → 决定重装哪个）。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>vLLM 文档 · 安装：<a href="https://docs.vllm.ai/en/latest/getting_started/installation.html" target="_blank" rel="noopener noreferrer">https://docs.vllm.ai/en/latest/getting_started/installation.html</a></li>
+<li>NVIDIA Container Toolkit 安装指南：<a href="https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html</a></li>
+<li>AutoAWQ 项目：<a href="https://github.com/casper-hansen/AutoAWQ" target="_blank" rel="noopener noreferrer">https://github.com/casper-hansen/AutoAWQ</a></li>
+<li>llama.cpp 项目与 GGUF 量化：<a href="https://github.com/ggml-org/llama.cpp" target="_blank" rel="noopener noreferrer">https://github.com/ggml-org/llama.cpp</a></li>
+<li>Hugging Face · 量化方法总览：<a href="https://huggingface.co/docs/transformers/main/en/quantization/overview" target="_blank" rel="noopener noreferrer">https://huggingface.co/docs/transformers/main/en/quantization/overview</a></li>
+</ul>
+<p><a href="#/l/deploy-ch2-l2">下一课：vLLM 启动与压测</a></p>

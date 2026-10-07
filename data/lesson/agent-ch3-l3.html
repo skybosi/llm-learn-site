@@ -1,0 +1,681 @@
+<h2 id="h-错误的分类与给模型的反馈设计">错误的分类与&quot;给模型的反馈&quot;设计<a class="anchor" href="#h-错误的分类与给模型的反馈设计" aria-label="本节链接">#</a></h2>
+<h3 id="h-这一节要解决什么">这一节要解决什么<a class="anchor" href="#h-这一节要解决什么" aria-label="本节链接">#</a></h3>
+<p>前两节把&quot;调用能成功&quot;这条路打通了：契约写清楚、重试安全。但<strong>失败是常态</strong>，而且失败里有一大半是重试解决不了的：参数不合法、权限不足、业务规则拒绝、资源不存在。</p>
+<p>这类失败有一个被浪费掉的价值：<strong>它们是最便宜、最精确的学习信号。</strong> 一个说清&quot;哪个参数、为什么、合法范围是什么&quot;的错误反馈，能让模型一次修正；一个栈回溯或一句 <code>Error: invalid input</code>，会让模型原地打转甚至编造。</p>
+<p>先看清这件事的规模。设每步的失败中可修复类占比 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">q</span></span></span></span>，模型在收到反馈后能正确修复的概率为 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span></span></span></span>，而&quot;无法修复&quot;的失败会导致至少一次无效尝试：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord cjk_fallback">无效步数期望</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.4em;vertical-align:-1.25em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.05em;"><span style="top:-1.9em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∑</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.25em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="delimsizing size2">[</span></span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">q</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">q</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.8em;vertical-align:-0.65em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="mclose">)</span><span class="mord"><span class="delimsizing size2">]</span></span></span></span></span></span></p>
+<p>把 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span></span></span></span> 从 0.4 提到 0.85（<strong>只改错误信息的写法</strong>，不改任何模型和工具），无效步数就下降近一半。这是投入产出比最高的改动之一 —— 它不需要换模型、不需要训练、不需要加工具。</p>
+<p>但&quot;写清楚&quot;不等于&quot;写更多&quot;。错误信息进入上下文，会占据 token、挤掉其他内容，并且可能<strong>泄漏不该给模型的信息</strong>。所以这一节的核心张力是：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord cjk_fallback">可修复性</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∝</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8778em;vertical-align:-0.1944em;"></span><span class="mord text"><span class="mord cjk_fallback">反馈里的可行动信息量</span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord cjk_fallback">成本与风险</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∝</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord cjk_fallback">反馈里的信息总量</span></span></span></span></span></span></p>
+<p>这一节的目标是把这个张力变成一组可执行的设计规则：<strong>分类维度、必须携带的字段、绝对不出现的内容、重复检测与升级。</strong></p>
+<p>学完这一节你应该能回答：</p>
+<ul>
+<li>为什么&quot;把异常原样抛给模型&quot;通常会让循环<strong>更快</strong>卡死，而不是慢下来？</li>
+<li>错误分类的维度为什么<strong>不是</strong>&quot;按异常类型&quot;，而是&quot;按模型能不能采取不同动作&quot;？</li>
+<li>一条合格的错误反馈里必须有哪些字段？为什么&quot;HTTP 500&quot;这四个字符的信息量是负的？</li>
+<li>模型连续两次犯同一个错，正确的响应是什么？（不是&quot;再给它一次同样的反馈&quot;。）</li>
+<li>错误信息里有哪些东西<strong>绝对不能</strong>出现？&quot;表不存在&quot;和&quot;你无权访问&quot;的差别在哪里？</li>
+</ul>
+<h3 id="h-一异常不是反馈原样抛出的三重代价">一、异常不是反馈：原样抛出的三重代价<a class="anchor" href="#h-一异常不是反馈原样抛出的三重代价" aria-label="本节链接">#</a></h3>
+<p>先看一个真实会发生的形态：</p>
+<pre data-lang="python"><code class="language-python"># ✗ 最常见的实现
+try:
+    result = tool(**args)
+except Exception as e:
+    observation = f&quot;Error: {e}&quot;          # 或 str(traceback.format_exc())
+    messages.append({&quot;role&quot;: &quot;tool&quot;, &quot;content&quot;: observation})</code></pre>
+<p>三重代价，逐条展开：</p>
+<h4 id="h-11-代价一可行动信息为零而噪声占满-token">1.1 代价一：可行动信息为零，而噪声占满 token<a class="anchor" href="#h-11-代价一可行动信息为零而噪声占满-token" aria-label="本节链接">#</a></h4>
+<p>一个典型的 Python 栈回溯是 800–3000 字符，其中对模型有用的信息通常只有一句（&quot;<code>limit</code> 必须是 1..100 的整数&quot;）。后果有两个：</p>
+<ul>
+<li><strong>token 成本</strong>：每次失败烧掉的钱不多，但 Agent 会反复失败。设一次失败反馈 1500 token、循环里失败 20 次，仅错误信息就占 3 万 token —— 在 6 万预算的循环里（第 2 章案例）这是致命的。</li>
+<li><strong>注意力稀释</strong>：上下文里多数内容是无关的文件路径、内部函数名、库版本。这些会稀释真正关键的观察（第 4 章的上下文工程会量化这一点）。</li>
+</ul>
+<h4 id="h-12-代价二模型会去修栈回溯里的东西">1.2 代价二：模型会去&quot;修栈回溯里的东西&quot;<a class="anchor" href="#h-12-代价二模型会去修栈回溯里的东西" aria-label="本节链接">#</a></h4>
+<p>这是最反直觉的一条。栈回溯里有函数名、模块名、行号 —— 模型会<strong>把它们当成任务的一部分</strong>去处理：</p>
+<pre><code>Observation: Traceback (most recent call last):
+  File &quot;/srv/app/tools/db.py&quot;, line 88, in fetch_orders
+    cur.execute(sql, params)
+psycopg2.errors.UndefinedColumn: column &quot;statu&quot; does not exist
+
+→ 模型接下来的行为（真实观察到的模式）：
+  · 试图&quot;修复&quot; db.py（它没有编辑权限，或者不该改代码）
+  · 在 SQL 里加上 &quot;statu&quot; 的双引号（错误的修法）
+  · 猜测表结构，编造更多列名，进入试错循环</code></pre>
+<p><strong>根因</strong>：栈回溯是给程序员看的<strong>内部实现细节</strong>，而模型看到的是一段文本 —— 它无法区分&quot;这是我该用的信息&quot;和&quot;这是我该忽略的实现细节&quot;。给它栈回溯，等于给它一个误导性的任务描述。</p>
+<h4 id="h-13-代价三把系统的内部结构泄露给了一个可被注入的组件">1.3 代价三：把系统的内部结构泄露给了一个&quot;可被注入的组件&quot;<a class="anchor" href="#h-13-代价三把系统的内部结构泄露给了一个可被注入的组件" aria-label="本节链接">#</a></h4>
+<p>第 4 节会展开工具投毒，这里先说结论：<strong>工具返回值是一条不可信输入通道</strong>。栈回溯会泄露：</p>
+<ul>
+<li>内部文件路径、模块结构、库与版本（攻击者可据此选择已知漏洞）</li>
+<li>SQL 片段与表结构（可用于构造注入）</li>
+<li>有时甚至是连接串、环境变量（<code>KeyError: &#39;STRIPE_SECRET_KEY&#39;</code>）</li>
+</ul>
+<p>而这条通道的另一端是一个会<strong>把内容当指令读</strong>的模型。这个组合是提示注入得以成立的基础设施之一。</p>
+<h4 id="h-14-结论错误必须被消费一次再给模型">1.4 结论：错误必须被&quot;消费&quot;一次再给模型<a class="anchor" href="#h-14-结论错误必须被消费一次再给模型" aria-label="本节链接">#</a></h4>
+<p>正确的形态是中间加一层<strong>错误适配器</strong>：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.1113em;vertical-align:-0.011em;"></span><span class="mord text"><span class="mord cjk_fallback">原始异常</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel x-arrow"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.1003em;"><span style="top:-3.322em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight x-arrow-pad"><span class="mord mtight"><span class="mspace mtight"><span class="mtight"> </span></span><span class="mord text mtight"><span class="mord cjk_fallback mtight">分类</span></span><span class="mspace mtight"><span class="mtight"> </span></span></span></span></span><span class="svg-align" style="top:-2.689em;"><span class="pstrut" style="height:2.7em;"></span><span class="hide-tail" style="height:0.522em;min-width:1.469em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.522em" viewBox="0 0 400000 522" preserveAspectRatio="xMaxYMin slice"><path d="M0 241v40h399891c-47.3 35.3-84 78-110 128
+-16.7 32-27.7 63.7-33 95 0 1.3-.2 2.7-.5 4-.3 1.3-.5 2.3-.5 3 0 7.3 6.7 11 20
+ 11 8 0 13.2-.8 15.5-2.5 2.3-1.7 4.2-5.5 5.5-11.5 2-13.3 5.7-27 11-41 14.7-44.7
+ 39-84.5 73-119.5s73.7-60.2 119-75.5c6-2 9-5.7 9-11s-3-9-9-11c-45.3-15.3-85
+-40.5-119-75.5s-58.3-74.8-73-119.5c-4.7-14-8.3-27.3-11-40-1.3-6.7-3.2-10.8-5.5
+-12.5-2.3-1.7-7.5-2.5-15.5-2.5-14 0-21 3.7-21 11 0 2 2 10.3 6 25 20.7 83.3 67
+ 151.7 139 205zm0 0v40h399900v-40z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.011em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.1113em;vertical-align:-0.011em;"></span><span class="mord text"><span class="mord cjk_fallback">结构化错误</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel x-arrow"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.1003em;"><span style="top:-3.322em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight x-arrow-pad"><span class="mord mtight"><span class="mspace mtight"><span class="mtight"> </span></span><span class="mord text mtight"><span class="mord cjk_fallback mtight">面向模型渲染</span></span><span class="mspace mtight"><span class="mtight"> </span></span></span></span></span><span class="svg-align" style="top:-2.689em;"><span class="pstrut" style="height:2.7em;"></span><span class="hide-tail" style="height:0.522em;min-width:1.469em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.522em" viewBox="0 0 400000 522" preserveAspectRatio="xMaxYMin slice"><path d="M0 241v40h399891c-47.3 35.3-84 78-110 128
+-16.7 32-27.7 63.7-33 95 0 1.3-.2 2.7-.5 4-.3 1.3-.5 2.3-.5 3 0 7.3 6.7 11 20
+ 11 8 0 13.2-.8 15.5-2.5 2.3-1.7 4.2-5.5 5.5-11.5 2-13.3 5.7-27 11-41 14.7-44.7
+ 39-84.5 73-119.5s73.7-60.2 119-75.5c6-2 9-5.7 9-11s-3-9-9-11c-45.3-15.3-85
+-40.5-119-75.5s-58.3-74.8-73-119.5c-4.7-14-8.3-27.3-11-40-1.3-6.7-3.2-10.8-5.5
+-12.5-2.3-1.7-7.5-2.5-15.5-2.5-14 0-21 3.7-21 11 0 2 2 10.3 6 25 20.7 83.3 67
+ 151.7 139 205zm0 0v40h399900v-40z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.011em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.1113em;vertical-align:-0.011em;"></span><span class="mord text"><span class="mord cjk_fallback">反馈文本</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel x-arrow"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.1003em;"><span style="top:-3.322em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight x-arrow-pad"><span class="mord mtight"><span class="mspace mtight"><span class="mtight"> </span></span><span class="mord text mtight"><span class="mord cjk_fallback mtight">审计</span></span><span class="mspace mtight"><span class="mtight"> </span></span></span></span></span><span class="svg-align" style="top:-2.689em;"><span class="pstrut" style="height:2.7em;"></span><span class="hide-tail" style="height:0.522em;min-width:1.469em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.522em" viewBox="0 0 400000 522" preserveAspectRatio="xMaxYMin slice"><path d="M0 241v40h399891c-47.3 35.3-84 78-110 128
+-16.7 32-27.7 63.7-33 95 0 1.3-.2 2.7-.5 4-.3 1.3-.5 2.3-.5 3 0 7.3 6.7 11 20
+ 11 8 0 13.2-.8 15.5-2.5 2.3-1.7 4.2-5.5 5.5-11.5 2-13.3 5.7-27 11-41 14.7-44.7
+ 39-84.5 73-119.5s73.7-60.2 119-75.5c6-2 9-5.7 9-11s-3-9-9-11c-45.3-15.3-85
+-40.5-119-75.5s-58.3-74.8-73-119.5c-4.7-14-8.3-27.3-11-40-1.3-6.7-3.2-10.8-5.5
+-12.5-2.3-1.7-7.5-2.5-15.5-2.5-14 0-21 3.7-21 11 0 2 2 10.3 6 25 20.7 83.3 67
+ 151.7 139 205zm0 0v40h399900v-40z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.011em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord cjk_fallback">完整日志（不给模型）</span></span></span></span></span></span></p>
+<p>注意最后一跳：<strong>完整信息不能丢，只是不给模型。</strong> 它要进轨迹/日志（第 2 章），供第 7 章的失效归因使用。给模型的是<strong>裁剪+翻译</strong>版本，给人看的是<strong>完整</strong>版本。这两者必须分开存放。</p>
+<h3 id="h-二分类维度按模型能采取什么不同动作">二、分类维度：按&quot;模型能采取什么不同动作&quot;<a class="anchor" href="#h-二分类维度按模型能采取什么不同动作" aria-label="本节链接">#</a></h3>
+<h4 id="h-21-为什么不用异常类型分类">2.1 为什么不用异常类型分类<a class="anchor" href="#h-21-为什么不用异常类型分类" aria-label="本节链接">#</a></h4>
+<p>按 <code>ValueError</code> / <code>TimeoutError</code> / <code>HTTPError</code> 分类是程序员的本能，但它对 Agent 无用。因为模型需要知道的不是&quot;这是什么异常&quot;，而是：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord cjk_fallback">我现在应该做什么不同的事？</span></span></span></span></span></span></p>
+<p>两种分类方式的对照：</p>
+<table>
+<thead>
+<tr>
+<th>按异常类型（✗）</th>
+<th>按&quot;可采取的动作&quot;（✓）</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>ValueError</code></td>
+<td>参数可以修 → 让模型改参数</td>
+</tr>
+<tr>
+<td><code>TimeoutError</code></td>
+<td>结果未知 → 先核对或原样重试（第 2 节）</td>
+</tr>
+<tr>
+<td><code>HTTPError</code></td>
+<td>按状态码分五类，动作各不相同</td>
+</tr>
+<tr>
+<td><code>PermissionError</code></td>
+<td>换工具 / 挂起求人 / 放弃</td>
+</tr>
+<tr>
+<td><code>KeyError</code></td>
+<td>我猜错了字段名 → 看返回的可用字段列表</td>
+</tr>
+</tbody></table>
+<p><strong>同一个异常类型可能对应不同动作</strong>（<code>ValueError</code> 既可能是&quot;参数的格式错&quot;也可能是&quot;业务规则拒绝&quot;），<strong>不同的异常类型可能对应同一个动作</strong>（<code>PermissionError</code> 与 <code>403</code> 都是&quot;换路或求人&quot;）。所以分类的<strong>主键必须是动作</strong>，异常类型只是特征。</p>
+<h4 id="h-22-六类错误修复主体与反馈要点">2.2 六类错误：修复主体与反馈要点<a class="anchor" href="#h-22-六类错误修复主体与反馈要点" aria-label="本节链接">#</a></h4>
+<p>这是本节的核心表。<strong>每一类的列&quot;谁来修&quot;决定了反馈要写给谁看。</strong></p>
+<table>
+<thead>
+<tr>
+<th>类别</th>
+<th>典型表现</th>
+<th>谁来修</th>
+<th>反馈必须包含</th>
+<th>可以重试？</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>① 调用格式错</strong></td>
+<td>类型错、字段名拼错、枚举值不在集合内、缺必需参数</td>
+<td><strong>模型自己</strong></td>
+<td>哪个字段、期望什么类型/集合、当前收到什么、可用字段列表</td>
+<td>✗（改参数后可重调）</td>
+</tr>
+<tr>
+<td><strong>② 参数语义/值域错</strong></td>
+<td>超范围、格式不匹配（日期/邮箱/ID）、跨字段约束违反</td>
+<td><strong>模型自己</strong></td>
+<td>哪个字段、合法域/格式、当前值、以及&quot;哪个组合才合法&quot;</td>
+<td>✗</td>
+</tr>
+<tr>
+<td><strong>③ 业务规则拒绝</strong></td>
+<td>余额不足、状态不允许、配额超限、重复提交</td>
+<td><strong>模型（换策略）或人</strong></td>
+<td>规则是什么、当前资源状态、有哪些可选路径（换额度/换方式/降级）</td>
+<td>✗（除非规则带时间窗口）</td>
+</tr>
+<tr>
+<td><strong>④ 资源/前置条件缺失</strong></td>
+<td>404、依赖资源未创建、会话未打开、顺序错</td>
+<td><strong>模型自己</strong></td>
+<td>缺什么、<strong>哪个工具能创建它</strong>、正确的调用顺序</td>
+<td>✗（做完前置后可重调）</td>
+</tr>
+<tr>
+<td><strong>⑤ 瞬态/基础设施</strong></td>
+<td>超时、连接重置、503、限流</td>
+<td><strong>框架（不是模型）</strong></td>
+<td>已尝试几次、结果是否未知（决定能不能重试）、下次可重试的时间</td>
+<td>✓（见第 2 节）</td>
+</tr>
+<tr>
+<td><strong>⑥ 权限/安全</strong></td>
+<td>401、403、审批未通过、越权访问</td>
+<td><strong>人</strong>（模型无法解决）</td>
+<td>需要什么权限、向谁申请、是否有替代的只读路径</td>
+<td>✗</td>
+</tr>
+</tbody></table>
+<p><strong>四个必须记住的推论</strong>：</p>
+<ol>
+<li><strong>⑤ 类根本不该让模型看到</strong>（或者只给一句摘要）。它是框架层的重试职责；让模型知道&quot;基础设施抖了一下&quot;只会诱发它做无意义的动作。<strong>只有重试用尽后才把它交给模型，并且必须附带&quot;结果是否未知&quot;这个关键信息。</strong></li>
+<li><strong>①②④ 类是&quot;高价值反馈&quot;</strong>：它们几乎全部可以自动化修复，前提是反馈里有足够信息。这三类的反馈质量直接决定 Agent 的任务成功率。</li>
+<li><strong>③⑥ 类是&quot;必须升级&quot;的</strong>：模型无论多想都修不了。<strong>反馈里必须包含升级路径</strong>（&quot;这个操作需要 <code>payments:write</code> 权限，请让管理员授权，或改用只读的 <code>get_balance</code>&quot;），否则模型会花掉大量预算尝试各种&quot;绕过&quot;。</li>
+<li><strong>类别决定是否重试，而重试策略必须是同一份分类的结果</strong>。第 2 节的 <code>FailureKind</code> 与这里的六类有一一映射，<strong>必须共用一份分类代码</strong>，否则会出现&quot;错误适配器说不可重试、重试器却在重试&quot;这种自相矛盾。</li>
+</ol>
+<h4 id="h-23-分类的判据树可直接实现">2.3 分类的判据树（可直接实现）<a class="anchor" href="#h-23-分类的判据树可直接实现" aria-label="本节链接">#</a></h4>
+<pre><code>收到失败
+├─ 请求是否到达远端？
+│    ├─ 否（连接前失败）→ ⑤-未执行（可安全重试，即使不幂等）
+│    └─ 是 ─┐
+├─ 远端是否明确表示&quot;未执行&quot;？
+│    ├─ 是 + 瞬态（503/限流）  → ⑤-未执行（退避重试）
+│    ├─ 是 + 确定性            → ① / ② / ③ / ④ / ⑥（按下面的细分）
+│    └─ 否（超时/500/连接重置）→ ⑤-结果未知（★ 只有幂等才可重试）
+└─ 确定性错误的细分（看错误里&quot;谁违规&quot;）
+     ├─ 参数本身不合法        → ① 或 ②（模型改参数）
+     ├─ 资源不存在/前置未满足 → ④（模型补前置，反馈要给工具名）
+     ├─ 规则拒绝（资源状态）  → ③（模型换策略，反馈要给可选路径）
+     └─ 身份/权限            → ⑥（升级给人）</code></pre>
+<p><strong>分类器的输入不只是异常</strong>，还包括：HTTP 状态码、响应体的 <code>error.code</code>（如果有的话）、以及<strong>这次调用的参数</strong>（用于判断&quot;是字段名错还是值域错&quot;）。这就是为什么工具应该返回<strong>机器可读的错误码</strong>，而不是只返回一句话：<code>{&quot;error&quot;: {&quot;code&quot;: &quot;limit_out_of_range&quot;, &quot;param&quot;: &quot;limit&quot;, &quot;allowed&quot;: [1,100]}}</code> 可以被精确分类；<code>&quot;invalid limit&quot;</code> 只能靠字符串匹配猜。</p>
+<h3 id="h-三反馈的构成字段顺序与长度预算">三、反馈的构成：字段、顺序与长度预算<a class="anchor" href="#h-三反馈的构成字段顺序与长度预算" aria-label="本节链接">#</a></h3>
+<h4 id="h-31-一条合格反馈的六个字段">3.1 一条合格反馈的六个字段<a class="anchor" href="#h-31-一条合格反馈的六个字段" aria-label="本节链接">#</a></h4>
+<p>按重要性排序（前面的必须有，后面的按类别选）：</p>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>字段</th>
+<th>作用</th>
+<th>示例</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1</td>
+<td><strong>状态</strong></td>
+<td>一句话说清发生了什么</td>
+<td><code>status=invalid_argument</code></td>
+</tr>
+<tr>
+<td>2</td>
+<td><strong>定位</strong></td>
+<td>哪个参数/哪一步/哪个资源</td>
+<td><code>param=limit</code></td>
+</tr>
+<tr>
+<td>3</td>
+<td><strong>期望</strong></td>
+<td>合法域、格式、前置条件</td>
+<td><code>期望 1..100 的整数，默认 20</code></td>
+</tr>
+<tr>
+<td>4</td>
+<td><strong>下一步</strong></td>
+<td>模型应该做的<strong>一个</strong>具体动作</td>
+<td><code>请把 limit 改为不超过 100 的值后重新调用</code></td>
+</tr>
+<tr>
+<td>5</td>
+<td><strong>护栏</strong></td>
+<td>明确禁止危险动作（针对模型倾向）</td>
+<td><code>不要修改 user_id，也不要重复提交相同参数</code></td>
+</tr>
+<tr>
+<td>6</td>
+<td><strong>升级路径</strong></td>
+<td>当模型无法解决时的出口</td>
+<td><code>若需要超过 100 条，请改用 export_all（需审批）</code></td>
+</tr>
+</tbody></table>
+<p>第 4 项有一个反直觉的设计要求：<strong>只给一个动作</strong>。给多个选项（&quot;你可以改 limit，或者用分页，或者用 export&quot;）会让模型在选项间摇摆，甚至尝试全部三个。<strong>给一条最优路径，把备选放在第 6 项（升级路径）里</strong>，措辞上区分&quot;现在做&quot;和&quot;若不行则&quot;。</p>
+<p>第 5 项是 Agent 场景特有的，也是最容易被忽略的。它针对的是模型的<strong>系统性倾向</strong>，而不是这一次的错误：</p>
+<table>
+<thead>
+<tr>
+<th>模型的倾向</th>
+<th>必须加的护栏</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>改参数后重试（结果未知时最危险）</td>
+<td>&quot;不要修改参数重试；结果未知，请先核对&quot;</td>
+</tr>
+<tr>
+<td>重复提交相同参数（明知会失败）</td>
+<td>&quot;不要重复提交相同参数&quot;，并配合重复检测</td>
+</tr>
+<tr>
+<td>编造缺失的字段值（猜 ID）</td>
+<td>&quot;不要自行构造 id；用 resolve_* 工具获取&quot;</td>
+</tr>
+<tr>
+<td>遇到权限错时尝试其他工具绕过</td>
+<td>&quot;不要尝试绕过权限；这是策略限制&quot;</td>
+</tr>
+<tr>
+<td>遇到空结果时随机换关键词猛试</td>
+<td>&quot;已检索范围是 X；换关键词无用，请改用 archive_search&quot;</td>
+</tr>
+</tbody></table>
+<p><strong>这五项本质上是在错误反馈里做&quot;提示工程&quot;</strong> —— 但它是<strong>合法的</strong>，因为它不是把答案给模型，而是防止模型做已知的有害动作。这与第 2 章&quot;不要把终止判据写进提示词&quot;形成对照：<strong>护栏应当写，答案不应当写。</strong></p>
+<h4 id="h-32-顺序把最重要的放在最前">3.2 顺序：把最重要的放在最前<a class="anchor" href="#h-32-顺序把最重要的放在最前" aria-label="本节链接">#</a></h4>
+<p>模型对长文本的注意力分布不均匀（第 3 章第 4 节的上下文工程会给出机制）。反馈文本的实用顺序是：</p>
+<pre><code>[状态码] 一句话摘要（★ 最重要：模型可能只看第一行）
+定位：字段/资源
+期望：合法域
+下一步：一个动作
+护栏：禁止动作
+升级：备选路径
+补充：可选的原始细节（如 upstream_request_id，供人排查）</code></pre>
+<p><strong>如果只保留一行</strong>，应该是&quot;摘要 + 定位 + 期望&quot;。这三者的组合足以让模型完成大多数修复。所以实现上可以做一个<strong>两级反馈</strong>：默认给精简版，模型连续失败后再给详细版（见 4.2）。</p>
+<h4 id="h-33-长度预算反馈也必须可裁剪">3.3 长度预算：反馈也必须&quot;可裁剪&quot;<a class="anchor" href="#h-33-长度预算反馈也必须可裁剪" aria-label="本节链接">#</a></h4>
+<p>反馈是上下文的一部分，所以它必须有预算。建议的量化规则：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord cjk_fallback">反馈长度上界</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.4em;vertical-align:-0.95em;"></span><span class="mop">min</span><span class="mspace" style="margin-right:-0.1667em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="minner"><span class="mopen delimcenter" style="top:0em;"><span class="delimsizing size3">(</span></span><span class="mord"><span class="mord mathnormal">L</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">hard</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3603em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">20</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">failures</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal" style="margin-right:0.0502em;">B</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:-0.0502em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">ctx</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.836em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mclose delimcenter" style="top:0em;"><span class="delimsizing size3">)</span></span></span></span></span></span></span></p>
+<p>其中 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">L</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">hard</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 是单条硬上限（经验值 500–800 字符），<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0502em;">B</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:-0.0502em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">ctx</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 是上下文预算。第二项的直觉：<strong>如果预计会失败很多次，单条反馈就要更短</strong>，否则错误信息会把预算吃光。实践中更简单的做法是：</p>
+<pre><code>第 1 次失败：完整反馈（≤800 字符）
+第 2 次同类失败：精简反馈（≤300 字符）+ &quot;你已犯过同样的错误&quot;
+第 3 次同类失败：升级（不再给同类细节，改给替代路径或求人）</code></pre>
+<p>这直接引出下一节。</p>
+<h3 id="h-四重复错误检测升级与不再给同样的话">四、重复错误：检测、升级与&quot;不再给同样的话&quot;<a class="anchor" href="#h-四重复错误检测升级与不再给同样的话" aria-label="本节链接">#</a></h3>
+<h4 id="h-41-为什么重复错误必须被特殊处理">4.1 为什么重复错误必须被特殊处理<a class="anchor" href="#h-41-为什么重复错误必须被特殊处理" aria-label="本节链接">#</a></h4>
+<p>如果同一个错误反馈原样出现第二次，模型的行为通常不会改变 —— 因为它看到的信息没变。更糟的是三种退化：</p>
+<table>
+<thead>
+<tr>
+<th>退化</th>
+<th>表现</th>
+<th>机制</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>原地重试</strong></td>
+<td>完全相同的调用再发一次</td>
+<td>模型把&quot;重试&quot;当成一个可尝试的动作</td>
+</tr>
+<tr>
+<td><strong>发散试错</strong></td>
+<td>参数随机微调，每次都错</td>
+<td>反馈没告诉它合法域，它只能搜索</td>
+</tr>
+<tr>
+<td><strong>放弃并编造</strong></td>
+<td>&quot;由于工具不可用，我根据经验推测...&quot;</td>
+<td>模型为避免卡死而编造结果（最危险）</td>
+</tr>
+</tbody></table>
+<p>第三种是 Agent 里最贵的事故：<strong>失败转化为幻觉</strong>。它往往发生在重复失败 3–5 次之后，且很难被发现（输出看起来合理）。</p>
+<h4 id="h-42-处理策略递减信息--强制升级">4.2 处理策略：递减信息 + 强制升级<a class="anchor" href="#h-42-处理策略递减信息--强制升级" aria-label="本节链接">#</a></h4>
+<pre><code>同一 (工具, 错误类别, 关键字段) 在窗口内第 n 次出现：
+  n = 1 → 完整反馈（含期望与下一步）
+  n = 2 → 精简反馈 + 「这是第 2 次相同错误。不要重复提交相同参数。」
+          + 把&quot;期望&quot;字段再强调一遍（这是唯一还可能被忽略的信息）
+  n ≥ 3 → 不再重复细节，改为：
+          · 明确宣布局部失败：「本工具在当前参数空间内无法完成该请求」
+          · 给替代路径或求人：「请改用 X，或向用户说明需要 &lt;具体信息&gt;」
+          · 降低终止状态的等级（第 2 章）：从&quot;继续尝试&quot;变成 need_human</code></pre>
+<p><strong>第 3 步的关键是&quot;不再重复细节&quot;</strong>。再给一遍同样的信息，等于指望同一个输入产生不同输出。必须<strong>改变输入的性质</strong>：从&quot;修复提示&quot;变成&quot;路径切换&quot;。</p>
+<h4 id="h-43-重复检测的键">4.3 重复检测的键<a class="anchor" href="#h-43-重复检测的键" aria-label="本节链接">#</a></h4>
+<p>检测重复需要定义&quot;什么是同一个错误&quot;。键的选择：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord cjk_fallback">重复键</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.06em;vertical-align:-0.31em;"></span><span class="mopen">(</span><span class="mord text"><span class="mord">tool_name</span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">error_class</span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">locator</span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">fingerprint</span></span><span class="mopen">(</span><span class="mord text"><span class="mord">args</span></span><span class="mclose">))</span></span></span></span></span></p>
+<ul>
+<li>若把 <code>fingerprint(args)</code> 算进去，那么&quot;参数微调后的失败&quot;不算重复 —— 这是<strong>不够</strong>的，因为发散试错正是要拦的模式。所以实践中应同时维护两个计数：<ul>
+<li><strong>精确重复</strong>（同参数同错误）→ 判定&quot;原地重试&quot;</li>
+<li><strong>类别重复</strong>（同工具同错误类别，参数不同）→ 判定&quot;发散试错&quot;</li>
+</ul>
+</li>
+<li><strong>类别重复的阈值要更低</strong>（例如 3 次），因为发散试错比原地重试消耗更多预算且更接近幻觉。</li>
+</ul>
+<h4 id="h-44-升级把我修不了变成可执行的交接">4.4 升级：把&quot;我修不了&quot;变成可执行的交接<a class="anchor" href="#h-44-升级把我修不了变成可执行的交接" aria-label="本节链接">#</a></h4>
+<p>第 2 章定义了终止状态枚举。错误升级必须映射到其中的状态：</p>
+<table>
+<thead>
+<tr>
+<th>情况</th>
+<th>终止状态</th>
+<th>必须携带</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>① ② 类，修好了</td>
+<td>继续循环</td>
+<td>——</td>
+</tr>
+<tr>
+<td>① ② 类，连错 3 次</td>
+<td><code>need_human</code></td>
+<td>尝试过的参数、每次的错误、你的建议</td>
+</tr>
+<tr>
+<td>③ 类（规则拒绝）且无替代路径</td>
+<td><code>blocked</code></td>
+<td>哪条规则、需要什么条件才能满足</td>
+</tr>
+<tr>
+<td>⑥ 类（权限）</td>
+<td><code>need_human</code></td>
+<td>需要哪个权限、向谁申请、有无只读替代</td>
+</tr>
+<tr>
+<td>⑤ 类，重试用尽且<strong>结果未知</strong></td>
+<td><code>error</code> + 未知标记</td>
+<td>幂等键、查询手段（第 2 节）</td>
+</tr>
+</tbody></table>
+<p><strong>&quot;升级&quot;必须是一个主动的产物，而不是&quot;卡住&quot;</strong>：<code>need_human</code> 状态要带上足够的信息让人在 30 秒内做决定。这直接复用第 2 章&quot;任何终止状态都必须产生可解释的结论&quot;。</p>
+<h3 id="h-五绝对不能出现在反馈里的东西">五、绝对不能出现在反馈里的东西<a class="anchor" href="#h-五绝对不能出现在反馈里的东西" aria-label="本节链接">#</a></h3>
+<p>这一节是安全边界，逐条都对应真实事故：</p>
+<table>
+<thead>
+<tr>
+<th>禁止内容</th>
+<th>为什么</th>
+<th>替代做法</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>栈回溯 / 内部路径 / 模块名</td>
+<td>诱发模型&quot;修代码&quot;，泄露内部结构</td>
+<td>只给分类后的摘要</td>
+</tr>
+<tr>
+<td>SQL 语句原文与表结构</td>
+<td>注入素材；诱导模型直接构造 SQL</td>
+<td>给字段级提示（&quot;可用参数：...&quot;）</td>
+</tr>
+<tr>
+<td>凭据、连接串、环境变量名</td>
+<td>直接泄露；且会被模型写进输出</td>
+<td>永不进入上下文；只在服务端日志</td>
+</tr>
+<tr>
+<td><strong>资源是否存在</strong>（对无权访问者）</td>
+<td>信息泄露（枚举攻击）：403 与 404 的区分会泄露&quot;这个 ID 存在&quot;</td>
+<td>对无权资源统一返回 404 语义</td>
+</tr>
+<tr>
+<td>内部业务阈值（风控规则的具体数值）</td>
+<td>可被用于规避（对抗性探测）</td>
+<td>给定性描述（&quot;该金额超过当前限额&quot;）</td>
+</tr>
+<tr>
+<td>其他用户/租户的数据</td>
+<td>越权</td>
+<td>只给当前主体范围内的信息</td>
+</tr>
+<tr>
+<td>完整的下游响应体</td>
+<td>常含注入内容与无关字段</td>
+<td>提取必需字段，丢弃其余</td>
+</tr>
+</tbody></table>
+<p><strong>403 vs 404 这一条值得单独强调</strong>：它不只是&quot;信息安全&quot;，而是<strong>Agent 可靠性</strong>问题。如果权限错返回的细节足够多，模型会学到&quot;多试几个参数就能进去&quot;，于是开始对抗性探测 —— 这在自动循环里会变成真实的越权尝试（第 7 章的沙箱与权限会处理这个，但反馈层是第一个关口）。</p>
+<h3 id="h-代码分类器--反馈渲染--重复检测--升级">代码：分类器 + 反馈渲染 + 重复检测 + 升级<a class="anchor" href="#h-代码分类器--反馈渲染--重复检测--升级" aria-label="本节链接">#</a></h3>
+<p>下面的代码把本节落成一个模块：<strong>(1)</strong> 一个不依赖异常类型的分类器；<strong>(2)</strong> 面向模型的两级反馈渲染（含长度预算）；<strong>(3)</strong> 精确重复与类别重复的双计数检测；<strong>(4)</strong> 升级到第 2 章终止状态的映射。</p>
+<pre data-lang="python"><code class="language-python">from collections import defaultdict
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Optional
+
+
+# ==================== 分类：主键是&quot;模型能做什么&quot; ====================
+class ErrorClass(Enum):
+    FORMAT = &quot;format&quot;            # ① 调用格式错 → 模型改参数
+    VALUE = &quot;value&quot;              # ② 值域/语义错 → 模型改参数
+    BUSINESS_RULE = &quot;rule&quot;       # ③ 业务规则拒绝 → 模型换策略或求人
+    PRECONDITION = &quot;precond&quot;     # ④ 资源/前置缺失 → 模型补前置
+    TRANSIENT = &quot;transient&quot;      # ⑤ 瞬态/基础设施 → 框架重试，不给模型
+    PERMISSION = &quot;permission&quot;    # ⑥ 权限/安全 → 升级给人
+
+
+# ★ 设计决策：谁负责修复，决定反馈写给谁看
+OWNER = {
+    ErrorClass.FORMAT: &quot;model&quot;, ErrorClass.VALUE: &quot;model&quot;,
+    ErrorClass.BUSINESS_RULE: &quot;model_or_human&quot;, ErrorClass.PRECONDITION: &quot;model&quot;,
+    ErrorClass.TRANSIENT: &quot;framework&quot;, ErrorClass.PERMISSION: &quot;human&quot;,
+}
+
+# ★ 与第 2 节 FailureKind 共用同一份&quot;可否重试&quot;的判定，避免两处矛盾
+RETRYABLE = {ErrorClass.TRANSIENT}
+
+# 模型倾向 → 必须加的护栏（3.1 第 5 项）
+GUARDRAILS = {
+    ErrorClass.FORMAT: &quot;不要重复提交相同参数；按上面的可用字段修正后重新调用一次。&quot;,
+    ErrorClass.VALUE: &quot;不要靠试错搜索边界；上面的合法域就是全部可能的取值。&quot;,
+    ErrorClass.BUSINESS_RULE: &quot;不要尝试绕过该规则；若需要例外，请向用户说明并请求确认。&quot;,
+    ErrorClass.PRECONDITION: &quot;不要自行构造缺失的资源标识；用上面指出的工具获取它。&quot;,
+    ErrorClass.TRANSIENT: &quot;结果可能未知，不要修改参数重试；原样重试或用查询工具核对。&quot;,
+    ErrorClass.PERMISSION: &quot;不要尝试其他工具绕过权限；这是策略限制，需人工授权。&quot;,
+}
+
+
+@dataclass
+class ToolFailure(Exception):
+    &quot;&quot;&quot;
+    ★ 设计决策：工具侧抛出的结构化失败。原始异常只用于内部日志（raw），
+      绝不出现在 feedback 里 —— 这一层就是&quot;把异常消费一次&quot;的地方。
+    &quot;&quot;&quot;
+    error_class: ErrorClass
+    summary: str                       # 一句话，给模型的第一行
+    locator: str = &quot;&quot;                  # 哪个参数/资源/步骤
+    expected: str = &quot;&quot;                 # 合法域/格式/前置条件
+    next_action: str = &quot;&quot;              # 唯一推荐动作
+    escalate: str = &quot;&quot;                 # 升级路径（人/替代工具/审批）
+    raw: str = &quot;&quot;                      # ★ 只进日志，永不进 feedback
+    code: str = &quot;&quot;                     # 机器可读错误码（供分类与评测断言）
+
+
+# ==================== 分类器：输入是构造好的失败，不是裸异常 ====================
+def classify(status_code: Optional[int], code: str, arrived: bool,
+             executed: Optional[bool]) -&gt; ErrorClass:
+    &quot;&quot;&quot;
+    ★ 设计决策：先回答&quot;请求到了吗 / 执行了吗&quot;，再细分。
+      这个顺序是第 2 节 1.2 表的直接编码 —— 顺序错了会把&quot;结果未知&quot;当成&quot;参数错&quot;。
+    &quot;&quot;&quot;
+    if not arrived:
+        return ErrorClass.TRANSIENT                      # 连接前失败：可安全重试
+    if executed is None and status_code in (None, 500, 502, 504):
+        return ErrorClass.TRANSIENT                      # ★ 结果未知：必须走幂等通道
+    if status_code == 429 or status_code == 503:
+        return ErrorClass.TRANSIENT                      # 明确未执行 + 瞬态
+    if status_code in (401, 403) or code.startswith(&quot;auth&quot;):
+        return ErrorClass.PERMISSION
+    if code in (&quot;unknown_field&quot;, &quot;missing_field&quot;, &quot;type_mismatch&quot;, &quot;bad_enum&quot;):
+        return ErrorClass.FORMAT
+    if code in (&quot;out_of_range&quot;, &quot;bad_format&quot;, &quot;cross_field&quot;):
+        return ErrorClass.VALUE
+    if code in (&quot;not_found&quot;, &quot;precondition_failed&quot;, &quot;session_required&quot;):
+        return ErrorClass.PRECONDITION
+    return ErrorClass.BUSINESS_RULE                       # 兜底：规则拒绝（最保守）
+
+
+# ==================== 反馈渲染：两级 + 长度预算 + 顺序 ====================
+MAX_LEN_FULL, MAX_LEN_TERSE = 800, 300
+
+
+def render_feedback(f: ToolFailure, repeat_exact: int, repeat_class: int) -&gt; str:
+    &quot;&quot;&quot;
+    ★ 设计决策：按重复次数递减信息（4.2）。
+      第 3 次起不再重复同类细节，改为&quot;路径切换&quot; —— 因为同一个输入不会产生不同输出。
+    &quot;&quot;&quot;
+    guard = GUARDRAILS[f.error_class]
+    head = f&quot;[{f.code or f.error_class.value}] {f.summary}&quot;
+
+    if repeat_exact == 1 and repeat_class == 1:
+        parts = [head]
+        if f.locator:
+            parts.append(f&quot;定位：{f.locator}&quot;)
+        if f.expected:
+            parts.append(f&quot;期望：{f.expected}&quot;)
+        if f.next_action:
+            parts.append(f&quot;下一步：{f.next_action}&quot;)
+        parts.append(f&quot;注意：{guard}&quot;)
+        if f.escalate:
+            parts.append(f&quot;若仍然失败：{f.escalate}&quot;)
+        text = &quot;\n&quot;.join(parts)
+        return text[:MAX_LEN_FULL]
+
+    if repeat_class &lt;= 2:
+        # ★ 第二次：只保留&quot;唯一还可能被忽略的信息&quot;，并显式指出重复
+        text = (f&quot;{head}\n这是第 {repeat_class} 次相同类别的错误。&quot;
+                + (f&quot;\n期望：{f.expected}&quot; if f.expected else &quot;&quot;)
+                + f&quot;\n{guard}&quot;)
+        return text[:MAX_LEN_TERSE]
+
+    # ★ 第三次起：停止重复细节，宣布局部失败 + 给出口（对应 4.2 的&quot;改变输入性质&quot;）
+    return (f&quot;{head}\n本工具在已尝试的参数空间内无法完成该请求（已连续 {repeat_class} 次同类失败）。&quot;
+            f&quot;\n不要再调用本工具相同参数。请改用：{f.escalate or &#39;向用户说明并请求指示&#39;}&quot;)
+
+
+# ==================== 重复检测：精确重复 + 类别重复 ====================
+@dataclass
+class ErrorLedger:
+    &quot;&quot;&quot;
+    ★ 设计决策：必须维护两个计数。只看&quot;精确重复&quot;会漏掉发散试错
+      （参数每次微调 → 精确键每次都不同 → 永远不触发升级 → 最终演变成编造结果）。
+    &quot;&quot;&quot;
+    window: int = 12
+    exact: dict[tuple, int] = field(default_factory=lambda: defaultdict(int))
+    by_class: dict[tuple, int] = field(default_factory=lambda: defaultdict(int))
+    history: list[tuple] = field(default_factory=list)
+
+    def record(self, tool: str, cls: ErrorClass, locator: str,
+               args_fp: str) -&gt; tuple[int, int]:
+        exact_key = (tool, cls.value, locator, args_fp)
+        class_key = (tool, cls.value)
+        self.exact[exact_key] += 1
+        self.by_class[class_key] += 1
+        self.history.append(exact_key)
+        if len(self.history) &gt; self.window:
+            old = self.history.pop(0)
+            self.exact[old] = max(0, self.exact[old] - 1)
+        return self.exact[exact_key], self.by_class[class_key]
+
+    def terminal_status(self, tool: str, cls: ErrorClass,
+                        class_count: int) -&gt; Optional[str]:
+        &quot;&quot;&quot;★ 映射到第 2 章的终止状态枚举：升级必须是一个主动产物。&quot;&quot;&quot;
+        if cls is ErrorClass.TRANSIENT:
+            return &quot;error&quot;            # 结果未知 → 必须带幂等键与查询手段
+        if cls is ErrorClass.PERMISSION:
+            return &quot;need_human&quot;       # 权限：模型无法解决
+        if cls is ErrorClass.BUSINESS_RULE:
+            return &quot;blocked&quot; if class_count &gt;= 3 else None
+        return &quot;need_human&quot; if class_count &gt;= 3 else None
+
+
+# ==================== 组装：从原始失败到模型可见的 observation ====================
+@dataclass
+class Adapted:
+    observation: str
+    log_only: str            # ★ 完整信息进日志（第 2 章轨迹 / 第 7 章归因）
+    retryable: bool
+    terminal: Optional[str] = None
+
+
+def adapt(tool: str, failure: ToolFailure, ledger: ErrorLedger,
+          args_fp: str) -&gt; Adapted:
+    e_exact, e_class = ledger.record(tool, failure.error_class, failure.locator, args_fp)
+    obs = render_feedback(failure, e_exact, e_class)
+    log = (f&quot;tool={tool} class={failure.error_class.value} code={failure.code} &quot;
+           f&quot;exact={e_exact} class_count={e_class} raw={failure.raw[:2000]}&quot;)
+    return Adapted(observation=obs,
+                   log_only=log,
+                   retryable=failure.error_class in RETRYABLE,
+                   terminal=ledger.terminal_status(tool, failure.error_class, e_class))
+
+
+if __name__ == &quot;__main__&quot;:
+    ledger = ErrorLedger()
+
+    # ---- 案例 1：字段名拼错（① 格式错）—— 完整反馈 + 可用字段列表 ----
+    f1 = ToolFailure(
+        error_class=ErrorClass.FORMAT, code=&quot;unknown_field&quot;,
+        summary=&quot;参数 statu 不存在，本次调用未执行任何操作&quot;,
+        locator=&quot;statu&quot;, expected=&quot;可用参数：status, limit, cursor&quot;,
+        next_action=&quot;把 statu 改为 status，取值范围 [&#39;paid&#39;,&#39;pending&#39;,&#39;shipped&#39;]&quot;,
+        escalate=&quot;若需要按其他维度过滤，请用 search_orders 的 filter 参数&quot;,
+        raw=&#39;Traceback ... File &quot;/srv/app/tools/db.py&quot;, line 88 ... column &quot;statu&quot; does not exist&#39;)
+    print(&quot;① 首次：&quot;)
+    print(adapt(&quot;list_orders&quot;, f1, ledger, &quot;fp_a&quot;).observation, &quot;\n&quot;)
+
+    # ---- 案例 2：同参数重发（精确重复）→ 递减信息 ----
+    print(&quot;① 同参数重发：&quot;)
+    print(adapt(&quot;list_orders&quot;, f1, ledger, &quot;fp_a&quot;).observation, &quot;\n&quot;)
+
+    # ---- 案例 3：参数微调后仍同类失败（发散试错）→ 类别重复触发升级 ----
+    print(&quot;① 参数微调后仍失败（类别重复）：&quot;)
+    for fp in (&quot;fp_b&quot;, &quot;fp_c&quot;):
+        a = adapt(&quot;list_orders&quot;, f1, ledger, fp)
+        print(a.observation, &quot;| terminal =&quot;, a.terminal, &quot;\n&quot;)
+
+    # ---- 案例 4：权限错（⑥）→ 升级给人，不含任何内部细节 ----
+    f2 = ToolFailure(
+        error_class=ErrorClass.PERMISSION, code=&quot;auth_scope_missing&quot;,
+        summary=&quot;当前身份缺少该操作的权限，本次调用未执行&quot;,
+        locator=&quot;scope=orders:write&quot;,
+        expected=&quot;需要 orders:write 权限&quot;,
+        next_action=&quot;改用只读工具 get_order(order_id) 获取信息&quot;,
+        escalate=&quot;如需写权限，请让管理员为当前服务账号授予 orders:write&quot;)
+    print(&quot;⑥ 权限错：&quot;)
+    print(adapt(&quot;update_order&quot;, f2, ledger, &quot;fp_d&quot;).observation, &quot;\n&quot;)
+
+    # ---- 案例 5：结果未知（⑤）→ 反馈必须阻止&quot;改参数重试&quot;----
+    f3 = ToolFailure(
+        error_class=ErrorClass.TRANSIENT, code=&quot;result_unknown&quot;,
+        summary=&quot;请求已发出但未在超时内收到响应：本次操作是否生效【未知】&quot;,
+        locator=&quot;idempotency_key=charge:order-9:0&quot;,
+        expected=&quot;同一 idempotency_key 的重试不会重复扣款&quot;,
+        next_action=&quot;原样重试（相同 idempotency_key），或用 get_transaction 核对&quot;,
+        escalate=&quot;若两次核对仍不一致，请生成对账工单并暂停该订单的后续步骤&quot;)
+    a3 = adapt(&quot;transfer_funds&quot;, f3, ledger, &quot;fp_e&quot;)
+    print(&quot;⑤ 结果未知：&quot;)
+    print(a3.observation)
+    print(&quot;retryable =&quot;, a3.retryable, &quot;| log_only(截断) =&quot;, a3.log_only[:120], &quot;...&quot;)</code></pre>
+<p><strong>六处关键设计决策</strong>：</p>
+<ol>
+<li><code>ToolFailure</code> 把 <code>raw</code>（原始异常/栈回溯）与 <code>summary</code>/<code>expected</code> 显式分开，<strong><code>render_feedback</code> 永不读取 <code>raw</code></strong>。这是&quot;错误必须被消费一次&quot;在类型层面的强制 —— 想泄露内部细节都得先绕过类型设计。</li>
+<li><code>classify</code> 的顺序是&quot;到达了吗 → 执行了吗 → 权限 → 格式/值域/前置 → 兜底规则拒绝&quot;。<strong>顺序是语义的一部分</strong>：把 <code>status_code == 500</code> 放到前面会把&quot;结果未知&quot;误判为&quot;可安全重试&quot;（第 2 节里最危险的误判）。</li>
+<li><code>OWNER</code> 与 <code>RETRYABLE</code> 是显式的映射表，且注释里指向第 2 节的 <code>FailureKind</code> —— <strong>分类与重试策略必须共用一份判定</strong>，否则两处会漂移出矛盾。</li>
+<li><code>render_feedback</code> 的三档（完整 / 精简+强调 / 只给出口）是 4.2 的直接实现。第三档的核心是<strong>改变输入的性质</strong>，而不是把同一句话说第三遍。</li>
+<li><code>ErrorLedger</code> 同时维护 <code>exact</code> 与 <code>by_class</code>。类别计数是拦&quot;发散试错&quot;的唯一手段 —— 而发散试错是幻觉的前一步。</li>
+<li><code>adapt</code> 返回 <code>observation</code> 与 <code>log_only</code> 两份产物。<code>log_only</code> 进轨迹（第 2 章）供第 7 章归因，<code>observation</code> 进上下文给模型。<strong>给人看的信息量必须 ≥ 给模型的信息量</strong>，反过来就是信息泄露。</li>
+</ol>
+<h3 id="h-练习">练习<a class="anchor" href="#h-练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><p><strong>重写错误文案</strong>：下面三条是原始反馈，请按 3.1 的六字段与 3.2 的顺序重写，并说明每一处改动减少了哪一类无效行为：
+（a）<code>Error: 400 Bad Request</code>;
+（b）<code>KeyError: &#39;user_id&#39;</code>（附 1200 字符栈回溯）;
+（c）<code>{&quot;detail&quot;: &quot;insufficient balance&quot;}</code>。</p>
+</li>
+<li><p><strong>分类练习</strong>：为下面八种失败各判定 ①–⑥ 类别、修复主体、是否重试，并写出反馈里<strong>必须包含</strong>的一句话：
+（a）<code>amount</code> 传了字符串 <code>&quot;100&quot;</code>；（b）<code>amount</code> 传了 <code>-5</code>；（c）账户余额不足；（d）<code>order_id</code> 不存在；（e）先用 <code>ship</code> 再 <code>pay</code>（顺序错）；（f）HTTP 502；（g）请求发出后客户端超时；（h）缺少 <code>orders:write</code> 权限。</p>
+</li>
+<li><p><strong>护栏设计</strong>：针对模型在失败后的四种危险倾向（改参数重试、重复提交、编造 ID、绕过权限），各写出一条护栏文案。要求：护栏必须是<strong>可执行的行为约束</strong>（能对照判断模型是否遵守），而不是&quot;请小心&quot;这类空话。然后说明为什么给模型写护栏是合理的，而&quot;把终止判据写进提示词&quot;是不合理的（提示：前者防有害动作，后者泄露答案）。</p>
+</li>
+<li><p><strong>重复检测的阈值</strong>：某 Agent 的轨迹显示，它在失败后平均会尝试 4.2 次不同的参数。请设计你的升级阈值：精确重复阈值、类别重复阈值、窗口大小。若类别重复阈值设成 5 会怎样？设成 2 呢？给出一个可测量的选择依据（提示：用离线轨迹统计&quot;第 n 次失败后成功修复&quot;的比例）。</p>
+</li>
+<li><p><strong>信息泄露审计</strong>：给定一条真实风格的错误反馈（你自己编造一个含 3 处泄露的），指出三处泄露、各自的攻击面（枚举攻击 / 注入素材 / 凭据泄露），并给出改写。特别说明 403 与 404 的区分在 Agent 循环里会怎样被&quot;学会利用&quot;。</p>
+</li>
+<li><p><strong>从失败到幻觉</strong>：构造一个具体场景：某工具连续返回同一句 <code>Error: invalid request</code>，模型在第 4 次失败后开始输出&quot;根据我的分析，该数据为 X&quot;并继续后续步骤。请写出这条轨迹里模型每一步的输入（错误反馈）与它可能的内在推理，指出<strong>哪一步的信息缺失</strong>导致了幻觉，并给出修复方案（要具体到反馈文案与升级条件）。</p>
+</li>
+</ol>
+<h3 id="h-小结">小结<a class="anchor" href="#h-小结" aria-label="本节链接">#</a></h3>
+<ul>
+<li><strong>异常不是反馈</strong>。原样抛出有三重代价：可行动信息为零却占满 token（稀释注意力）、<strong>模型会去&quot;修&quot;栈回溯里的内部细节</strong>、泄露内部结构给一个可被注入的组件。</li>
+<li><strong>完整信息不能丢，只是不给模型</strong>：<code>raw</code> 进日志/轨迹（供第 7 章归因），<code>feedback</code> 进上下文。给人看的信息量必须 <strong>≥</strong> 给模型的信息量。</li>
+<li><strong>分类的主键是&quot;模型能采取什么不同动作&quot;</strong>，不是异常类型。六类：格式错 ①、值域/语义错 ②、业务规则 ③、前置缺失 ④、瞬态 ⑤、权限 ⑥。①②④ 是模型能自修的（高价值反馈），③⑥ 必须给升级路径。</li>
+<li><strong>顺序即语义</strong>：分类必须先回答&quot;请求到达了吗 / 执行了吗&quot;，再细分。把 500 放在前面会把&quot;结果未知&quot;误判为&quot;可安全重试&quot;。</li>
+<li><strong>⑤ 类通常不该给模型看</strong>（框架职责）；只有重试用尽后才交给模型，且<strong>必须附带&quot;结果是否未知&quot;</strong>。分类与重试策略必须共用一份判定，否则两处漂移出矛盾。</li>
+<li><strong>反馈六字段</strong>：状态 / 定位 / 期望 / <strong>下一步（只给一个）</strong> / <strong>护栏</strong>（针对模型倾向）/ 升级路径。护栏必须写（防有害动作），<strong>答案不能写</strong>（不自造 ID、不泄露合法集之外的探测路径）。</li>
+<li><strong>重复错误必须改变输入的性质</strong>：第 1 次给完整反馈、第 2 次精简并强调唯一可能被忽略的信息、<strong>第 3 次起停止重复细节</strong>（同一个输入不会产生不同输出），改为宣告&quot;局部失败&quot;并给出口。</li>
+<li><strong>必须同时检测精确重复与类别重复</strong>：只看精确重复会漏掉<strong>发散试错</strong>，而发散试错是<strong>幻觉的前一步</strong>（&quot;工具不可用，我根据经验推测……&quot;是 Agent 最贵的事故）。</li>
+<li><strong>绝不能出现在反馈里</strong>：栈回溯/内部路径、SQL 与表结构、凭据、<strong>无权资源的&quot;存在性&quot;</strong>（403 vs 404 的区分会被学会利用）、内部阈值数值、他人数据。</li>
+</ul>
+<blockquote>
+<p>下一节：单个工具的契约已经可靠了。但当你把工具从 10 个加到 40 个，会出现三类新问题：<strong>模型开始选错工具</strong>、描述里的一句话能改变整个选择分布、以及工具描述与返回值都成了<strong>攻击通道</strong>。这是本章的最后一节，也是安全边界正式登场的地方。</p>
+</blockquote>

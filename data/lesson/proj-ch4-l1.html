@@ -1,0 +1,196 @@
+<h2 id="h-项目规划本地部署与成本核算">项目规划（本地部署与成本核算）<a class="anchor" href="#h-项目规划本地部署与成本核算" aria-label="本节链接">#</a></h2>
+<p>你已经学完《LLM 推理引擎与优化》，知道 prefill/decode 两阶段、KV Cache、vLLM 的 PagedAttention、量化（AWQ/GPTQ/GGUF）这些概念。现在要把它们落地成一个<strong>能写进简历的项目</strong>：真正部署一个开源 LLM，实测它的显存、吞吐、延迟，并写出一份&quot;成本核算报告&quot;。</p>
+<p>这个项目的价值不在&quot;能跑起来&quot;——网上教程谁都能照抄一条 <code>vllm serve</code> 命令——而在<strong>&quot;算得清账&quot;</strong>。面试官最常问的一类问题是：&quot;给你一个 70B 模型和固定预算，你怎么选卡和量化方案？&quot; 背参数答不出来，真正量过、算过的人才能答。本课先做规划：选什么模型、什么引擎、什么硬件，以及&quot;账&quot;该怎么算。</p>
+<h3 id="h-一目标与步骤">一、目标与步骤<a class="anchor" href="#h-一目标与步骤" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-项目目标一句话">1. 项目目标（一句话）<a class="anchor" href="#h-1-项目目标一句话" aria-label="本节链接">#</a></h4>
+<p><strong>用 vLLM / llama.cpp 在本地（或云 GPU）部署 Qwen/Llama 7B 级别的开源模型，对 FP16 与三种量化方案（AWQ / GPTQ / GGUF）分别实测显存、吞吐、延迟，产出一份成本核算报告。</strong></p>
+<h4 id="h-2-验收标准做完项目你手里必须有这些">2. 验收标准（做完项目你手里必须有这些）<a class="anchor" href="#h-2-验收标准做完项目你手里必须有这些" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>交付物</th>
+<th>验收标准</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>可复现的部署记录</td>
+<td>每条命令、每个参数都能照着重跑出同样的服务</td>
+</tr>
+<tr>
+<td>实测对比表</td>
+<td>至少 4 行（FP16、AWQ、GPTQ、GGUF）× 显存/吞吐/延迟 三列，数字来自你的实测而非抄网文</td>
+</tr>
+<tr>
+<td>成本核算报告</td>
+<td>含单 token 成本、每百万 token 成本，并推算&quot;70B 要几张什么卡、每小时多少钱&quot;</td>
+</tr>
+<tr>
+<td>3 分钟口头总结</td>
+<td>能不看稿讲清&quot;你做了什么、量出了什么、省了多少&quot;</td>
+</tr>
+</tbody></table>
+<h4 id="h-3-分步计划5-步走完">3. 分步计划（5 步走完）<a class="anchor" href="#h-3-分步计划5-步走完" aria-label="本节链接">#</a></h4>
+<ol>
+<li><strong>选型</strong>：模型 + 推理引擎 + 硬件，三者要匹配（见下一节）。</li>
+<li><strong>环境</strong>：Docker / conda + 正确的 CUDA 版本。</li>
+<li><strong>部署</strong>：先跑 FP16 基准，再部署三种量化，逐一定量记录。</li>
+<li><strong>压测</strong>：并发请求测吞吐、TTFT、TPOT。</li>
+<li><strong>核算</strong>：把&quot;显存/吞吐/延迟&quot;翻译成&quot;钱&quot;。</li>
+</ol>
+<h3 id="h-二选型与目标">二、选型与目标<a class="anchor" href="#h-二选型与目标" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-模型选型7b8b-是甜点区">1. 模型选型：7B~8B 是&quot;甜点区&quot;<a class="anchor" href="#h-1-模型选型7b8b-是甜点区" aria-label="本节链接">#</a></h4>
+<p>选 <strong>Qwen2.5-7B-Instruct</strong> 或 <strong>Llama-3.1-8B-Instruct</strong>。理由：</p>
+<ul>
+<li><strong>单卡消费级能跑</strong>：7B 权重 FP16 约 15 GB，一张 24 GB 显卡装得下，做量化后余量更大，适合大多数学习者的硬件条件；</li>
+<li><strong>成本可控</strong>：云上租一张 24 GB 卡跑一天只有几十块量级，实验成本低；</li>
+<li><strong>有代表性</strong>：7B 是开源生态里被讨论最多、量化文件最全的档位，你量出的规律可以外推到 70B。</li>
+</ul>
+<table>
+<thead>
+<tr>
+<th>模型</th>
+<th>参数规模</th>
+<th>FP16 权重</th>
+<th>特点</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Qwen/Qwen2.5-7B-Instruct</td>
+<td>~7.6B</td>
+<td>~15 GB</td>
+<td>中文强、指令跟随好、GGUF/AWQ 生态全</td>
+</tr>
+<tr>
+<td>meta-llama/Llama-3.1-8B-Instruct</td>
+<td>~8B</td>
+<td>~16 GB</td>
+<td>英文与通用能力强、社区资料多</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p>二选一即可，本课程示例统一用 Qwen2.5-7B-Instruct，Llama 的操作几乎完全相同（换模型名即可）。</p>
+</blockquote>
+<h4 id="h-2-推理引擎选型vllm-主打llamacpp-补位">2. 推理引擎选型：vLLM 主打，llama.cpp 补位<a class="anchor" href="#h-2-推理引擎选型vllm-主打llamacpp-补位" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>vLLM</strong>：高吞吐在线服务的首选。PagedAttention 管理 KV Cache、continuous batching 提高 GPU 利用率，内置 AWQ/GPTQ 支持，暴露 OpenAI 兼容接口。</li>
+<li><strong>llama.cpp</strong>：跑 <strong>GGUF</strong> 格式的引擎。CPU 就能跑、量化档位极细（Q4_K_M/Q5_K_M/Q8_0…）、苹果芯片/Metal 支持好，适合&quot;低资源、边缘设备&quot;场景。</li>
+</ul>
+<p>本项目两条线都走：<strong>在线高并发场景用 vLLM（FP16/AWQ/GPTQ），低资源场景用 llama.cpp（GGUF）</strong>，这样对比表才有说服力。</p>
+<h4 id="h-3-硬件选型先看显存够不够">3. 硬件选型：先看显存够不够<a class="anchor" href="#h-3-硬件选型先看显存够不够" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>硬件</th>
+<th>显存</th>
+<th>能跑什么（7B）</th>
+<th>成本定位</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>消费级 RTX 4090</td>
+<td>24 GB</td>
+<td>FP16 + 中等并发；量化后更高并发</td>
+<td>一次性购卡</td>
+</tr>
+<tr>
+<td>云 GPU A10 / L4</td>
+<td>24 GB</td>
+<td>同上</td>
+<td>按小时租用，便宜</td>
+</tr>
+<tr>
+<td>云 GPU A100</td>
+<td>80 GB</td>
+<td>FP16 高并发；70B AWQ 也放得下</td>
+<td>按小时租用，较贵</td>
+</tr>
+</tbody></table>
+<p><strong>选型铁律：先算显存，再谈性能。</strong> 一张卡&quot;装不下&quot;就一切免谈，所以规划阶段的第一件事是把显存账算出来。</p>
+<h4 id="h-4-显存估算算账的第一步">4. 显存估算：算账的第一步<a class="anchor" href="#h-4-显存估算算账的第一步" aria-label="本节链接">#</a></h4>
+<p>一次推理服务占用的显存 ≈ 四块之和：</p>
+<pre><code>显存 ≈ 模型权重 + KV Cache + 激活/中间结果 + 框架/碎片开销</code></pre>
+<ul>
+<li><strong>权重</strong>：7B × 每参数字节数。FP16/BF16 每参数 2 字节 ≈ 15 GB；INT8 ≈ 7.5 GB；INT4 ≈ 3.8 GB。</li>
+<li><strong>KV Cache</strong>：随&quot;并发数 × 序列长度&quot;线性增长，是决定<strong>能同时服务多少人</strong>的关键变量。粗略地，7B 模型每 1K token 的 KV Cache 约 50<del>60 MB，8K 上下文一个请求就占约 0.4</del>0.5 GB——并发一高，它才是显存大头。</li>
+<li><strong>激活/中间结果</strong>：与当前 batch 大小、序列长度有关，通常几 GB 量级。</li>
+<li><strong>框架/碎片</strong>：CUDA context、vLLM 的预留，一般几百 MB 到 1~2 GB。</li>
+</ul>
+<p>规划阶段结论：<strong>7B FP16 在一张 24 GB 卡上能跑，但并发要克制；量化（尤其 INT4）把权重从 15 GB 压到约 4 GB，省出的显存几乎全给 KV Cache，于是能扛更高的并发——这就是量化在&quot;成本&quot;上的意义。</strong></p>
+<p><figure><img class="md-img" src="content/courses/ai-projects/assets/chapter-4-figure-01.svg" alt="部署选型决策：三条路线（vLLM+AWQ/GPTQ 在线高并发、vLLM FP16 基准、llama.cpp+GGUF 低资源）对应不同硬件与成本定位" loading="lazy" decoding="async"><figcaption>部署选型决策：三条路线（vLLM+AWQ/GPTQ 在线高并发、vLLM FP16 基准、llama.cpp+GGUF 低资源）对应不同硬件与成本定位</figcaption></figure>
+</p>
+<p><figure><img class="md-img" src="content/courses/ai-projects/assets/chapter-4-figure-02.svg" alt="显存构成示意图：一张显存条被切成&quot;模型权重（固定）&quot;&quot;KV Cache（随并发×长度增长）&quot;&quot;激活/中间结果&quot;&quot;框架/碎片&quot;四段，用箭头标出量化后权重段明显变短、KV Cache 段可拉长" loading="lazy" decoding="async"><figcaption>显存构成示意图：一张显存条被切成&quot;模型权重（固定）&quot;&quot;KV Cache（随并发×长度增长）&quot;&quot;激活/中间结果&quot;&quot;框架/碎片&quot;四段，用箭头标出量化后权重段明显变短、KV Cache 段可拉长</figcaption></figure>
+</p>
+<h3 id="h-三代码骨架先纸面算账">三、代码骨架：先&quot;纸面算账&quot;<a class="anchor" href="#h-三代码骨架先纸面算账" aria-label="本节链接">#</a></h3>
+<p>正式部署前，先写一个<strong>不需要真 GPU 的显存估算脚本</strong>，把预期占用量和成本先算一遍。这一步练的是&quot;算账能力&quot;，也是后面写报告的骨架。</p>
+<pre data-lang="python"><code class="language-python"># -*- coding: utf-8 -*-
+# estimate_vram.py —— 部署前的&quot;纸面算账&quot;：估算显存占用与单 token 成本
+# 数字是估算公式，真实值以部署后 nvidia-smi / 压测为准
+
+def estimate_weights(params_b, bits):
+    &quot;&quot;&quot;按参数量(billion)与位宽估算权重显存(GB)。&quot;&quot;&quot;
+    bytes_per_param = bits / 8
+    return params_b * 1e9 * bytes_per_param / (1024 ** 3)
+
+def estimate_kv_cache(per_1k_token_mb, context_len, concurrency):
+    &quot;&quot;&quot;估算 KV Cache 占用(GB)：每 1K token 占用的 MB × 上下文长度 × 并发数。&quot;&quot;&quot;
+    total_kb = (context_len / 1000) * per_1k_token_mb * concurrency
+    return total_kb / 1024  # MB -&gt; GB
+
+def unit_token_cost(gpu_hour_price, num_gpus, throughput_tps):
+    &quot;&quot;&quot;按吞吐(tokens/s)估算每百万 token 成本(元)。&quot;&quot;&quot;
+    # 每小时产出 token = throughput * 3600；总费用 = 单价 * 卡数
+    tokens_per_hour = throughput_tps * 3600
+    cost_per_million = (gpu_hour_price * num_gpus) / (tokens_per_hour / 1e6)
+    return cost_per_million
+
+# ---- 场景 1：7B FP16 部署在 24GB 卡 ----
+params_b, bits = 7.6, 16
+w = estimate_weights(params_b, bits)
+kv = estimate_kv_cache(per_1k_token_mb=56, context_len=8192, concurrency=8)
+print(f&quot;[7B FP16] 权重 {w:.1f} GB + KV(8并发×8K) {kv:.1f} GB &quot;
+      f&quot;+ 激活~3GB + 框架~1GB ≈ {w + kv + 4:.1f} GB（24GB 卡，余量 {24 - w - kv - 4:.1f} GB）&quot;)
+
+# ---- 场景 2：7B INT4(AWQ) 同卡、更高并发 ----
+w4 = estimate_weights(params_b, 4)
+kv4 = estimate_kv_cache(56, 8192, 32)
+print(f&quot;[7B INT4] 权重 {w4:.1f} GB + KV(32并发×8K) {kv4:.1f} GB &quot;
+      f&quot;+ 激活~3GB + 框架~1GB ≈ {w4 + kv4 + 4:.1f} GB（同样的卡，并发从 8 提到 32）&quot;)
+
+# ---- 场景 3：把吞吐翻译成钱 ----
+price = 1.2        # 示例：一张 24GB 云卡每小时单价（元），替换为你的账单
+fp16_tps = 400     # 示例：FP16 实测吞吐（tokens/s）
+awq_tps  = 900     # 示例：AWQ 实测吞吐（tokens/s）
+print(f&quot;[成本] FP16 每百万 token ≈ {unit_token_cost(price, 1, fp16_tps):.2f} 元&quot;)
+print(f&quot;[成本] AWQ  每百万 token ≈ {unit_token_cost(price, 1, awq_tps):.2f} 元&quot;)
+print(&quot;结论：量化省下的显存转化为更高并发/吞吐，从而摊薄单 token 成本。&quot;)</code></pre>
+<blockquote>
+<p>说明：脚本里的 <code>per_1k_token_mb=56</code>、吞吐、单价都是<strong>示例值</strong>，目的在讲清公式；真实数字要在下一课部署压测后填进去。这份&quot;先估算、后实测、再对照&quot;的过程，本身就是面试里能讲的亮点。</p>
+</blockquote>
+<h3 id="h-四验收与复盘">四、验收与复盘<a class="anchor" href="#h-四验收与复盘" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-本课验收规划阶段完成标志">1. 本课验收（规划阶段完成标志）<a class="anchor" href="#h-1-本课验收规划阶段完成标志" aria-label="本节链接">#</a></h4>
+<ul>
+<li><input disabled="" type="checkbox"> 选定模型、引擎、硬件，并能一句话说清&quot;为什么这么配&quot;；</li>
+<li><input disabled="" type="checkbox"> 能写出显存四段构成，并口算 7B FP16 与 INT4 的权重大小；</li>
+<li><input disabled="" type="checkbox"> 能写出单 token 成本公式，并说清吞吐如何摊薄成本。</li>
+</ul>
+<h4 id="h-2-动手练习">2. 动手练习<a class="anchor" href="#h-2-动手练习" aria-label="本节链接">#</a></h4>
+<ol>
+<li>把脚本里的模型换成 <strong>70B</strong>（参数 70B、INT4 权重约 35 GB），算一算：FP16 权重约多少 GB？需要几张 24 GB 卡（张量并行）才放得下？INT4 呢？</li>
+<li>把 <code>concurrency</code> 从 8 加到 64，观察 KV Cache 如何成为显存大头，说明为什么&quot;量化省权重&quot;在高并发下尤其值钱。</li>
+<li>查一下你所在云平台的真实 GPU 单价，替换脚本里的 <code>price</code>，估算&quot;7B 服务跑一个月的常驻成本&quot;（按 30 天 × 24 小时）。</li>
+</ol>
+<h4 id="h-3-复盘要点规划阶段要避开的坑">3. 复盘要点（规划阶段要避开的坑）<a class="anchor" href="#h-3-复盘要点规划阶段要避开的坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>别上来就挑最大的模型</strong>：70B 是&quot;结果&quot;不是&quot;起点&quot;，先用 7B 把流程和公式跑通；</li>
+<li><strong>别抄网文数字</strong>：所有显存/吞吐必须来自你自己的 <code>nvidia-smi</code> 和压测，这是项目的可信度所在；</li>
+<li><strong>算账要落到&quot;钱&quot;</strong>：GB 和 tokens/s 是中间量，最终都要折算成&quot;每百万 token 多少元&quot;或&quot;每小时多少元&quot;，面试官只认这个。</li>
+</ul>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>vLLM 官方文档（安装与基础部署）：<a href="https://docs.vllm.ai/en/latest/getting_started/installation.html" target="_blank" rel="noopener noreferrer">https://docs.vllm.ai/en/latest/getting_started/installation.html</a></li>
+<li>vLLM 官方文档（支持的量化方案）：<a href="https://docs.vllm.ai/en/latest/features/quantization/index.html" target="_blank" rel="noopener noreferrer">https://docs.vllm.ai/en/latest/features/quantization/index.html</a></li>
+<li>llama.cpp 项目仓库（GGUF 与量化档位说明）：<a href="https://github.com/ggerganov/llama.cpp" target="_blank" rel="noopener noreferrer">https://github.com/ggerganov/llama.cpp</a></li>
+<li>Qwen2.5 模型卡与量化说明：<a href="https://huggingface.co/Qwen/Qwen2.5-7B-Instruct" target="_blank" rel="noopener noreferrer">https://huggingface.co/Qwen/Qwen2.5-7B-Instruct</a></li>
+<li>Meta Llama 3.1 模型卡：<a href="https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct" target="_blank" rel="noopener noreferrer">https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct</a></li>
+</ul>
+<p><a href="#/l/proj-ch4-l2">下一课：核心实现</a></p>

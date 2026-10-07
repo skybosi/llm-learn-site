@@ -1,0 +1,560 @@
+<h2 id="h-pass-基础设施如何写一个图级-pass">pass 基础设施：如何写一个图级 pass<a class="anchor" href="#h-pass-基础设施如何写一个图级-pass" aria-label="本节链接">#</a></h2>
+<p>一个 pass 看起来只是&quot;读 IR、改 IR&quot;的一段代码。但在真实编译器里它是一份合约：声明依赖、如实报告&quot;是否改动&quot;、失败要能被察觉、改写后 IR 必须还能通过验证器、能被并行调度。合约缺失的后果往往半年后才回来。本课把 pass 基础设施的零件写出来，并用一段 15 节点的图跑出三组数字：单趟 7 个节点 vs 不动点 5 个节点、一个真实 pattern bug 被逐元素对拍抓住、写错的 pass 被验证器当场拦下。</p>
+<p><figure><img class="md-img" src="content/courses/ml-compilers/assets/chapter-3-figure-02.svg" alt="图级 pass 的执行骨架：分析、匹配、改写、复核" loading="lazy" decoding="async"><figcaption>图级 pass 的执行骨架：分析、匹配、改写、复核</figcaption></figure>
+</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-pass-的最小契约">1. pass 的最小契约<a class="anchor" href="#h-1-pass-的最小契约" aria-label="本节链接">#</a></h4>
+<p>MLIR 的 <code>OperationPass</code> 把规则写得很具体：pass 只作用于被锚定的那个 operation；<strong>不得查看兄弟 operation</strong>（可能正被别的线程改写）；<strong>不得修改它之外的状态</strong>（自身属性例外）；<strong>不得跨 <code>runOnOperation</code> 保存可变状态</strong>；而且必须可拷贝构造（pass manager 会复制它并行处理成千上万个函数）。失败要用 <code>signalPassFailure</code> 报出来，pipeline 立刻停，不带着半个非法 IR 往下跑。</p>
+<p>TVM 侧精神一致：每个 pass 注册成 <code>PassInfo</code>（名字、<code>opt_level</code>、<code>required</code> 依赖），<code>PassContext</code> 负责门槛与黑白名单，<code>required</code> 让依赖自动排到前面。本课的 <code>Pass</code> / <code>PassContext</code> / <code>PassManager</code> 就是这两套设计的最小复刻。</p>
+<h4 id="h-2-pass-管理器顺序依赖不动点">2. pass 管理器：顺序、依赖、不动点<a class="anchor" href="#h-2-pass-管理器顺序依赖不动点" aria-label="本节链接">#</a></h4>
+<p>管理器做三件事：按顺序跑（TVM 的 <code>SequentialPass</code>）、按依赖排（<code>deps</code>）、决定跑几趟。第三件最容易被低估。代码里的对比很直白：同一张 15 节点的图，<strong>单趟</strong>（<code>max_rounds=1</code>）跑完还剩 <strong>7 个节点</strong>（死链 <code>z1 → z2</code> 的孤儿留在图里），<strong>跑到不动点</strong>剩 <strong>5 个节点</strong>、用了 <strong>4 轮</strong>。原因在 DCE 的实现：本课故意把它写成&quot;前向扫一遍&quot;，删掉使用者时生产者早已被访问过，于是每轮只清一层；逆序扫能一轮清完，但任何 pass 组合都可能在后面制造新机会，所以<strong>在管理器层面迭代到不动点</strong>更省心（MLIR 的 greedy driver 就是跑到不动点）。</p>
+<p>跑几趟必须可观测：统计表打印每个 pass 的<strong>调用次数、改写次数、IR 节点数</strong>；<code>PassContext</code> 还挂了 <code>before</code> / <code>after</code> 钩子，对应 MLIR 的 <code>PassInstrumentation</code> 与 TVM 的 <code>PassInstrument</code>。</p>
+<p><figure><img class="md-img" src="content/courses/ml-compilers/assets/chapter-3-figure-04.svg" alt="pass 管理器做的三件事：顺序与依赖、跑到不动点、以及可观测的统计与钩子" loading="lazy" decoding="async"><figcaption>pass 管理器做的三件事：顺序与依赖、跑到不动点、以及可观测的统计与钩子</figcaption></figure>
+</p>
+<h4 id="h-3-pattern-改写命中改写记账">3. pattern 改写：命中、改写、记账<a class="anchor" href="#h-3-pattern-改写命中改写记账" aria-label="本节链接">#</a></h4>
+<p>MLIR 把改写拆成两半：<code>RewritePattern</code>（静态 benefit、可选的 root op 名、<code>matchAndRewrite</code>）与 <code>PatternRewriter</code>（<strong>所有</strong> IR 变更都必须经它，否则驱动器的状态会失效）。三条约束值得背下来：改写成功必须真的改了 IR（返回 success 而没改动是 bug）；失败时不得留下任何修改；<strong>递归应用必须显式声明边界</strong>（<code>setHasBoundedRewriteRecursion</code>），否则驱动器宁可判失败。</p>
+<p>代码里的 <code>AlgebraicSimplify</code> 就是三条 pattern：<code>x + 0 → x</code>、<code>x · 1 → x</code>、<code>relu(relu(x)) → relu(x)</code>。它们全部通过 <code>Graph</code> 暴露的三个原语落地——<code>replace</code>（就地替换）、<code>alias</code>（把某个值的所有使用改指另一个值，等价于 MLIR 的 <code>replaceOp</code> / RAUW）、<code>erase</code>。<strong>pass 不直接改数据结构</strong>，这条纪律换来可审计：<code>Graph.events</code> 记录每一次改写。</p>
+<h4 id="h-4-融合pass-顺序与融合边界">4. 融合：pass 顺序与融合边界<a class="anchor" href="#h-4-融合pass-顺序与融合边界" aria-label="本节链接">#</a></h4>
+<p><code>FusePointwise</code> 把相邻 pointwise 链串成一个 <code>fused</code> 节点，命中条件两条：链上中间结果<strong>只被使用一次</strong>，且下一个节点<strong>真的消费了上一条链的结果</strong>。第二条不是多余的：本课第一版只检查了&quot;单使用者&quot;，把两条无关的链（死链 <code>z1→z2</code> 与 <code>r2</code>）融成一个节点，程序算错，是第 6 节的逐元素对拍报出 18.0 的最大绝对差才暴露的；修正后三个图全部 <code>0.0e+00</code>。这正是本课重点：<strong>pass 的正确性不能靠&quot;看起来对&quot;，只能靠对拍</strong>。</p>
+<p>顺序同样重要：<code>g3</code> 的审计日志里，孤儿链 <code>z1 → z2</code> 先被融成一个节点、下一轮又被 DCE 删掉，白干一次——所以融合应排在死代码消除之后。真实调度器还要给融合<strong>打分</strong>：TorchInductor 用 <code>can_fuse</code> 判断能否融合、<code>score_fusion</code> 决定先融哪一对，因为有些融合会挡住后面更好的融合。</p>
+<h4 id="h-5-可观测性与验证pass-的体检">5. 可观测性与验证：pass 的&quot;体检&quot;<a class="anchor" href="#h-5-可观测性与验证pass-的体检" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>每个 pass 之后跑验证器</strong>（依赖闭合、声明类型 = 推导类型、输出存在）。第 5 节的 <code>BuggyFuse</code> 把 <code>relu</code> 的结果类型写成 <code>(1,1)</code>，验证器立刻报出四条（含 <code>matmul</code> 的 K 维不匹配）并中止 pipeline。</li>
+<li><strong>类型推导规则只能有一份</strong>：<code>infer()</code> 被验证器与所有 pass 共用；pass 自己另写一套形状逻辑，第 5 节这类错误就会被&quot;两边都错得一致&quot;掩盖掉。</li>
+<li><strong>改写前后逐元素对拍</strong>：第 6 节把五类改写后的图放进同一个解释器与优化前比对，最大绝对差全是 <code>0.0e+00</code>。</li>
+</ul>
+<h4 id="h-6-常见坑">6. 常见坑<a class="anchor" href="#h-6-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>绕过改写原语直接动结构</strong>：分析缓存与 use-list 不会更新，后续 pass 读到幽灵节点。</li>
+<li><strong>返回 success 却什么都没改</strong>：驱动器会反复重试，表现为编译时间暴涨。</li>
+<li><strong>只跑单趟就宣布优化完成</strong>：本课 7 vs 5 个节点的差别就是这么来的。</li>
+<li><strong>依赖靠&quot;顺序碰巧对&quot;</strong>：没写进 <code>deps</code> 的依赖，换个人重排 pipeline 就崩。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>纯 Python + numpy，本机 <code>python3.10</code> + <code>numpy 1.26.2</code> 实跑，无需 GPU。六个小节分别对应上面六点：初始图、单趟、不动点、加融合、禁用某个 pass、写错的 pass、以及改写正确性对拍。</p>
+<pre data-lang="python"><code class="language-python"># ---- 图级 pass 基础设施：pass 管理器 + IR 验证器 + pattern 改写 + 统计（纯 Python + numpy）----
+import numpy as np
+
+F32 = np.dtype(&#39;float32&#39;)
+POINTWISE = {&#39;add&#39;, &#39;mul&#39;, &#39;relu&#39;}
+
+
+# ---------- 1. 最小图 IR：值带显式类型，改写只能走 Graph 暴露的三个原语 ----------
+class Node:
+    def __init__(self, name, op, operands=(), attrs=None, out_type=None):
+        self.name, self.op, self.operands = name, op, tuple(operands)
+        self.attrs, self.out_type = attrs or {}, out_type
+
+    def __repr__(self):
+        return (f&#39;{self.name} = {self.op}({&quot;, &quot;.join(self.operands)})&#39;
+                f&#39;{self.attrs} : {self.out_type[0]}/{self.out_type[1].name}&#39;)
+
+
+class Graph:
+    def __init__(self, inputs, nodes, outputs):
+        self.inputs = dict(inputs)                     # name -&gt; (shape, dtype)
+        self.nodes = {n.name: n for n in nodes}
+        self.outputs = list(outputs)
+        self.events = []                               # 改写审计日志
+        self.decl = {n.name: i for i, n in enumerate(nodes)}    # 声明序 → 稳定拓扑序
+
+    def producers(self):
+        p = {k: [] for k in self.inputs}
+        p.update({k: list(v.operands) for k, v in self.nodes.items()})
+        return p
+
+    def order(self):
+        p = self.producers()
+        indeg = {k: len([i for i in v if i in self.nodes]) for k, v in p.items()}
+        ready = [k for k, d in indeg.items() if d == 0]
+        out = []
+        while ready:                                   # 同层按声明序挑，输出可复现
+            ready.sort(key=lambda k: self.decl.get(k, -1))
+            k = ready.pop(0)
+            if k in self.nodes:
+                out.append(self.nodes[k])
+            for m, deps in p.items():
+                if k in deps:
+                    indeg[m] -= 1
+                    if indeg[m] == 0:
+                        ready.append(m)
+        assert len(out) == len(self.nodes), &#39;IR 有环或存在不可达节点&#39;
+        return out
+
+    def users_of(self, name):
+        return [n.name for n in self.nodes.values() if name in n.operands]
+
+    # --- 三个改写原语：就地替换、别名（≡ MLIR 的 replaceOp / RAUW）、删除 ---
+    def replace(self, name, new_node):
+        assert new_node.name == name
+        self.nodes[name] = new_node
+        self.events.append(f&#39;replace {name} → {new_node.op}&#39;)
+
+    def alias(self, name, keep):
+        for n in self.nodes.values():
+            n.operands = tuple(keep if o == name else o for o in n.operands)
+        self.outputs = [keep if o == name else o for o in self.outputs]
+        del self.nodes[name]
+        self.events.append(f&#39;alias {name} → {keep}&#39;)
+
+    def erase(self, name):
+        del self.nodes[name]
+        self.events.append(f&#39;erase {name}&#39;)
+
+    def dump(self):
+        return &#39;\n&#39;.join(&#39;    &#39; + repr(n) for n in self.order())
+
+
+def infer(op, in_types, attrs):
+    &quot;&quot;&quot;类型推导：验证器与所有 pass 共用同一份规则，杜绝&quot;pass 自己猜形状&quot;。&quot;&quot;&quot;
+    if op == &#39;const&#39;:                                  # 常量节点没有输入
+        return tuple(attrs[&#39;shape&#39;]), attrs[&#39;dtype&#39;]
+    if op == &#39;fused&#39;:                                  # 融合节点的类型由调度器写好
+        return tuple(attrs[&#39;out_shape&#39;]), attrs[&#39;dtype&#39;]
+    shapes = [t[0] for t in in_types]
+    dt = in_types[0][1]
+    if op in (&#39;add&#39;, &#39;mul&#39;):
+        out = []
+        for dims in zip(*[s[::-1] for s in shapes]):
+            sizes = {d for d in dims if d != 1}
+            assert len(sizes) &lt;= 1, f&#39;{op}: 无法广播 {shapes}&#39;
+            out.append(sizes.pop() if sizes else 1)
+        return tuple(out[::-1]), dt
+    if op == &#39;relu&#39;:
+        return shapes[0], dt
+    if op == &#39;matmul&#39;:
+        (m, k), (k2, n) = shapes
+        assert k == k2, f&#39;matmul: K 维不匹配 {k} != {k2}&#39;
+        return (m, n), dt
+    raise AssertionError(f&#39;未知算子 {op}&#39;)
+
+
+def verify(graph):
+    &quot;&quot;&quot;IR 验证器：依赖闭合 + 声明类型 = 推导类型 + 输出存在。每个 pass 之后都跑。&quot;&quot;&quot;
+    problems, known = [], dict(graph.inputs)
+    for n in graph.order():
+        missing = [o for o in n.operands if o not in known]
+        if missing:
+            problems.append(f&#39;{n.name}: 使用了未定义的值 {&quot;, &quot;.join(missing)}&#39;)
+            known[n.name] = n.out_type
+            continue
+        try:
+            want = infer(n.op, [known[o] for o in n.operands], n.attrs)
+        except AssertionError as e:
+            problems.append(f&#39;{n.name}: 类型推导失败（{e}）&#39;)
+            known[n.name] = n.out_type
+            continue
+        if n.out_type != want:
+            problems.append(f&#39;{n.name}: 声明 {n.out_type} ≠ 推导 {want}&#39;)
+        known[n.name] = n.out_type
+    for out in graph.outputs:
+        if out not in known:
+            problems.append(f&#39;输出 {out} 不存在&#39;)
+    return problems
+
+
+# ---------- 2. pass 基础设施：Pass / PassContext / PassManager ----------
+class Pass:
+    name, opt_level, deps = &#39;pass&#39;, 0, ()
+
+    def run(self, graph, ctx):
+        raise NotImplementedError
+
+
+class PassContext:
+    &quot;&quot;&quot;opt_level 门槛 + 黑白名单 + instrumentation，对应 TVM PassContext / MLIR pass options。&quot;&quot;&quot;
+
+    def __init__(self, opt_level=2, disabled=(), instruments=()):
+        self.opt_level, self.disabled = opt_level, set(disabled)
+        self.instruments, self.stats = list(instruments), {}
+
+    def enabled(self, p):
+        return p.name not in self.disabled and p.opt_level &lt;= self.opt_level
+
+    def report(self):
+        print(f&quot;    {&#39;pass&#39;:&lt;18}{&#39;调用&#39;:&gt;4}{&#39;改写次数&#39;:&gt;9}{&#39;IR 节点&#39;:&gt;9}&quot;)
+        for k, v in self.stats.items():
+            print(f&quot;    {k:&lt;18}{v[&#39;调用&#39;]:&gt;4}{v[&#39;改写&#39;]:&gt;9}{v[&#39;节点数&#39;]:&gt;9}&quot;)
+
+
+class PassManager:
+    def __init__(self, ctx):
+        self.ctx, self.passes = ctx, []
+
+    def add(self, p):
+        missing = set(p.deps) - {x.name for x in self.passes}
+        assert not missing, f&#39;{p.name} 依赖未加入：{missing}&#39;
+        self.passes.append(p)
+        return self
+
+    def run(self, graph, max_rounds=1):
+        for round_ in range(1, max_rounds + 1):
+            changed_any = False
+            for p in self.passes:
+                if not self.ctx.enabled(p):
+                    print(f&#39;    [跳过] {p.name}（PassContext 禁用）&#39;)
+                    continue
+                for hook in self.ctx.instruments:
+                    hook(&#39;before&#39;, p, graph)
+                p.rewrites = 0
+                changed = p.run(graph, self.ctx)
+                problems = verify(graph)
+                if problems:                            # ≡ MLIR verify 失败 / signalPassFailure
+                    print(f&#39;    [失败] {p.name} 之后 IR 非法，pipeline 中止：&#39;)
+                    for x in problems:
+                        print(f&#39;           - {x}&#39;)
+                    return None
+                st = self.ctx.stats.setdefault(p.name, {&#39;调用&#39;: 0, &#39;改写&#39;: 0, &#39;节点数&#39;: 0})
+                st[&#39;调用&#39;] += 1
+                st[&#39;改写&#39;] += p.rewrites
+                st[&#39;节点数&#39;] = len(graph.nodes)
+                changed_any |= changed
+                for hook in self.ctx.instruments:
+                    hook(&#39;after&#39;, p, graph)
+            if not changed_any:
+                return {&#39;rounds&#39;: round_, &#39;converged&#39;: True}
+        return {&#39;rounds&#39;: max_rounds, &#39;converged&#39;: False}
+
+
+# ---------- 3. 五个 pass ----------
+class ConstFold(Pass):
+    &quot;&quot;&quot;常量折叠：所有输入都是常量 → 就地换成常量节点。&quot;&quot;&quot;
+    name, opt_level, deps = &#39;ConstFold&#39;, 0, ()
+
+    def run(self, g, ctx):
+        changed = False
+        for n in list(g.order()):
+            if not n.operands or not all(o in g.nodes and g.nodes[o].op == &#39;const&#39;
+                                         for o in n.operands):
+                continue
+            vals = [np.full(g.nodes[o].attrs[&#39;shape&#39;], g.nodes[o].attrs[&#39;value&#39;],
+                            dtype=g.nodes[o].attrs[&#39;dtype&#39;]) for o in n.operands]
+            if n.op == &#39;add&#39;:
+                v = vals[0] + vals[1]
+            elif n.op == &#39;mul&#39;:
+                v = vals[0] * vals[1]
+            elif n.op == &#39;relu&#39;:
+                v = np.maximum(vals[0], 0)
+            else:
+                continue
+            g.replace(n.name, Node(n.name, &#39;const&#39;, (),
+                                   {&#39;value&#39;: float(v.reshape(-1)[0]), &#39;shape&#39;: v.shape,
+                                    &#39;dtype&#39;: v.dtype}, n.out_type))
+            self.rewrites += 1
+            changed = True
+        return changed
+
+
+class AlgebraicSimplify(Pass):
+    &quot;&quot;&quot;代数恒等式：x+0 → x、x·1 → x、relu(relu(x)) → relu(x)。&quot;&quot;&quot;
+    name, opt_level, deps = &#39;AlgebraicSimplify&#39;, 0, (&#39;ConstFold&#39;,)
+
+    def run(self, g, ctx):
+        changed = False
+        for n in list(g.order()):
+            if n.name not in g.nodes:
+                continue
+            if any(o not in g.nodes and o not in g.inputs for o in n.operands):
+                continue                                   # 悬挂引用：不由本 pass 负责
+            consts = [o for o in n.operands if o in g.nodes and g.nodes[o].op == &#39;const&#39;]
+            if n.op == &#39;add&#39; and any(g.nodes[c].attrs[&#39;value&#39;] == 0 for c in consts):
+                zero = [c for c in consts if g.nodes[c].attrs[&#39;value&#39;] == 0][0]
+                keep = [o for o in n.operands if o != zero]
+                if len(keep) == 1:
+                    g.alias(n.name, keep[0])
+                    self.rewrites += 1
+                    changed = True
+            elif n.op == &#39;mul&#39; and any(g.nodes[c].attrs[&#39;value&#39;] == 1 for c in consts):
+                one = [c for c in consts if g.nodes[c].attrs[&#39;value&#39;] == 1][0]
+                keep = [o for o in n.operands if o != one]
+                if len(keep) == 1:
+                    g.alias(n.name, keep[0])
+                    self.rewrites += 1
+                    changed = True
+            elif (n.op == &#39;relu&#39; and len(n.operands) == 1
+                  and n.operands[0] in g.nodes and g.nodes[n.operands[0]].op == &#39;relu&#39;):
+                inner = g.nodes[n.operands[0]]
+                g.replace(n.name, Node(n.name, &#39;relu&#39;, (inner.operands[0],), {}, n.out_type))
+                self.rewrites += 1
+                changed = True
+        return changed
+
+
+class DeadCodeElim(Pass):
+    &quot;&quot;&quot;朴素实现：前向扫一遍。缺点很真实 —— 一次删不干净，必须迭代到不动点。&quot;&quot;&quot;
+    name, opt_level, deps = &#39;DeadCodeElim&#39;, 0, ()
+
+    def run(self, g, ctx):
+        changed = False
+        for n in g.order():                                # 前向：生产者先于使用者被访问
+            if n.name in g.outputs or g.users_of(n.name):
+                continue
+            g.erase(n.name)
+            self.rewrites += 1
+            changed = True
+        return changed
+
+
+class FusePointwise(Pass):
+    &quot;&quot;&quot;融合：把&quot;结果只被用一次&quot;的相邻 pointwise 串成一个 fused 节点（省中间 buffer）。&quot;&quot;&quot;
+    name, opt_level, deps = &#39;FusePointwise&#39;, 1, (&#39;AlgebraicSimplify&#39;,)
+
+    def run(self, g, ctx):
+        chains, cur = [], []
+        for n in list(g.order()):
+            external = all(o in g.inputs or g.nodes[o].op not in POINTWISE
+                           for o in n.operands if o not in cur)
+            ok = (n.op in POINTWISE
+                  and all(o in g.nodes or o in g.inputs for o in n.operands)
+                  and all(len(g.users_of(m)) &lt;= 1 for m in cur) and external)
+            if ok and cur and cur[-1] in n.operands:       # 必须真的消费上一条链的结果
+                cur.append(n.name)
+                continue
+            if len(cur) &gt; 1:
+                chains.append(cur)
+            cur = [n.name] if ok else []
+        if len(cur) &gt; 1:
+            chains.append(cur)
+        for chain in chains:
+            last = g.nodes[chain[-1]]
+            outer, ops = [], []
+            for name in chain:                             # 外部输入按消费顺序排在操作数表里
+                for o in g.nodes[name].operands:
+                    if o not in chain:
+                        outer.append(o)
+                ops.append([g.nodes[name].op, len(g.nodes[name].operands)])
+            for name in chain[:-1]:
+                g.erase(name)
+                self.rewrites += 1
+            g.replace(last.name, Node(last.name, &#39;fused&#39;, outer,
+                                      {&#39;ops&#39;: ops, &#39;out_shape&#39;: last.out_type[0],
+                                       &#39;dtype&#39;: last.out_type[1]}, last.out_type))
+            self.rewrites += 1
+        return bool(chains)
+
+
+class BuggyFuse(Pass):
+    &quot;&quot;&quot;故意写错的 pass：改写后把结果类型写成 (1,1) —— 验证器必须拒收。&quot;&quot;&quot;
+    name, opt_level, deps = &#39;BuggyFuse&#39;, 0, ()
+
+    def run(self, g, ctx):
+        for n in list(g.order()):
+            if n.op == &#39;relu&#39;:
+                g.replace(n.name, Node(n.name, &#39;relu&#39;, n.operands, {},
+                                       ((1, 1), g.inputs[&#39;%x&#39;][1])))
+                self.rewrites += 1
+        return True
+
+
+# ---------- 4. 一段能同时命中五条规则的图 ----------
+def build():
+    def c(name, value):
+        return Node(name, &#39;const&#39;, (), {&#39;value&#39;: value, &#39;shape&#39;: (2, 2), &#39;dtype&#39;: F32},
+                    ((2, 2), F32))
+    nodes = [
+        c(&#39;c0&#39;, 0.0), c(&#39;c1&#39;, 1.0),
+        Node(&#39;cadd&#39;, &#39;add&#39;, (&#39;c0&#39;, &#39;c1&#39;), {}, ((2, 2), F32)),        # 全常量 → 折叠成 1.0
+        Node(&#39;dd&#39;, &#39;mul&#39;, (&#39;cadd&#39;, &#39;%b&#39;), {}, ((2, 2), F32)),        # 折叠后 ·1 → 别名 %b
+        Node(&#39;z1&#39;, &#39;mul&#39;, (&#39;%x&#39;, &#39;%b&#39;), {}, ((2, 2), F32)),          # 死链头：含输入，折叠不了
+        Node(&#39;z2&#39;, &#39;relu&#39;, (&#39;z1&#39;,), {}, ((2, 2), F32)),
+        Node(&#39;z3&#39;, &#39;mul&#39;, (&#39;z2&#39;, &#39;%b&#39;), {}, ((2, 2), F32)),          # 死链尾
+        Node(&#39;sum&#39;, &#39;add&#39;, (&#39;%x&#39;, &#39;c0&#39;), {}, ((2, 2), F32)),         # x + 0 → x
+        Node(&#39;sq&#39;, &#39;mul&#39;, (&#39;sum&#39;, &#39;c1&#39;), {}, ((2, 2), F32)),         # · 1 → sum
+        Node(&#39;r1&#39;, &#39;relu&#39;, (&#39;sq&#39;,), {}, ((2, 2), F32)),
+        Node(&#39;r2&#39;, &#39;relu&#39;, (&#39;r1&#39;,), {}, ((2, 2), F32)),              # relu∘relu → relu
+        Node(&#39;mm&#39;, &#39;matmul&#39;, (&#39;r2&#39;, &#39;%w&#39;), {}, ((2, 2), F32)),       # 融合边界（要物化）
+        Node(&#39;a1&#39;, &#39;relu&#39;, (&#39;mm&#39;,), {}, ((2, 2), F32)),
+        Node(&#39;a2&#39;, &#39;mul&#39;, (&#39;a1&#39;, &#39;%b&#39;), {}, ((2, 2), F32)),
+        Node(&#39;out&#39;, &#39;add&#39;, (&#39;a2&#39;, &#39;%b&#39;), {}, ((2, 2), F32)),         # 链：relu→mul→add
+    ]
+    return Graph({&#39;%x&#39;: ((2, 2), F32), &#39;%w&#39;: ((2, 2), F32), &#39;%b&#39;: ((2, 2), F32)},
+                 nodes, [&#39;out&#39;])
+
+
+base = build()
+print(f&#39;=== 0. 优化前：{len(base.nodes)} 个节点 ===&#39;)
+print(base.dump())
+
+print(&#39;\n=== 1. 单趟 pipeline（每 pass 只跑一遍，不查收敛）===&#39;)
+g = build()
+ctx = PassContext(opt_level=2, instruments=[
+    lambda when, p, gr: print(f&#39;    -&gt; {when} {p.name}（{len(gr.nodes)} 节点）&#39;)])
+pm = PassManager(ctx).add(ConstFold()).add(AlgebraicSimplify()).add(DeadCodeElim())
+r = pm.run(g, max_rounds=1)
+print(f&quot;  单趟结束：{r[&#39;rounds&#39;]} 轮，收敛={r[&#39;converged&#39;]}；剩下 {len(g.nodes)} 个节点&quot;
+      &#39;（前向 DCE 留下了孤儿）&#39;)
+print(g.dump())
+ctx.report()
+
+print(&#39;\n=== 2. 跑到不动点（max_rounds=4）===&#39;)
+g2 = build()
+ctx2 = PassContext(opt_level=2)
+pm2 = PassManager(ctx2).add(ConstFold()).add(AlgebraicSimplify()).add(DeadCodeElim())
+r2 = pm2.run(g2, max_rounds=4)
+print(f&quot;  返回：{r2[&#39;rounds&#39;]} 轮，收敛={r2[&#39;converged&#39;]}；剩下 {len(g2.nodes)} 个节点&quot;)
+print(g2.dump())
+print(&#39;  审计日志：&#39; + &#39; | &#39;.join(g2.events))
+ctx2.report()
+
+print(&#39;\n=== 3. 再加融合 pass（opt_level=1，声明依赖 AlgebraicSimplify）===&#39;)
+g3 = build()
+ctx3 = PassContext(opt_level=2)
+pm3 = (PassManager(ctx3).add(ConstFold()).add(AlgebraicSimplify())
+       .add(DeadCodeElim()).add(FusePointwise()))
+r3 = pm3.run(g3, max_rounds=4)
+print(f&quot;  返回：{r3[&#39;rounds&#39;]} 轮，收敛={r3[&#39;converged&#39;]}；剩下 {len(g3.nodes)} 个节点&quot;)
+print(g3.dump())
+print(&#39;  事件：&#39; + &#39; | &#39;.join(g3.events))
+
+print(&#39;\n=== 4. 同一份图、关掉 DCE（PassContext 名单的实际作用）===&#39;)
+g4 = build()
+ctx4 = PassContext(opt_level=2, disabled=(&#39;DeadCodeElim&#39;,))
+pm4 = PassManager(ctx4).add(ConstFold()).add(AlgebraicSimplify()).add(DeadCodeElim())
+pm4.run(g4, max_rounds=4)
+print(f&#39;  禁用后剩下 {len(g4.nodes)} 个节点（死节点仍在图里）&#39;)
+
+print(&#39;\n=== 5. 写错的 pass 会被验证器挡下 ===&#39;)
+g5 = build()
+pm5 = PassManager(PassContext()).add(BuggyFuse())
+print(f&#39;  pipeline 返回：{pm5.run(g5, max_rounds=1)}&#39;)
+
+print(&#39;\n=== 6. 改写正确性对拍：优化前后逐元素一致 ===&#39;)
+
+
+def numpy_exec(graph, feeds):
+    env = dict(feeds)
+    for n in graph.order():
+        if n.op == &#39;const&#39;:
+            env[n.name] = np.full(n.attrs[&#39;shape&#39;], n.attrs[&#39;value&#39;], dtype=n.attrs[&#39;dtype&#39;])
+            continue
+        a = [env[o] for o in n.operands]
+        if n.op == &#39;add&#39;:
+            v = a[0] + a[1]
+        elif n.op == &#39;mul&#39;:
+            v = a[0] * a[1]
+        elif n.op == &#39;relu&#39;:
+            v = np.maximum(a[0], np.float32(0))
+        elif n.op == &#39;matmul&#39;:
+            v = a[0] @ a[1]
+        elif n.op == &#39;fused&#39;:
+            v, idx = None, 0                            # ops[k] 的 [算子, 元数]，元数从操作数表取
+            for k, (op, arity) in enumerate(n.attrs[&#39;ops&#39;]):
+                args = a[idx:idx + arity] if k == 0 else [v] + a[idx:idx + arity - 1]
+                idx += arity if k == 0 else arity - 1
+                v = (args[0] + args[1] if op == &#39;add&#39; else
+                     args[0] * args[1] if op == &#39;mul&#39; else np.maximum(args[0], np.float32(0)))
+        else:
+            raise ValueError(n.op)
+        env[n.name] = v
+    return env
+
+
+rng = np.random.default_rng(0)
+x = rng.integers(-5, 5, (2, 2)).astype(np.float32)
+w = rng.integers(-3, 3, (2, 2)).astype(np.float32)
+b = rng.integers(-2, 2, (2, 2)).astype(np.float32)
+feeds = {&#39;%x&#39;: x, &#39;%w&#39;: w, &#39;%b&#39;: b}
+y0 = numpy_exec(base, feeds)[&#39;out&#39;]
+for tag, graph in ((&#39;单趟&#39;, g), (&#39;不动点&#39;, g2), (&#39;融合后&#39;, g3)):
+    y1 = numpy_exec(graph, feeds)[graph.outputs[0]]
+    print(f&#39;  {tag:&lt;6} 输出值={graph.outputs[0]:&lt;5} 最大绝对差={np.abs(y0 - y1).max():.1e}&#39;)
+print(&#39;  常量折叠 / x+0 / ·1 / relu 幂等 / 融合 五个改写都没有改变数值语义&#39;)</code></pre>
+<p>运行结果：</p>
+<pre data-lang="text"><code class="language-text">=== 0. 优化前：15 个节点 ===
+    c0 = const(){&#39;value&#39;: 0.0, &#39;shape&#39;: (2, 2), &#39;dtype&#39;: dtype(&#39;float32&#39;)} : (2, 2)/float32
+    c1 = const(){&#39;value&#39;: 1.0, &#39;shape&#39;: (2, 2), &#39;dtype&#39;: dtype(&#39;float32&#39;)} : (2, 2)/float32
+    cadd = add(c0, c1){} : (2, 2)/float32
+    dd = mul(cadd, %b){} : (2, 2)/float32
+    z1 = mul(%x, %b){} : (2, 2)/float32
+    z2 = relu(z1){} : (2, 2)/float32
+    z3 = mul(z2, %b){} : (2, 2)/float32
+    sum = add(%x, c0){} : (2, 2)/float32
+    sq = mul(sum, c1){} : (2, 2)/float32
+    r1 = relu(sq){} : (2, 2)/float32
+    r2 = relu(r1){} : (2, 2)/float32
+    mm = matmul(r2, %w){} : (2, 2)/float32
+    a1 = relu(mm){} : (2, 2)/float32
+    a2 = mul(a1, %b){} : (2, 2)/float32
+    out = add(a2, %b){} : (2, 2)/float32
+
+=== 1. 单趟 pipeline（每 pass 只跑一遍，不查收敛）===
+    -&gt; before ConstFold（15 节点）
+    -&gt; after ConstFold（15 节点）
+    -&gt; before AlgebraicSimplify（15 节点）
+    -&gt; after AlgebraicSimplify（12 节点）
+    -&gt; before DeadCodeElim（12 节点）
+    -&gt; after DeadCodeElim（7 节点）
+  单趟结束：1 轮，收敛=False；剩下 7 个节点（前向 DCE 留下了孤儿）
+    z1 = mul(%x, %b){} : (2, 2)/float32
+    z2 = relu(z1){} : (2, 2)/float32
+    r2 = relu(%x){} : (2, 2)/float32
+    mm = matmul(r2, %w){} : (2, 2)/float32
+    a1 = relu(mm){} : (2, 2)/float32
+    a2 = mul(a1, %b){} : (2, 2)/float32
+    out = add(a2, %b){} : (2, 2)/float32
+    pass                调用     改写次数    IR 节点
+    ConstFold            1        1       15
+    AlgebraicSimplify    1        4       12
+    DeadCodeElim         1        5        7
+
+=== 2. 跑到不动点（max_rounds=4）===
+  返回：4 轮，收敛=True；剩下 5 个节点
+    r2 = relu(%x){} : (2, 2)/float32
+    mm = matmul(r2, %w){} : (2, 2)/float32
+    a1 = relu(mm){} : (2, 2)/float32
+    a2 = mul(a1, %b){} : (2, 2)/float32
+    out = add(a2, %b){} : (2, 2)/float32
+  审计日志：replace cadd → const | alias dd → %b | alias sum → %x | alias sq → %x | replace r2 → relu | erase c0 | erase c1 | erase cadd | erase z3 | erase r1 | erase z2 | erase z1
+    pass                调用     改写次数    IR 节点
+    ConstFold            4        1        5
+    AlgebraicSimplify    4        4        5
+    DeadCodeElim         4        7        5
+
+=== 3. 再加融合 pass（opt_level=1，声明依赖 AlgebraicSimplify）===
+  返回：3 轮，收敛=True；剩下 3 个节点
+    r2 = relu(%x){} : (2, 2)/float32
+    mm = matmul(r2, %w){} : (2, 2)/float32
+    out = fused(mm, %b, %b){&#39;ops&#39;: [[&#39;relu&#39;, 1], [&#39;mul&#39;, 2], [&#39;add&#39;, 2]], &#39;out_shape&#39;: (2, 2), &#39;dtype&#39;: dtype(&#39;float32&#39;)} : (2, 2)/float32
+  事件：replace cadd → const | alias dd → %b | alias sum → %x | alias sq → %x | replace r2 → relu | erase c0 | erase c1 | erase cadd | erase z3 | erase r1 | erase z1 | replace z2 → fused | erase a1 | erase a2 | replace out → fused | erase z2
+
+=== 4. 同一份图、关掉 DCE（PassContext 名单的实际作用）===
+    [跳过] DeadCodeElim（PassContext 禁用）
+    [跳过] DeadCodeElim（PassContext 禁用）
+  禁用后剩下 12 个节点（死节点仍在图里）
+
+=== 5. 写错的 pass 会被验证器挡下 ===
+    [失败] BuggyFuse 之后 IR 非法，pipeline 中止：
+           - z2: 声明 ((1, 1), dtype(&#39;float32&#39;)) ≠ 推导 ((2, 2), dtype(&#39;float32&#39;))
+           - r1: 声明 ((1, 1), dtype(&#39;float32&#39;)) ≠ 推导 ((2, 2), dtype(&#39;float32&#39;))
+           - mm: 类型推导失败（matmul: K 维不匹配 1 != 2）
+           - a1: 声明 ((1, 1), dtype(&#39;float32&#39;)) ≠ 推导 ((2, 2), dtype(&#39;float32&#39;))
+  pipeline 返回：None
+
+=== 6. 改写正确性对拍：优化前后逐元素一致 ===
+  单趟     输出值=out   最大绝对差=0.0e+00
+  不动点    输出值=out   最大绝对差=0.0e+00
+  融合后    输出值=out   最大绝对差=0.0e+00
+  常量折叠 / x+0 / ·1 / relu 幂等 / 融合 五个改写都没有改变数值语义</code></pre>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选，需自备或云上按需：在真实编译器里看 pass 基础设施 ----
+# MLIR：跑注册好的 pipeline，并打印每个 pass 的统计
+#   mlir-opt prog.mlir -pass-pipeline=&#39;builtin.module(func.func(canonicalize,cse))&#39; -mlir-pass-statistics
+# TorchInductor：打印 indutor 生成的内核源码，看融合后的真实产物
+#   TORCH_LOGS=output_code python -c &quot;import torch; torch.compile(lambda x: torch.relu(x+1))(torch.randn(8))&quot;
+#   （日志开关名以 TorchInductor / torch.compile 文档为准）
+# TVM：用 PassContext 的 with 语法设置 opt_level 与 disabled_pass（见 TVM Pass Infrastructure 文档）
+# 三个工具都没有也不影响本课：第 1~6 节的全部结论都来自上面的纯 Python 实现。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：把 <code>AlgebraicSimplify</code> 的两条恒等式改成用 <code>matchAndRewrite</code> 风格的一对 <code>(匹配函数, 改写函数)</code> 注册表，并给每条 pattern 加一个 <code>benefit</code> 值；当 <code>x + 0</code> 与 <code>relu(relu(x))</code> 同时可命中时，按 benefit 决定先做哪条，验证结果与顺序无关。</li>
+<li><strong>解释</strong>：为什么 <code>DeadCodeElim</code> 写成前向扫要 4 轮才收敛，而逆序扫能一轮清完？如果只在&quot;最后&quot;跑一次 DCE（而不是每轮都跑），代码里的哪个数字会变化？</li>
+<li><strong>对比/验证</strong>：把 <code>FusePointwise</code> 的命中条件退回第一版（只检查&quot;中间结果单使用者&quot;），重跑第 6 节的对拍，记录最大绝对差；再解释为什么这个 bug 在只打印 IR 时看不出来。</li>
+<li><strong>思考</strong>：本课验证器检查的是&quot;本地类型自洽&quot;。如果要检查&quot;改写保持语义&quot;，你会加什么机制（提示：差分测试、随机输入、不变量断言）？下一章讲的&quot;翻译验证&quot;想解决的就是这个问题，两者的成本差在哪？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>MLIR, <em>Pass Infrastructure</em>（OperationPass 的硬约束、<code>signalPassFailure</code>、pass statistics 与 instrumentation）：<a href="https://mlir.llvm.org/docs/PassManagement/" target="_blank" rel="noopener noreferrer">https://mlir.llvm.org/docs/PassManagement/</a></li>
+<li>MLIR, <em>Pattern Rewriting : Generic DAG-to-DAG Rewriting</em>（<code>RewritePattern</code> / <code>matchAndRewrite</code> / <code>PatternRewriter</code>、greedy 驱动器的收敛与递归边界）：<a href="https://mlir.llvm.org/docs/PatternRewriter/" target="_blank" rel="noopener noreferrer">https://mlir.llvm.org/docs/PatternRewriter/</a></li>
+<li>Apache TVM, <em>Pass Infrastructure</em>（<code>PassInfo</code> 的 name/opt_level/required、<code>PassContext</code> 的门槛与黑白名单、<code>SequentialPass</code>、<code>PassInstrument</code>）：<a href="https://tvm.apache.org/docs/arch/pass_infra.html" target="_blank" rel="noopener noreferrer">https://tvm.apache.org/docs/arch/pass_infra.html</a></li>
+<li>PyTorch dev-discuss, <em>TorchInductor: a PyTorch-native Compiler with Define-by-Run IR and Symbolic Shapes</em>（调度器的 <code>can_fuse</code> / <code>score_fusion</code> 与&quot;融合顺序会互相挡住&quot;的工程现实）：<a href="https://dev-discuss.pytorch.org/t/torchinductor-a-pytorch-native-compiler-with-define-by-run-ir-and-symbolic-shapes/747" target="_blank" rel="noopener noreferrer">https://dev-discuss.pytorch.org/t/torchinductor-a-pytorch-native-compiler-with-define-by-run-ir-and-symbolic-shapes/747</a></li>
+</ul>
+<p><a href="#/l/mlc-ch4-l1">下一章：常量折叠、代数化简与算子消除</a></p>

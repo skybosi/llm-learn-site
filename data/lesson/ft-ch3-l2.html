@@ -1,0 +1,166 @@
+<h2 id="h-lora-实现">LoRA 实现<a class="anchor" href="#h-lora-实现" aria-label="本节链接">#</a></h2>
+<p>上一课讲清了 LoRA 的数学原理，这一课用 Hugging Face <strong>PEFT</strong> 库把它落到工程上：怎么配置、往哪些层挂 LoRA、怎么训练、怎么保存与合并。学完本课，你就能把 LoRA 微调完整跑起来。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-peft-库与-loraconfig">1. PEFT 库与 LoraConfig<a class="anchor" href="#h-1-peft-库与-loraconfig" aria-label="本节链接">#</a></h4>
+<p>PEFT（Parameter-Efficient Fine-Tuning）是 Hugging Face 推出的参数高效微调统一库。用 LoRA 只需两步：先定义一个 <code>LoraConfig</code>，再用 <code>get_peft_model(model, config)</code> 把普通模型包装成带 LoRA 的模型。</p>
+<p><code>LoraConfig</code> 的关键参数：</p>
+<table>
+<thead>
+<tr>
+<th>参数</th>
+<th>含义</th>
+<th>常见取值</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>r</code></td>
+<td>低秩维度</td>
+<td>4 / 8 / 16</td>
+</tr>
+<tr>
+<td><code>lora_alpha</code></td>
+<td>缩放系数 α</td>
+<td>通常取 r 的 1~2 倍（如 16）</td>
+</tr>
+<tr>
+<td><code>lora_dropout</code></td>
+<td>低秩支路的 dropout 率</td>
+<td>0.05</td>
+</tr>
+<tr>
+<td><code>target_modules</code></td>
+<td>挂 LoRA 的模块名列表</td>
+<td><code>[&quot;q_proj&quot;, &quot;v_proj&quot;]</code> 等</td>
+</tr>
+<tr>
+<td><code>bias</code></td>
+<td>是否训练偏置</td>
+<td><code>&quot;none&quot;</code>（默认不训）</td>
+</tr>
+<tr>
+<td><code>task_type</code></td>
+<td>任务类型</td>
+<td><code>&quot;CAUSAL_LM&quot;</code>（因果语言模型）</td>
+</tr>
+</tbody></table>
+<h4 id="h-2-target_modules往哪里挂">2. target_modules：往哪里挂<a class="anchor" href="#h-2-target_modules往哪里挂" aria-label="本节链接">#</a></h4>
+<p>LoRA 不是挂在所有参数上，而是选择性地挂在<strong>注意力层的投影矩阵</strong>上。最常见的做法是挂 <code>q_proj</code> 和 <code>v_proj</code>（查询、值投影），有时再加 <code>k_proj</code>、<code>o_proj</code>，或 FFN 的 <code>up_proj</code>、<code>down_proj</code>。挂得越多，可训练参数越多、表达力越强，但成本也越高。</p>
+<p>不同模型的模块命名不同（LLaMA 系叫 <code>q_proj</code>，GPT-2 系叫 <code>c_attn</code>），可以先用 <code>model.named_modules()</code> 查看实际名字，或直接用 <code>target_modules=&quot;all-linear&quot;</code> 让库自动匹配所有线性层。</p>
+<h4 id="h-3-训练流程">3. 训练流程<a class="anchor" href="#h-3-训练流程" aria-label="本节链接">#</a></h4>
+<p>包装成 PEFT 模型后，训练流程和第 2 章完全一样：<code>Trainer</code> 只更新 <code>requires_grad=True</code> 的参数（也就是 A、B），原权重冻结。训练中可以用 <code>model.print_trainable_parameters()</code> 实时查看可训练参数量。</p>
+<h4 id="h-4-保存与合并merge">4. 保存与合并（merge）<a class="anchor" href="#h-4-保存与合并merge" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>保存适配器</strong>：训练完用 <code>model.save_pretrained(...)</code> 只保存 LoRA 权重（A、B），通常只有几 MB。</li>
+<li><strong>推理两种方式</strong>：<ul>
+<li><strong>加载适配器</strong>：<code>PeftModel.from_pretrained(base_model, adapter_path)</code>，推理时原权重 + 低秩旁路分开算，可动态切换不同任务的适配器。</li>
+<li><strong>合并进基座</strong>：<code>model.merge_and_unload()</code> 把 BA 直接加进 W0，得到一份和原模型同结构的完整权重，推理零额外延迟、可正常量化/导出。</li>
+</ul>
+</li>
+</ul>
+<h4 id="h-5-常见坑">5. 常见坑<a class="anchor" href="#h-5-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>pad_token 未设置</strong>：LoRA + 因果模型训练时常因 pad_token 报错，记得 <code>tokenizer.pad_token = tokenizer.eos_token</code>。</li>
+<li><strong>精度不匹配</strong>：混合精度训练时，低秩矩阵的计算精度要和模型一致，PEFT 会自动处理，但要留意 bf16/fp16 可用性。</li>
+<li><strong>target_modules 名字写错</strong>：拼错会导致一个 LoRA 都没挂上，训练&quot;看似在跑却毫无效果&quot;。务必先打印模块名核对。</li>
+<li><strong><code>merge_and_unload</code> 后忘了量化</strong>：如果要在合并后做量化，注意顺序——一般先合并再量化，或用 QLoRA（下一课讲）。</li>
+</ul>
+<p><figure><img class="md-img" src="content/courses/llm-fine-tuning/assets/chapter-3-figure-04.svg" alt="LoRA 适配器的保存与合并两种用法" loading="lazy" decoding="async"><figcaption>LoRA 适配器的保存与合并两种用法</figcaption></figure>
+</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面完整走一遍&quot;配置 → 包装 → 查看可训练参数 → 训练 → 保存&quot;。</p>
+<pre data-lang="python"><code class="language-python"># 安装：pip install peft transformers datasets accelerate
+from transformers import AutoTokenizer, AutoModelForCausalLM, Trainer, TrainingArguments
+from peft import LoraConfig, get_peft_model
+from datasets import Dataset
+
+model_name = &quot;Qwen/Qwen2.5-0.5B&quot;
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+
+# 1) 加载基座模型
+model = AutoModelForCausalLM.from_pretrained(model_name)
+
+# 2) 配置 LoRA：只挂注意力层的 q_proj / v_proj
+lora_config = LoraConfig(
+    r=8,                              # 低秩维度
+    lora_alpha=16,                    # 缩放系数
+    target_modules=[&quot;q_proj&quot;, &quot;v_proj&quot;],  # 往哪里挂 LoRA
+    lora_dropout=0.05,                # 低秩支路 dropout
+    bias=&quot;none&quot;,                      # 不训练偏置
+    task_type=&quot;CAUSAL_LM&quot;,            # 因果语言模型
+)
+
+# 3) 包装成 PEFT 模型，原权重冻结，只训练 A、B
+model = get_peft_model(model, lora_config)
+model.print_trainable_parameters()    # 打印&quot;可训练/总&quot;参数量
+
+# 4) 准备玩具数据（与第 2 章相同的 SFT 格式）
+raw = [
+    {&quot;instruction&quot;: &quot;把下面的句子翻译成英文&quot;, &quot;input&quot;: &quot;今天天气很好。&quot;, &quot;output&quot;: &quot;The weather is nice today.&quot;},
+    {&quot;instruction&quot;: &quot;把下面的句子翻译成英文&quot;, &quot;input&quot;: &quot;我喜欢学习编程。&quot;, &quot;output&quot;: &quot;I like learning to program.&quot;},
+]
+
+def tokenize_fn(example):
+    messages = [
+        {&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: example[&quot;instruction&quot;] + &quot;\n&quot; + example[&quot;input&quot;]},
+        {&quot;role&quot;: &quot;assistant&quot;, &quot;content&quot;: example[&quot;output&quot;]},
+    ]
+    prompt = tokenizer.apply_chat_template(messages[:-1], tokenize=False, add_generation_prompt=True)
+    full = tokenizer.apply_chat_template(messages, tokenize=False)
+    p_ids = tokenizer(prompt, add_special_tokens=False)[&quot;input_ids&quot;]
+    f_ids = tokenizer(full, add_special_tokens=False)[&quot;input_ids&quot;]
+    return {&quot;input_ids&quot;: f_ids, &quot;labels&quot;: [-100]*len(p_ids) + f_ids[len(p_ids):]}
+
+dataset = Dataset.from_list(raw).map(tokenize_fn)
+
+# 5) 训练（LoRA 通常能用更大的学习率，因为只训少量参数）
+training_args = TrainingArguments(
+    output_dir=&quot;./lora-output&quot;,
+    per_device_train_batch_size=1,
+    gradient_accumulation_steps=4,
+    learning_rate=2e-4,               # 比全参数微调大一个量级
+    num_train_epochs=3,
+    warmup_ratio=0.03,
+    lr_scheduler_type=&quot;cosine&quot;,
+    bf16=True,
+    logging_steps=1,
+    report_to=&quot;none&quot;,
+)
+
+trainer = Trainer(model=model, args=training_args, train_dataset=dataset, tokenizer=tokenizer)
+trainer.train()
+
+# 6) 保存适配器（只有几 MB）
+model.save_pretrained(&quot;./lora-adapter&quot;)
+print(&quot;\nLoRA 适配器已保存到 ./lora-adapter&quot;)</code></pre>
+<p>再看&quot;合并&quot;与&quot;动态加载&quot;两种推理方式的用法。</p>
+<pre data-lang="python"><code class="language-python">from peft import PeftModel
+
+# 方式一：合并进基座，得到一份完整权重，推理零额外延迟
+merged = model.merge_and_unload()
+merged.save_pretrained(&quot;./lora-merged&quot;)
+
+# 方式二：动态加载适配器，在同一基座上切换不同任务
+# （需重新加载基座模型再挂适配器，此处仅示意接口）
+base = AutoModelForCausalLM.from_pretrained(model_name)
+peft_model = PeftModel.from_pretrained(base, &quot;./lora-adapter&quot;)
+
+print(&quot;\n两种用法：&quot;)
+print(&quot;  merge_and_unload -&gt; 完整权重，便于导出/量化，不可再切换任务&quot;)
+print(&quot;  PeftModel.from_pretrained -&gt; 可插拔，多任务共用一个基座&quot;)</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>填空</strong>：LoRA 用 PEFT 库的 ____ 类来配置，用 ____ 函数把普通模型包装成 PEFT 模型；<code>target_modules</code> 决定 ____，<code>task_type</code> 对因果语言模型应设为 ____。</li>
+<li><strong>判断</strong>：<code>merge_and_unload()</code> 之后，还能否在同一基座上动态切换多个任务？为什么？</li>
+<li><strong>动手实验</strong>：把 <code>target_modules</code> 从 <code>[&quot;q_proj&quot;, &quot;v_proj&quot;]</code> 改为 <code>[&quot;q_proj&quot;, &quot;v_proj&quot;, &quot;k_proj&quot;, &quot;o_proj&quot;]</code>，重新运行 <code>print_trainable_parameters()</code>，观察可训练参数如何变化。</li>
+<li><strong>思考题</strong>：为什么 LoRA 微调通常可以用比全参数微调更大的学习率（如 2e-4 vs 2e-5）？从&quot;只更新少量低秩参数、扰动小&quot;的角度解释。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Hugging Face PEFT 文档（LoRA 教程）：<a href="https://huggingface.co/docs/peft/task_guides/token_classification_lora" target="_blank" rel="noopener noreferrer">https://huggingface.co/docs/peft/task_guides/token_classification_lora</a></li>
+<li>Hugging Face PEFT 快速上手：<a href="https://huggingface.co/docs/peft/quicktour" target="_blank" rel="noopener noreferrer">https://huggingface.co/docs/peft/quicktour</a></li>
+<li>Hugging Face LoRA 概念指南：<a href="https://huggingface.co/docs/peft/conceptual_guides/lora" target="_blank" rel="noopener noreferrer">https://huggingface.co/docs/peft/conceptual_guides/lora</a></li>
+<li>Hugging Face Trainer API：<a href="https://huggingface.co/docs/transformers/main_classes/trainer" target="_blank" rel="noopener noreferrer">https://huggingface.co/docs/transformers/main_classes/trainer</a></li>
+</ul>
+<p><a href="#/l/ft-ch3-l3">下一课：参数对比</a></p>

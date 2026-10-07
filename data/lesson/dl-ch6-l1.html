@@ -1,0 +1,115 @@
+<h2 id="h-文本分类">文本分类<a class="anchor" href="#h-文本分类" aria-label="本节链接">#</a></h2>
+<p>从这一课开始，我们把前面学到的 RNN、LSTM、GRU 真正落地。<strong>文本分类</strong>是最经典的序列任务之一：给一句话，判断它是好评还是差评、是新闻还是广告。它的完整流程——分词、建词表、嵌入、LSTM/GRU 编码、全连接分类——几乎可以套用到所有 NLP 任务上。这一课我们亲手搭一个端到端的中文情感分类器。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-任务定义与整体流程">1. 任务定义与整体流程<a class="anchor" href="#h-1-任务定义与整体流程" aria-label="本节链接">#</a></h4>
+<p>文本分类的输入是一条变长文本，输出是一个<strong>类别标签</strong>。以二分类情感分析为例：输入&quot;这家店的服务态度特别好&quot;，输出&quot;正面&quot;。</p>
+<p>完整流程是一条清晰的流水线：</p>
+<ol>
+<li><strong>分词</strong>：把句子切成词（或字）；</li>
+<li><strong>建词表 + 映射</strong>：把词换成整数索引，并统一做 padding；</li>
+<li><strong>嵌入</strong>：把整数索引映射成稠密向量；</li>
+<li><strong>序列编码</strong>：用 LSTM 或 GRU 按顺序读入，得到整句的表示（多对一，取最后一步或对时间步取平均/最大）；</li>
+<li><strong>分类头</strong>：接一个全连接层 + softmax，输出每个类别的概率。</li>
+</ol>
+<p><figure><img class="md-img" src="content/courses/deep-learning-architectures/assets/chapter-6-figure-01.svg" alt="文本分类从分词到分类的完整流水线" loading="lazy" decoding="async"><figcaption>文本分类从分词到分类的完整流水线</figcaption></figure>
+</p>
+<h4 id="h-2-关键设计怎么从一串状态得到一个句向量">2. 关键设计：怎么从&quot;一串状态&quot;得到&quot;一个句向量&quot;<a class="anchor" href="#h-2-关键设计怎么从一串状态得到一个句向量" aria-label="本节链接">#</a></h4>
+<p>LSTM/GRU 会输出每个时间步的隐藏状态，但分类只需要<strong>一个</strong>向量代表整句。常用三种取法：</p>
+<ul>
+<li><strong>取最后一步</strong>（<code>out[:, -1]</code>）：最简单，但句首信息可能被冲淡；</li>
+<li><strong>时间步平均</strong>（<code>out.mean(dim=1)</code>）：对所有时间步求平均，更均衡；</li>
+<li><strong>时间步最大池化</strong>（<code>out.max(dim=1)</code>）：取每个维度上的最大值，能捕捉最显著的特征。</li>
+</ul>
+<p>工程上&quot;取最后一步&quot;和&quot;平均&quot;最常用。配合<strong>双向</strong> LSTM（<code>bidirectional=True</code>），还能同时利用上下文，效果通常更好。本课示例里，我们把双向 GRU 的正向、反向最后一步拼起来作为句向量。</p>
+<h4 id="h-3-损失函数与评估指标">3. 损失函数与评估指标<a class="anchor" href="#h-3-损失函数与评估指标" aria-label="本节链接">#</a></h4>
+<p>分类任务用<strong>交叉熵损失（CrossEntropyLoss）</strong>，它对数 softmax 后的预测概率与真实标签，天然适合多分类。评估则看：</p>
+<ul>
+<li><strong>准确率（accuracy）</strong>：预测对的比例，最直观；</li>
+<li>类别不平衡时还要看<strong>精确率、召回率、F1</strong>，但对入门实战，先盯准确率就够了。</li>
+</ul>
+<p>训练时记得：损失下降 ≠ 一定在学有用的规律，还要在<strong>验证集</strong>上看指标，防止过拟合。</p>
+<h4 id="h-4-一个容易踩的坑数据泄漏与填充">4. 一个容易踩的坑：数据泄漏与填充<a class="anchor" href="#h-4-一个容易踩的坑数据泄漏与填充" aria-label="本节链接">#</a></h4>
+<p>用 <code>pad_sequence</code> 补长后，<code>&lt;pad&gt;</code> 位置也会参与编码。如果直接对全部时间步求平均，<code>&lt;pad&gt;</code> 的噪声会被算进句向量。正确做法是用 <code>pack_padded_sequence</code> 让 RNN 跳过填充，或者只对有意义的输出做平均。本课示例数据长度接近，采用&quot;取最后一步&quot;来规避这个问题；真实项目中要更谨慎地处理。</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面用一个内置的小型中文情感数据集（无需联网下载），完整实现&quot;分词 → 词表 → 双向 GRU → 分类 → 训练&quot;的全流程。你可以在自己的数据上替换 <code>samples</code> 列表，直接复用这套代码。</p>
+<pre data-lang="python"><code class="language-python">import torch
+import torch.nn as nn
+from torch.nn.utils.rnn import pad_sequence
+
+torch.manual_seed(0)
+
+# 1) 小型情感数据集：(句子, 标签)，1=正面，0=负面
+samples = [
+    (&quot;这个 电影 很 好看&quot;, 1),
+    (&quot;服务 态度 特别 好&quot;, 1),
+    (&quot;剧情 精彩 演员 出色&quot;, 1),
+    (&quot;这家 店 太 差 了&quot;, 0),
+    (&quot;电影 无聊 透顶&quot;, 0),
+    (&quot;味道 很 一般&quot;, 0),
+    (&quot;画面 精美 配乐 动听&quot;, 1),
+    (&quot;体验 非常 糟糕&quot;, 0),
+]
+
+# 2) 分词（这里已按空格切好）+ 建词表
+vocab = [&quot;&lt;pad&gt;&quot;, &quot;&lt;unk&gt;&quot;] + sorted({w for s, _ in samples for w in s.split()})
+w2i = {w: i for i, w in enumerate(vocab)}
+
+def encode(s):
+    return torch.tensor([w2i.get(w, w2i[&quot;&lt;unk&gt;&quot;]) for w in s.split()])
+
+texts = [encode(s) for s, _ in samples]
+labels = torch.tensor([l for _, l in samples])
+padded = pad_sequence(texts, batch_first=True, padding_value=0)  # (8, 最长长度)
+
+# 3) 模型：双向 GRU 编码 + 分类头
+class SentimentGRU(nn.Module):
+    def __init__(self, vocab_size, embed_dim, hidden, num_class):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+        self.gru = nn.GRU(embed_dim, hidden, batch_first=True, bidirectional=True)
+        self.fc = nn.Linear(hidden * 2, num_class)
+
+    def forward(self, x):
+        out, _ = self.gru(self.embed(x))        # (batch, seq_len, hidden*2)
+        last = out[:, -1, :]                    # 取最后一步作为句向量
+        return self.fc(last)
+
+model = SentimentGRU(len(vocab), embed_dim=8, hidden=8, num_class=2)
+loss_fn = nn.CrossEntropyLoss()
+opt = torch.optim.Adam(model.parameters(), lr=0.02)
+
+# 4) 训练
+for step in range(300):
+    logits = model(padded)
+    loss = loss_fn(logits, labels)
+    opt.zero_grad()
+    loss.backward()
+    opt.step()
+
+# 5) 评估
+with torch.no_grad():
+    pred = model(padded).argmax(1)
+    acc = (pred == labels).float().mean().item()
+
+print(f&quot;最终损失：{loss.item():.4f}，训练准确率：{acc:.3f}&quot;)
+
+# 6) 拿一条&quot;新句子&quot;做预测
+new = encode(&quot;剧情 很 好看&quot;)
+with torch.no_grad():
+    prob = model(new.unsqueeze(0)).softmax(1)
+print(&quot;新句子“剧情 很 好看”的预测概率（负面/正面）：&quot;, prob.tolist())</code></pre>
+<p>运行后，模型会把训练集里的句子正确分类（准确率接近 1.0），对&quot;剧情 很 好看&quot;也输出较高的正面概率。注意：数据集太小，这个高准确率更多是&quot;记住了&quot;，并不能代表真实泛化能力——真实项目一定要划分训练/验证集，并在验证集上选模型。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>给 <code>samples</code> 再补充几条新句子（含未登录词，如&quot;体验 很棒 五星&quot;），重新训练并观察准确率；同时验证 <code>&lt;unk&gt;</code> 机制是否正常处理了没见过的词。</li>
+<li>把模型从双向 GRU 换成双向 LSTM，比较参数量和训练收敛速度；再试试单向（<code>bidirectional=False</code>），看准确率是否下降。</li>
+<li>把&quot;取最后一步&quot;改成&quot;对所有时间步求平均&quot;（<code>out.mean(dim=1)</code>），观察结果差异；思考在有 padding 的真实数据里，哪种取法更稳健。</li>
+<li>把二分类改成三分类（加一个中性标签 2），修改标签和输出维度，重写训练代码并验证。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>PyTorch 官方文档 · CrossEntropyLoss：<a href="https://pytorch.org/docs/stable/generated/torch.nn.CrossEntropyLoss.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/docs/stable/generated/torch.nn.CrossEntropyLoss.html</a></li>
+<li>PyTorch 官方文档 · GRU：<a href="https://pytorch.org/docs/stable/generated/torch.nn.GRU.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/docs/stable/generated/torch.nn.GRU.html</a></li>
+<li>PyTorch 官方教程 · 文本分类：<a href="https://pytorch.org/tutorials/beginner/text_sentiment_ngrams_tutorial.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/tutorials/beginner/text_sentiment_ngrams_tutorial.html</a></li>
+</ul>
+<p><a href="#/l/dl-ch6-l2">下一课：序列生成</a></p>

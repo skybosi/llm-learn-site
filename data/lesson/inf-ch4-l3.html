@@ -1,0 +1,94 @@
+<h2 id="h-bitsandbytes-与部署">bitsandbytes 与部署<a class="anchor" href="#h-bitsandbytes-与部署" aria-label="本节链接">#</a></h2>
+<p>量化家族里还有一个&quot;平民英雄&quot;——<strong>bitsandbytes</strong>。它让任何人在一块普通显卡（甚至消费级卡）上，用几行代码就把一个大模型以 4-bit 或 8-bit 载入显存，是 Hugging Face <code>transformers</code> 生态里<strong>最省事</strong>的量化入口。学完本课，你应当能用 bitsandbytes 载入一个 4-bit 模型跑推理，并理解 NF4、双量化、QLoRA 这三个关键词，最后串起一条完整的量化部署流程。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-bitsandbytes-是什么">1. bitsandbytes 是什么<a class="anchor" href="#h-1-bitsandbytes-是什么" aria-label="本节链接">#</a></h4>
+<p>bitsandbytes 是一个 CUDA 量化库，提供 INT8 与 4-bit 的<strong>运行时量化</strong>。它最大的便利在于：<strong>你不需要预先准备量化好的模型文件</strong>，直接在 <code>from_pretrained</code> 时加上量化参数，就能边加载边量化，几行代码搞定。</p>
+<pre data-lang="python"><code class="language-python">from transformers import AutoModelForCausalLM, BitsAndBytesConfig
+
+nf4_config = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type=&quot;nf4&quot;)
+model = AutoModelForCausalLM.from_pretrained(&quot;meta-llama/Llama-2-7b-hf&quot;,
+                                             quantization_config=nf4_config)</code></pre>
+<h4 id="h-2-nf4更适合权重的-4-bit-表示">2. NF4：更适合权重的 4-bit 表示<a class="anchor" href="#h-2-nf4更适合权重的-4-bit-表示" aria-label="本节链接">#</a></h4>
+<p>普通 INT4 是<strong>均匀</strong>地把浮点区间切成 16 份。但权重值的分布通常<strong>接近正态</strong>——中间多、两头少。均匀切割会浪费格子。</p>
+<p><strong>NF4（4-bit NormalFloat）</strong> 是一种<strong>非均匀</strong>的 4-bit 数据类型：它的 16 个取值点按照标准正态分布的分位数来放置，让格子<strong>密集地落在权重最常出现的区域</strong>，从而在同样 4-bit 下获得更小的量化误差。经验上，NF4 比均匀 INT4 精度更好，是 bitsandbytes 4-bit 的默认选择。</p>
+<h4 id="h-3-双量化double-quantization">3. 双量化（double quantization）<a class="anchor" href="#h-3-双量化double-quantization" aria-label="本节链接">#</a></h4>
+<p>4-bit 量化还需要为每个块存一个 FP32 的 scale 因子，这些 scale 本身也要占内存。<strong>双量化</strong>就是&quot;连 scale 也再做一次量化&quot;（把 scale 也压成 8-bit），进一步省下可观的显存——对一个 7B 模型，双量化通常能再省约 0.4GB 左右。损失极小，性价比很高。</p>
+<h4 id="h-4-qlora在-4-bit-基座上微调">4. QLoRA：在 4-bit 基座上微调<a class="anchor" href="#h-4-qlora在-4-bit-基座上微调" aria-label="本节链接">#</a></h4>
+<p>QLoRA 是 bitsandbytes 生态里最重要的衍生成果：它在<strong>4-bit NF4 量化模型</strong>之上叠加低秩适配器（LoRA）做微调，让&quot;在一块 24GB 卡上微调 65B 模型&quot;成为可能。核心是&quot;量化主权重 + 只训练一小撮 LoRA 参数 + 双量化省显存&quot;。推理部署时，LoRA 可合并回量化权重或单独加载。</p>
+<h4 id="h-5-一条完整部署流程">5. 一条完整部署流程<a class="anchor" href="#h-5-一条完整部署流程" aria-label="本节链接">#</a></h4>
+<p>从零到&quot;跑起来的 4-bit 服务&quot;，通常是这几步：</p>
+<ol>
+<li><strong>选量化方案</strong>：GPU 在线服务优先 AWQ/GPTQ（vLLM 原生）；本地/边缘用 GGUF；图省事用 bitsandbytes；</li>
+<li><strong>载入模型</strong>：用 bitsandbytes 或 vLLM 按目标精度载入；</li>
+<li><strong>压测</strong>：测显存、吞吐、TTFT/TPOT，确认满足目标；</li>
+<li><strong>上线</strong>：封装成 OpenAI 兼容服务，配置并发与显存利用率。</li>
+</ol>
+<h3 id="h-二可运行示例">二、可运行示例<a class="anchor" href="#h-二可运行示例" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-bitsandbytes-载入-4-bit-模型推理">1. bitsandbytes 载入 4-bit 模型推理<a class="anchor" href="#h-1-bitsandbytes-载入-4-bit-模型推理" aria-label="本节链接">#</a></h4>
+<pre data-lang="python"><code class="language-python"># -*- coding: utf-8 -*-
+# 用 bitsandbytes 以 4-bit NF4 载入模型并推理（需 GPU + bitsandbytes）
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+
+bnb = BitsAndBytesConfig(
+    load_in_4bit=True,                  # 启用 4-bit
+    bnb_4bit_quant_type=&quot;nf4&quot;,          # NF4 非均匀量化
+    bnb_4bit_use_double_quant=True,     # 双量化，再省显存
+    bnb_4bit_compute_dtype=torch.float16,
+)
+model_id = &quot;meta-llama/Llama-2-7b-hf&quot;
+tok = AutoTokenizer.from_pretrained(model_id)
+model = AutoModelForCausalLM.from_pretrained(model_id,
+                                             quantization_config=bnb,
+                                             device_map=&quot;auto&quot;)
+
+prompt = &quot;用一句话解释量化为什么能提速 decode&quot;
+inputs = tok(prompt, return_tensors=&quot;pt&quot;).to(&quot;cuda&quot;)
+out = model.generate(**inputs, max_new_tokens=64)
+print(tok.decode(out[0], skip_special_tokens=True))
+
+# 打印量化后模型占用的显存（应远小于 FP16 的 ~14GB）
+print(f&quot;显存占用约 {model.get_memory_footprint()/1024**3:.1f} GB&quot;)</code></pre>
+<h4 id="h-2-对照-int8-与-fp16-的显存">2. 对照 INT8 与 FP16 的显存<a class="anchor" href="#h-2-对照-int8-与-fp16-的显存" aria-label="本节链接">#</a></h4>
+<pre data-lang="python"><code class="language-python"># -*- coding: utf-8 -*-
+# 估算不同量化精度下 7B 模型权重的显存占用
+def weight_gb(params_billion, bytes_per_param):
+    return params_billion * 1e9 * bytes_per_param / 1024**3
+
+for name, bpp in [(&quot;FP16&quot;, 2), (&quot;INT8&quot;, 1), (&quot;INT4/NF4&quot;, 0.5),
+                  (&quot;INT4+双量化&quot;, 0.5)]:   # 双量化主要省 scale，权重仍 0.5
+    print(f&quot;7B {name:&gt;12}：权重约 {weight_gb(7, bpp):.1f} GB&quot;)
+print(&quot;\n注：双量化额外省下的是 scale 因子占用的显存，7B 约 0.4GB。&quot;)</code></pre>
+<h4 id="h-3-部署检查清单伪代码">3. 部署检查清单（伪代码）<a class="anchor" href="#h-3-部署检查清单伪代码" aria-label="本节链接">#</a></h4>
+<pre data-lang="python"><code class="language-python"># -*- coding: utf-8 -*-
+# 量化部署上线前的检查清单
+
+def deploy_check(engine, quant, vram_gb, tpot_ms, ttft_ms):
+    checks = {
+        &quot;引擎就绪&quot;: engine in {&quot;vLLM&quot;, &quot;TensorRT-LLM&quot;, &quot;SGLang&quot;, &quot;llama.cpp&quot;},
+        &quot;量化生效&quot;: quant is not None,
+        &quot;显存不超预算&quot;: vram_gb &lt; 40,
+        &quot;TPOT 达标&quot;: tpot_ms &lt; 50,
+        &quot;TTFT 达标&quot;: ttft_ms &lt; 1000,
+    }
+    failed = [k for k, v in checks.items() if not v]
+    return &quot;通过&quot; if not failed else f&quot;未通过：{failed}&quot;
+
+print(deploy_check(&quot;vLLM&quot;, &quot;awq&quot;, vram_gb=12, tpot_ms=25, ttft_ms=300))</code></pre>
+<p><figure><img class="md-img" src="content/courses/llm-inference-optimization/assets/chapter-4-figure-03.svg" alt="NF4 量化与部署流程图：左侧画一条正态分布曲线，横轴为权重值，曲线上叠加 16 个红色刻度点（非均匀分布，中间密、两头疏），标注&quot;NF4：按正态分位数放 16 个点，非均匀&quot;；旁边画一个&quot;双量化&quot;小框（scale 也被 8-bit 量化，箭头指向 scale 因子图标）；中间画一台 GPU，标注&quot;4-bit 载入 + QLoRA（量化主权重 + 小 LoRA）&quot;；右侧画一条 5 步部署流程箭头链：选量化方案 → 载入模型 → 压测（显存/吞吐/TTFT/TPOT）→ 上线 OpenAI 兼容服务；底部一句话&quot;几行代码把大模型塞进消费级显卡&quot;" loading="lazy" decoding="async"><figcaption>NF4 量化与部署流程图：左侧画一条正态分布曲线，横轴为权重值，曲线上叠加 16 个红色刻度点（非均匀分布，中间密、两头疏），标注&quot;NF4：按正态分位数放 16 个点，非均匀&quot;；旁边画一个&quot;双量化&quot;小框（scale 也被 8-bit 量化，箭头指向 scale 因子图标）；中间画一台 GPU，标注&quot;4-bit 载入 + QLoRA（量化主权重 + 小 LoRA）&quot;；右侧画一条 5 步部署流程箭头链：选量化方案 → 载入模型 → 压测（显存/吞吐/TTFT/TPOT）→ 上线 OpenAI 兼容服务；底部一句话&quot;几行代码把大模型塞进消费级显卡&quot;</figcaption></figure>
+</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>跑 4-bit</strong>：在有 GPU 的环境里运行示例 1，对比 <code>get_memory_footprint()</code> 与 FP16 的 ~14GB，验证 4-bit 的显存减半。</li>
+<li><strong>关双量化</strong>：把 <code>bnb_4bit_use_double_quant</code> 改成 <code>False</code>，观察显存与生成速度的微小差异，理解双量化&quot;省的是 scale&quot;。</li>
+<li><strong>换 INT8</strong>：改用 <code>BitsAndBytesConfig(load_in_8bit=True)</code> 载入，对比 8-bit 与 4-bit 的显存和输出质量，体会精度与省内存的权衡。</li>
+<li><strong>思考</strong>：QLoRA 为什么能让&quot;微调大模型&quot;的门槛大幅降低？把&quot;量化主权重 + LoRA + 双量化&quot;三者各自的作用写清楚。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>bitsandbytes 官方文档：<a href="https://huggingface.co/docs/bitsandbytes/main/en/index" target="_blank" rel="noopener noreferrer">https://huggingface.co/docs/bitsandbytes/main/en/index</a></li>
+<li>bitsandbytes GitHub 仓库：<a href="https://github.com/bitsandbytes-foundation/bitsandbytes" target="_blank" rel="noopener noreferrer">https://github.com/bitsandbytes-foundation/bitsandbytes</a></li>
+<li>QLoRA 论文《QLoRA: Efficient Finetuning of Quantized LLMs》：<a href="https://arxiv.org/abs/2305.14314" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2305.14314</a></li>
+<li>Hugging Face：4-bit 量化加载示例：<a href="https://huggingface.co/docs/transformers/main/en/quantization/bitsandbytes" target="_blank" rel="noopener noreferrer">https://huggingface.co/docs/transformers/main/en/quantization/bitsandbytes</a></li>
+</ul>
+<p><a href="#/l/inf-ch5-l1">下一课：张量并行</a></p>

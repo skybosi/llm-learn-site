@@ -1,0 +1,101 @@
+<h2 id="h-验收与总结">验收与总结<a class="anchor" href="#h-验收与总结" aria-label="本节链接">#</a></h2>
+<p>服务跑起来了不算完，<strong>通过验收才算交付</strong>。这一课做三件事：用脚本把上一课的 SLO 逐条验收、做一次故障演练看服务扛不扛得住、最后把整门课程串成一张知识地图，给你一条清晰的收尾与进阶路径。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-验收要验三样东西">1. 验收要验三样东西<a class="anchor" href="#h-1-验收要验三样东西" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>性能达标</strong>：压测结果满足 SLO（P99 TTFT、吞吐、可用性）；</li>
+<li><strong>正确性可用</strong>：真实业务样例能给出正确、格式合规的回答；</li>
+<li><strong>稳定性扛得住</strong>：故障演练——把组件杀掉、把显存打满，看服务能否自愈或至少不&quot;静默崩溃&quot;。</li>
+</ul>
+<p>三者缺一不可：只压测不看正确性，可能&quot;又快又错&quot;；只看正确性不演练，可能&quot;平时好、出事就瘫&quot;。</p>
+<h4 id="h-2-验收脚本怎么写">2. 验收脚本怎么写<a class="anchor" href="#h-2-验收脚本怎么写" aria-label="本节链接">#</a></h4>
+<p>验收脚本和普通压测的区别在于<strong>它自己会下结论</strong>：跑完样本后计算分位数，再用 <code>assert</code> 对照 SLO 判断通过/失败。这样验收结果可复现、可写进交付文档，也方便日后回归。</p>
+<h4 id="h-3-故障演练的价值">3. 故障演练的价值<a class="anchor" href="#h-3-故障演练的价值" aria-label="本节链接">#</a></h4>
+<p>演练不是制造事故，而是<strong>提前暴露单点</strong>。典型动作：<code>docker compose kill vllm</code> 观察健康检查与重启；把 <code>gpu_memory_utilization</code> 临时调到 0.98 制造 OOM；断开监控看告警是否触发。练一次，比上线后半夜被电话叫醒强一百倍。</p>
+<p><figure><img class="md-img" src="content/courses/llm-deployment-practice/assets/chapter-6-figure-03.svg" alt="六章学习链路总览图：一条从左上到右下的折线流程，六个节点依次标&quot;① 部署全景与需求分析 → ② 单卡部署实战 → ③ 多卡与分布式 → ④ 服务化与生产化 → ⑤ 成本优化实战 → ⑥ 端到端综合项目&quot;，最后一个节点用绿色高亮并在旁标注&quot;验收与总结（收官）&quot;；底部一句话&quot;从需求到上线，从上线到算清账&quot;" loading="lazy" decoding="async"><figcaption>六章学习链路总览图：一条从左上到右下的折线流程，六个节点依次标&quot;① 部署全景与需求分析 → ② 单卡部署实战 → ③ 多卡与分布式 → ④ 服务化与生产化 → ⑤ 成本优化实战 → ⑥ 端到端综合项目&quot;，最后一个节点用绿色高亮并在旁标注&quot;验收与总结（收官）&quot;；底部一句话&quot;从需求到上线，从上线到算清账&quot;</figcaption></figure>
+</p>
+<h3 id="h-二可运行示例">二、可运行示例<a class="anchor" href="#h-二可运行示例" aria-label="本节链接">#</a></h3>
+<h4 id="h-示例-1验收压测脚本断言-p99-ttft">示例 1：验收压测脚本（断言 P99 TTFT）<a class="anchor" href="#h-示例-1验收压测脚本断言-p99-ttft" aria-label="本节链接">#</a></h4>
+<pre data-lang="python"><code class="language-python"># -*- coding: utf-8 -*-
+# 验收脚本：走网关压测，断言 P99 TTFT 达标
+import time, asyncio, aiohttp
+
+BASE = &quot;http://localhost:8080/v1/chat/completions&quot;   # 走网关
+MODEL = &quot;support-assistant&quot;
+
+async def measure_ttft(session):
+    payload = {
+        &quot;model&quot;: MODEL,
+        &quot;messages&quot;: [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;我的订单什么时候发货？&quot;}],
+        &quot;max_tokens&quot;: 100, &quot;stream&quot;: True,           # 流式才能测 TTFT
+    }
+    t0 = time.perf_counter()
+    ttft = None
+    async with session.post(BASE, json=payload) as r:
+        async for line in r.content:                 # 逐行读 SSE
+            if line.startswith(b&quot;data: [DONE]&quot;):
+                break
+            if line.startswith(b&quot;data: &quot;) and ttft is None:
+                ttft = time.perf_counter() - t0      # 首个内容分片即 TTFT
+    return ttft or (time.perf_counter() - t0)
+
+async def run(n_req=100, concurrency=10):
+    sem = asyncio.Semaphore(concurrency)
+    async with aiohttp.ClientSession() as sess:
+        async def one():
+            async with sem:
+                return await measure_ttft(sess)
+        return await asyncio.gather(*[one() for _ in range(n_req)])
+
+ttfts = asyncio.run(run())
+ttfts.sort()
+p99 = ttfts[int(len(ttfts) * 0.99)]
+print(f&quot;样本 {len(ttfts)} 个，P99 TTFT = {p99*1000:.0f} ms&quot;)
+assert p99 &lt;= 1.5, f&quot;SLO 不达标：P99 TTFT 超过 1.5s（实测 {p99:.2f}s）&quot;
+print(&quot;✅ 验收通过：P99 TTFT ≤ 1.5s&quot;)</code></pre>
+<h4 id="h-示例-2正确性冒烟样例">示例 2：正确性冒烟样例<a class="anchor" href="#h-示例-2正确性冒烟样例" aria-label="本节链接">#</a></h4>
+<pre data-lang="python"><code class="language-python"># -*- coding: utf-8 -*-
+# 用几条真实业务样例，检查回答是否可解析、非空、含关键信息
+from openai import OpenAI
+
+client = OpenAI(base_url=&quot;http://localhost:8080/v1&quot;, api_key=&quot;EMPTY&quot;)
+cases = [
+    &quot;我的订单什么时候发货？&quot;,
+    &quot;如何申请退货？&quot;,
+    &quot;你们的客服电话是多少？&quot;,
+]
+for q in cases:
+    r = client.chat.completions.create(
+        model=&quot;support-assistant&quot;,
+        messages=[{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: q}],
+        max_tokens=100,
+    )
+    answer = r.choices[0].message.content
+    ok = bool(answer and answer.strip())
+    print(f&quot;[{&#39;PASS&#39; if ok else &#39;FAIL&#39;}] {q} -&gt; {answer[:30]}...&quot;)</code></pre>
+<h4 id="h-示例-3故障演练命令">示例 3：故障演练命令<a class="anchor" href="#h-示例-3故障演练命令" aria-label="本节链接">#</a></h4>
+<pre data-lang="bash"><code class="language-bash"># 演练 1：杀掉 vllm，观察健康检查与自动重启
+docker compose kill vllm
+docker compose ps                # 看 health 状态
+docker compose up -d vllm        # 恢复
+
+# 演练 2：把显存打满制造 OOM（改完重启再压测）
+# 把 --gpu-memory-utilization 临时改成 0.98，观察长上下文请求是否报错
+docker compose logs -f vllm      # 盯 OOM 日志</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>用示例 1 的脚本，把并发从 10 提到 40 重跑，观察 P99 TTFT 是否仍达标；若失败，回到第 5 章 l2 的思路找出甜点并发并写进交付文档。</li>
+<li>给示例 2 增加一条&quot;输入为空&quot;的边界用例，看服务是友好返回还是崩溃，说明边界测试的必要性。</li>
+<li>执行示例 3 的&quot;杀容器&quot;演练，记录从 kill 到服务恢复的耗时，评估它是否落在你的可用性 SLO 预算内。</li>
+<li>补全一份「上线检查清单」：至少覆盖权重挂载、GPU 可见性、SSE 透传、监控抓取、告警规则、成本红线六项。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>vLLM · 基准测试与压测：<a href="https://docs.vllm.ai/en/latest/benchmarking/" target="_blank" rel="noopener noreferrer">https://docs.vllm.ai/en/latest/benchmarking/</a></li>
+<li>k6 · 负载测试文档：<a href="https://k6.io/docs/" target="_blank" rel="noopener noreferrer">https://k6.io/docs/</a></li>
+<li>Google SRE Book · SLO 与错误预算：<a href="https://sre.google/sre-book/service-level-objectives/" target="_blank" rel="noopener noreferrer">https://sre.google/sre-book/service-level-objectives/</a></li>
+<li>vLLM 项目仓库：<a href="https://github.com/vllm-project/vllm" target="_blank" rel="noopener noreferrer">https://github.com/vllm-project/vllm</a></li>
+</ul>
+<hr>
+<p>恭喜你完成《大模型推理部署实战》！这是整个学习链路的收官一课！</p>
+<p>回顾这六章，你从「部署场景与需求分析」出发，走过了「单卡部署」「多卡与分布式」，再到「服务化与生产化」「成本优化实战」，最终用这个端到端项目把全部知识串成了一次真实的交付。至此，你已经具备&quot;从需求到上线、从上线到算清账&quot;的完整能力——这正是把大模型真正用起来、用得起的那一步。</p>

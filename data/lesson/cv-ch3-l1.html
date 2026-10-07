@@ -1,0 +1,86 @@
+<h2 id="h-实例分割mask-r-cnn">实例分割（Mask R-CNN）<a class="anchor" href="#h-实例分割mask-r-cnn" aria-label="本节链接">#</a></h2>
+<p>语义分割给每个像素一个类别，却分不清&quot;两个人&quot;是两个人；目标检测框出了每个人，却画不出每个人的精确轮廓。<strong>实例分割（Instance Segmentation）</strong> 把两者合二为一：<strong>既要框出每个物体，又要给每个物体单独画出一张像素级掩码</strong>。</p>
+<p><strong>Mask R-CNN</strong> 是这个任务最经典、也最好懂的答案：它在 Faster R-CNN 上<strong>加了一个分支</strong>，就同时拿到了框和掩码。这一课我们拆解它&quot;加在哪儿、怎么加、为什么这么加&quot;，以及它贡献的那个著名改进——RoIAlign。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-从-faster-r-cnn-到-mask-r-cnn加一个掩码分支">1. 从 Faster R-CNN 到 Mask R-CNN：加一个&quot;掩码分支&quot;<a class="anchor" href="#h-1-从-faster-r-cnn-到-mask-r-cnn加一个掩码分支" aria-label="本节链接">#</a></h4>
+<p>回顾 Faster R-CNN 的检测头：对每个候选框（RoI），RoI 池化出一个定长特征，再接两个并行的全连接头——一个分类、一个框回归。Mask R-CNN 的结构几乎原封不动，只做一件事：<strong>在分类头和框回归头旁边，再加一个&quot;掩码分支（mask branch）&quot;</strong>。</p>
+<p>这个掩码分支是一个<strong>小型全卷积网络（FCN）</strong>：对同一个 RoI 特征，输出一张 <code>K × m × m</code> 的输出，其中 K 是类别数、m×m 是掩码的分辨率（如 28×28）。它&quot;看到&quot;的特征和分类/回归头是<strong>共享的</strong>，所以增加的额外计算量很小，却让网络同时学会了三件事。</p>
+<p><figure><img class="md-img" src="content/courses/cv-advanced/assets/chapter-3-figure-01.svg" alt="Mask R-CNN 结构：Faster R-CNN 之上并列增加一个掩码分支" loading="lazy" decoding="async"><figcaption>Mask R-CNN 结构：Faster R-CNN 之上并列增加一个掩码分支</figcaption></figure>
+</p>
+<h4 id="h-2-关键设计一掩码与类别解耦">2. 关键设计一：掩码与类别&quot;解耦&quot;<a class="anchor" href="#h-2-关键设计一掩码与类别解耦" aria-label="本节链接">#</a></h4>
+<p>一个容易踩的坑是：掩码分支要不要和分类一样用 softmax 做&quot;每像素多分类&quot;？Mask R-CNN 的答案是<strong>不</strong>。</p>
+<p>它对<strong>每个类别独立预测一张二值掩码</strong>，即第 k 个通道只回答&quot;这个像素属于第 k 类吗？&quot;，损失用<strong>逐像素的 sigmoid + 二值交叉熵</strong>。<strong>训练时只对&quot;该 RoI 的真实类别&quot;那一张掩码计算损失</strong>，其他类别的通道不参与。这样就把&quot;这是什么&quot;（由分类头决定）和&quot;这个物体的像素在哪&quot;（由掩码分支决定）<strong>解耦</strong>了：</p>
+<ul>
+<li>分类头负责挑出类别，掩码分支负责为每个候选类别画轮廓，互不打架；</li>
+<li>避免了&quot;像素级多分类&quot;里类别间的竞争，对每个物体能画出更干净的掩码。</li>
+</ul>
+<p>这一设计是 Mask R-CNN 的精华之一，务必理解&quot;解耦&quot;二字。</p>
+<h4 id="h-3-关键设计二roialign修掉量化误差">3. 关键设计二：RoIAlign——修掉量化误差<a class="anchor" href="#h-3-关键设计二roialign修掉量化误差" aria-label="本节链接">#</a></h4>
+<p>Mask R-CNN 另一个里程碑式的贡献是把 <strong>RoI Pooling 换成了 RoIAlign</strong>。问题出在 RoI Pooling 的<strong>两次量化</strong>：</p>
+<ol>
+<li>候选框坐标是浮点数（如 <code>x1=2.4</code>），RoI Pooling 先把它<strong>取整</strong>到整数像素边界；</li>
+<li>把框内区域等分成 m×m 子网格时，若框的宽高不能被 m 整除，子网格边界再次<strong>取整</strong>。</li>
+</ol>
+<p>这两次取整对&quot;框检测&quot;影响不大（框偏一两个像素无所谓），但对&quot;像素级掩码&quot;是灾难——<strong>掩码直接错位、边界出现锯齿</strong>。</p>
+<p><strong>RoIAlign</strong> 的做法是<strong>全程不做取整</strong>：保留浮点坐标，在每个子网格里按固定规则取若干<strong>采样点</strong>，对每个采样点用<strong>双线性插值</strong>从特征图上取值，再取平均。这样特征与像素之间建立了连续、可微的对应，掩码精度大幅提升。</p>
+<p><figure><img class="md-img" src="content/courses/cv-advanced/assets/chapter-3-figure-02.svg" alt="RoIPool（两次取整）与 RoIAlign（浮点 + 双线性插值）的对比" loading="lazy" decoding="async"><figcaption>RoIPool（两次取整）与 RoIAlign（浮点 + 双线性插值）的对比</figcaption></figure>
+</p>
+<h4 id="h-4-多任务损失与整体训练">4. 多任务损失与整体训练<a class="anchor" href="#h-4-多任务损失与整体训练" aria-label="本节链接">#</a></h4>
+<p>Mask R-CNN 的总损失是三部分之和：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">L</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">cls</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">L</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">box</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">L</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">mask</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span></span></p>
+<p>即分类交叉熵 + 框回归平滑 L1 + 掩码二值交叉熵。三者共享骨干特征、联合反向传播。骨干通常用 ResNet + FPN（特征金字塔），让不同尺度的物体都能被检测与分割。推理时：RPN 出候选 → RoIAlign → 分类/回归给出框与类别 → 掩码分支按分类头选定的类别取出对应掩码，得到最终&quot;框 + 类别 + 掩码&quot;的实例分割结果。</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>第一段用 torchvision 直接跑预训练的 Mask R-CNN；第二段<strong>从零实现 RoIAlign 的核心——双线性插值</strong>，亲手体会&quot;浮点坐标连续采样&quot;是怎么回事。</p>
+<pre data-lang="python"><code class="language-python">import torch
+from torchvision.models.detection import maskrcnn_resnet50_fpn, MaskRCNN_ResNet50_FPN_Weights
+
+# ---------- 1) 预训练 Mask R-CNN 推理 ----------
+weights = MaskRCNN_ResNet50_FPN_Weights.DEFAULT
+model = maskrcnn_resnet50_fpn(weights=weights).eval()
+
+img = torch.rand(3, 800, 800)          # 真实使用时换成 PIL 图并走 weights.transforms()
+with torch.no_grad():
+    out = model([img])[0]
+print(&quot;实例数量：&quot;, len(out[&quot;boxes&quot;]))
+if len(out[&quot;boxes&quot;]):
+    print(&quot;第一个实例 框：&quot;, out[&quot;boxes&quot;][0].tolist())
+    print(&quot;第一个实例 类别：&quot;, out[&quot;labels&quot;][0].item(), &quot; 分数：&quot;, round(out[&quot;scores&quot;][0].item(), 3))
+    print(&quot;第一个实例 掩码形状：&quot;, tuple(out[&quot;masks&quot;][0].shape))   # (1, H, W)，二值概率图
+
+# ---------- 2) 从零实现双线性插值（RoIAlign 的核心） ----------
+def bilinear_sample(feat, y, x):
+    &quot;&quot;&quot;
+    feat: (C, H, W) 单张特征图；y, x: 浮点坐标（可能落在像素之间）
+    做法：取 (y, x) 周围四个最近像素的值，按与它们的距离做加权平均。
+    &quot;&quot;&quot;
+    H, W = feat.shape[1], feat.shape[2]
+    y0, x0 = int(torch.floor(y)), int(torch.floor(x))
+    y1, x1 = min(y0 + 1, H - 1), min(x0 + 1, W - 1)
+    # 把坐标夹在有效范围内，避免越界
+    y0, x0 = max(y0, 0), max(x0, 0)
+    wy = y - y0          # y 方向到左上像素的权重
+    wx = x - x0
+    # 四个角的值按&quot;面积&quot;加权组合
+    top = feat[:, y0, x0] * (1 - wx) + feat[:, y0, x1] * wx
+    bottom = feat[:, y1, x0] * (1 - wx) + feat[:, y1, x1] * wx
+    return top * (1 - wy) + bottom * wy
+
+feat = torch.rand(256, 50, 50)
+val = bilinear_sample(feat, y=12.4, x=7.8)   # 浮点坐标采样
+print(&quot;双线性插值得到的特征向量形状：&quot;, tuple(val.shape))   # (256,)</code></pre>
+<p>第 2 段是 RoIAlign 的最小内核：它不在 <code>y=12.4</code> 处取整成 <code>12</code>，而是用周围四个像素（12、13 行 × 7、8 列）按距离加权，从而在浮点坐标上得到连续、可微的取值。RoIAlign 就是把这个操作应用到候选框内每个子网格的采样点上再取平均。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>把 <code>bilinear_sample</code> 改成向量化版本：一次对一张 (C, H, W) 特征图上的 N 个浮点坐标 (y, x) 批量采样，并验证与逐点版本结果一致。</li>
+<li>解释 RoIPool 的&quot;两次取整&quot;具体发生在哪两个环节；构造一个&quot;框宽 7、要分成 2×2 子网格&quot;的例子，算一算取整带来的最大偏移量。</li>
+<li>说明 Mask R-CNN 的掩码分支为什么用&quot;每类一张二值掩码 + sigmoid&quot;，而不是&quot;像素级 softmax 多分类&quot;；如果改成 softmax 多分类，会带来什么问题？</li>
+<li>用 torchvision 的 <code>maskrcnn_resnet50_fpn</code> 对真实照片推理，把第一个实例的 <code>masks[0]</code> 阈值化（如 &gt; 0.5）后可视化，观察掩码边缘的精细程度。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Mask R-CNN 原论文：<a href="https://arxiv.org/abs/1703.06870" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1703.06870</a></li>
+<li>Faster R-CNN 原论文（Mask R-CNN 的基底）：<a href="https://arxiv.org/abs/1506.01497" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1506.01497</a></li>
+<li>特征金字塔网络 FPN：<a href="https://arxiv.org/abs/1612.03144" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1612.03144</a></li>
+<li>PyTorch 官方文档 · torchvision 实例分割模型：<a href="https://pytorch.org/vision/stable/models.html#instance-segmentation" target="_blank" rel="noopener noreferrer">https://pytorch.org/vision/stable/models.html#instance-segmentation</a></li>
+</ul>
+<p><a href="#/l/cv-ch3-l2">下一课：关键点检测</a></p>

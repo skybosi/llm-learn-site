@@ -1,0 +1,121 @@
+<h2 id="h-完整项目">完整项目<a class="anchor" href="#h-完整项目" aria-label="本节链接">#</a></h2>
+<p>这是《LLM 微调》的最后一课。前面每一课都是一块拼图，这一课我们把它们拼成一张完整的项目蓝图：从<strong>需求定义</strong>到<strong>数据工程</strong>，再到<strong>训练、评估、部署与迭代</strong>，用一个真实可复用的项目骨架串起来。学完这一课，你应该能独立接手一个&quot;把通用模型改造成领域助手&quot;的完整任务，并知道每一步该看什么、防什么。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-项目全景五个阶段">1. 项目全景：五个阶段<a class="anchor" href="#h-1-项目全景五个阶段" aria-label="本节链接">#</a></h4>
+<p>一个严谨的微调项目按顺序走五步：</p>
+<ol>
+<li><strong>需求与基线</strong>：明确任务（做什么、给谁用、怎么算成功），并<strong>先测基座模型</strong>在当前任务上的表现，作为必须超越的基线；</li>
+<li><strong>数据工程</strong>：收集、清洗、去重、切分、格式化，产出训练集/验证集/测试集；</li>
+<li><strong>训练</strong>：选定路线（纯 SFT / 先 CPT 后 SFT / 结合 RAG），配好 QLoRA + SFTTrainer，管理好实验；</li>
+<li><strong>评估</strong>：困惑度 + 基准 + 人工抽查，与基座做增量对比，防过拟合、防遗忘；</li>
+<li><strong>部署与迭代</strong>：合并适配器、量化推理、接入服务，并根据线上反馈回流数据、进入下一轮。</li>
+</ol>
+<p><figure><img class="md-img" src="content/courses/llm-fine-tuning/assets/chapter-6-figure-03.svg" alt="LLM 微调完整项目从需求到部署的五阶段全景" loading="lazy" decoding="async"><figcaption>LLM 微调完整项目从需求到部署的五阶段全景</figcaption></figure>
+</p>
+<h4 id="h-2-工程化的三个支柱">2. 工程化的三个支柱<a class="anchor" href="#h-2-工程化的三个支柱" aria-label="本节链接">#</a></h4>
+<p><strong>① 配置管理</strong>：把模型名、数据路径、超参、LoRA 配置都放进一个 YAML/JSON，代码只读配置，杜绝&quot;改了代码忘了同步参数&quot;的隐患。</p>
+<p><strong>② 实验跟踪</strong>：用 <strong>wandb</strong>（或 MLflow）记录每次运行的超参、损失曲线、评估分数，否则几十次实验后你根本记不住&quot;哪个配置最好&quot;。</p>
+<p><strong>③ 可复现性</strong>：固定随机种子、记录数据版本（数据也要版本化）、记录依赖版本（<code>requirements.txt</code> 或 lock 文件）。&quot;昨天能跑、今天崩了&quot;通常是依赖漂移。</p>
+<h4 id="h-3-部署的关键决策">3. 部署的关键决策<a class="anchor" href="#h-3-部署的关键决策" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>是否合并</strong>：追求极致推理速度就 <code>merge_and_unload</code>；要保留多任务可插拔就只存适配器；</li>
+<li><strong>量化推理</strong>：部署到低配/高并发环境，用 <code>bitsandbytes</code> 的 8-bit/4-bit，或 vLLM 这类高性能推理框架做批量服务；</li>
+<li><strong>在线 vs 离线</strong>：需要实时响应用 HTTP 服务（FastAPI + vLLM），离线批量任务直接脚本批处理。</li>
+</ul>
+<h4 id="h-4-一张防翻车清单">4. 一张防翻车清单<a class="anchor" href="#h-4-一张防翻车清单" aria-label="本节链接">#</a></h4>
+<ul>
+<li><input disabled="" type="checkbox"> 训练/推理用<strong>同一套 chat template</strong>；</li>
+<li><input disabled="" type="checkbox"> 验证集<strong>绝不出现在</strong>训练数据里（先去重再切分）；</li>
+<li><input disabled="" type="checkbox"> 每轮实验都<strong>和基座对比</strong>，而非只看绝对分；</li>
+<li><input disabled="" type="checkbox"> CPT 时<strong>混入通用语料</strong>，防灾难性遗忘；</li>
+<li><input disabled="" type="checkbox"> 学习率、轮数、<code>lora_alpha/r</code> 有记录、可回溯；</li>
+<li><input disabled="" type="checkbox"> 部署前在测试集上做<strong>最终评估</strong>，不拿训练分数充数。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面是一个项目骨架：把配置、训练、推理拆成三个清晰的文件/函数，体现&quot;配置驱动 + 可复现&quot;。依赖 <code>transformers</code>、<code>peft</code>、<code>trl</code>、<code>datasets</code>。</p>
+<pre data-lang="python"><code class="language-python"># ============ config.py：集中管理配置 ============
+CONFIG = {
+    &quot;model_id&quot;: &quot;HuggingFaceH4/zephyr-7b-beta&quot;,
+    &quot;data_path&quot;: &quot;./data/train.jsonl&quot;,
+    &quot;output_dir&quot;: &quot;./runs/exp-01&quot;,
+    &quot;lora&quot;: {&quot;r&quot;: 16, &quot;alpha&quot;: 32, &quot;dropout&quot;: 0.05,
+             &quot;target_modules&quot;: [&quot;q_proj&quot;, &quot;k_proj&quot;, &quot;v_proj&quot;, &quot;o_proj&quot;]},
+    &quot;train&quot;: {&quot;lr&quot;: 2e-4, &quot;epochs&quot;: 1, &quot;batch&quot;: 1, &quot;accum&quot;: 8, &quot;max_len&quot;: 512},
+}
+
+# ============ train.py：训练入口 ============
+import torch
+from datasets import load_dataset
+from transformers import (AutoModelForCausalLM, AutoTokenizer,
+                          BitsAndBytesConfig, TrainingArguments)
+from peft import LoraConfig, prepare_model_for_kbit_training
+from trl import SFTTrainer
+from config import CONFIG as C
+
+dataset = load_dataset(&quot;json&quot;, data_files=C[&quot;data_path&quot;])[&quot;train&quot;]
+dataset = dataset.train_test_split(test_size=0.1)  # 留 10% 验证
+
+bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type=&quot;nf4&quot;,
+                         bnb_4bit_use_double_quant=True,
+                         bnb_4bit_compute_dtype=torch.bfloat16)
+model = AutoModelForCausalLM.from_pretrained(C[&quot;model_id&quot;],
+                                             quantization_config=bnb,
+                                             device_map=&quot;auto&quot;)
+tokenizer = AutoTokenizer.from_pretrained(C[&quot;model_id&quot;])
+tokenizer.pad_token = tokenizer.eos_token
+model = prepare_model_for_kbit_training(model)
+
+peft_cfg = LoraConfig(r=C[&quot;lora&quot;][&quot;r&quot;], lora_alpha=C[&quot;lora&quot;][&quot;alpha&quot;],
+                      lora_dropout=C[&quot;lora&quot;][&quot;dropout&quot;],
+                      target_modules=C[&quot;lora&quot;][&quot;target_modules&quot;],
+                      bias=&quot;none&quot;, task_type=&quot;CAUSAL_LM&quot;)
+
+args = TrainingArguments(output_dir=C[&quot;output_dir&quot;],
+                         per_device_train_batch_size=C[&quot;train&quot;][&quot;batch&quot;],
+                         gradient_accumulation_steps=C[&quot;train&quot;][&quot;accum&quot;],
+                         learning_rate=C[&quot;train&quot;][&quot;lr&quot;],
+                         num_train_epochs=C[&quot;train&quot;][&quot;epochs&quot;],
+                         bf16=True, gradient_checkpointing=True,
+                         logging_steps=1, save_strategy=&quot;epoch&quot;,
+                         report_to=&quot;wandb&quot;)  # 实验跟踪
+
+trainer = SFTTrainer(model=model, args=args, train_dataset=dataset[&quot;train&quot;],
+                     tokenizer=tokenizer, peft_config=peft_cfg,
+                     max_seq_length=C[&quot;train&quot;][&quot;max_len&quot;])
+trainer.train()
+trainer.save_model(C[&quot;output_dir&quot;] + &quot;/adapter&quot;)
+
+# ============ infer.py：推理入口 ============
+from peft import PeftModel
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from config import CONFIG as C
+
+base = AutoModelForCausalLM.from_pretrained(C[&quot;model_id&quot;], device_map=&quot;auto&quot;)
+model = PeftModel.from_pretrained(base, C[&quot;output_dir&quot;] + &quot;/adapter&quot;)
+tok = AutoTokenizer.from_pretrained(C[&quot;model_id&quot;])
+
+def ask(question):
+    msgs = [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: question}]
+    ids = tok.apply_chat_template(msgs, return_tensors=&quot;pt&quot;).to(model.device)
+    out = model.generate(ids, max_new_tokens=128, do_sample=False)
+    return tok.decode(out[0][ids.shape[1]:], skip_special_tokens=True)
+
+print(ask(&quot;请用一句话解释什么是 LoRA。&quot;))</code></pre>
+<p>这个骨架把配置、训练、推理解耦：改超参只动 <code>config.py</code>，训练产物按 <code>output_dir</code> 分实验存放，推理脚本单独维护。把它作为你未来项目的起点，逐步往里加&quot;评估脚本&quot;和&quot;数据版本号&quot;，就是一个可落地的微调工程。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>基于这个骨架，补一个 <code>eval.py</code>：加载验证集，计算困惑度，并输出 10 条基座与微调模型的对比回答，供人工抽查。</li>
+<li>给 <code>config.py</code> 增加&quot;数据版本号&quot;字段，并在训练前打印当前使用的数据哈希，实现简单的数据可复现。</li>
+<li>接入 wandb，跑两次不同学习率的实验，对比 wandb 面板上的损失曲线，体会实验跟踪的价值。</li>
+<li>把 <code>infer.py</code> 的模型换成一个 <code>merge_and_unload</code> 后的合并模型，再换成一个 4-bit 量化加载的模型，比较三者的推理延迟。</li>
+</ol>
+<p>到这里，你已经完整走通了 LLM 微调从原理（LoRA/QLoRA/PEFT）、方法（指令微调/SFT/评估）到工程（端到端、领域适配、完整项目）的全程。剩下的就是拿一个你真正关心的领域，动手做一个属于你自己的模型。</p>
+<p>恭喜你完成《LLM 微调》！</p>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Hugging Face · Transformers 文档：<a href="https://huggingface.co/docs/transformers/index" target="_blank" rel="noopener noreferrer">https://huggingface.co/docs/transformers/index</a></li>
+<li>Hugging Face · PEFT 文档：<a href="https://huggingface.co/docs/peft/index" target="_blank" rel="noopener noreferrer">https://huggingface.co/docs/peft/index</a></li>
+<li>Hugging Face · TRL 文档：<a href="https://huggingface.co/docs/trl/index" target="_blank" rel="noopener noreferrer">https://huggingface.co/docs/trl/index</a></li>
+<li>Weights &amp; Biases · 实验跟踪文档：<a href="https://docs.wandb.ai/" target="_blank" rel="noopener noreferrer">https://docs.wandb.ai/</a></li>
+<li>vLLM · 高性能推理框架：<a href="https://docs.vllm.ai/" target="_blank" rel="noopener noreferrer">https://docs.vllm.ai/</a></li>
+</ul>

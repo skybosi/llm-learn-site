@@ -1,0 +1,306 @@
+<h2 id="h-与框架衔接自定义算子cuda-graphs动态-shape">与框架衔接：自定义算子、CUDA Graphs、动态 shape<a class="anchor" href="#h-与框架衔接自定义算子cuda-graphs动态-shape" aria-label="本节链接">#</a></h2>
+<p>一个在微基准里快 3 倍的 kernel，接进训练脚本后可能一点都不快——甚至更慢。原因通常不在 kernel 内部，而在<strong>衔接面</strong>：框架不认识它（编译器把它当黑盒或直接报错）、每次迭代要发射几十个 kernel（CPU 发射成瓶颈）、输入的序列长度一直在变（刚实例化的图就失效）。本课把这三件事拆成注册、调度、形状三层，逐层给出可运行的判据。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-三层衔接面">1. 三层衔接面<a class="anchor" href="#h-1-三层衔接面" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>层</th>
+<th>要解决的问题</th>
+<th>框架侧的手段</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>注册</td>
+<td>让框架知道这个算子，且能推导形状、能求导</td>
+<td><code>torch.library.custom_op</code> + fake kernel + autograd</td>
+</tr>
+<tr>
+<td>调度</td>
+<td>用很少的 CPU 开销把整段工作交给 GPU</td>
+<td>CUDA Graphs（stream capture / Graph API）</td>
+</tr>
+<tr>
+<td>形状</td>
+<td>让上面两件事在 shape 变化时仍然成立</td>
+<td>分桶（bucketing）+ 按桶各持一张图</td>
+</tr>
+</tbody></table>
+<p>三层是<strong>依赖顺序</strong>：注册没做对，后面的图与分桶无从谈起。</p>
+<h4 id="h-2-自定义算子schema-与-fake-kernel-不是形式主义">2. 自定义算子：schema 与 fake kernel 不是形式主义<a class="anchor" href="#h-2-自定义算子schema-与-fake-kernel-不是形式主义" aria-label="本节链接">#</a></h4>
+<p>PyTorch 官方指南把三件事列为自定义算子的必备项：<strong>稳定的 schema 与变异/别名契约</strong>、<strong>用 <code>torch.library.opcheck</code> 校验</strong>、<strong>返回张量时必须提供 fake kernel</strong>（否则 <code>torch.compile</code> 与 <code>torch.export</code> 用不了）。<code>torch.compile</code> 要先把图 trace 出来而不真正执行，需要&quot;只算形状不算数&quot;的 fake 实现推导输出元信息；schema 里的 <code>mutates_args</code> 告诉编译器这次调用会不会改写输入——声明错了，编译器可能合并两次调用或错误复用缓冲区。</p>
+<p>注册形态是 <code>@torch.library.custom_op(&quot;lib::name&quot;, mutates_args=())</code> 加一个 <code>@op.register_fake</code>；较新版本还有 <code>torch.library.triton_op</code>/<code>wrap_triton</code> 专门包 Triton kernel。更早的写法 <code>torch.library.Library(&quot;lib&quot;,&quot;DEF&quot;).define(schema)</code> + <code>impl(...)</code> + <code>impl_abstract(...)</code> 语义相同；示例代码两条路都实现并运行时探测（本机 2.3.1 走旧路径）。</p>
+<h4 id="h-3-cuda-graphs把-n-次发射压成-1-次">3. CUDA Graphs：把 N 次发射压成 1 次<a class="anchor" href="#h-3-cuda-graphs把-n-次发射压成-1-次" aria-label="本节链接">#</a></h4>
+<p>官方把建图分成 <strong>定义 → 实例化 → 执行</strong> 三阶段：定义时描述节点与依赖，实例化时&quot;对图模板做快照、校验，并完成大部分初始化工作&quot;，之后可执行图（executable graph）能被反复发射而不必重新实例化。理由就是 CPU 发射成本：向流里放 kernel 时驱动要做一连串准备，这笔开销<strong>每个 kernel 都要付一次</strong>，&quot;对执行时间很短的 kernel，可能占端到端时间的很大比例&quot;。</p>
+<p>建图有两条路：<strong>Graph API</strong>（<code>cudaGraphCreate()</code> + <code>cudaGraphAddNode()</code>，后者统一了早期按类型分的 <code>cudaGraphAddKernelNode()</code> 之类）与 <strong>stream capture</strong>（<code>cudaStreamBeginCapture()</code>/<code>cudaStreamEndCapture()</code> 把已有流式代码括起来，捕获期间的工作只被记录、不执行）。硬约束：<strong>legacy default stream（NULL stream）不可捕获</strong>（per-thread stream 可以）；捕获中的流与捕获事件<strong>不能同步、不能查询状态</strong>，<code>cudaMemcpy()</code> 这类会同步的 API 在捕获期间无效；跨流依赖要用 <code>cudaEventRecord</code>/<code>cudaStreamWaitEvent</code> 表达，参与捕获的流最后都要 <strong>rejoin 回 origin stream</strong>。</p>
+<p>参数变化时不必重建图：<code>cudaGraphExecUpdate(hGraphExec, hGraph, &amp;resultInfo)</code> 用新图的节点参数更新已实例化图，前提是两张图<strong>拓扑相同</strong>（&quot;topologically identical&quot;），否则返回更新失败。另有 <code>cudaGraphInstantiateFlagAutoFreeOnLaunch</code>（每次发射自动释放未释放的分配）与 <code>cudaGraphUpload()</code>（预先上传可执行图）。</p>
+<p>PyTorch 把它包成 <code>torch.cuda.CUDAGraph</code>、<code>torch.cuda.graph</code>、<code>torch.cuda.make_graphed_callables</code>（官方标注 beta）：<strong>捕获前在 side stream 上预热</strong>；每次重放读写<strong>同一批内存地址</strong>，输入/输出张量须长期持有；换数据就拷进捕获时的输入张量再 <code>replay()</code>。</p>
+<p><figure><img class="md-img" src="content/courses/gpu-cuda-kernels/assets/chapter-8-figure-04.svg" alt="CUDA Graphs：定义 → 实例化 → 重放，把发射开销摊薄" loading="lazy" decoding="async"><figcaption>CUDA Graphs：定义 → 实例化 → 重放，把发射开销摊薄</figcaption></figure>
+</p>
+<h4 id="h-4-动态-shape不是优化技巧而是前置条件">4. 动态 shape：不是优化技巧，而是前置条件<a class="anchor" href="#h-4-动态-shape不是优化技巧而是前置条件" aria-label="本节链接">#</a></h4>
+<p>PyTorch 文档在&quot;会静默出错或未定义行为&quot;一档里明确写着：<strong>Dynamic shapes are prohibited</strong>——图假定捕获序列里每个张量在每次重放的尺寸与布局都一致。于是&quot;处理动态 shape&quot;变成三种工程选择：</p>
+<table>
+<thead>
+<tr>
+<th>策略</th>
+<th>图的数量</th>
+<th>计算浪费</th>
+<th>适用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>pad 到全局最大</td>
+<td>1</td>
+<td>最大（长尾下可达数倍）</td>
+<td>长度分布集中且浪费可接受</td>
+</tr>
+<tr>
+<td>定宽分桶（如 128 一档）</td>
+<td>中</td>
+<td>小</td>
+<td>想精确控制浪费</td>
+</tr>
+<tr>
+<td>2 的幂分桶</td>
+<td>少</td>
+<td>中</td>
+<td>最常用的折中：图数是个位数</td>
+</tr>
+<tr>
+<td>逐 shape 各一张图</td>
+<td>极多</td>
+<td>0</td>
+<td>只在长度取值很少时可行</td>
+</tr>
+</tbody></table>
+<p>判据不是&quot;哪个浪费最少&quot;，而是<strong>总成本 = 填充后 token 数 × 单位成本 + 图数量 × 实例化成本</strong>；示例 A 把这张表算成数字。</p>
+<h4 id="h-5-常见坑">5. 常见坑<a class="anchor" href="#h-5-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>在 forward 里直接调 CUDA 扩展</strong>：能跑，但编译器看不到契约，会被当图断点。</li>
+<li><strong>忘了 fake kernel</strong>：eager 正常、<code>torch.compile</code> 报错，且报错不指向根因。</li>
+<li><strong>捕获前不预热</strong>：首次调用的惰性初始化（内存池、cuBLAS 句柄、autotune）会被录进图或让捕获失败。</li>
+<li><strong><code>mutates_args</code> 声明错</strong>：编译器做出错误的复用/合并决策，症状是数值悄悄错。</li>
+<li><strong>捕获区域里有 <code>.item()</code></strong>：捕获期间禁止 CPU-GPU 同步，直接报错。</li>
+<li><strong>指望 <code>cudaGraphExecUpdate</code> 改形状</strong>：它要求拓扑相同；换 bucket 应<strong>每桶各实例化一张图</strong>。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<h4 id="h-示例-agraph-盈亏平衡点--动态-shape-分桶账纯-numpy">示例 A：graph 盈亏平衡点 + 动态 shape 分桶账（纯 numpy）<a class="anchor" href="#h-示例-agraph-盈亏平衡点--动态-shape-分桶账纯-numpy" aria-label="本节链接">#</a></h4>
+<pre data-lang="python"><code class="language-python"># ===== 本课示例 A：graph 的盈亏平衡点 + 动态 shape 的分桶账（纯 numpy，无 GPU）=====
+import numpy as np
+
+# ---------- 1. 流式提交 vs graph 重放：什么时候 graph 才划算 ----------
+# 参数都是&quot;待实测&quot;的占位值：用 nsys 量你自己的 CPU 发射耗时与 kernel 时长再替换。
+LAUNCH_US = 8.0    # 每个 kernel 的 CPU 发射开销（示例占位）
+EXEC_US = 3.0      # 每个 kernel 的 GPU 执行时间（示例占位）
+N_OPS = 40         # 一次迭代里有几个 kernel
+INSTANTIATE_US = 2000.0   # 一次 cudaGraphInstantiate 的一次性成本（示例占位）
+GRAPH_LAUNCH_US = 10.0    # 一次整图 cudaGraphLaunch 的 CPU 开销（示例占位）
+
+def t_stream(iters):
+    return iters * N_OPS * max(LAUNCH_US, EXEC_US)   # CPU 发射成为瓶颈则等 CPU
+
+def t_graph(iters):
+    return INSTANTIATE_US + iters * (N_OPS * EXEC_US + GRAPH_LAUNCH_US)
+
+denom = N_OPS * (LAUNCH_US - EXEC_US) - GRAPH_LAUNCH_US
+breakeven = INSTANTIATE_US / denom if denom &gt; 0 else float(&quot;inf&quot;)
+print(f&quot;设置：{N_OPS} 个 kernel/迭代；发射 {LAUNCH_US} us，执行 {EXEC_US} us&quot;
+      f&quot; -&gt; {&#39;CPU 发射是瓶颈&#39; if LAUNCH_US &gt; EXEC_US else &#39;GPU 执行是瓶颈&#39;}&quot;)
+print(f&quot;盈亏平衡迭代数 = 实例化成本 / 每迭代省下的时间 = {breakeven:.1f} 次\n&quot;)
+print(f&quot;{&#39;迭代次数&#39;:&gt;8}{&#39;流式总时长(ms)&#39;:&gt;16}{&#39;graph 总时长(ms)&#39;:&gt;18}{&#39;加速比&#39;:&gt;9}&quot;)
+for it in (1, 10, 50, 100, 1000):
+    a, b = t_stream(it) / 1000, t_graph(it) / 1000
+    print(f&quot;{it:&gt;8}{a:&gt;16.3f}{b:&gt;18.3f}{a/b:&gt;8.2f}x&quot;)
+print(f&quot;判读：图把每迭代的 CPU 开销从 {N_OPS} 次发射压成 1 次；迭代次数低于平衡点时&quot;
+      &quot;实例化成本收不回来 —— 这就是「短命 workload 别上 graph」的量化依据。&quot;)
+
+# ---------- 2. 动态 shape：分桶的浪费 vs 重新实例化的次数 ----------
+rng = np.random.default_rng(0)
+lens = np.clip(rng.lognormal(mean=5.5, sigma=0.9, size=512).astype(int), 16, 4096)
+MAXLEN = int(lens.max())
+
+def bucket_pow2(n):
+    b = 16
+    while b &lt; n:
+        b *= 2
+    return b
+
+def bucket_fixed(n, width=128):
+    return int(np.ceil(n / width) * width)
+
+strategies = {
+    &quot;pad 到全局最大&quot;: np.full_like(lens, MAXLEN),
+    &quot;2 的幂分桶&quot;: np.array([bucket_pow2(n) for n in lens]),
+    &quot;定宽 128 分桶&quot;: np.array([bucket_fixed(n) for n in lens]),
+    &quot;不定桶（逐 shape）&quot;: lens.copy(),
+}
+PER_TOKEN_US = 0.02   # 每个（填充后）token 的计算成本占位值
+print(f&quot;\n请求数 {len(lens)}，长度 min={lens.min()} max={MAXLEN} &quot;
+      f&quot;mean={lens.mean():.0f}；实际 token {lens.sum():,}&quot;)
+print(f&quot;{&#39;策略&#39;:&lt;20}{&#39;填充后 token&#39;:&gt;14}{&#39;浪费&#39;:&gt;9}{&#39;不同 shape 数&#39;:&gt;14}&quot;
+      f&quot;{&#39;实例化成本(ms)&#39;:&gt;15}{&#39;总成本(ms)&#39;:&gt;12}&quot;)
+for name, padded in strategies.items():
+    waste = padded.sum() / lens.sum() - 1
+    n_shapes = len(np.unique(padded))
+    inst = n_shapes * INSTANTIATE_US / 1000
+    total = padded.sum() * PER_TOKEN_US / 1000 + inst
+    print(f&quot;{name:&lt;20}{padded.sum():&gt;14,}{waste:&gt;8.0%}{n_shapes:&gt;14}{inst:&gt;15.1f}{total:&gt;12.1f}&quot;)
+n_exact = len(np.unique(lens))
+print(f&quot;判读：不定桶浪费 0%，但要维护 {n_exact} 张图，实例化成本压倒一切；&quot;)
+print(&quot;      2 的幂分桶把图的数量压到个位数、浪费仍在可接受范围 —— 这才是工程选择。&quot;)
+print(&quot;      注意：CUDA Graphs / torch.cuda.graph 明确要求静态 shape，&quot;
+      &quot;所以「分桶」不是优化技巧而是前置条件。&quot;)</code></pre>
+<p>实际运行结果（python3.10 + numpy）：</p>
+<pre data-lang="text"><code class="language-text">设置：40 个 kernel/迭代；发射 8.0 us，执行 3.0 us -&gt; CPU 发射是瓶颈
+盈亏平衡迭代数 = 实例化成本 / 每迭代省下的时间 = 10.5 次
+
+    迭代次数       流式总时长(ms)     graph 总时长(ms)      加速比
+       1           0.320             2.130    0.15x
+      10           3.200             3.300    0.97x
+      50          16.000             8.500    1.88x
+     100          32.000            15.000    2.13x
+    1000         320.000           132.000    2.42x
+判读：图把每迭代的 CPU 开销从 40 次发射压成 1 次；迭代次数低于平衡点时实例化成本收不回来 —— 这就是「短命 workload 别上 graph」的量化依据。
+
+请求数 512，长度 min=16 max=3863 mean=356；实际 token 182,471
+策略                       填充后 token       浪费    不同 shape 数      实例化成本(ms)     总成本(ms)
+pad 到全局最大                1,977,856    984%             1            2.0        41.6
+2 的幂分桶                     259,200     42%             9           18.0        23.2
+定宽 128 分桶                  214,912     18%            16           32.0        36.3
+不定桶（逐 shape）               182,471      0%           355          710.0       713.6
+判读：不定桶浪费 0%，但要维护 355 张图，实例化成本压倒一切；
+      2 的幂分桶把图的数量压到个位数、浪费仍在可接受范围 —— 这才是工程选择。
+      注意：CUDA Graphs / torch.cuda.graph 明确要求静态 shape，所以「分桶」不是优化技巧而是前置条件。</code></pre>
+<p>两个关键读数：<strong>平衡点是 10.5 次迭代</strong>——少于它 graph 反而更慢（1 次迭代 0.15x），多于它收益逼近上限（1000 次 2.42x，不会超过 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">40</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">8/</span><span class="mopen">(</span><span class="mord">40</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">3</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">10</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2.46</span></span></span></span>）；长尾分布下&quot;pad 到全局最大&quot;只要 1 张图，却把计算量放大到 <strong>984%</strong> 的浪费，而&quot;2 的幂分桶&quot;用 9 张图把总成本压到最低。</p>
+<h4 id="h-示例-b注册成框架算子--graph-安全体检torchcpu">示例 B：注册成框架算子 + graph 安全体检（torch，CPU）<a class="anchor" href="#h-示例-b注册成框架算子--graph-安全体检torchcpu" aria-label="本节链接">#</a></h4>
+<pre data-lang="python"><code class="language-python"># ===== 本课示例 B：把 kernel 注册成框架算子 + graph 安全体检 =====
+# 依赖 torch（CPU 即可，无需 GPU）。真实 kernel 换成 C++/CUDA 实现，注册协议完全相同。
+import torch
+
+SCHEMA = &quot;fused_scale_bias(Tensor x, Tensor scale, Tensor bias) -&gt; Tensor&quot;
+
+def _impl(x, scale, bias):
+    &quot;&quot;&quot;占位实现：真实现是 CUDA kernel；这里保持数值语义一致以便验收。&quot;&quot;&quot;
+    return x * scale + bias
+
+def _abstract(x, scale, bias):
+    return torch.empty_like(x)
+
+if hasattr(torch.library, &quot;custom_op&quot;):                 # 新路径：较新版本才有（本机 2.3.1 无）
+    @torch.library.custom_op(&quot;gck::fused_scale_bias&quot;, mutates_args=())
+    def fused_scale_bias(x: torch.Tensor, scale: torch.Tensor, bias: torch.Tensor) -&gt; torch.Tensor:
+        return _impl(x, scale, bias)
+
+    @fused_scale_bias.register_fake
+    def _(x, scale, bias):
+        return _abstract(x, scale, bias)
+
+    op, path = torch.ops.gck.fused_scale_bias, &quot;torch.library.custom_op + register_fake&quot;
+else:                                                    # 旧路径：更早版本
+    _lib = torch.library.Library(&quot;gck&quot;, &quot;DEF&quot;)
+    _lib.define(SCHEMA)
+    _lib.impl(&quot;fused_scale_bias&quot;, _impl, &quot;CPU&quot;)
+    _lib.impl(&quot;fused_scale_bias&quot;, _abstract, &quot;Meta&quot;)     # Meta 实现 = fake kernel
+    op, path = torch.ops.gck.fused_scale_bias, &quot;torch.library.Library(define/impl/impl_abstract)&quot;
+
+print(f&quot;torch {torch.__version__}；注册路径：{path}&quot;)
+print(f&quot;算子 schema：{op.default._schema}\n&quot;)
+
+# ---------- 正确性验收：必须与参考实现逐元素对齐 ----------
+torch.manual_seed(0)
+x = torch.randn(4, 8)
+s, b = torch.tensor(2.0), torch.tensor(-0.5)
+got, ref = op(x, s, b), x * s + b
+print(f&quot;[正确性] shape={tuple(got.shape)} dtype={got.dtype} &quot;
+      f&quot;max|got-ref|={float((got - ref).abs().max()):.1e} &quot;
+      f&quot;-&gt; {&#39;PASS&#39; if torch.allclose(got, ref, atol=1e-6) else &#39;FAIL&#39;}&quot;)
+
+# ---------- opcheck：框架侧的契约体检 ----------
+if hasattr(torch.library, &quot;opcheck&quot;):
+    res = torch.library.opcheck(op, (x, s, b))
+    print(f&quot;[opcheck] {sum(1 for v in res.values() if v == &#39;PASS&#39;)}/{len(res)} 项通过&quot;)
+else:
+    print(&quot;[opcheck] 本机 torch 无 torch.library.opcheck（较新版本才有，2.3.1 无），&quot;
+          &quot;跳过；你的版本若有该 API，务必跑一次。&quot;)
+
+# ---------- graph 安全体检：按 CUDA Graphs 的硬约束逐条查 ----------
+RULES = [
+    (&quot;capture_on_side_stream&quot;, &quot;捕获必须在非默认流上（默认流不可捕获）&quot;),
+    (&quot;no_host_sync&quot;, &quot;禁止任何 CPU-GPU 同步（.item()/print 张量/隐式搬运）&quot;),
+    (&quot;static_shape&quot;, &quot;禁止动态 shape：每次重放张量尺寸与布局必须一致&quot;),
+    (&quot;static_control_flow&quot;, &quot;禁止动态控制流（除非用 torch.cond 之类的图内算子）&quot;),
+    (&quot;no_alloc_in_capture&quot;, &quot;捕获期间不要临时分配（用 graph 私有内存池/预分配输出）&quot;),
+    (&quot;single_capture&quot;, &quot;同一进程同一时刻只允许一次捕获进行中&quot;),
+]
+OPS = [  # 一个假想的 fused attention 前向链（示例数据）
+    (&quot;embedding&quot;, dict(capture_on_side_stream=True, no_host_sync=True, static_shape=True,
+                       static_control_flow=True, no_alloc_in_capture=True, single_capture=True)),
+    (&quot;shape_dispatch&quot;, dict(capture_on_side_stream=True, no_host_sync=True, static_shape=False,
+                            static_control_flow=True, no_alloc_in_capture=True, single_capture=True)),
+    (&quot;top_p_filter&quot;, dict(capture_on_side_stream=True, no_host_sync=False, static_shape=False,
+                          static_control_flow=False, no_alloc_in_capture=True, single_capture=True)),
+    (&quot;fused_scale_bias&quot;, dict(capture_on_side_stream=True, no_host_sync=True, static_shape=True,
+                              static_control_flow=True, no_alloc_in_capture=False, single_capture=True)),
+]
+print(&quot;\n[graph 体检] 逐算子对照硬约束（同一时刻只允许一次捕获：全局约束，逐算子默认满足）&quot;)
+bad_total = 0
+for name, flags in OPS:
+    bad = [(k, why) for k, why in RULES if not flags.get(k, True)]
+    bad_total += len(bad)
+    print(f&quot;  {name:&lt;18} {&#39;可捕获&#39; if not bad else f&#39;不可捕获（{len(bad)} 条违规）&#39;}&quot;)
+    for k, why in bad:
+        print(f&quot;      - 违反 {k}：{why}&quot;)
+print(f&quot;\n判读：一个 capture 区域里只要有 1 个算子违规，整段就不可捕获 —— &quot;
+      f&quot;共发现 {bad_total} 条违规，需要先把它们移出 capture 或改写成图内算子。&quot;)</code></pre>
+<p>实际运行结果：</p>
+<pre data-lang="text"><code class="language-text">torch 2.3.1；注册路径：torch.library.Library(define/impl/impl_abstract)
+算子 schema：gck::fused_scale_bias(Tensor x, Tensor scale, Tensor bias) -&gt; Tensor
+
+[正确性] shape=(4, 8) dtype=torch.float32 max|got-ref|=0.0e+00 -&gt; PASS
+[opcheck] 本机 torch 无 torch.library.opcheck（较新版本才有，2.3.1 无），跳过；你的版本若有该 API，务必跑一次。
+
+[graph 体检] 逐算子对照硬约束（同一时刻只允许一次捕获：全局约束，逐算子默认满足）
+  embedding          可捕获
+  shape_dispatch     不可捕获（1 条违规）
+      - 违反 static_shape：禁止动态 shape：每次重放张量尺寸与布局必须一致
+  top_p_filter       不可捕获（3 条违规）
+      - 违反 no_host_sync：禁止任何 CPU-GPU 同步（.item()/print 张量/隐式搬运）
+      - 违反 static_shape：禁止动态 shape：每次重放张量尺寸与布局必须一致
+      - 违反 static_control_flow：禁止动态控制流（除非用 torch.cond 之类的图内算子）
+  fused_scale_bias   不可捕获（1 条违规）
+      - 违反 no_alloc_in_capture：捕获期间不要临时分配（用 graph 私有内存池/预分配输出）
+
+判读：一个 capture 区域里只要有 1 个算子违规，整段就不可捕获 —— 共发现 5 条违规，需要先把它们移出 capture 或改写成图内算子。</code></pre>
+<p>有一处要留意：本机 torch 2.3.1 走旧注册路径，<code>custom_op</code> + <code>register_fake</code> 与 <code>torch.library.opcheck</code> 两个分支<strong>没有在本机执行过</strong>（代码用 <code>hasattr</code> 探测，新版本才会走到）；正确性验收与 graph 体检是两条路径共用的逻辑，已在 CPU 上跑通。这正是衔接面的现实：<strong>框架 API 会跨版本挪位置，注册代码必须能告诉你它走了哪条路</strong>。</p>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选，需要 GPU（云上按需开一台单卡实例即可，本课不需要多卡）----
+# 用 nsys 先量出&quot;发射开销 vs kernel 执行&quot;这两个数，再代入示例 A 的模型：
+#   nsys profile -o /tmp/iter --stats=true ./train_step
+#   nsys stats --report cuda_gpu_kern_sum,cuda_api_sum /tmp/iter.nsys-rep
+# 判读：cuda_api_sum 里 cudaLaunchKernel 的总时间若与 cuda_gpu_kern_sum 同量级或更大，
+#      说明 CPU 发射是瓶颈，上 graph 值得；否则先别动图，去优化 kernel 本身。
+# 捕获 + 重放的最小闭环（Python）：
+#   g = torch.cuda.CUDAGraph()
+#   s = torch.cuda.Stream(); s.wait_stream(torch.cuda.current_stream())
+#   with torch.cuda.stream(s):                      # 预热必须在 side stream 上
+#       for _ in range(3): static_out = model(static_in)
+#   torch.cuda.current_stream().wait_stream(s)
+#   with torch.cuda.graph(g):                       # 捕获：此处工作只被记录，不执行
+#       static_out = model(static_in)
+#   static_in.copy_(new_batch); g.replay()          # 重放：读写同一批地址
+# 没有 GPU 不影响本课：示例 A 已把&quot;何时划算 + 怎么分桶&quot;算成数字，
+# 示例 B 的注册与体检在 CPU 上完整可跑。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：给示例 B 的 <code>fused_scale_bias</code> 加 <code>out=</code> 版本（写入传入的输出缓冲），把 <code>mutates_args</code> 改成 <code>{&quot;out&quot;}</code>，并说明为什么声明成&quot;不改输入&quot;会让编译器做出错误假设。</li>
+<li><strong>解释</strong>：示例 A 中 1000 次迭代的加速比 2.42x，忽略实例化成本的理论上限是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">40</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">8/</span><span class="mopen">(</span><span class="mord">40</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">3</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">10</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2.46</span></span></span></span>。这 0.04x 从哪来？</li>
+<li><strong>对比/验证</strong>：把 <code>INSTANTIATE_US</code> 从 2000 改成 200，重算平衡点；再把 <code>sigma</code> 从 0.9 改成 0.3 让长度更集中，观察三种分桶策略的排名是否变化。</li>
+<li><strong>思考</strong>：为什么 <code>cudaGraphExecUpdate</code> 要求两图&quot;拓扑相同&quot;，而&quot;每个 bucket 各持一张图&quot;反而更常见？用示例 A 的表说明。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>NVIDIA, <em>CUDA Programming Guide</em> §4.2「CUDA Graphs」（定义/实例化/执行三阶段、<code>cudaGraphCreate</code>/<code>cudaGraphAddNode</code>、stream capture、legacy stream 不可捕获、捕获期间禁止同步与查询、跨流依赖须 rejoin 回 origin stream）：<a href="https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/cuda-graphs.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/cuda-graphs.html</a></li>
+<li>NVIDIA, <em>CUDA Runtime API</em>「Graph Management」（<code>cudaGraphExecUpdate</code> 要求图拓扑相同及其限制、<code>cudaGraphInstantiateFlagAutoFreeOnLaunch</code>、<code>cudaGraphUpload</code>）：<a href="https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__GRAPH.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__GRAPH.html</a></li>
+<li>PyTorch, <em>CUDA Graphs</em>（笔记：三个 API 的用法、side stream 预热、长期持有输入输出张量、&quot;Dynamic shapes are prohibited&quot; 等约束）：<a href="https://docs.pytorch.org/docs/stable/notes/cuda.html" target="_blank" rel="noopener noreferrer">https://docs.pytorch.org/docs/stable/notes/cuda.html</a></li>
+<li>PyTorch, <em>Custom Python Operators</em>（自定义算子必备三件：schema 与变异/别名契约、<code>opcheck</code> 校验、fake kernel）与 <em>torch.library API 参考</em>（<code>custom_op</code>/<code>register_fake</code>/<code>opcheck</code>/<code>impl</code> 符号列表）：<a href="https://docs.pytorch.org/tutorials/advanced/python_custom_ops.html" target="_blank" rel="noopener noreferrer">https://docs.pytorch.org/tutorials/advanced/python_custom_ops.html</a> · <a href="https://docs.pytorch.org/docs/stable/library.html" target="_blank" rel="noopener noreferrer">https://docs.pytorch.org/docs/stable/library.html</a></li>
+</ul>
+<p><a href="#/l/cuda-ch8-l3">下一课：项目：三个 kernel 的实现与报告</a></p>

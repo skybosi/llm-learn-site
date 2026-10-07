@@ -1,0 +1,190 @@
+<h2 id="h-megatron--deepspeed-的并行组合与配置要点">Megatron / DeepSpeed 的并行组合与配置要点<a class="anchor" href="#h-megatron--deepspeed-的并行组合与配置要点" aria-label="本节链接">#</a></h2>
+<p>前六章你分别拿到了 DP、TP、PP、EP、CP 与 ZeRO 的&quot;单件账本&quot;。真到开训时它们必须<strong>同时出现</strong>：一台 64 卡机器上，你得说清 TP 放在哪几条卡上、PP 切成几段、DP 组跨不跨机、EP 组和谁重合。这一课把这些&quot;旋钮&quot;变成一张可校验的配置表：总卡数是乘积，切分必须整除，组合有硬性要求，而每种组合的通信代价都能用前几章的 α-β 账算出来。</p>
+<p><figure><img class="md-img" src="content/courses/distributed-training-systems/assets/chapter-7-figure-01.svg" alt="三种并行度叠加成一张卡的组合" loading="lazy" decoding="async"><figcaption>三种并行度叠加成一张卡的组合</figcaption></figure>
+</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-总卡数是乘积不是加法">1. 总卡数是乘积，不是加法<a class="anchor" href="#h-1-总卡数是乘积不是加法" aria-label="本节链接">#</a></h4>
+<p>Megatron Core 的并行指南给出一条可以直接进配置校验脚本的恒等式：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord text"><span class="mord">Total GPUs</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord text"><span class="mord">TP</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord text"><span class="mord">PP</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord text"><span class="mord">CP</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord text"><span class="mord">EP</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord">DP</span></span></span></span></span></span></p>
+<p>五个维度各管一件事，官方口径是：<strong>DP 切 batch</strong>、<strong>TP 切层内张量</strong>（适合大 hidden）、<strong>PP 切模型深度</strong>（适合 50+ 层）、<strong>CP 切序列</strong>（8K+ token）、<strong>EP 切 MoE 专家</strong>。指南在同一页给出参考配置，本课的校验器直接拿它们当测试用例：LLaMA-3 70B 用 64 卡（TP4/PP4/CP2/DP2）、LLaMA-3.1 405B 用 1024 卡（TP8/PP8/CP2/DP8）、DeepSeek-V3 671B 用 1024 卡（TP2/PP16/CP1/EP64）。</p>
+<p>乘积式有个直接推论：<strong>任何一个维度翻倍，总卡数就翻倍，而&quot;每份计算&quot;只变小一部分</strong>——这正是第 8 章&quot;三本账&quot;要解决的取舍。</p>
+<h4 id="h-2-硬约束一切分必须整除否则根本跑不起来">2. 硬约束一：切分必须整除，否则根本跑不起来<a class="anchor" href="#h-2-硬约束一切分必须整除否则根本跑不起来" aria-label="本节链接">#</a></h4>
+<p>两类整除约束：</p>
+<table>
+<thead>
+<tr>
+<th>切谁</th>
+<th>必须能被谁整除</th>
+<th>不满足时的现象</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>attention heads、hidden</td>
+<td>TP</td>
+<td>初始化即报错，或头被切开后数值错</td>
+</tr>
+<tr>
+<td>层数</td>
+<td>PP</td>
+<td>各 stage 层数不均 → 慢 stage 拖住整条流水线</td>
+</tr>
+<tr>
+<td>专家数</td>
+<td>EP</td>
+<td>专家槽位对不齐，路由越界或负载严重倾斜</td>
+</tr>
+</tbody></table>
+<p>这让 TP 成了一个<strong>离散</strong>选择：hidden=8192、heads=64 时 TP 只能取 2、4、8、16、32、64，<strong>TP=3 非法</strong>（示例 1 会打印）。工程顺序因此是&quot;先枚举合法 TP，再挑其他维度&quot;，而不是先定总卡数反推。</p>
+<h4 id="h-3-硬约束二tp-与-ep-组合时建议开序列并行">3. 硬约束二：TP 与 EP 组合时建议开序列并行<a class="anchor" href="#h-3-硬约束二tp-与-ep-组合时建议开序列并行" aria-label="本节链接">#</a></h4>
+<p>Megatron Core 指南明确写着：<strong>TP + EP 组合时必须启用序列并行</strong>（<code>--sequence-parallel</code>），它把 LayerNorm / Dropout 的激活按序列维分片，消掉 TP 各 rank 上重复的激活。指南同时说&quot;用 TP 就该常开&quot;——这是激活账本里最便宜的一刀。</p>
+<p>另一条与网络有关：<strong>EP 的路由通信（All2All）往往比 DP 的梯度 AllReduce 更敏感</strong>，所以 MoE 配置倾向把 EP 组压在节点内、让 DP 组跨机；TP 恰好相反——它的 AllReduce 次数最多、单次消息最小，<strong>必须待在节点内</strong>。这两条方向相反的偏好，就是&quot;组合&quot;最反直觉的地方。</p>
+<h4 id="h-4-pp-的隐藏税气泡随段数上升">4. PP 的隐藏税：气泡随段数上升<a class="anchor" href="#h-4-pp-的隐藏税气泡随段数上升" aria-label="本节链接">#</a></h4>
+<p>PP 把层分到 p 个 stage 上，但同一时刻只有部分 stage 有活干。1F1B（一前一后交替）调度下，气泡占比为</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord">bubble</span></span><span class="mopen">(</span><span class="mord mathnormal">p</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">m</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.2019em;vertical-align:-0.8804em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3214em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">m</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord">1</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.8804em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></p>
+<p><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">m</span></span></span></span> 是在流水线里流动的 micro-batch 数。示例 2 把表打全：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span><span class="mord"><span class="mrel">=</span></span><span class="mord">4</span></span></span></span> 时 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord mathnormal">m</span><span class="mord"><span class="mrel">=</span></span><span class="mord">4</span></span></span></span> 要付 42.9% 的气泡，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord mathnormal">m</span><span class="mord"><span class="mrel">=</span></span><span class="mord">16</span></span></span></span> 降到 15.8%。<strong>这就是&quot;PP 省显存但要交时间税&quot;的定量版本</strong>，而 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">m</span></span></span></span> 由谁决定、怎么加，是下一课的主题。</p>
+<h4 id="h-5-反直觉点pp-与-dp-之间存在等价条款">5. 反直觉点：PP 与 DP 之间存在&quot;等价条款&quot;<a class="anchor" href="#h-5-反直觉点pp-与-dp-之间存在等价条款" aria-label="本节链接">#</a></h4>
+<p>先看两个旋钮各自做了什么。PP 把 80 层切成 4 段：<strong>每卡只存 20 层的参数、梯度和优化器状态</strong>，代价是气泡。DP 不减免任何模型状态，但可以让 ZeRO-1 把优化器状态按 DP 组切分：DP=8 时每卡只存 1/8 的优化器状态，代价是 optimizer step 后要 AllGather 参数、以及一次 ReduceScatter。</p>
+<p>两者都在对付同一件事——<strong>模型状态冗余</strong>。所以当某个 PP 度的显存收益已能被 ZeRO-1 用更小的通信代价换到时，加 PP 就不划算。这也是 Megatron 对<strong>所有</strong>多卡训练都推荐 <code>--use-distributed-optimizer</code>（把优化器状态按 DP 切分）的原因：它是&quot;零气泡版&quot;的那一半。</p>
+<h4 id="h-6-配置表六个旋钮三处陷阱一条自检">6. 配置表：六个旋钮、三处陷阱、一条自检<a class="anchor" href="#h-6-配置表六个旋钮三处陷阱一条自检" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>旋钮</th>
+<th>典型取值</th>
+<th>先问自己</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>TP</td>
+<td>1/2/4/8</td>
+<td>hidden、heads 整除吗？TP 组在节点内吗？</td>
+</tr>
+<tr>
+<td>PP</td>
+<td>1/2/4/8/16</td>
+<td>层数整除吗？<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">m</span></span></span></span> 够大吗（气泡 &lt; 20%）？</td>
+</tr>
+<tr>
+<td>CP</td>
+<td>1/2/4</td>
+<td>序列够长吗（8K+ 才有明确收益）？</td>
+</tr>
+<tr>
+<td>EP</td>
+<td>1/专家数</td>
+<td>整除吗？路由通信在节点内吗？</td>
+</tr>
+<tr>
+<td>DP</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="mord">/</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">E</span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="mclose">)</span></span></span></span></td>
+<td>梯度 AllReduce 跨了几台机？</td>
+</tr>
+<tr>
+<td>ZeRO/FSDP</td>
+<td>off / 1 / 2 / 3</td>
+<td>优化器状态、梯度、参数分别要不要切？</td>
+</tr>
+</tbody></table>
+<p>三处最常见的陷阱：<strong>① 拿总卡数去反推维度</strong>（应先枚举合法 TP）；<strong>② 以为 PP 一定比 ZeRO 省</strong>（两者可互换，先算通信账）；<strong>③ 让 TP 组跨机</strong>（示例 3 显示单步从 18.70 ms 涨到 215.55 ms）。自检只有一条：<strong>写下每个 rank 的坐标 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord mathnormal">tp</span><span class="mpunct">,</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">pp</span><span class="mpunct">,</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">c</span><span class="mord mathnormal">p</span><span class="mpunct">,</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">e</span><span class="mord mathnormal">p</span><span class="mpunct">,</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">d</span><span class="mord mathnormal">p</span><span class="mclose">)</span></span></span></span>，确认它与邻居的通信落在预期链路上</strong>。</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>三段纯 Python（标准库），把&quot;组合合法性、PP 气泡、TP 通信&quot;变成可打印的数字。带宽、延迟、层配置都是<strong>示例参数</strong>，请用 <code>nvidia-smi topo -m</code> 与 <code>nccl-tests</code> 实测值替换。</p>
+<pre data-lang="python"><code class="language-python"># ===== 示例 1：并行组合的合法性校验 + 总卡数 =====
+ATTN_HEADS, HIDDEN, NUM_LAYERS = 64, 8192, 80
+
+def check(tp, pp, cp, ep, dp, heads=ATTN_HEADS, hidden=HIDDEN, layers=NUM_LAYERS, experts=None):
+    &quot;&quot;&quot;返回 (总卡数, 违反的约束)。约束都来自&quot;切分必须整除&quot;与&quot;组合必须成组&quot;。&quot;&quot;&quot;
+    bad = []
+    if heads % tp:  bad.append(f&quot;attention heads={heads} 不能被 TP={tp} 整除&quot;)
+    if hidden % tp: bad.append(f&quot;hidden={hidden} 不能被 TP={tp} 整除&quot;)
+    if layers % pp: bad.append(f&quot;layers={layers} 不能被 PP={pp} 整除 → 各 stage 层数不均&quot;)
+    if ep &gt; 1 and tp == 1: bad.append(&quot;EP&gt;1 与 TP 组合时需开序列并行（只上 EP 时先确认实现）&quot;)
+    if experts is not None and experts % ep:
+        bad.append(f&quot;experts={experts} 不能被 EP={ep} 整除&quot;)
+    return tp * pp * cp * ep * dp, bad
+
+print(&quot;示例 1：并行组合校验（总卡数 = TP×PP×CP×EP×DP）&quot;)
+cfgs = [(&quot;纯 DP（起步配置）&quot;,       1, 1, 1, 1, 8,  None),
+        (&quot;TP+DP&quot;,                   8, 1, 1, 1, 2,  None),
+        (&quot;LLaMA-3 70B 参考配置&quot;,    4, 4, 2, 1, 2,  None),
+        (&quot;LLaMA-3.1 405B 参考配置&quot;, 8, 8, 2, 1, 8,  None),
+        (&quot;DeepSeek-V3 MoE 参考&quot;,    2, 16, 1, 64, 1, 256),
+        (&quot;非法：TP=3&quot;,              3, 1, 1, 1, 2,  None)]
+for name, tp, pp, cp, ep, dp, ne in cfgs:
+    n, bad = check(tp, pp, cp, ep, dp, experts=ne)
+    print(f&quot;  [{&#39;OK &#39; if not bad else &#39;BAD&#39;}] {name:&lt;22} TP{tp} PP{pp} CP{cp} EP{ep} DP{dp} = {n:&gt;5} 卡&quot;)
+    for b in bad: print(f&quot;          └─ {b}&quot;)
+
+# ===== 示例 2：PP 气泡 —— 为什么 micro-batch 数 m 至少要到 4p =====
+def bubble(p, m):
+    return (p - 1) / (m + p - 1)
+
+ms = (1, 2, 4, 8, 16, 32)
+print(&quot;\n示例 2：1F1B 的气泡占比 (p-1)/(m+p-1)&quot;)
+print(&quot;   p\\m &quot;, &quot;&quot;.join(f&quot;{m:&gt;8}&quot; for m in ms))
+for p in (2, 4, 8, 16):
+    print(f&quot;  {p:&gt;4} &quot; + &quot;&quot;.join(f&quot;{bubble(p, m)*100:7.1f}%&quot; for m in ms))
+
+# ===== 示例 3：TP 组放节点内还是跨节点（α-β 模型；每 rank 体积含 batch×seq/tp） =====
+ALPHA, BW_INTRA, BW_INTER = 5.0, 300.0, 25.0       # 全部为示例参数
+
+def tp_step_ms(tp, hidden, b, s, layers, bw, alpha=ALPHA):
+    &quot;&quot;&quot;TP 每层 2 次 AllReduce；每 rank 体积 = b*s*hidden*2B/tp。&quot;&quot;&quot;
+    vol = b * s * hidden * 2 / tp
+    per_call = alpha + (vol / (bw * 1e9) * 1e6)     # us
+    return layers * 2 * per_call / 1e3, vol
+
+print(&quot;\n示例 3：TP 通信时间（示例参数：hidden=8192, b=1, s=8192, layers=80, α=5 μs）&quot;)
+for tp, bw, tag in ((4, BW_INTRA, &quot;TP=4 节点内&quot;), (4, BW_INTER, &quot;TP=4 跨节点&quot;),
+                    (8, BW_INTRA, &quot;TP=8 节点内&quot;), (8, BW_INTER, &quot;TP=8 跨节点&quot;)):
+    ms, vol = tp_step_ms(tp, 8192, 1, 8192, 80, bw)
+    print(f&quot;  {tag:&lt;12} 每 rank 每次 {vol/2**20:6.1f} MiB  单步 {ms:8.2f} ms（160 次 AllReduce）&quot;)</code></pre>
+<p>在 Python 3.14.5（仅标准库）下实际运行结果：</p>
+<pre data-lang="text"><code class="language-text">示例 1：并行组合校验（总卡数 = TP×PP×CP×EP×DP）
+  [OK ] 纯 DP（起步配置）             TP1 PP1 CP1 EP1 DP8 =     8 卡
+  [OK ] TP+DP                  TP8 PP1 CP1 EP1 DP2 =    16 卡
+  [OK ] LLaMA-3 70B 参考配置       TP4 PP4 CP2 EP1 DP2 =    64 卡
+  [OK ] LLaMA-3.1 405B 参考配置    TP8 PP8 CP2 EP1 DP8 =  1024 卡
+  [OK ] DeepSeek-V3 MoE 参考     TP2 PP16 CP1 EP64 DP1 =  2048 卡
+  [BAD] 非法：TP=3                TP3 PP1 CP1 EP1 DP2 =     6 卡
+          └─ attention heads=64 不能被 TP=3 整除
+          └─ hidden=8192 不能被 TP=3 整除
+
+示例 2：1F1B 的气泡占比 (p-1)/(m+p-1)
+   p\m         1       2       4       8      16      32
+     2    50.0%   33.3%   20.0%   11.1%    5.9%    3.0%
+     4    75.0%   60.0%   42.9%   27.3%   15.8%    8.6%
+     8    87.5%   77.8%   63.6%   46.7%   30.4%   17.9%
+    16    93.8%   88.2%   78.9%   65.2%   48.4%   31.9%
+
+示例 3：TP 通信时间（示例参数：hidden=8192, b=1, s=8192, layers=80, α=5 μs）
+  TP=4 节点内     每 rank 每次   32.0 MiB  单步    18.70 ms（160 次 AllReduce）
+  TP=4 跨节点     每 rank 每次   32.0 MiB  单步   215.55 ms（160 次 AllReduce）
+  TP=8 节点内     每 rank 每次   16.0 MiB  单步     9.75 ms（160 次 AllReduce）
+  TP=8 跨节点     每 rank 每次   16.0 MiB  单步   108.17 ms（160 次 AllReduce）</code></pre>
+<p>示例 3 里有个易被忽略的换算：TP 从 4 加到 8，<strong>每 rank 体积减半</strong>（32 → 16 MiB），单步通信时间也减半；但 TP 组越大，能同时容纳的 DP 越少——<strong>TP 是在拿 DP 并行度换单层显存</strong>。</p>
+<p><strong>可选，需自备或云上按需 1~2 卡</strong>（本课全部结论已由上表给出，没有卡也能完成）：想把配置跑成真的，最小可复现路径是：</p>
+<pre data-lang="bash"><code class="language-bash"># 1) 先看这台机器有哪些链路，以及每张卡和谁直连
+nvidia-smi topo -m
+# 2) 用 nccl-tests 量出示例 3 里那个 β（把结果代回 tp_step_ms 的 bw 参数）
+git clone https://github.com/NVIDIA/nccl-tests &amp;&amp; cd nccl-tests &amp;&amp; make MPI=1
+./build/all_reduce_perf -b 8 -e 128M -f 2 -g 2
+# 3) 用 torchrun 起一个 2 卡/2 进程的纯通信脚本，确认 TP 组是否落在节点内
+#    （把每层 2 次 AllReduce 换成一次 all_reduce，量单次耗时，与示例 3 对照）
+NCCL_DEBUG=INFO torchrun --standalone --nproc_per_node=2 allreduce_probe.py
+# 判读：NCCL_DEBUG 的 GRAPH/TUNING 行会告诉你它选了环还是树、用了哪些通道</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：给示例 1 的 <code>check()</code> 加上&quot;DP 组是否跨机&quot;的判断（输入节点数与每节点卡数，返回 DP 组的跨机跳数），并用它扫描 LLaMA-3 70B 参考配置的 rank 布局，指出哪些 rank 对之间的 TP 通信会跨机。</li>
+<li><strong>解释</strong>：为什么 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span><span class="mord"><span class="mrel">=</span></span><span class="mord">16</span></span></span></span> 时即使 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord mathnormal">m</span><span class="mord"><span class="mrel">=</span></span><span class="mord">32</span></span></span></span>，气泡仍有 31.9%，而 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span><span class="mord"><span class="mrel">=</span></span><span class="mord">2</span></span></span></span> 时 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord mathnormal">m</span><span class="mord"><span class="mrel">=</span></span><span class="mord">4</span></span></span></span> 就只有 20.0%？用 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.3783em;vertical-align:-0.4811em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8972em;"><span style="top:-2.655em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">m</span><span class="mbin mtight">+</span><span class="mord mathnormal mtight">p</span><span class="mbin mtight">−</span><span class="mord mtight">1</span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.4461em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">p</span><span class="mbin mtight">−</span><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.4811em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span> 的分子分母各说明一次。</li>
+<li><strong>对比/验证</strong>：把示例 3 的 <code>bw</code> 换成你自己机器上 <code>nvidia-smi topo -m</code> 显示的两类链路实测值（节点内一类、跨节点一类），重算四行，并回答：TP 从 4 提到 8，收益在节点内还是跨节点更大？</li>
+<li><strong>思考</strong>：某团队把 80 层模型按 TP8/PP8 切到 64 卡上，单步比 TP4/PP4 慢了 40%。请列出至少三条互斥的候选原因，并各给一个只用日志或 <code>nccl-tests</code> 就能证伪的实验。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>NVIDIA, <em>Megatron Core Developer Guide</em> —「Parallelism Strategies Guide」（本课第 1、2、3、4 节的依据：总卡数 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.3669em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord text"><span class="mord">TP</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord text"><span class="mord">PP</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord text"><span class="mord">CP</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord text"><span class="mord">EP</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord">DP</span></span></span></span></span>、各维度&quot;Best For&quot;表、LLaMA-3 / LLaMA-3.1 / GPT-3 / Mixtral / DeepSeek-V3 的参考配置、<code>--sequence-parallel</code> 与 <code>--use-distributed-optimizer</code> 的推荐口径）：<a href="https://docs.nvidia.com/megatron-core/developer-guide/latest/user-guide/parallelism-guide.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/megatron-core/developer-guide/latest/user-guide/parallelism-guide.html</a></li>
+<li>NVIDIA, <em>Megatron-LM</em> 仓库首页（Megatron Core 提供的并行策略为 TP / PP / DP / EP / CP，混合精度支持 FP16 / BF16 / FP8 / FP4；论文出处 arXiv:1909.08053）：<a href="https://github.com/NVIDIA/Megatron-LM" target="_blank" rel="noopener noreferrer">https://github.com/NVIDIA/Megatron-LM</a></li>
+<li>Microsoft, <em>DeepSpeed Configuration JSON</em> —「Batch Size Related Parameters」「ZeRO Optimizations」（并行与 ZeRO 两组旋钮的官方字段表；本课用于说明 ZeRO 与 PP 在&quot;模型状态冗余&quot;上的重叠）：<a href="https://www.deepspeed.ai/docs/config-json/" target="_blank" rel="noopener noreferrer">https://www.deepspeed.ai/docs/config-json/</a></li>
+<li>M. Shoeybi et al., <em>Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism</em>, arXiv:1909.08053（TP 的列并行 / 行并行切分与两处 AllReduce 的原始出处）：<a href="https://arxiv.org/abs/1909.08053" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1909.08053</a></li>
+<li>S. Rajbhandari et al., <em>ZeRO: Memory Optimizations Toward Training Trillion Parameter Models</em>, arXiv:1910.02054（优化器状态 / 梯度 / 参数三级分片的原始出处；本课第 5 节&quot;分布式优化器把优化器状态按 DP 切分&quot;的依据）：<a href="https://arxiv.org/abs/1910.02054" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1910.02054</a></li>
+</ul>
+<p><a href="#/l/dts-ch7-l2">下一课：梯度累积与并行的交互、有效 batch 换算</a></p>

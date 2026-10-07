@@ -1,0 +1,305 @@
+<h2 id="h-寄存器压力与-occupancy-的工程权衡">寄存器压力与 occupancy 的工程权衡<a class="anchor" href="#h-寄存器压力与-occupancy-的工程权衡" aria-label="本节链接">#</a></h2>
+<p>前三课的方向都是&quot;越大越好&quot;：tile 越大搬运越省，缓冲越深延迟藏得越干净。它们花的是同一种资源——每线程可用的寄存器与每块可用的 shared memory。把 GEMM 的块 tile 从 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">128</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">64</span></span></span></span> 提到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">128</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">128</span></span></span></span>，每线程累加器从 32 涨到 64，下面算出的 occupancy 就从 38% 掉到 25%。本课把&quot;多省一点搬运&quot;与&quot;多留一点并行&quot;的交换算成一笔可核对的账。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-occupancy-的定义与四个限制">1. occupancy 的定义与四个限制<a class="anchor" href="#h-1-occupancy-的定义与四个限制" aria-label="本节链接">#</a></h4>
+<p><strong>occupancy</strong>（占用率）= SM 上实际驻留的 warp 数 ÷ SM 支持的最大 warp 数。它不是性能指标，而是<strong>约束条件</strong>：驻留 warp 越多，越有机会在某个 warp 等访存时切到别人，把延迟藏掉。</p>
+<p>它由四个资源分别决定，取其中最紧的那个：</p>
+<ol>
+<li><strong>寄存器</strong>：每线程寄存器数 × 每块线程数 → 每 SM 能放几块；</li>
+<li><strong>线程上限</strong>：每 SM 最多 2048 线程（= 64 warp）；</li>
+<li><strong>块数上限</strong>：每 SM 最多驻留 32 个 block；</li>
+<li><strong>shared memory</strong>：每 SM 的共享内存容量 ÷ 每块占用。</li>
+</ol>
+<p>以 Hopper（cc 9.0）为例，官方公开参数是：寄存器文件 <strong>64K 个 32-bit 寄存器/SM</strong>、<strong>每线程最多 255 个寄存器</strong>、<strong>最多 2048 线程 / 64 warp per SM</strong>、<strong>每 SM 最多 32 个 block</strong>、<strong>shared memory 228 KB/SM</strong>（单块最多 227 KB，官方保留 1 KB）。cc 9.0 的最大并发 warp 数与 Ampere 相同（64）。<strong>这些数字要按自己手上的卡核对</strong>：<code>cudaDeviceProp</code> 或官方 occupancy calculator 才是权威。</p>
+<p>还有一条最容易被忽略的细节：<strong>寄存器按 warp 级、8 个寄存器/线程的粒度分配</strong>（向上取整）。所以 17 与 24 个寄存器/线程可能一样贵；&quot;少用 3 个寄存器就能多住一个块&quot;成立与否，取决于跨过的是哪一个 8 的倍数。</p>
+<p><figure><img class="md-img" src="content/courses/gpu-cuda-kernels/assets/chapter-4-figure-04.svg" alt="occupancy 由四个资源限制取最小，压寄存器不一定提高它" loading="lazy" decoding="async"><figcaption>occupancy 由四个资源限制取最小，压寄存器不一定提高它</figcaption></figure>
+</p>
+<h4 id="h-2-一本可核对的账">2. 一本可核对的账<a class="anchor" href="#h-2-一本可核对的账" aria-label="本节链接">#</a></h4>
+<p>下一节的代码按上面的规则实现了 occupancy 计算。先看<strong>只受寄存器限制</strong>的情形（256 线程/块、不用 shared memory）：</p>
+<table>
+<thead>
+<tr>
+<th>regs/线程</th>
+<th>允许块数</th>
+<th>驻留线程</th>
+<th>occupancy</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>24</td>
+<td>8</td>
+<td>2048</td>
+<td>100%</td>
+</tr>
+<tr>
+<td>32</td>
+<td>8</td>
+<td>2048</td>
+<td>100%</td>
+</tr>
+<tr>
+<td>40</td>
+<td>6</td>
+<td>1536</td>
+<td>75%</td>
+</tr>
+<tr>
+<td>64</td>
+<td>4</td>
+<td>1024</td>
+<td>50%</td>
+</tr>
+<tr>
+<td>96</td>
+<td>2</td>
+<td>512</td>
+<td>25%</td>
+</tr>
+<tr>
+<td>128</td>
+<td>2</td>
+<td>512</td>
+<td>25%</td>
+</tr>
+<tr>
+<td>168</td>
+<td>1</td>
+<td>256</td>
+<td>12.5%</td>
+</tr>
+<tr>
+<td>255</td>
+<td>1</td>
+<td>256</td>
+<td>12.5%</td>
+</tr>
+</tbody></table>
+<p>再看 shared memory 一起参与（256 线程、每块 32 KB）：regs=32 时是 <strong>88%（限制因素变成 shared memory）</strong>，regs=128 时 25%。这说明：<strong>压寄存器不一定能提高 occupancy</strong>——先看清是谁在卡。</p>
+<p>最后看 GEMM 配置（按&quot;累加器 + 约 40 个其他寄存器&quot;量级估计）：</p>
+<table>
+<thead>
+<tr>
+<th>块 tile / 线程</th>
+<th>累加器/线程</th>
+<th>约计寄存器</th>
+<th>occupancy（限制因素）</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>64×64 / 128</td>
+<td>32</td>
+<td>72</td>
+<td>44%（寄存器）</td>
+</tr>
+<tr>
+<td>128×64 / 256</td>
+<td>32</td>
+<td>72</td>
+<td>38%（寄存器）</td>
+</tr>
+<tr>
+<td>128×128 / 256</td>
+<td>64</td>
+<td>104</td>
+<td>25%（寄存器）</td>
+</tr>
+<tr>
+<td>128×128 / 128</td>
+<td>128</td>
+<td>168</td>
+<td>19%（寄存器）</td>
+</tr>
+</tbody></table>
+<p>这张表就是本课的核心矛盾：<strong>tile 面积决定复用（第 1 课），而累加器面积就是寄存器面积</strong>。要更大的复用，就在同一个寄存器池里少留一点给并行。</p>
+<h4 id="h-3-为什么-occupancy-重要延迟隐藏的两条路">3. 为什么 occupancy 重要：延迟隐藏的两条路<a class="anchor" href="#h-3-为什么-occupancy-重要延迟隐藏的两条路" aria-label="本节链接">#</a></h4>
+<p>要维持带宽 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0502em;">B</span><span class="mord mathnormal" style="margin-right:0.1389em;">W</span></span></span></span>，在飞的字节数必须满足（Little 定律的形式）：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord text"><span class="mord">bytes in flight</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≥</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal" style="margin-right:0.0502em;">B</span><span class="mord mathnormal" style="margin-right:0.1389em;">W</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span></span></span></span></span></p>
+<p><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span></span></span></span> 是访存延迟，几百个周期量级，改不了；<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0502em;">B</span><span class="mord mathnormal" style="margin-right:0.1389em;">W</span></span></span></span> 是每个 SM 分到的带宽份额。左边的量只能靠两样东西凑：<strong>驻留 warp 数</strong>（occupancy）与<strong>每线程同时在飞的独立 load 数</strong>（ILP，指令级并行）。</p>
+<p>下一节的代码用一个周期级仿真量了前者：1 个发射口/周期、每个 warp 只允许 1 个 load 在飞、延迟 400 周期、每次 load 后 8 条计算指令：</p>
+<table>
+<thead>
+<tr>
+<th>驻留 warp</th>
+<th>occupancy</th>
+<th>仿真 IPC</th>
+<th>发射口空闲</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>8</td>
+<td>12.5%</td>
+<td>0.175</td>
+<td>82%</td>
+</tr>
+<tr>
+<td>16</td>
+<td>25%</td>
+<td>0.345</td>
+<td>65%</td>
+</tr>
+<tr>
+<td>32</td>
+<td>50%</td>
+<td>0.655</td>
+<td>34%</td>
+</tr>
+<tr>
+<td>48</td>
+<td>75%</td>
+<td>0.886</td>
+<td>11%</td>
+</tr>
+<tr>
+<td>64</td>
+<td>100%</td>
+<td>0.955</td>
+<td>5%</td>
+</tr>
+</tbody></table>
+<p>两个读数值得记住：<strong>occupancy 从 25% 提到 50%，吞吐几乎翻倍</strong>（0.345 → 0.655）；而<strong>从 75% 提到 100% 只多 7 个百分点</strong>，收益明显递减。所以&quot;occupancy 越高越好&quot;是错的，正确问法是&quot;<strong>够不够撑起带宽目标</strong>&quot;。</p>
+<p>ILP 这条路解释了另一个现象：为什么真实 GEMM 在 25% occupancy 下依然很快。8×8 的 thread tile 意味着每线程有 8 条互相独立的累加链，一次能发出多个不相关 load，在飞字节数靠 ILP 就凑够了。<strong>低 occupancy + 高 ILP 与高 occupancy + 低 ILP 可以打平，选哪条取决于访存形态与寄存器预算。</strong></p>
+<h4 id="h-4-工程上的三个旋钮">4. 工程上的三个旋钮<a class="anchor" href="#h-4-工程上的三个旋钮" aria-label="本节链接">#</a></h4>
+<ol>
+<li><strong><code>__launch_bounds__(maxThreadsPerBlock, minBlocksPerMultiprocessor)</code></strong>：告诉编译器&quot;我要至少 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span></span></span></span> 个块驻留，请把每线程寄存器压到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">65536/</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord cjk_fallback">线程数</span></span><span class="mclose">)</span></span></span></span> 以下&quot;。编译器会照办，代价是可能 <strong>spill</strong>（把放不下的值溢出到 local memory）。</li>
+<li><strong><code>-maxrregcount</code></strong>：给整个编译单元设每线程寄存器上限；粒度粗（非 per-kernel），一般不如 <code>__launch_bounds__</code> 精确。</li>
+<li><strong>手工改造</strong>：减少同时活跃的临时值、复用寄存器、把大 tile 拆成两级——把&quot;要复用&quot;与&quot;要并行&quot;分别放在 shared memory 与寄存器上。</li>
+</ol>
+<p><strong>判断顺序永远是：先 profile 找到瓶颈，再决定动不动寄存器。</strong> 常用指标（以本机 <code>ncu --query-metrics</code> 为准）：<code>launch__registers_per_thread</code>、<code>sm__warps_active.avg.pct_of_peak_sustained_active</code>、<code>launch__occupancy_limit_registers</code>，以及 local memory/spill 相关指标。特别要警惕 spill：local memory 实际落在 off-chip 内存里，一次 spill 就是一次额外访存，<strong>可能把第 1 课省下来的搬运全部吐回去</strong>。</p>
+<h4 id="h-5-常见坑">5. 常见坑<a class="anchor" href="#h-5-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>只盯 occupancy</strong>：带宽已经打满时，提高 occupancy 的收益是 0；先确认是延迟受限还是带宽受限。</li>
+<li><strong>压寄存器压出 spill</strong>：没看 spill 指标就调 <code>__launch_bounds__</code>，结果搬运量涨了、时间没降。</li>
+<li><strong>用 <code>-maxrregcount</code> 一刀切</strong>：为了一个大 kernel 的 occupancy，把同文件里的小 kernel 一起压坏。</li>
+<li><strong>按&quot;差 3 个寄存器&quot;推 occupancy</strong>：忘了 8 个/线程的分配粒度。</li>
+<li><strong>没发现是 shared memory 在卡</strong>：regs=32 + 32 KB/块的例子里，压寄存器完全无效。</li>
+<li><strong>把 100% 当目标</strong>：工程目标应是&quot;够用的 occupancy + 足够的 ILP&quot;，不是把 SM 塞满。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>两段：occupancy 账本（按公开的 cc 9.0 参数实现四个限制的取最小逻辑）与延迟隐藏仿真（occupancy → 吞吐）。</p>
+<pre data-lang="python"><code class="language-python"># ===== 本课示例：occupancy 账本 + 延迟隐藏曲线 =====
+REG_SM, THREAD_SM, WARP_SM = 65536, 2048, 64
+BLOCK_SM, SMEM_SM, SMEM_RESERVED, REG_GRAN = 32, 228 * 1024, 1024, 8
+
+def occupancy(threads, regs, smem_per_block):
+    &quot;&quot;&quot;按公开的 cc 9.0 参数算 occupancy；上限各自算&quot;允许几个块&quot;，再取最小。&quot;&quot;&quot;
+    wpb = threads // 32
+    regs_r = -(-regs // REG_GRAN) * REG_GRAN
+    blk_reg = REG_SM // (regs_r * 32 * wpb) if regs_r else BLOCK_SM
+    blk_thr = THREAD_SM // threads
+    blk_smem = (SMEM_SM - SMEM_RESERVED) // max(smem_per_block, 1)
+    blk_warp = WARP_SM // wpb
+    caps = {&#39;寄存器&#39;: blk_reg, &#39;线程上限&#39;: blk_thr, &#39;共享内存&#39;: blk_smem,
+            &#39;块/warp 上限&#39;: min(BLOCK_SM, blk_warp)}
+    blocks = max(min(caps.values()), 0)
+    limit = min(caps, key=caps.get)
+    return blocks * threads, (blocks * threads) / THREAD_SM, blocks, limit
+
+print(&quot;参数取 Hopper（cc 9.0）公开值：64K 寄存器/SM、2048 线程/SM、64 warp/SM、&quot;
+      &quot;228 KB 共享内存/SM、32 块/SM。\n&quot;)
+print(f&quot;{&#39;regs/线程&#39;:&gt;9} {&#39;块数&#39;:&gt;5} {&#39;驻留线程&#39;:&gt;9} {&#39;occupancy&#39;:&gt;10} {&#39;限制因素&#39;:&gt;10}&quot;)
+for R in (24, 32, 40, 64, 96, 128, 168, 255):
+    live, occ, blocks, limit = occupancy(256, R, 0)     # 纯寄存器受限的 kernel
+    print(f&quot;{R:&gt;9} {blocks:&gt;5} {live:&gt;9} {occ:&gt;9.0%} {limit:&gt;10}&quot;)
+
+print(&quot;\n同样 256 线程，但每块占 32 KB 共享内存（双缓冲的一级）：&quot;)
+for R in (32, 64, 128):
+    live, occ, blocks, limit = occupancy(256, R, 32 * 1024)
+    print(f&quot;  regs={R:&gt;3} → {blocks} 块 = {live} 线程，occupancy {occ:.0%}（限制：{limit}）&quot;)
+
+print(&quot;\n输出 tile 越大越省搬运，但累加器直接吃寄存器：&quot;)
+for bm, bn, th in ((64, 64, 128), (128, 64, 256), (128, 128, 256), (128, 128, 128)):
+    acc = (bm * bn) // th
+    regs = acc + 40          # ≈ 累加器 + A/B 片段 + 地址与循环变量（数量级估计）
+    live, occ, blocks, limit = occupancy(th, regs, 2 * 128 * 32 * 2)
+    print(f&quot;  tile {bm:&gt;3}x{bn:&lt;3} / {th:&gt;3} 线程 → 累加器 {acc:&gt;3}/线程，&quot;
+          f&quot;约 {regs:&gt;3} 寄存器 → occupancy {occ:&gt;4.0%}（{limit}）&quot;)
+
+def simulate(n_warps, iters=40, latency=400, comp=8, jitter=64):
+    &quot;&quot;&quot;1 个发射口/周期；每 warp 同时只允许 1 个 load in flight；抖动只为打散相位。&quot;&quot;&quot;
+    nxt=[0]*n_warps; pend=[0]*n_warps; left=[iters]*n_warps
+    comp_left=[0]*n_warps; waiting=[False]*n_warps; issued=idle=0
+    cyc=cursor=0
+    while any(l&gt;0 for l in left):
+        got=False
+        for _ in range(n_warps):
+            w=cursor%n_warps; cursor+=1
+            if left[w]==0 or nxt[w]&gt;cyc: continue
+            if waiting[w]:
+                if pend[w]&gt;cyc: continue
+                waiting[w]=False; comp_left[w]=comp
+            if comp_left[w]&gt;0: comp_left[w]-=1
+            else:
+                waiting[w]=True
+                pend[w]=cyc+latency+((w*13+(iters-left[w])*7)%jitter)-jitter//2
+                left[w]-=1
+            nxt[w]=cyc+1; issued+=1; got=True; break
+        if not got: idle+=1
+        cyc+=1
+    return cyc, issued, idle
+
+print(f&quot;\n延迟隐藏：1 发射口/周期、每 warp 只允许 1 个 load in flight、&quot;
+      f&quot;延迟 400 周期、每次 load 后 8 条计算&quot;)
+print(f&quot;{&#39;驻留 warp&#39;:&gt;9} {&#39;occupancy&#39;:&gt;10} {&#39;仿真 IPC&#39;:&gt;9} {&#39;端口空闲&#39;:&gt;9}&quot;)
+for W, occ in ((8,&#39;12.5%&#39;),(16,&#39;25%&#39;),(32,&#39;50%&#39;),(48,&#39;75%&#39;),(64,&#39;100%&#39;)):
+    cyc, issued, idle = simulate(W)
+    print(f&quot;{W:&gt;9} {occ:&gt;10} {issued/cyc:&gt;9.3f} {idle/cyc:&gt;9.0%}&quot;)</code></pre>
+<p>实跑输出（<code>python3</code>，纯标准库）：</p>
+<pre data-lang="text"><code class="language-text">参数取 Hopper（cc 9.0）公开值：64K 寄存器/SM、2048 线程/SM、64 warp/SM、228 KB 共享内存/SM、32 块/SM。
+
+  regs/线程    块数      驻留线程  occupancy       限制因素
+       24     8      2048      100%       线程上限
+       32     8      2048      100%        寄存器
+       40     6      1536       75%        寄存器
+       64     4      1024       50%        寄存器
+       96     2       512       25%        寄存器
+      128     2       512       25%        寄存器
+      168     1       256       12%        寄存器
+      255     1       256       12%        寄存器
+
+同样 256 线程，但每块占 32 KB 共享内存（双缓冲的一级）：
+  regs= 32 → 7 块 = 1792 线程，occupancy 88%（限制：共享内存）
+  regs= 64 → 4 块 = 1024 线程，occupancy 50%（限制：寄存器）
+  regs=128 → 2 块 = 512 线程，occupancy 25%（限制：寄存器）
+
+输出 tile 越大越省搬运，但累加器直接吃寄存器：
+  tile  64x64  / 128 线程 → 累加器  32/线程，约  72 寄存器 → occupancy  44%（寄存器）
+  tile 128x64  / 256 线程 → 累加器  32/线程，约  72 寄存器 → occupancy  38%（寄存器）
+  tile 128x128 / 256 线程 → 累加器  64/线程，约 104 寄存器 → occupancy  25%（寄存器）
+  tile 128x128 / 128 线程 → 累加器 128/线程，约 168 寄存器 → occupancy  19%（寄存器）
+
+延迟隐藏：1 发射口/周期、每 warp 只允许 1 个 load in flight、延迟 400 周期、每次 load 后 8 条计算
+  驻留 warp  occupancy    仿真 IPC      端口空闲
+        8      12.5%     0.175       82%
+       16        25%     0.345       65%
+       32        50%     0.655       34%
+       48        75%     0.886       11%
+       64       100%     0.955        5%</code></pre>
+<p>（<code>regs=32</code> 那行两个限制同时触顶：8 块既是线程上限也是寄存器上限，脚本按字典序报了&quot;寄存器&quot;。）</p>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选：需要 GPU。让运行时替你算 occupancy，并用 ncu 验证瓶颈 ----
+# 1) 运行时 API（权威口径，和 cudaDeviceProp 一起用）：
+#    int blocks; cudaOccupancyMaxActiveBlocksPerMultiprocessor(&amp;blocks, my_kernel, threads, smem);
+#    printf(&quot;blocks/SM=%d, occupancy=%.0f%%\n&quot;, blocks, 100.0*blocks*threads/prop.maxThreadsPerMultiProcessor);
+# 2) 看寄存器与实际驻留 warp：
+#    ncu --metrics launch__registers_per_thread,\
+#          sm__warps_active.avg.pct_of_peak_sustained_active,launch__occupancy_limit_registers \
+#        ./my_kernel
+# 3) 想验证&quot;压寄存器是否压出 spill&quot;：对比加 __launch_bounds__ 前后
+#    ncu --metrics l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum,dram__bytes_read.sum ./my_kernel
+#    局部内存访问量上升 = 溢出变多，此时&quot;省下的搬运&quot;可能又被吃回去。
+# 没有 GPU 不影响本课：上面两段 Python 已经把四个限制与延迟隐藏曲线算完。
+# 指标名以 ncu --query-metrics 在本机输出的清单为准。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：给 <code>occupancy</code> 增加 <code>blocks_per_sm</code> 上限之外的第五个限制——&quot;每块的 shared memory 若有 carveout 限制（例如静态分配最多 48 KB，更大需显式 opt-in）&quot;，用 48 KB 重跑 32 KB/块那一组，说明限制因素是否改变。</li>
+<li><strong>解释</strong>：为什么&quot;每线程 17 个寄存器&quot;与&quot;每线程 24 个寄存器&quot;可能给出完全相同的 occupancy？把 <code>REG_GRAN</code> 从 8 改成 1 再跑一次，说明差异来自哪里。</li>
+<li><strong>对比/验证</strong>：把延迟从 400 改成 200、计算从 8 改成 16，重跑仿真。在同样的 occupancy 下吞吐提升了多少？用&quot;延迟/计算比&quot;解释这个结果，并说明它对&quot;要不要为了 occupancy 压寄存器&quot;的启示。</li>
+<li><strong>思考</strong>：一个 GEMM kernel 在 25% occupancy 下达到了 90% 的 HBM 带宽。你会去调 <code>__launch_bounds__</code> 提高 occupancy 吗？写出你的判断依据（需要看哪两个指标、什么条件下才值得动手）。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>NVIDIA, <em>NVIDIA Hopper Tuning Guide</em> §1.4.1.1「Occupancy」（64K 寄存器/SM、每线程最多 255 寄存器、最多 32 块/SM、64 warp/SM、228 KB 共享内存/SM 等公开参数）：<a href="https://docs.nvidia.com/cuda/hopper-tuning-guide/" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/hopper-tuning-guide/</a></li>
+<li>NVIDIA, <em>CUDA C++ Best Practices Guide</em> §11.1「Occupancy」与 §11.1.1「Calculating Occupancy」（occupancy 的定义、限制因素与运行时 API）：<a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#occupancy" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#occupancy</a></li>
+<li>NVIDIA, <em>CUDA C++ Best Practices Guide</em> §10.2.7.1「Register Pressure」与 §11.2「Hiding Register Dependencies」（寄存器压力与 ILP 的作用）：<a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#register-pressure" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#register-pressure</a></li>
+<li>NVIDIA, <em>Nsight Compute 文档</em>（<code>launch__registers_per_thread</code>、<code>sm__warps_active</code> 等指标与 <code>--query-metrics</code> 用法）：<a href="https://docs.nvidia.com/nsight-compute/" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/nsight-compute/</a></li>
+</ul>
+<p><a href="#/learn/../chapter-5/lesson-01">下一章：内存模型与同步进阶</a></p>

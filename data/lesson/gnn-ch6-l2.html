@@ -1,0 +1,145 @@
+<h2 id="h-数据集">数据集<a class="anchor" href="#h-数据集" aria-label="本节链接">#</a></h2>
+<p>上一课我们只用了一个内置的小图。真实项目里，你得会<strong>加载各类基准数据集</strong>，更要会<strong>把自己的数据变成 PyG 认识的样子</strong>。本课讲清 PyG 的数据集体系：内置数据集怎么用、<code>Dataset</code>/<code>InMemoryDataset</code> 的内部结构是什么、以及如何从原始边表造出自定义数据集。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-内置数据集全家桶">1. 内置数据集全家桶<a class="anchor" href="#h-1-内置数据集全家桶" aria-label="本节链接">#</a></h4>
+<p>PyG 把常用数据集分成几大类，导入路径都统一：</p>
+<ul>
+<li><strong>节点级（引文网络）</strong>：<code>Planetoid</code>（Cora、CiteSeer、PubMed），含固定训练/验证/测试掩码。</li>
+<li><strong>图级（分子/蛋白质/社交子图）</strong>：<code>TUDataset</code>（MUTAG、PROTEINS、ENZYMES、IMDB-BINARY 等几百个图分类数据集）。</li>
+<li><strong>小示例图</strong>：<code>KarateClub</code>（空手道俱乐部，社区检测入门）。</li>
+<li><strong>大规模基准</strong>：<code>OGB</code>（Open Graph Benchmark，节点/边/图分类的权威大榜）、<code>HeterophilousGraphDataset</code> 等。</li>
+</ul>
+<p>加载方式大同小异，以 <code>Planetoid</code> 和 <code>TUDataset</code> 为例：</p>
+<pre data-lang="python"><code class="language-python">from torch_geometric.datasets import Planetoid, TUDataset
+
+# 节点分类：Cora 是一张&quot;大图&quot;，dataset[0] 即这张图
+cora = Planetoid(root=&#39;./data/Cora&#39;, name=&#39;Cora&#39;)
+data = cora[0]
+print(data)  # 含 train_mask/val_mask/test_mask
+
+# 图分类：MUTAG 是&quot;一批小图&quot;，dataset[i] 是第 i 张图
+mutag = TUDataset(root=&#39;./data/MUTAG&#39;, name=&#39;MUTAG&#39;)
+print(len(mutag))          # 图的数量
+print(mutag[0])            # 第一张图</code></pre>
+<p>注意一个容易混淆的点：<code>Planetoid</code> 的 <code>len(dataset)</code> 是 1（一张大图），而 <code>TUDataset</code> 的 <code>len(dataset)</code> 是图的个数。前者靠掩码切分节点，后者靠索引切分图。</p>
+<h4 id="h-2-dataset-的通用接口">2. <code>Dataset</code> 的通用接口<a class="anchor" href="#h-2-dataset-的通用接口" aria-label="本节链接">#</a></h4>
+<p>所有数据集都继承 <code>Dataset</code>，实现三个约定方法，用户只需面向这三个接口：</p>
+<ul>
+<li><code>len(dataset)</code>：数据对象总数。</li>
+<li><code>dataset[i]</code>：第 <code>i</code> 个 <code>Data</code> 对象（可能是&quot;一张大图&quot;或&quot;一批小图中的一张&quot;）。</li>
+<li><code>dataset.num_features</code> / <code>dataset.num_classes</code>：特征维数 / 类别数（模型构造时必用）。</li>
+</ul>
+<p>此外还有 <code>dataset.get(idx)</code> 返回原始对象、<code>dataset.shuffle()</code> 打乱顺序、<code>dataset.indices()</code> 返回索引等工具。</p>
+<h4 id="h-3-缓存机制inmemorydataset">3. 缓存机制：<code>InMemoryDataset</code><a class="anchor" href="#h-3-缓存机制inmemorydataset" aria-label="本节链接">#</a></h4>
+<p>内置数据集大多继承 <strong><code>InMemoryDataset</code></strong>：第一次加载时，它会把整个数据集<strong>下载、预处理、打包成一个文件缓存到 <code>root/</code> 目录</strong>，之后直接从缓存读，速度极快。它的生命周期是：</p>
+<pre><code>download() → process() → 保存 processed/ 缓存 → 之后直接 load</code></pre>
+<ul>
+<li><code>root/raw/</code>：存放原始下载文件。</li>
+<li><code>root/processed/</code>：存放预处理后的缓存（下次不再重复处理）。</li>
+</ul>
+<p>理解这一点很重要：如果你改了预处理逻辑，需要<strong>删除 <code>processed/</code> 目录</strong>（或换 <code>root</code> 路径）强制重新处理，否则会一直读到旧缓存。</p>
+<h4 id="h-4-自定义数据集两条路">4. 自定义数据集：两条路<a class="anchor" href="#h-4-自定义数据集两条路" aria-label="本节链接">#</a></h4>
+<p><strong>路子 A：从边表和特征手工构造 <code>Data</code>（适合一次性小图）</strong></p>
+<pre data-lang="python"><code class="language-python">import torch
+from torch_geometric.data import Data
+
+# 假设你有：特征矩阵 X（N×F）、边表 edge_list（E×2）、标签 y
+X = torch.tensor([[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]], dtype=torch.float)
+edge_list = torch.tensor([[0, 1], [1, 2], [2, 0]], dtype=torch.long)
+
+# edge_index 需要 [2, E] 且转置；无向图要双向写
+edge_index = edge_list.t().contiguous()
+edge_index = torch.cat([edge_index, edge_index.flip(0)], dim=1)  # 加反向边
+y = torch.tensor([0, 1, 0], dtype=torch.long)
+
+data = Data(x=X, edge_index=edge_index, y=y)</code></pre>
+<p><strong>路子 B：继承 <code>InMemoryDataset</code>（适合多图、可复用、需缓存的标准数据集）</strong></p>
+<p>自定义图分类数据集时，重写 <code>process()</code> 即可。骨架如下：</p>
+<pre data-lang="python"><code class="language-python">from torch_geometric.data import InMemoryDataset, Data
+import torch
+
+class MyGraphDataset(InMemoryDataset):
+    def __init__(self, root, transform=None, pre_transform=None):
+        super().__init__(root, transform, pre_transform)
+        self.load(self.processed_paths[0])   # 从缓存加载
+
+    @property
+    def raw_file_names(self):
+        return [&#39;my_raw.txt&#39;]                 # 原始文件名
+
+    @property
+    def processed_file_names(self):
+        return [&#39;data.pt&#39;]                    # 缓存文件名
+
+    def process(self):
+        data_list = []
+        # 在这里读原始文件，构造每张图的 Data 对象
+        # 例如：对每个分子，用 rdkit 解析得到节点特征 x、边索引 edge_index、标签 y
+        # data_list.append(Data(x=x, edge_index=edge_index, y=y))
+        data, slices = self.collate(data_list)  # 打包成一个大 Data + 切片信息
+        torch.save((data, slices), self.processed_paths[0])</code></pre>
+<p>其中的核心是 <code>collate</code>：它把多张图拼接成一张大图，并记录 <code>slices</code>（每张图的节点/边区间），这样 <code>dataset[i]</code> 能按切片还原第 <code>i</code> 张图——这正是上一课图分类里 batch 机制的底层实现。</p>
+<h4 id="h-5-dataloader-与-mini-batch">5. <code>DataLoader</code> 与 mini-batch<a class="anchor" href="#h-5-dataloader-与-mini-batch" aria-label="本节链接">#</a></h4>
+<p>节点分类常用整图前向；图分类则必须 <code>DataLoader</code> 分小批。它内部做了两件事：把 <code>batch_size</code> 张图 <code>collate</code> 成一张大图，并生成 <code>data.batch</code> 向量标记每个节点属于哪张图。</p>
+<pre data-lang="python"><code class="language-python">from torch_geometric.loader import DataLoader
+loader = DataLoader(mutag, batch_size=32, shuffle=True)
+for batch in loader:
+    print(batch.num_graphs)   # 本批图的数量
+    print(batch.batch)        # 每个节点所属的图编号
+    # 之后用 global_*_pool(x, batch.batch) 做图级读出</code></pre>
+<p><figure><img class="md-img" src="content/courses/graph-neural-networks/assets/chapter-6-figure-02.svg" alt="PyG 数据集与批处理示意：左上角画出 root 目录结构（raw/ 原始文件 → processed/ 缓存），表示 InMemoryDataset 的下载→处理→缓存流程；右侧画出三张不同大小的图经 collate 沿节点维拼接成一张大图，边上用 batch 向量 [0,0,1,1,1,2,...] 标注每个节点的归属，下方注明 global_pool 按 batch 分组做图级读出" loading="lazy" decoding="async"><figcaption>PyG 数据集与批处理示意：左上角画出 root 目录结构（raw/ 原始文件 → processed/ 缓存），表示 InMemoryDataset 的下载→处理→缓存流程；右侧画出三张不同大小的图经 collate 沿节点维拼接成一张大图，边上用 batch 向量 [0,0,1,1,1,2,...] 标注每个节点的归属，下方注明 global_pool 按 batch 分组做图级读出</figcaption></figure>
+</p>
+<h3 id="h-二可运行示例">二、可运行示例<a class="anchor" href="#h-二可运行示例" aria-label="本节链接">#</a></h3>
+<p><strong>示例：遍历内置数据集 + 自定义数据集完整流程</strong></p>
+<pre data-lang="python"><code class="language-python">import torch
+from torch_geometric.datasets import Planetoid, TUDataset
+from torch_geometric.loader import DataLoader
+from torch_geometric.data import Data
+
+# —— 第一部分：内置数据集 ——
+cora = Planetoid(root=&#39;./data/Cora&#39;, name=&#39;Cora&#39;)
+print(&#39;Cora 节点数:&#39;, cora[0].num_nodes,
+      &#39;特征维:&#39;, cora.num_features,
+      &#39;类别数:&#39;, cora.num_classes)
+
+mutag = TUDataset(root=&#39;./data/MUTAG&#39;, name=&#39;MUTAG&#39;)
+print(&#39;MUTAG 图数:&#39;, len(mutag),
+      &#39;特征维:&#39;, mutag.num_features,
+      &#39;类别数:&#39;, mutag.num_classes)
+
+loader = DataLoader(mutag, batch_size=32, shuffle=True)
+first_batch = next(iter(loader))
+print(&#39;一个 batch 里的图数:&#39;, first_batch.num_graphs)
+print(&#39;batch 向量（前 12 个节点归属）:&#39;, first_batch.batch[:12].tolist())
+
+# —— 第二部分：从边表构造自定义 Data ——
+X = torch.tensor([[1., 0.], [0., 1.], [1., 1.], [0., 0.]], dtype=torch.float)
+edge_list = torch.tensor([[0, 1], [1, 2], [2, 3], [3, 0], [0, 2]], dtype=torch.long)
+# 转成 [2, E] 并补反向边 → 无向图
+ei = edge_list.t().contiguous()
+ei = torch.cat([ei, ei.flip(0)], dim=1)
+y = torch.tensor([1, 0, 1, 0], dtype=torch.long)   # 4 个节点的二分类标签
+
+custom = Data(x=X, edge_index=ei, y=y)
+print(&#39;自定义图:&#39;, custom)   # Data(x=[4, 2], edge_index=[2, 10], y=[4])
+
+# 校验图的基本属性
+print(&#39;是否有自环:&#39;, custom.has_self_loops())
+print(&#39;是否无向:&#39;, custom.is_undirected())</code></pre>
+<p>运行后应能看到：Cora 是一张 2708 节点的图，MUTAG 有 188 张图，自定义 <code>Data</code> 的边被正确地双向化（5 条边变 10 条）。这三点正是理解 PyG 数据体系的关键检查点。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>区分两种 dataset</strong>：打印 <code>len(Planetoid(name=&#39;Cora&#39;))</code> 和 <code>len(TUDataset(name=&#39;MUTAG&#39;))</code>，解释为什么前者是 1 而后者是几百，以及各自的切分方式。</li>
+<li><strong>查看缓存目录</strong>：加载 Cora 后，进入 <code>./data/Cora</code> 目录，列出 <code>raw/</code> 和 <code>processed/</code> 下的文件，说明 <code>InMemoryDataset</code> 的缓存机制。</li>
+<li><strong>强制重处理</strong>：删除 <code>processed/</code> 目录后重新加载数据集，观察它是否重新执行了处理流程。</li>
+<li><strong>自定义图分类数据</strong>：仿照路子 B，写一个继承 <code>InMemoryDataset</code> 的最小数据集（哪怕只含 3 张手工构造的小图），跑通 <code>len</code>、索引、<code>DataLoader</code> 三个接口。</li>
+<li><strong>batch 与 global_pool</strong>：对 MUTAG 的一个 batch，用 <code>global_mean_pool</code> 和 <code>global_add_pool</code> 分别计算图级表示，验证输出形状都是 <code>[batch_size, hidden]</code>。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>PyG 官方文档 · 创建你自己的数据集（Creating Datasets）：<a href="https://pytorch-geometric.readthedocs.io/en/latest/notes/create_dataset.html" target="_blank" rel="noopener noreferrer">https://pytorch-geometric.readthedocs.io/en/latest/notes/create_dataset.html</a></li>
+<li>PyG 官方文档 · InMemoryDataset：<a href="https://pytorch-geometric.readthedocs.io/en/latest/generated/torch_geometric.data.InMemoryDataset.html" target="_blank" rel="noopener noreferrer">https://pytorch-geometric.readthedocs.io/en/latest/generated/torch_geometric.data.InMemoryDataset.html</a></li>
+<li>PyG 官方文档 · 内置数据集清单：<a href="https://pytorch-geometric.readthedocs.io/en/latest/cheatsheet/data_cheatsheet.html" target="_blank" rel="noopener noreferrer">https://pytorch-geometric.readthedocs.io/en/latest/cheatsheet/data_cheatsheet.html</a></li>
+<li>TUDataset 原论文：Morris 等. &quot;TUDataset: A collection of benchmark datasets&quot; (2020)：<a href="https://arxiv.org/abs/2007.08663" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2007.08663</a></li>
+</ul>
+<p><a href="#/l/gnn-ch6-l3">下一课：完整项目</a></p>

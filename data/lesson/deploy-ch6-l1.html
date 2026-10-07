@@ -1,0 +1,111 @@
+<h2 id="h-项目规划">项目规划<a class="anchor" href="#h-项目规划" aria-label="本节链接">#</a></h2>
+<p>前面五章把&quot;部署场景、单卡、多卡、服务化、成本优化&quot;逐个击破，这一章要把它们<strong>串成一个真实项目</strong>：从需求出发，走完&quot;规划 → 实现 → 验收&quot;的完整闭环。本课先做规划——定义一个可落地的目标、量化 SLA 与容量、敲定技术选型与架构，为下一课的动手实现铺路。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-项目目标一个智能客服问答服务">1. 项目目标：一个智能客服问答服务<a class="anchor" href="#h-1-项目目标一个智能客服问答服务" aria-label="本节链接">#</a></h4>
+<p>我们以一个典型业务为背景：为一家中型电商公司搭建<strong>「智能客服问答助手」</strong>，对外提供 OpenAI 兼容 API，供官网聊天窗和内部工单系统调用。它的特点很有代表性：<strong>白天高峰、夜间低谷、短问答为主、偶发长文档检索</strong>，几乎覆盖了我们前面讲过的所有权衡。</p>
+<p>一句话目标：<strong>在满足&quot;P99 TTFT ≤ 1.5s、可用性 ≥ 99.9%、每百万 token ≤ 2 元&quot;的前提下，扛住峰值 20 QPS</strong>。</p>
+<h4 id="h-2-需求分析把要什么翻译成可测的数字">2. 需求分析：把&quot;要什么&quot;翻译成可测的数字<a class="anchor" href="#h-2-需求分析把要什么翻译成可测的数字" aria-label="本节链接">#</a></h4>
+<p>模糊的需求无法验收。规划第一步是把需求落成 SLA 表（回顾第 4 章 l3 的 SLI/SLO）：</p>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>目标（SLO）</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>吞吐</td>
+<td>峰值 20 QPS，平均输出 150 token</td>
+<td>决定 GPU 张数</td>
+</tr>
+<tr>
+<td>首 token 延迟</td>
+<td>P99 TTFT ≤ 1.5s</td>
+<td>用户体感核心</td>
+</tr>
+<tr>
+<td>生成速度</td>
+<td>P99 TPOT ≤ 30ms</td>
+<td>读起来顺不顺</td>
+</tr>
+<tr>
+<td>可用性</td>
+<td>≥ 99.9%（月度）</td>
+<td>错误预算约 43 分钟/月</td>
+</tr>
+<tr>
+<td>成本</td>
+<td>≤ 2 元 / 百万 token</td>
+<td>盈亏红线</td>
+</tr>
+</tbody></table>
+<h4 id="h-3-技术选型用决策树走一遍">3. 技术选型：用决策树走一遍<a class="anchor" href="#h-3-技术选型用决策树走一遍" aria-label="本节链接">#</a></h4>
+<p>回看第 1 章的选型决策树，逐项敲定：</p>
+<ul>
+<li><strong>模型</strong>：<code>Llama-3.1-8B-Instruct</code>——8B 在单卡/双卡上性价比较高，指令跟随够用；</li>
+<li><strong>量化</strong>：<strong>AWQ INT4</strong>——客服场景对精度宽容度高，但吞吐和显存收益大（第 5 章 l1 的结论）；</li>
+<li><strong>引擎</strong>：<strong>vLLM</strong>——连续批处理成熟、OpenAI 兼容 API 开箱即用、指标完备；</li>
+<li><strong>硬件</strong>：2 张 A100-80G，张量并行 <code>TP=2</code>——8B + INT4 单卡其实能装，但双卡 TP 能分摊 decode 的访存压力、提升吞吐并留余量（第 3 章）；</li>
+<li><strong>服务化</strong>：Docker 容器 + OpenAI 兼容 API + Nginx 网关（第 4 章）；</li>
+<li><strong>可观测</strong>：Prometheus + Grafana 盯 P99 TTFT 与排队长度（第 4 章 l3）。</li>
+</ul>
+<h4 id="h-4-架构设计">4. 架构设计<a class="anchor" href="#h-4-架构设计" aria-label="本节链接">#</a></h4>
+<p>分层架构如下（箭头表示请求流向）：</p>
+<pre data-lang="text"><code class="language-text">客户端(官网聊天窗/工单系统)
+        │  OpenAI 兼容协议 (HTTP/SSE)
+        ▼
+   Nginx 网关(统一入口、限流、SSE 透传)
+        │
+        ▼
+   vLLM 服务(OpenAI 兼容 API, AWQ INT4, TP=2)
+        │
+        ▼
+   模型权重(挂载卷)          Prometheus ── Grafana(大盘+告警)</code></pre>
+<p>要点：网关负责对外暴露、做限流与鉴权；vLLM 只对内；监控走旁路采集 <code>/metrics</code>，不与业务请求抢资源。</p>
+<p><figure><img class="md-img" src="content/courses/llm-deployment-practice/assets/chapter-6-figure-01.svg" alt="项目架构分层图：从上到下&quot;客户端（官网聊天窗/工单系统）→ Nginx 网关（统一入口/限流/SSE 透传）→ vLLM 服务（OpenAI 兼容 API、AWQ INT4、TP=2）→ 模型权重挂载卷&quot;，右侧一条旁路从 vLLM 连到&quot;Prometheus → Grafana（大盘+告警）&quot;；箭头方向表示请求流向，右侧旁路用紫色虚线标注&quot;监控走旁路，不抢业务资源&quot;" loading="lazy" decoding="async"><figcaption>项目架构分层图：从上到下&quot;客户端（官网聊天窗/工单系统）→ Nginx 网关（统一入口/限流/SSE 透传）→ vLLM 服务（OpenAI 兼容 API、AWQ INT4、TP=2）→ 模型权重挂载卷&quot;，右侧一条旁路从 vLLM 连到&quot;Prometheus → Grafana（大盘+告警）&quot;；箭头方向表示请求流向，右侧旁路用紫色虚线标注&quot;监控走旁路，不抢业务资源&quot;</figcaption></figure>
+</p>
+<h3 id="h-二可运行示例">二、可运行示例<a class="anchor" href="#h-二可运行示例" aria-label="本节链接">#</a></h3>
+<h4 id="h-示例-1容量规划脚本">示例 1：容量规划脚本<a class="anchor" href="#h-示例-1容量规划脚本" aria-label="本节链接">#</a></h4>
+<pre data-lang="python"><code class="language-python"># -*- coding: utf-8 -*-
+# 从 SLA 反推需要几张卡、以及单位成本
+import math
+
+peak_qps = 20               # 峰值每秒请求数
+avg_out_tokens = 150        # 平均每个回答的输出 token 数
+peak_out_tps = peak_qps * avg_out_tokens   # 峰值输出 token/s
+
+single_gpu_tps = 3000       # 单卡 A100 + INT4 满载吞吐（示意值）
+util_target = 0.6           # 目标利用率 60%，留 40% 余量
+gpus_needed = peak_out_tps / (single_gpu_tps * util_target)
+print(f&quot;峰值输出需求 = {peak_out_tps} token/s&quot;)
+print(f&quot;建议 GPU 数 = {gpus_needed:.2f} -&gt; 向上取整 {math.ceil(gpus_needed)} 张&quot;)
+
+# 成本核算：满载时每百万 token 成本
+gpu_price = 20.0            # A100 预留实例单价（元/小时，示意）
+cost_per_m = gpu_price / (single_gpu_tps * 3600) * 1_000_000
+print(f&quot;满载时每百万 token 成本 = {cost_per_m:.2f} 元&quot;)</code></pre>
+<h4 id="h-示例-2把需求落成配置文件清单">示例 2：把需求落成配置文件清单<a class="anchor" href="#h-示例-2把需求落成配置文件清单" aria-label="本节链接">#</a></h4>
+<p>规划阶段就应把&quot;要交付什么&quot;列成清单，下一步实现时逐项勾掉：</p>
+<pre data-lang="text"><code class="language-text">项目交付物清单（检查表）
+[ ] docker-compose.yml          # vLLM + 网关 + 监控编排
+[ ] nginx.conf                  # SSE 透传、限流、统一入口
+[ ] prometheus.yml              # 抓取 vLLM /metrics
+[ ] 模型权重挂载目录（AWQ INT4 权重）
+[ ] 验收脚本（压测 + 断言 SLO）
+[ ] Grafana 大盘（P99 TTFT / 排队 / 吞吐）</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>把示例 1 的 <code>avg_out_tokens</code> 从 150 改成 400（客服开始做长摘要），观察 <code>gpus_needed</code> 怎么变，说明&quot;平均输出长度&quot;为何是容量规划的第一变量。</li>
+<li>若某天双十一峰值 QPS 是日常的 5 倍，用示例 1 的公式算需要临时扩到几张卡，并说明你倾向于&quot;常驻扩容&quot;还是&quot;临时按需/spot 扩容&quot;（结合第 5 章 l3 的计费）。</li>
+<li>补充一张&quot;风险登记表&quot;，至少包含：GPU OOM、模型加载失败、SSE 被网关缓冲、监控指标缺失四类风险，并各写一条应对措施。</li>
+<li>思考：为什么把&quot;每百万 token ≤ 2 元&quot;也写进 SLO？它和吞吐/延迟目标之间可能产生怎样的张力？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>vLLM · 部署与服务文档：<a href="https://docs.vllm.ai/" target="_blank" rel="noopener noreferrer">https://docs.vllm.ai/</a></li>
+<li>vLLM · 使用 Docker 部署：<a href="https://docs.vllm.ai/en/latest/serving/deploying_with_docker.html" target="_blank" rel="noopener noreferrer">https://docs.vllm.ai/en/latest/serving/deploying_with_docker.html</a></li>
+<li>OpenAI · Chat Completions API 参考：<a href="https://platform.openai.com/docs/api-reference/chat" target="_blank" rel="noopener noreferrer">https://platform.openai.com/docs/api-reference/chat</a></li>
+<li>关于 SLO 与错误预算：<a href="https://sre.google/sre-book/service-level-objectives/" target="_blank" rel="noopener noreferrer">https://sre.google/sre-book/service-level-objectives/</a></li>
+</ul>
+<p><a href="#/l/deploy-ch6-l2">下一课：完整部署实现</a></p>

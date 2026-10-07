@@ -1,0 +1,205 @@
+<h2 id="h-simt-与线程层次thread--warp--block--grid">SIMT 与线程层次（thread / warp / block / grid）<a class="anchor" href="#h-simt-与线程层次thread--warp--block--grid" aria-label="本节链接">#</a></h2>
+<p>写第一个 kernel 时，我们都会看到 <code>kernel&lt;&lt;&lt;grid, block&gt;&gt;&gt;(...)</code> 这种写法，并且很快记住&quot;线程数 = grid × block&quot;。但 GPU 内部<strong>从来没有</strong>这么多独立的执行单元：硬件把连续的 32 个线程编成一个 warp，同一 warp 共享一个取指单元。这一课要把四层结构（grid / block / warp / thread）、索引线性化公式，以及&quot;block 之间没有任何顺序保证&quot;这条硬约束讲清楚——第 2、3 课的发散、同步与 occupancy 全都建立在这上面。</p>
+<p><figure><img class="md-img" src="content/courses/gpu-cuda-kernels/assets/chapter-2-figure-01.svg" alt="SIMT 线程层次：launch 出来的线程怎么一层层落到 warp 与 lane" loading="lazy" decoding="async"><figcaption>SIMT 线程层次：launch 出来的线程怎么一层层落到 warp 与 lane</figcaption></figure>
+</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-simt32-个线程共用一个取指单元">1. SIMT：32 个线程共用一个取指单元<a class="anchor" href="#h-1-simt32-个线程共用一个取指单元" aria-label="本节链接">#</a></h4>
+<p>SIMT 全称 <strong>Single-Instruction Multiple-Threads</strong>（单指令多线程）。CUDA C++ Programming Guide 的编程模型一章给出的定义是：一个 thread block 内的线程会被组织成每组 32 个线程的 <strong>warp</strong>，warp 以 SIMT 范式执行 kernel 代码；warp 内的所有线程执行同一段代码，但每个线程可以走不同的分支。同一处在 SIMT 模型下还强调：<strong>warp 内的线程以 lock step（锁步）方式推进</strong>。</p>
+<p>对照 SIMD（Single-Instruction Multiple-Data）就好理解：SIMD 由程序员显式操作向量；SIMT 是<strong>一条指令让 32 个 lane 干同一件事，但你写的是标量代码</strong>，lane 由硬件分组。代价是分组由硬件定：只想让 16 个线程干活时，另外 16 个 lane 也不能去干别的（第 2 课讲发散）。</p>
+<p>这一点很关键：warp 里 32 个线程各有自己的寄存器副本与程序计数器视图，所以同一句 <code>x = x + 1</code> 在不同线程里算出不同结果。</p>
+<h4 id="h-2-四层结构谁可见谁对应什么硬件">2. 四层结构：谁可见、谁对应什么硬件<a class="anchor" href="#h-2-四层结构谁可见谁对应什么硬件" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>层级</th>
+<th>你在代码里怎么拿到</th>
+<th>数量与范围</th>
+<th>硬件对应</th>
+<th>顺序能不能依赖</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>grid</td>
+<td><code>gridDim</code>（<code>dim3</code>）</td>
+<td>一次 launch 的全部 block</td>
+<td>整个 GPU（可能有几十到几百个 SM）</td>
+<td>❌ block 之间无顺序保证</td>
+</tr>
+<tr>
+<td>block</td>
+<td><code>blockIdx</code>、<code>blockDim</code></td>
+<td>一个 block 的线程，<code>blockDim.x*y*z ≤ 1024</code></td>
+<td>一个 SM；&quot;全部线程由同一个 SM 执行，且通常在该 SM 上跑到结束&quot;</td>
+<td>❌ 靠 <code>__syncthreads</code> 只能同步块内</td>
+</tr>
+<tr>
+<td>warp</td>
+<td>无内置变量，需自己算</td>
+<td>32 个线程，块内按线性号连续编组</td>
+<td>调度器（warp scheduler）的发射单位</td>
+<td>❌ 不应依赖 warp 间的相对进度</td>
+</tr>
+<tr>
+<td>thread</td>
+<td><code>threadIdx</code></td>
+<td>一个执行流</td>
+<td>每线程一份寄存器 + 一个 lane</td>
+<td>—</td>
+</tr>
+</tbody></table>
+<p>表里&quot;block 全在同一 SM 上跑完&quot;这句来自官方编程模型一章；同一段还写明 <strong>block 的调度没有保证</strong>——一个 block 依赖另一个 block 的结果就可能永远等不到（后者也许直到前者结束都没被调度）。官方把它总结成更强的约束：CUDA 编程模型要求 block&quot;可以以任意顺序、并行或串行地执行&quot;。</p>
+<p>这条约束管三件事：① 不能写&quot;block 0 先算好、其他 block 后读&quot;的代码；② 需要全 grid 同步时，要么拆成两次 launch，要么用 cooperative groups（第 3 课）；③ 结果是确定性的前提是&quot;每个输出只由自己那个线程写&quot;。</p>
+<h4 id="h-3-索引怎么算线性化与-warplane">3. 索引怎么算：线性化与 warp/lane<a class="anchor" href="#h-3-索引怎么算线性化与-warplane" aria-label="本节链接">#</a></h4>
+<p>一维 launch 最简单：全局线性号 <code>gid = blockIdx.x * blockDim.x + threadIdx.x</code>。二维/三维时，<code>x</code> 是<strong>最快变化</strong>的维度，线性化公式是：</p>
+<pre><code>gid = ((blockIdx.z * gridDim.y + blockIdx.y) * gridDim.x + blockIdx.x)
+      * (blockDim.x * blockDim.y * blockDim.z)
+      + (threadIdx.z * blockDim.y + threadIdx.y) * blockDim.x + threadIdx.x</code></pre>
+<p>符号含义：<code>blockIdx</code>/<code>gridDim</code> 是 block 在 grid 里的坐标与尺寸，<code>threadIdx</code>/<code>blockDim</code> 是线程在 block 内的坐标与尺寸；乘出来 <code>gid</code> 恰是 <code>[0, gridDim.x*y*z × blockDim.x*y*z)</code> 的一个排列。</p>
+<p>warp 的划分发生在 <strong>block 内部</strong>：块内线性线程号 <code>local</code> 满足 <code>warp_in_block = local / 32</code>、<code>lane = local % 32</code>。注意 block 基址不参与 warp 编号，于是有：<strong>当 blockDim 不是 32 的倍数时，每个 block 的最后一个 warp 会有一部分 lane 是空的</strong>。<code>blockDim = 48</code> 时，每块 2 个 warp，其中第 2 个 warp 只有 16 个活跃 lane，硬件照样按 64 个 lane 的位置分配资源。</p>
+<h4 id="h-4-grid-stride-loop不要用元素数反推线程数">4. grid-stride loop：不要用元素数反推线程数<a class="anchor" href="#h-4-grid-stride-loop不要用元素数反推线程数" aria-label="本节链接">#</a></h4>
+<p>常见写法是&quot;n 个元素就 launch n 个线程&quot;。问题是：<code>n</code> 远超 GPU 能同时容纳的线程数时，多出来的线程只是排队；<code>n</code> 小于一个 block 时，块里大半线程被边界判断掩掉。</p>
+<p>工程上的默认做法是 <strong>grid-stride loop</strong>：launch 一个固定的、约等于&quot;能同时驻留的线程数&quot;的规模，然后让每个线程跨步循环：</p>
+<pre data-lang="cuda"><code class="language-cuda">for (int i = blockIdx.x * blockDim.x + threadIdx.x; i &lt; n; i += gridDim.x * blockDim.x) {
+    out[i] = a[i] + b[i];       // 步长 = 本次 launch 的线程总数
+}</code></pre>
+<p>好处有三：边界保护从&quot;每线程一次判断&quot;变成循环条件；同一份代码在 40 个 SM 与 140 个 SM 的卡上都能跑满；调 block 大小只改 launch 参数。</p>
+<h4 id="h-5-常见坑">5. 常见坑<a class="anchor" href="#h-5-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>把 <code>threadIdx.x</code> 当全局下标</strong>：只有单 block 时二者才相等；多 block 必须加 <code>blockIdx.x * blockDim.x</code>。</li>
+<li><strong>默认 blockDim 是 32 的倍数</strong>：48、96、100 这类值会让每个 block 的尾部 warp 半空；实在需要非整倍，也要知道损失了多少 lane。</li>
+<li><strong>用 <code>__syncthreads()</code> 妄想同步整个 grid</strong>：它的作用域只有当前 block，跨 block 用它是错的（第 3 课）。</li>
+<li><strong>依赖 block 的执行顺序做累加</strong>：例如让每个 block 去读别的 block 写好的中间结果，是模型层面禁止的。</li>
+<li><strong>维度顺序记反</strong>：<code>threadIdx.x</code> 变化最快，二维 block 里 <code>x</code> 是列方向，写内存时它与合并访存直接相关（第 3 章）。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>没有 GPU 也能把上面的结构算清楚：下面这段纯 Python（只依赖 numpy）模拟一次 <code>&lt;&lt;&lt;grid, block&gt;&gt;&gt;</code>，打印索引映射、warp/lane 占用，并用 grid-stride 循环真正执行一遍 <code>a + b</code> 与 numpy 向量化结果对照。</p>
+<pre data-lang="python"><code class="language-python"># ---- 无 GPU 模拟 SIMT 线程层次（纯 Python + numpy，可直接运行）----
+import numpy as np
+
+WARP = 32                      # 官方定义：一个 warp = 32 个线程
+
+
+def launch_map(block_dim, grid_dim):
+    &quot;&quot;&quot;模拟 &lt;&lt;&lt;grid_dim, block_dim&gt;&gt;&gt;：算清每个线程的 (block, 块内线程, warp, lane)。&quot;&quot;&quot;
+    rows = []
+    for b in range(grid_dim):
+        for t in range(block_dim):
+            rows.append({
+                &#39;block&#39;: b,                 # blockIdx.x
+                &#39;tin&#39;: t,                   # threadIdx.x（块内线性号）
+                &#39;gid&#39;: b * block_dim + t,   # 设备内全局线性号
+                &#39;warp&#39;: t // WARP,          # warp 是**块内**划分：threadIdx / 32
+                &#39;lane&#39;: t % WARP,           # 块内线程号对 32 取模
+            })
+    return rows
+
+
+def show_index_table(block_dim, grid_dim, limit=6):
+    rows = launch_map(block_dim, grid_dim)
+    print(f&#39;--- blockDim={block_dim}, gridDim={grid_dim}：前 {limit} 个线程 ---&#39;)
+    print(f&#39;{&quot;block&quot;:&gt;5} {&quot;tin&quot;:&gt;4} {&quot;gid&quot;:&gt;5} {&quot;warp&quot;:&gt;5} {&quot;lane&quot;:&gt;5}&#39;)
+    for r in rows[:limit]:
+        print(f&#39;{r[&quot;block&quot;]:&gt;5} {r[&quot;tin&quot;]:&gt;4} {r[&quot;gid&quot;]:&gt;5} {r[&quot;warp&quot;]:&gt;5} {r[&quot;lane&quot;]:&gt;5}&#39;)
+    lanes = {}
+    for r in rows:
+        lanes[(r[&#39;block&#39;], r[&#39;warp&#39;])] = lanes.get((r[&#39;block&#39;], r[&#39;warp&#39;]), 0) + 1
+    warps = max(r[&#39;warp&#39;] for r in rows) + 1
+    print(f&#39;每块 warp 数 = {warps}；每块实际线程 {block_dim}，&#39;
+          f&#39;而硬件按 {warps * WARP} 个 lane 分配&#39;)
+    print(&#39;未满 32 的 warp 及其 lane 占用：&#39;,
+          {f&#39;blk{k[0]}warp{k[1]}&#39;: f&#39;{v}/32&#39; for k, v in lanes.items()
+           if v &lt; WARP} or &#39;全部满 32&#39;)
+
+
+def grid_stride_add(a, b, n, block_dim, grid_dim):
+    &quot;&quot;&quot;按 grid-stride 循环真正地&quot;逐线程&quot;执行 a+b，返回结果与统计。&quot;&quot;&quot;
+    total = block_dim * grid_dim          # 一次 launch 的线程总数
+    out = np.zeros(n, dtype=a.dtype)
+    max_iter = 0
+    for r in launch_map(block_dim, grid_dim):
+        i, it = r[&#39;gid&#39;], 0
+        while i &lt; n:                      # 边界保护靠循环条件，而不是靠 tid &lt; n
+            out[i] = a[i] + b[i]
+            i += total
+            it += 1
+        max_iter = max(max_iter, it)
+    return out, total, max_iter
+
+
+rng = np.random.default_rng(0)
+show_index_table(block_dim=48, grid_dim=2)
+show_index_table(block_dim=256, grid_dim=3, limit=3)
+
+for n_case, blk, grd in ((1000, 256, 4), (100000, 256, 8)):
+    a2, b2 = rng.integers(0, 100, n_case), rng.integers(0, 100, n_case)
+    out, total, max_iter = grid_stride_add(a2, b2, n_case, blk, grd)
+    useful = min(n_case, total)
+    print(f&#39;\nn={n_case}, launch &lt;&lt;&lt;{grd}, {blk}&gt;&gt;&gt; → 线程总数 {total}；&#39;
+          f&#39;每线程最多循环 {max_iter} 次&#39;)
+    print(&#39;  与 numpy 向量化结果一致：&#39;, bool(np.array_equal(out, a2 + b2)))
+    print(f&#39;  线程利用率（有效线程/总线程）= {useful}/{total} = {useful / total:.3f}&#39;)
+    print(f&#39;  边界外被掩掉（masked off）的线程数 = {max(total - n_case, 0)}&#39;)
+
+# 2D 索引：行主序线性化公式与 numpy 的 flatten 对齐
+bd = (4, 8)          # blockDim = (x=4, y=8)
+gd = (2, 3)          # gridDim  = (x=2, y=3)
+ids = np.array([((by * gd[0] + bx) * bd[1] + ty) * bd[0] + tx
+                for by in range(gd[1]) for bx in range(gd[0])
+                for ty in range(bd[1]) for tx in range(bd[0])])
+print(f&#39;\n2D launch &lt;&lt;&lt;{gd}, {bd}&gt;&gt;&gt;：线性化公式得到 {len(ids)} 个 id，&#39;
+      f&#39;是否恰为 0..{len(ids) - 1} 的排列：{bool(np.array_equal(ids, np.arange(len(ids))))}&#39;)</code></pre>
+<p>运行结果（在只有 CPU 的机器上实测）：</p>
+<pre><code>--- blockDim=48, gridDim=2：前 6 个线程 ---
+block  tin   gid  warp  lane
+    0    0     0     0     0
+    0    1     1     0     1
+    0    2     2     0     2
+    0    3     3     0     3
+    0    4     4     0     4
+    0    5     5     0     5
+每块 warp 数 = 2；每块实际线程 48，而硬件按 64 个 lane 分配
+未满 32 的 warp 及其 lane 占用： {&#39;blk0warp1&#39;: &#39;16/32&#39;, &#39;blk1warp1&#39;: &#39;16/32&#39;}
+--- blockDim=256, gridDim=3：前 3 个线程 ---
+block  tin   gid  warp  lane
+    0    0     0     0     0
+    0    1     1     0     1
+    0    2     2     0     2
+每块 warp 数 = 8；每块实际线程 256，而硬件按 256 个 lane 分配
+未满 32 的 warp 及其 lane 占用： 全部满 32
+
+n=1000, launch &lt;&lt;&lt;4, 256&gt;&gt;&gt; → 线程总数 1024；每线程最多循环 1 次
+  与 numpy 向量化结果一致： True
+  线程利用率（有效线程/总线程）= 1000/1024 = 0.977
+  边界外被掩掉（masked off）的线程数 = 24
+
+n=100000, launch &lt;&lt;&lt;8, 256&gt;&gt;&gt; → 线程总数 2048；每线程最多循环 49 次
+  与 numpy 向量化结果一致： True
+  线程利用率（有效线程/总线程）= 2048/2048 = 1.000
+  边界外被掩掉（masked off）的线程数 = 0
+
+2D launch &lt;&lt;&lt;(2, 3), (4, 8)&gt;&gt;&gt;：线性化公式得到 192 个 id，是否恰为 0..191 的排列：True</code></pre>
+<p>读这段输出要抓住两点：第一，<code>n=1000</code> 配 <code>&lt;&lt;&lt;4,256&gt;&gt;&gt;</code> 有 24 个线程被掩掉（launch 规模按 block 取整的必然结果，利用率 0.977）；第二，<code>n=100000</code> 只用了 2048 个线程，靠 grid-stride 每个线程循环 49 次才覆盖完——<strong>线程数与元素数本来就不该绑死</strong>。</p>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选（需自备 GPU 或云上按需）：在真机上核对同样的事实 ----
+# 1) 编译并运行官方 deviceQuery 样例（CUDA Toolkit 自带 samples）：
+#      nvcc -o deviceQuery deviceQuery.cpp &amp;&amp; ./deviceQuery
+#    重点看 warpSize（应为 32）、maxThreadsPerBlock（1024）、
+#    maxThreadsPerMultiProcessor、multiProcessorCount —— 本课表格里的量级都来自这些字段。
+# 2) 用一个 kernel 打印 (blockIdx, threadIdx, gid) 与 Python 版逐行对照：
+#      idx&lt;&lt;&lt;2, 48&gt;&gt;&gt;(...);   // printf(&quot;b=%d t=%d gid=%d\n&quot;, blockIdx.x, threadIdx.x, ...)
+#    GPU 上 printf 的顺序是乱的（block 并发、无顺序保证），这本身就是模型的一部分：
+#    把输出按 gid 排序后应与 Python 表完全一致。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：给 <code>launch_map</code> 增加二维 block 支持（<code>block_dim=(bx, by)</code>、<code>grid_dim=(gx, gy)</code>），并用课里的线性化公式算出 <code>gid</code>；验证输出 id 恰好是 <code>0..(gx*gy*bx*by-1)</code> 的排列，并回答：当 <code>bx=16, by=16</code> 时，一个 warp 覆盖的是 block 内的哪一块区域？</li>
+<li><strong>解释</strong>：为什么官方文档说&quot;一个 thread block 不能依赖另一个 block 的结果&quot;？请分别给出两个后果：一个关于正确性（举例说明什么样的代码会错），一个关于性能（提示：能同时驻留的 block 数有限）。</li>
+<li><strong>对比/验证</strong>：把 <code>grid_dim</code> 从 4 改成 1、8、64，保持 <code>block_dim=256</code>、<code>n=100000</code>，记录每个线程的循环次数与&quot;线程总数/有效线程数&quot;的变化；解释为什么 grid 超过&quot;能同时驻留的 block 数 × SM 数&quot;之后不再有收益。</li>
+<li><strong>思考</strong>：如果 block 的 warp 划分改成&quot;按整个 grid 的线性号除以 32&quot;（而不是块内划分），<code>blockDim=48</code> 时会发生什么？为什么硬件选择在 block 内划分 warp（提示：从 block 必须能独立调度、<code>__syncthreads</code> 的作用域、以及 shared memory 的归属三个角度想）？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>NVIDIA, <em>CUDA C++ Programming Guide</em> §1.2「Programming Model」— Warps and SIMT、Thread Blocks and Grids、Thread Block Scheduling（warp 定义、block 不可跨 SM、block 间无顺序保证）：<a href="https://docs.nvidia.com/cuda/cuda-programming-guide/01-introduction/programming-model.html#warps-and-simt" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/cuda-programming-guide/01-introduction/programming-model.html#warps-and-simt</a></li>
+<li>同上 §2.3「Writing SIMT Kernels」— Basics of SIMT、Thread Hierarchy、Kernel Launch and Occupancy（线程层次与索引、launch 与 occupancy 的关系）：<a href="https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/writing-cuda-kernels.html#thread-hierarchy" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/writing-cuda-kernels.html#thread-hierarchy</a></li>
+<li>同上 §5「Compute Capabilities」附录 — Features and Technical Specifications（warpSize、maxThreadsPerBlock 等规格表的唯一权威出处）：<a href="https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/compute-capabilities.html#features-and-technical-specifications" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/compute-capabilities.html#features-and-technical-specifications</a></li>
+<li>NVIDIA, <em>CUDA C++ Best Practices Guide</em> — Assessing Your Application / Exposing Parallelism（grid-stride 与按&quot;可驻留规模&quot;配 launch 的思路）：<a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#assessing-your-application" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#assessing-your-application</a></li>
+</ul>
+<p><a href="#/l/cuda-ch2-l2">下一课：warp 调度、分支发散与占用率的取舍</a></p>

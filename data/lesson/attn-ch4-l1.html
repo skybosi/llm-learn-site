@@ -1,0 +1,85 @@
+<h2 id="h-为什么需要位置">为什么需要位置<a class="anchor" href="#h-为什么需要位置" aria-label="本节链接">#</a></h2>
+<p>你已经知道，Transformer 去掉了循环神经网络（RNN）那种&quot;一个 token 接一个 token&quot;的串行处理，改成一整条序列同时并行计算。并行带来的效率是巨大的，但它也丢掉了一件 RNN 天然拥有的东西——<strong>顺序</strong>。RNN 是按时间步读入序列的，&quot;第一个词&quot;和&quot;第二个词&quot;这个先后关系被硬编码进了它的计算过程；而 Transformer 的自注意力把所有位置当成了一个<strong>集合</strong>来对待。这一课就从一个尖锐的问题开始：如果把注意力直接作用在词向量上，模型真的能区分&quot;我打你&quot;和&quot;你打我&quot;吗？答案是<strong>不能</strong>。我们要先把这个&quot;位置盲&quot;讲透，才能理解第 2、3 课为什么要给每个位置补一个向量。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-rnn-有顺序transformer-没有">1. RNN 有顺序，Transformer 没有<a class="anchor" href="#h-1-rnn-有顺序transformer-没有" aria-label="本节链接">#</a></h4>
+<p>RNN 每读入一个 token，就更新一次隐藏状态，再把状态传给下一个时间步：</p>
+<pre><code>h_t = f(W_h · h_{t-1} + W_x · x_t)</code></pre>
+<p>因为 <code>h_t</code> 依赖 <code>h_{t-1}</code>，token 的先后关系被自然地编码进了状态里。交换两个 token 的位置，整条状态链会完全不同。</p>
+<p>Transformer 的自注意力则完全不同。对每个位置，它先算 Query、Key、Value，然后用 Query 去和<strong>所有</strong>位置的 Key 做点积，得到权重，再对 Value 加权求和。注意这里的措辞——&quot;所有位置&quot;。计算第 3 个位置的输出时，模型会同时看向第 1、第 2、第 4 个位置，而它<strong>没有任何机制去记录&quot;第 3 个&quot;这个身份本身</strong>。它只知道&quot;有一堆向量，我要按相似度加权它们&quot;。</p>
+<h4 id="h-2-自注意力是置换等变的">2. 自注意力是&quot;置换等变&quot;的<a class="anchor" href="#h-2-自注意力是置换等变的" aria-label="本节链接">#</a></h4>
+<p>这是理解本课最关键的一个性质。所谓置换等变（permutation equivariance），意思是：<strong>如果把输入的 token 换一种顺序，那么输出的向量也只会跟着换同样的顺序，内容本身不变</strong>。</p>
+<p>换句话说，注意力把输入序列当作一个&quot;袋子里的一堆词&quot;（bag of tokens）来处理。对第 <code>i</code> 个位置的输出而言，它只是&quot;输入向量的一个加权平均&quot;，而权重由 Query 与各个 Key 的相似度决定。相似度和&quot;谁排在第几位&quot;毫无关系，只和&quot;这些向量本身长什么样&quot;有关。</p>
+<p>于是出现一个尴尬的结论：句子 <code>[&quot;我&quot;, &quot;打&quot;, &quot;你&quot;]</code> 和句子 <code>[&quot;你&quot;, &quot;打&quot;, &quot;我&quot;]</code>，经过同一个自注意力层之后，得到的输出向量集合是<strong>完全相同的一组向量</strong>（只是顺序对调了）。模型根本无法凭注意力本身知道，谁是主语、谁是宾语。</p>
+<p><figure><img class="md-img" src="content/courses/attention-transformer/assets/chapter-4-figure-01.svg" alt="自注意力置换等变的示意：同一组 token 不同顺序得到相同输出" loading="lazy" decoding="async"><figcaption>自注意力置换等变的示意：同一组 token 不同顺序得到相同输出</figcaption></figure>
+</p>
+<h4 id="h-3-为什么不能靠顺序遍历来救">3. 为什么不能靠&quot;顺序遍历&quot;来救<a class="anchor" href="#h-3-为什么不能靠顺序遍历来救" aria-label="本节链接">#</a></h4>
+<p>有人会问：既然并行是问题，那让模型仍然按顺序一个一个算不就行了？这就回到了 RNN 的老路上——串行意味着无法并行训练，长序列的效率会急剧下降。Transformer 的设计初衷就是<strong>用并行换速度</strong>，因此它选择了一个折中：<strong>并行计算，同时显式地把位置信息&quot;注入&quot;输入</strong>。</p>
+<p>这个&quot;注入&quot;就是位置编码（positional encoding）的由来：在把 token 的 embedding 送进自注意力之前，先给它加上一个<strong>只与位置有关、与内容无关</strong>的向量。这样，&quot;我&quot;在位置 0 和&quot;我&quot;在位置 2 得到的输入向量就不同了，注意力层才有机会把它们区分开。</p>
+<pre><code>带位置的输入 = token_embedding + position_encoding(position)</code></pre>
+<h4 id="h-4-位置编码需要满足什么">4. 位置编码需要满足什么<a class="anchor" href="#h-4-位置编码需要满足什么" aria-label="本节链接">#</a></h4>
+<p>一个合格的位置编码，至少要有两个特点：</p>
+<ol>
+<li><strong>唯一且有序</strong>：不同位置得到不同的向量，且这个向量能反映先后顺序，让模型能算出&quot;谁在前、谁在后、隔了多远&quot;。</li>
+<li><strong>可加性</strong>：它以&quot;加法&quot;的方式和 token embedding 结合，且维度必须与 <code>d_model</code> 一致，不破坏后面的矩阵运算。</li>
+</ol>
+<p>至于这个向量是固定公式算出来的（第 2 课的正弦编码），还是当作参数训练出来的（第 3 课的可学习编码），就构成了两种主流方案。在动手实现它们之前，先亲眼确认一下&quot;位置盲&quot;到底有多彻底。</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面写一个最简的缩放点积自注意力，输入三个随机向量，然后交换前两个 token，观察输出发生了怎样的变化。</p>
+<pre data-lang="python"><code class="language-python">import torch
+import torch.nn.functional as F
+
+torch.manual_seed(0)
+
+def self_attention(X):
+    # X: (seq_len, d_model)，自注意力中 Q、K、V 都来自 X
+    d = X.shape[-1]
+    Q = K = V = X
+    scores = Q @ K.T / (d ** 0.5)      # (seq_len, seq_len) 的相似度矩阵
+    weights = F.softmax(scores, dim=-1) # 每一行是&quot;该位置对全体位置的关注分布&quot;
+    return weights @ V, weights
+
+# 三个 token 的 embedding，顺序为 [A, B, C]
+X = torch.randn(3, 4)
+out_abc, _ = self_attention(X)
+
+# 交换前两个 token，顺序变为 [B, A, C]
+X_swap = X[[1, 0, 2]]
+out_swap, _ = self_attention(X_swap)
+
+print(&quot;原始顺序输出:\n&quot;, out_abc)
+print(&quot;交换后输出:\n&quot;, out_swap)
+print()
+# 关键验证：交换输入只是把输出也换了位置，向量内容一个都没变
+print(&quot;原始第0行(A) 等于 交换后第1行:&quot;, torch.allclose(out_abc[0], out_swap[1]))
+print(&quot;原始第1行(B) 等于 交换后第0行:&quot;, torch.allclose(out_abc[1], out_swap[0]))
+print(&quot;原始第2行(C) 等于 交换后第2行:&quot;, torch.allclose(out_abc[2], out_swap[2]))</code></pre>
+<p>运行后三个 <code>allclose</code> 都会输出 <code>True</code>。这直观地说明：<strong>自注意力只关心&quot;这些向量彼此多相似&quot;，完全不关心&quot;它们各自站在哪个位置&quot;</strong>。如果把 A、B、C 换成真实词向量，&quot;我打你&quot;和&quot;你打我&quot;就会得到同一组输出——位置信息在这里彻底丢失了。</p>
+<p>再看一个更贴近真实 Transformer 的例子：加上位置编码后，交换 token 就不再&quot;等价&quot;了。</p>
+<pre data-lang="python"><code class="language-python"># 一个简单的&quot;可学习位置编码&quot;雏形：每个位置一个独立的向量
+pos_encoding = torch.randn(3, 4)          # 位置 0/1/2 各有一个 4 维向量
+
+X_pos = X + pos_encoding                  # token embedding + 位置编码
+out_pos = self_attention(X_pos)[0]
+
+X_pos_swap = X[[1, 0, 2]] + pos_encoding  # 注意：token 换了，但位置编码按位置不变
+out_pos_swap = self_attention(X_pos_swap)[0]
+
+# 这次输出不再是简单换位，说明位置信息已经进入了计算
+print(&quot;加位置编码后，交换输出是否还只是换位:&quot;,
+      torch.allclose(out_pos[0], out_pos_swap[1]) and torch.allclose(out_pos[1], out_pos_swap[0]))</code></pre>
+<p>这一次结果为 <code>False</code>：位置向量打破了置换等变，模型终于有能力&quot;看见&quot;顺序了。剩下的问题只是——这个 <code>pos_encoding</code> 该怎么设计，是固定的还是学出来的。这就是后两课的内容。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>把上面的 <code>self_attention</code> 改成多头的版本（把 <code>d_model</code> 拆成几个头分别算再拼起来），确认&quot;置换等变&quot;这个性质对多头注意力是否依然成立，并解释为什么。</li>
+<li>构造两句话 <code>[&quot;我&quot;, &quot;爱&quot;, &quot;你&quot;]</code> 与 <code>[&quot;你&quot;, &quot;爱&quot;, &quot;我&quot;]</code>，各用随机 embedding 表示，计算它们自注意力输出（不加位置编码），验证两组输出只是顺序对调。这说明不加位置编码的 Transformer 会犯什么具体的语言理解错误？</li>
+<li>思考：为什么位置编码要&quot;加&quot;在输入上，而不是&quot;拼接&quot;（concatenate）在输入后面？两种做法在维度、参数量、以及后续线性层的处理上各有什么代价？</li>
+<li>位置编码要不要参与梯度更新？如果参与，它和&quot;把位置当作普通可训练参数&quot;有什么区别？带着这个问题进入第 3 课。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>论文《Attention Is All You Need》3.5 节（Positional Encoding）：<a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1706.03762</a></li>
+<li>The Illustrated Transformer（Jay Alammar）· 位置编码部分：<a href="https://jalammar.github.io/illustrated-transformer/" target="_blank" rel="noopener noreferrer">https://jalammar.github.io/illustrated-transformer/</a></li>
+<li>The Annotated Transformer（Harvard NLP）· 位置编码实现：<a href="https://nlp.seas.harvard.edu/annotated-transformer/" target="_blank" rel="noopener noreferrer">https://nlp.seas.harvard.edu/annotated-transformer/</a></li>
+<li>PyTorch 官方文档 · MultiheadAttention：<a href="https://pytorch.org/docs/stable/generated/torch.nn.MultiheadAttention.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/docs/stable/generated/torch.nn.MultiheadAttention.html</a></li>
+</ul>
+<p><a href="#/l/attn-ch4-l2">下一课：正弦位置编码</a></p>

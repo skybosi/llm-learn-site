@@ -1,0 +1,226 @@
+<h2 id="h-词法分析token-化与手写扫描器">词法分析：token 化与手写扫描器<a class="anchor" href="#h-词法分析token-化与手写扫描器" aria-label="本节链接">#</a></h2>
+<p>第一课我们用正则切过词，那只是玩具。真实扫描器要回答的问题具体得多：<code>if</code> 为什么是关键字而 <code>iffy</code> 是标识符？<code>a---b</code> 该切成什么？字符串里的 <code>\n</code> 是反斜杠加 n 还是换行？这些判断有<strong>确定的规则</strong>，而规则一旦定错，后面的语法分析再正确也没用。这一课把&quot;切词&quot;从直觉变成一份可实现的规范。</p>
+<p><figure><img class="md-img" src="content/courses/compiler-foundations/assets/chapter-2-figure-01.svg" alt="词法分析：字符流到 token 流的扫描管线" loading="lazy" decoding="async"><figcaption>词法分析：字符流到 token 流的扫描管线</figcaption></figure>
+</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-为什么切词要独立成一个阶段">1. 为什么切词要独立成一个阶段<a class="anchor" href="#h-1-为什么切词要独立成一个阶段" aria-label="本节链接">#</a></h4>
+<p>词法结构是<strong>正则</strong>的（能用有限状态机描述），语法结构不是（括号配对需要计数）。把两层混在一起写，递归下降的每个函数都要重新处理空白、注释、数字格式，代码会迅速失控。分开的收益是可检验的：</p>
+<ul>
+<li>扫描器只需一遍、无回溯，<strong>O(n)</strong> 处理字符流；</li>
+<li>语法分析看到的输入是<strong>有类型的短列表</strong>，线性扫描即可，不必反复做字符判断；</li>
+<li>同一份扫描器能被格式化工具、语法高亮、IDE 补全复用——它们都只需要 token 流。</li>
+</ul>
+<h4 id="h-2-一个-token-由哪些字段构成">2. 一个 token 由哪些字段构成<a class="anchor" href="#h-2-一个-token-由哪些字段构成" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>含义</th>
+<th>例（源码 <code>count = 42;</code> 里的 <code>42</code>）</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>type（类型）</td>
+<td>词法类别，语法分析只看它</td>
+<td><code>NUMBER</code></td>
+</tr>
+<tr>
+<td>lexeme（原词）</td>
+<td>源码里原始切片，报错时回显用</td>
+<td><code>&quot;42&quot;</code></td>
+</tr>
+<tr>
+<td>literal（字面值）</td>
+<td>解释后的值，避免下游重复解析</td>
+<td><code>42.0</code></td>
+</tr>
+<tr>
+<td>line（行号）</td>
+<td>出错定位</td>
+<td><code>1</code></td>
+</tr>
+</tbody></table>
+<p>关键设计：<strong>数字与字符串的&quot;值&quot;在扫描阶段就算好</strong>（<code>value()</code> 顺带解析），把一处只做一次的活儿做完，语法分析只做结构。</p>
+<h4 id="h-3-最长匹配maximal-munch与前瞻">3. 最长匹配（maximal munch）与前瞻<a class="anchor" href="#h-3-最长匹配maximal-munch与前瞻" aria-label="本节链接">#</a></h4>
+<p>规则只有两条：从当前位置起贪心吃<strong>最长</strong>的合法词；只有贪心没路可走时才退回一步。于是：</p>
+<table>
+<thead>
+<tr>
+<th>输入</th>
+<th>切法</th>
+<th>依据</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>a---b</code></td>
+<td><code>a</code> <code>-</code> <code>-</code> <code>-</code> <code>b</code></td>
+<td><code>-</code> 是左结合减号，<code>--</code> 不是本语言词法单元</td>
+</tr>
+<tr>
+<td><code>a &lt;= b</code></td>
+<td><code>a</code> <code>&lt;=</code> <code>b</code></td>
+<td><code>&lt;=</code> 比 <code>&lt;</code> 长，优先匹配</td>
+</tr>
+<tr>
+<td><code>iffy</code></td>
+<td>标识符 <code>iffy</code></td>
+<td>判关键字靠<strong>整个词</strong>相等，不做前缀匹配</td>
+</tr>
+<tr>
+<td><code>1..2</code></td>
+<td>若语言有 <code>..</code> 则 <code>1</code> <code>..</code> <code>2</code></td>
+<td>长度优先</td>
+</tr>
+</tbody></table>
+<p><code>=</code> 与 <code>==</code> 这种&quot;一条边对应两种规则&quot;的情况，实现手法是先吃下第一个字符，再<strong>前瞻一个字符</strong>决定是否吞第二个。前瞻只做一次，不需要回溯整个 token。</p>
+<h4 id="h-4-关键字是个查表问题不是词法问题">4. 关键字是个&quot;查表&quot;问题，不是词法问题<a class="anchor" href="#h-4-关键字是个查表问题不是词法问题" aria-label="本节链接">#</a></h4>
+<p>朴素做法是给每个关键字写一条规则、各自一个 token 类型。工业做法更省：<strong>把关键字当标识符扫</strong>，扫完后拿 <code>lexeme</code> 去哈希表查，命中就把类型从 <code>IDENTIFIER</code> 换成对应关键字类型（查表 O(1)，表在编译期就是常量）。</p>
+<p>识别规则本身也是可列举的：标识符允许首字符为字母或下划线、其后为字母/数字/下划线；多数工业语言只接受 ASCII 字母数字，个别语言（如 Java）允许 Unicode 标识符。这些细节必须写进规范，否则 <code>变量</code> 这样的名字在不同实现上行为不一致。</p>
+<h4 id="h-5-扫描器内部其实是个小状态机">5. 扫描器内部其实是个小状态机<a class="anchor" href="#h-5-扫描器内部其实是个小状态机" aria-label="本节链接">#</a></h4>
+<p>一个手写扫描器可以写成两层：<strong>外层</strong>跳过空白与注释并循环，<strong>内层</strong>按当前字符分派到 <code>identifier</code>、<code>number</code>、<code>string</code>、<code>scan_token</code> 四个分支。Crafting Interpreters 第 4 章就是这套结构，它和下一课的自动机没有本质差别——区别只在&quot;转移表是手写的还是自动生成的&quot;。</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面这个扫描器支持注释、关键字表、<code>==</code>/<code>!=</code>/<code>&lt;=</code>/<code>&gt;=</code> 双字符运算符、带小数的数字、带转义与行号统计的字符串。</p>
+<pre data-lang="python"><code class="language-python"># ---- 例 1：手写扫描器（纯标准库，直接 python3 运行）----
+KEYWORDS = {
+    &#39;if&#39;: &#39;IF&#39;, &#39;else&#39;: &#39;ELSE&#39;, &#39;while&#39;: &#39;WHILE&#39;, &#39;for&#39;: &#39;FOR&#39;,
+    &#39;var&#39;: &#39;VAR&#39;, &#39;print&#39;: &#39;PRINT&#39;, &#39;true&#39;: &#39;TRUE&#39;, &#39;false&#39;: &#39;FALSE&#39;,
+    &#39;and&#39;: &#39;AND&#39;, &#39;or&#39;: &#39;OR&#39;, &#39;nil&#39;: &#39;NIL&#39;,
+}
+
+class Token:
+    __slots__ = (&#39;type&#39;, &#39;lexeme&#39;, &#39;literal&#39;, &#39;line&#39;)
+    def __init__(self, type_, lexeme, literal=None, line=1):
+        self.type, self.lexeme, self.literal, self.line = type_, lexeme, literal, line
+    def __repr__(self):
+        return f&#39;{self.type:&lt;6} {self.lexeme!r:&lt;12} line {self.line}&#39;
+
+class ScannerError(Exception):
+    pass
+
+class Scanner:
+    def __init__(self, src):
+        self.src, self.start, self.cur, self.line = src, 0, 0, 1
+        self.tokens = []
+
+    # --- 字符流工具 ---
+    def at_end(self):   return self.cur &gt;= len(self.src)
+    def advance(self):
+        ch = self.src[self.cur]; self.cur += 1; return ch
+    def peek(self, k=0):
+        i = self.cur + k
+        return self.src[i] if i &lt; len(self.src) else &#39;\0&#39;
+    def match(self, expect):
+        if self.at_end() or self.src[self.cur] != expect: return False
+        self.cur += 1; return True
+
+    def add(self, type_, literal=None):
+        self.tokens.append(Token(type_, self.src[self.start:self.cur], literal, self.line))
+
+    # --- 主循环：跳过空白/注释，再分派 ---
+    def scan(self):
+        while not self.at_end():
+            self.start = self.cur
+            self.scan_token()
+        self.tokens.append(Token(&#39;EOF&#39;, &#39;&#39;, None, self.line))
+        return self.tokens
+
+    def scan_token(self):
+        c = self.advance()
+        if c in &#39; \t\r&#39;:                       # 空白直接丢
+            return
+        if c == &#39;\n&#39;:
+            self.line += 1; return
+        if c == &#39;/&#39; and self.match(&#39;/&#39;):       # 行注释丢到行尾
+            while self.peek() != &#39;\n&#39; and not self.at_end():
+                self.advance()
+            return
+        if c == &#39;(&#39;: return self.add(&#39;LEFT_PAREN&#39;)
+        if c == &#39;)&#39;: return self.add(&#39;RIGHT_PAREN&#39;)
+        if c == &#39;{&#39;: return self.add(&#39;LEFT_BRACE&#39;)
+        if c == &#39;}&#39;: return self.add(&#39;RIGHT_BRACE&#39;)
+        if c == &#39;;&#39;: return self.add(&#39;SEMICOLON&#39;)
+        if c == &#39;+&#39;: return self.add(&#39;PLUS&#39;)
+        if c == &#39;-&#39;: return self.add(&#39;MINUS&#39;)
+        if c == &#39;*&#39;: return self.add(&#39;STAR&#39;)
+        if c == &#39;/&#39;: return self.add(&#39;SLASH&#39;)
+        if c == &#39;=&#39;: return self.add(&#39;EQUAL_EQUAL&#39; if self.match(&#39;=&#39;) else &#39;EQUAL&#39;)
+        if c == &#39;!&#39;: return self.add(&#39;BANG_EQUAL&#39; if self.match(&#39;=&#39;) else &#39;BANG&#39;)
+        if c == &#39;&lt;&#39;: return self.add(&#39;LESS_EQUAL&#39; if self.match(&#39;=&#39;) else &#39;LESS&#39;)
+        if c == &#39;&gt;&#39;: return self.add(&#39;GREATER_EQUAL&#39; if self.match(&#39;=&#39;) else &#39;GREATER&#39;)
+        if c == &#39;&quot;&#39;: return self.string()
+        if c.isdigit(): return self.number()
+        if c.isalpha() or c == &#39;_&#39;: return self.identifier()
+        raise ScannerError(f&#39;第 {self.line} 行：非法字符 {c!r}&#39;)
+
+    def string(self):
+        buf = []
+        while self.peek() != &#39;&quot;&#39;:
+            if self.at_end():                      # 明确报错，而不是切出一个残缺 token
+                raise ScannerError(f&#39;第 {self.line} 行：未闭合的字符串&#39;)
+            if self.peek() == &#39;\n&#39;:
+                self.line += 1
+            c = self.advance()
+            if c == &#39;\\&#39;:                          # 转义：这里只示范 \\n 与 \\&quot;
+                nxt = self.advance()
+                buf.append({&#39;n&#39;: &#39;\n&#39;, &#39;t&#39;: &#39;\t&#39;, &#39;&quot;&#39;: &#39;&quot;&#39;, &#39;\\&#39;: &#39;\\&#39;}.get(nxt, nxt))
+            else:
+                buf.append(c)
+        self.advance()                             # 吃掉收尾的 &quot;
+        self.add(&#39;STRING&#39;, &#39;&#39;.join(buf))
+
+    def number(self):
+        while self.peek().isdigit():
+            self.advance()
+        if self.peek() == &#39;.&#39; and self.peek(1).isdigit():
+            self.advance()
+            while self.peek().isdigit():
+                self.advance()
+        self.add(&#39;NUMBER&#39;, float(self.src[self.start:self.cur]))
+
+    def identifier(self):
+        while self.peek().isalnum() or self.peek() == &#39;_&#39;:
+            self.advance()
+        text = self.src[self.start:self.cur]
+        kind = KEYWORDS.get(text)                  # 关键字 = 查表，不做前缀匹配
+        self.add(kind or &#39;IDENTIFIER&#39;)
+
+SRC = &#39;&#39;&#39;var total = 0;      // 一只累加器
+while total &lt;= 10 and total != 3 {
+  total = total + 2 * 1.5;
+}
+print &quot;sum = \\n&quot; ;&#39;&#39;&#39;
+
+for tok in Scanner(SRC).scan():
+    print(tok)</code></pre>
+<p>运行输出（节选，<code>type / lexeme / line</code>；数字与字符串的 <code>literal</code> 已在扫描期解析完毕）：</p>
+<pre><code>VAR    &#39;var&#39;        line 1
+IDENTIFIER &#39;total&#39;      line 1
+EQUAL  &#39;=&#39;          line 1
+NUMBER &#39;0&#39;          line 1
+SEMICOLON &#39;;&#39;          line 1
+WHILE  &#39;while&#39;      line 2
+IDENTIFIER &#39;total&#39;      line 2
+LESS_EQUAL &#39;&lt;=&#39;         line 2
+NUMBER &#39;10&#39;         line 2
+...
+STRING &#39;&quot;sum = \\n&quot;&#39; line 5
+EOF    &#39;&#39;           line 5</code></pre>
+<p>注意 <code>if</code> 只出现在关键字表里、<code>iffy</code> 落在 <code>IDENTIFIER</code>；<code>// 一只累加器</code> 整段消失但 <code>line</code> 照常前进——<strong>行号必须在丢注释时也维护</strong>，否则后面所有报错定位都会偏。</p>
+<pre data-lang="python"><code class="language-python"># ---- 例 2（可选，需要本机有 clang）：对照真实扫描器 ----
+#   clang -E demo.c              # 预处理：注释被剥离，宏展开
+#   clang -Xclang -dump-tokens -fsyntax-only demo.c   # 打印 clang 自己的 token 流
+# 没装 clang 不影响本课：例 1 已经完整演示了 token 流的四个字段与错误路径。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：给例 1 加 <code>&lt;=</code>、<code>&gt;=</code> 的<strong>位置记录</strong>（起始列号），让报错能输出 <code>第 2 行第 11 列</code>。再补一条 <code>/* 块注释 */</code>：注意未闭合块注释要报错而不是静默到文件尾。</li>
+<li><strong>解释</strong>：为什么关键字用&quot;先当标识符、再查表&quot;实现，比给每个关键字写独立词法规则更好？从表的大小、代码量与可维护性两方面回答。</li>
+<li><strong>对比</strong>：<code>a---b</code>、<code>1..2</code>、<code>x=y==z</code> 三段在&quot;最长匹配&quot;下分别切成什么？如果语言里有 <code>..</code> 却没有 <code>--</code>，这会影响切法吗？</li>
+<li><strong>思考</strong>：扫描器只能识别正则语言。给出一个&quot;看起来像词法问题、其实不是&quot;的例子（提示：C 的 <code>&gt;&gt;</code> 在模板 <code>vector&lt;vector&lt;int&gt;&gt;</code> 里该不该切开），并说明为什么这个判断被推迟到了语法分析。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Robert Nystrom, <em>Crafting Interpreters</em> 第 4 章「Scanning」（手写扫描器、最长匹配、关键字查表）：<a href="https://craftinginterpreters.com/scanning.html" target="_blank" rel="noopener noreferrer">https://craftinginterpreters.com/scanning.html</a></li>
+<li>Aho, Lam, Sethi, Ullman, <em>Compilers: Principles, Techniques, and Tools</em>（龙书）第 3 章「Lexical Analysis」：token/lexeme/pattern 的关系与最长匹配规则</li>
+<li>LLVM 官方 Kaleidoscope 教程第 1 章「Lexer」（工业编译器怎么切 token）：<a href="https://llvm.org/docs/tutorial/MyFirstLanguageFrontend/LangImpl01.html" target="_blank" rel="noopener noreferrer">https://llvm.org/docs/tutorial/MyFirstLanguageFrontend/LangImpl01.html</a></li>
+</ul>
+<p><a href="#/l/cf-ch2-l2">下一课：正则与有限自动机：为什么词法器可以自动生成</a></p>

@@ -1,0 +1,193 @@
+<h2 id="h-自动调优的成本搜索预算缓存与可复现性">自动调优的成本：搜索预算、缓存与可复现性<a class="anchor" href="#h-自动调优的成本搜索预算缓存与可复现性" aria-label="本节链接">#</a></h2>
+<p>第 3 课的代价模型能把候选排对顺序，却不回答一个工程问题：<strong>这次调优值多少钱、多久回本</strong>。三组数据构成本课骨架：预算从 5 条加到 72 条时，&quot;落在最优 2% 以内&quot;的比例从 1/12 升到 12/12，但机上耗时从 0.06 秒涨到 0.86 秒；测量噪声从 σ=0 涨到 0.20 时，同一策略的命中率从 10/10 掉到 5/10；把 72 条候选 × 3 次样本的一次性成本（864 ms）用缓存摊掉后，后续同 shape 调用只花查表时间。<strong>自动调优不是&quot;搜得越久越好&quot;，而是&quot;在预算内买到足够好的调度，并且不再重复付钱&quot;。</strong></p>
+<p><figure><img class="md-img" src="content/courses/ml-compilers/assets/chapter-6-figure-02.svg" alt="自动调优的成本账：搜索预算、缓存命中与可复现性三笔账" loading="lazy" decoding="async"><figcaption>自动调优的成本账：搜索预算、缓存命中与可复现性三笔账</figcaption></figure>
+</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-三笔成本搜索测量重编译">1. 三笔成本：搜索、测量、重编译<a class="anchor" href="#h-1-三笔成本搜索测量重编译" aria-label="本节链接">#</a></h4>
+<p>一次调优的开销分三块。<strong>搜索成本</strong> = 候选数 × 每条候选的样本数（本课 <code>repeats=3</code>，72 条即 216 次真测）。<strong>测量成本</strong> = 单次编译 + 运行时间，决定&quot;能搜多大&quot;；第 3 课的代价模型把多数候选的评估降级为预测，正是为压这一项。<strong>重编译成本</strong>最易被忽略：调优结果绑定在特定 shape、dtype 与设备上，新 shape 到来就要重编译甚至重调优——第 2 章讲动态 shape 时的编译键，在调优语境下就是<strong>缓存键</strong>。</p>
+<p><figure><img class="md-img" src="content/courses/ml-compilers/assets/chapter-6-figure-04.svg" alt="自动调优的三笔成本：搜索、测量与重编译，以及缓存如何把一次性成本摊成零" loading="lazy" decoding="async"><figcaption>自动调优的三笔成本：搜索、测量与重编译，以及缓存如何把一次性成本摊成零</figcaption></figure>
+</p>
+<h4 id="h-2-搜索预算的收益递减">2. 搜索预算的收益递减<a class="anchor" href="#h-2-搜索预算的收益递减" aria-label="本节链接">#</a></h4>
+<p>第 3 节给出典型曲线：预算 5 条命中 1/12，10 条仍 1/12，20 条 3/12，36 条 6/12，72 条 12/12。前两档几乎无差别（好区域抽不到），20 条起改善，36→72 才跨过&quot;基本稳&quot;的门槛。<strong>这条 S 形曲线说明：早期投入买不到什么，中段见效，之后饱和</strong>。正确做法是先估饱和点、把预算定在附近，而不是&quot;调到不动为止&quot;。</p>
+<h4 id="h-3-噪声为什么不能只信单次冠军">3. 噪声：为什么不能只信单次冠军<a class="anchor" href="#h-3-噪声为什么不能只信单次冠军" aria-label="本节链接">#</a></h4>
+<p>第 3 节显示 σ=0 时 10/10 落在最优 2% 以内，σ=0.10 与 0.20 时降到 9/10 与 5/10，最差一次比最优差 60%。原因是<strong>好调度之间的差距与单次测量的抖动同一量级</strong>。三条对策：每条候选测多次取中位数（<code>statistics.median</code>）；计时前先 warmup（第一次调用含编译与冷启动，必须剔除）；对最终选中的少数几条重复测，用置信区间而非单点值决策。</p>
+<h4 id="h-4-缓存把一次性成本摊成零">4. 缓存：把一次性成本摊成零<a class="anchor" href="#h-4-缓存把一次性成本摊成零" aria-label="本节链接">#</a></h4>
+<p>调优结果要落成 <strong>key → 调度参数表</strong>，key 至少含：算子/子图标识、输入 shape 与 dtype、目标设备、编译选项。第 5 节给出它的真实形态（JSON：tile、order、vec、unroll、候选数、样本数）。缓存命中率是这套系统最重要的运营指标之一：本课 4 次同 key 调用全部命中，真测次数保持 216 不变——<strong>冷启动 864 ms 之后，每次调用只花查表时间</strong>。反过来，缓存键漏字段（把 batch 写进 key 却不写 shape）会造成&quot;看着命中了、结果算错了&quot;，比不命中更危险。</p>
+<h4 id="h-5-可复现性日志里少一项别人就复现不出">5. 可复现性：日志里少一项，别人就复现不出<a class="anchor" href="#h-5-可复现性日志里少一项别人就复现不出" aria-label="本节链接">#</a></h4>
+<p>调优结果是<strong>基于测量做出的决策</strong>，必须成套记录：硬件标识（型号 + 驱动 / CUDA 版本）、编译器与库版本、精度模式（fp32 / tf32 / fp16 累加规则不同）、输入 shape 与布局、搜索算法与随机种子、每条候选的样本统计。少一项，换台机器就可能选出另一条调度；&quot;快了 N 倍&quot;没有这套记录也无法验证。<strong>结论的不确定性本身就是结果的一部分。</strong></p>
+<h4 id="h-6-常见坑">6. 常见坑<a class="anchor" href="#h-6-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>不设预算上限</strong>：先定&quot;最多多少 GPU 小时 / 多少次真测&quot;，否则搜索不收敛。</li>
+<li><strong>拿单次测量当结论</strong>：σ=0.10 时单次冠军有相当概率不是最优。</li>
+<li><strong>缓存键漏字段</strong>：漏 dtype 或 shape 会让不同问题撞进同一个键；漏设备会把一台卡的结论搬到别处用。</li>
+<li><strong>调优记录不落盘</strong>：进程退出即丢失，下次冷启动重付代价。</li>
+<li><strong>忽略回归</strong>：硬件或库升级后先跑回归，确认旧 key 的结果仍成立再决定是否保留缓存。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<pre data-lang="python"><code class="language-python"># ---- 第 4 课：自动调优的成本账（纯 Python，无第三方依赖）----
+import itertools, json, random, statistics
+
+TILES = [(1, 1, 1), (8, 8, 1), (16, 16, 1), (32, 32, 1), (64, 64, 1), (128, 64, 8)]
+ORDERS = [(&#39;i&#39;, &#39;j&#39;, &#39;k&#39;), (&#39;j&#39;, &#39;i&#39;, &#39;k&#39;)]
+VECS = [1, 4]
+UNROLLS = [1, 4, 8]
+
+
+def space():
+    for t, o, v, u in itertools.product(TILES, ORDERS, VECS, UNROLLS):
+        yield dict(tiles=t, order=o, vec=v, unroll=u, parallel=(&#39;i&#39;, &#39;j&#39;))
+
+
+def truth(s):
+    &quot;&quot;&quot;&quot;真机&quot;：本课用第 2/3 课那种解析模型扮演；调优程序只能通过 measure() 看它。
+    最优点在 tile 面积 64×64、unroll=4、次序 i 优先、向量化 4 —— 由模型结构决定，不是硬编码。&quot;&quot;&quot;
+    area = s[&#39;tiles&#39;][0] * s[&#39;tiles&#39;][1]
+    e = 1.0
+    e += 2.0 * abs(area - 4096) / 4096                  # 面积偏离 64×64 就变差
+    e += 0.8 * abs(s[&#39;unroll&#39;] - 4) / 4                 # unroll 4 最好，1/8 都差
+    e += 0.2 if s[&#39;order&#39;][0] != &#39;i&#39; else 0.0
+    return e * (1.0 + 0.15 * (1 if s[&#39;vec&#39;] == 1 else 0))
+
+
+class Tuner:
+    &quot;&quot;&quot;调优器：对每条候选真测 k 次，按统计量挑一条，并把&quot;成本账&quot;记全。&quot;&quot;&quot;
+
+    def __init__(self, noise=0.05, k=3, seed=0, measure_ms=4.0):
+        self.noise, self.k, self.measure_ms = noise, k, measure_ms
+        self.rng, self.trials, self.hits, self.cache = random.Random(seed), 0, 0, {}
+
+    def measure(self, s):
+        &quot;&quot;&quot;一次&quot;真测&quot;：返回 k 个带测量噪声的样本。&quot;&quot;&quot;
+        self.trials += 1
+        base = truth(s)
+        return [base * (1.0 + self.rng.gauss(0, self.noise)) for _ in range(self.k)]
+
+    def tune(self, key, budget=None):
+        cands = list(space())
+        if budget and budget &lt; len(cands):
+            cands = self.rng.sample(cands, budget)
+        best, best_stat = None, float(&#39;inf&#39;)
+        for s in cands:
+            stat = statistics.median(self.measure(s))
+            if stat &lt; best_stat:
+                best, best_stat = s, stat
+        self.cache[key] = dict(tiles=best[&#39;tiles&#39;], order=&#39;&#39;.join(best[&#39;order&#39;]), vec=best[&#39;vec&#39;],
+                               unroll=best[&#39;unroll&#39;], candidates=len(cands), repeats=self.k,
+                               samples=len(cands) * self.k)
+        return best, len(cands)
+
+    def call(self, key):
+        &quot;&quot;&quot;同一 shape 再跑：查缓存命中就不付搜索成本。&quot;&quot;&quot;
+        if key in self.cache:
+            self.hits += 1
+            return self.cache[key]
+        return None
+
+
+if __name__ == &#39;__main__&#39;:
+    pool = list(space())
+    oracle = min(truth(s) for s in pool)
+    print(f&#39;=== 1. 空间 {len(pool)} 条；真值最优 {oracle:.4f} —— 调优要逼近它，&#39;
+          f&#39;但只能靠带噪声的实测 ===&#39;)
+
+    print(&#39;\n=== 2. 每条候选测 k 次：成本随 k 线性涨，准确度不必线性涨 ===&#39;)
+    print(f&quot;{&#39;k&#39;:&gt;3}{&#39;候选数&#39;:&gt;8}{&#39;实测样本数&#39;:&gt;12}{&#39;机上耗时(ms)&#39;:&gt;14}{&#39;选中真值&#39;:&gt;12}&quot;)
+    for budget, k in ((12, 1), (12, 3), (12, 10), (72, 3)):
+        t = Tuner(noise=0.05, k=k, seed=1)
+        s, n = t.tune(f&#39;k{k}_{budget}&#39;, budget=budget)
+        print(f&#39;{k:&gt;3}{n:&gt;8}{n * k:&gt;12}{n * k * t.measure_ms:&gt;14.0f}{truth(s):&gt;12.4f}&#39;)
+
+    print(&#39;\n=== 3. 搜索预算的收益递减：12 次调优里有多少次落在最优 2% 以内 ===&#39;)
+    print(f&quot;{&#39;budget&#39;:&gt;8}{&#39;每次真测次数&#39;:&gt;14}{&#39;总机上耗时(秒)&#39;:&gt;16}{&#39;落在最优2%&#39;:&gt;12}&quot;)
+    for budget in (5, 10, 20, 36, len(pool)):
+        near = 0
+        for trial in range(12):
+            t = Tuner(noise=0.02, k=3, seed=500 + trial)
+            s, _ = t.tune(f&#39;b{budget}_{trial}&#39;, budget=budget)
+            near += truth(s) &lt;= oracle * 1.02
+        print(f&#39;{budget:&gt;8}{budget * 3:&gt;14}{budget * 3 * 4.0 / 1000:&gt;16.2f}{f&quot;{near}/12&quot;:&gt;12}&#39;)
+
+    print(&#39;\n=== 4. 测量噪声：预算拉满（72 条全测、k=3），噪声如何淹没差距 ===&#39;)
+    print(f&quot;{&#39;每点噪声σ&#39;:&gt;10}{&#39;落最优2%&#39;:&gt;10}{&#39;中位真值&#39;:&gt;10}{&#39;最差真值&#39;:&gt;10}&quot;)
+    for noise in (0.0, 0.02, 0.05, 0.10, 0.20):
+        picks = []
+        for trial in range(10):
+            t = Tuner(noise=noise, k=3, seed=1700 + trial)
+            s, _ = t.tune(f&#39;n{noise}_{trial}&#39;)
+            picks.append(truth(s))
+        near = sum(1 for v in picks if v &lt;= oracle * 1.02)
+        print(f&#39;{noise:&gt;10.2f}{f&quot;{near}/10&quot;:&gt;10}{statistics.median(picks):&gt;10.4f}{max(picks):&gt;10.4f}&#39;)
+    print(&#39;  好调度之间的差距只有百分之几，而一次实测的抖动可能有几个百分点 —— &#39;
+          &#39;这就是&quot;必须多次测量 + 不能只信单次冠军&quot;的原因&#39;)
+
+    print(&#39;\n=== 5. 缓存与可复现性：调优结果是一张 key → 调度表 ===&#39;)
+    t = Tuner(noise=0.03, k=3, seed=5)
+    key = &#39;matmul_1024_1024_1024_f32_cuda&#39;
+    s, n = t.tune(key)
+    print(f&#39;  冷启动 key={key}&#39;)
+    print(f&#39;    → {json.dumps(t.cache[key], ensure_ascii=False)}&#39;)
+    for _ in range(4):
+        t.call(key)
+    print(f&#39;  同一 key 再跑 4 次：缓存命中 {t.hits} 次；累计候选 {t.trials} 条、&#39;
+          f&#39;实测样本 {t.trials * t.k} 个&#39;)
+    print(f&#39;  一次性成本 = {t.trials} 条候选 × {t.k} 次样本 = {t.trials * t.k} 次真测，&#39;
+          f&#39;约 {t.trials * t.k * t.measure_ms:.0f} ms；命中缓存后每次只花查表时间&#39;)
+    print(&#39;  可复现性清单：硬件标识 + 驱动/编译器版本 + 精度 + 搜索种子 + 输入 shape，&#39;
+          &#39;缺任何一项都复现不出同一条调度&#39;)</code></pre>
+<p>运行结果（Python 3.10.14，无第三方依赖）：</p>
+<pre data-lang="text"><code class="language-text">=== 1. 空间 72 条；真值最优 1.0000 —— 调优要逼近它，但只能靠带噪声的实测 ===
+
+=== 2. 每条候选测 k 次：成本随 k 线性涨，准确度不必线性涨 ===
+  k     候选数       实测样本数      机上耗时(ms)        选中真值
+  1      12          12            48      1.8400
+  3      12          36           144      1.8000
+ 10      12         120           480      1.8000
+  3      72         216           864      1.0000
+
+=== 3. 搜索预算的收益递减：12 次调优里有多少次落在最优 2% 以内 ===
+  budget        每次真测次数        总机上耗时(秒)      落在最优2%
+       5            15            0.06        1/12
+      10            30            0.12        1/12
+      20            60            0.24        3/12
+      36           108            0.43        6/12
+      72           216            0.86       12/12
+
+=== 4. 测量噪声：预算拉满（72 条全测、k=3），噪声如何淹没差距 ===
+     每点噪声σ     落最优2%      中位真值      最差真值
+      0.00     10/10    1.0000    1.0000
+      0.02     10/10    1.0000    1.0000
+      0.05     10/10    1.0000    1.0000
+      0.10      9/10    1.0000    1.2000
+      0.20      5/10    1.0750    1.6000
+  好调度之间的差距只有百分之几，而一次实测的抖动可能有几个百分点 —— 这就是&quot;必须多次测量 + 不能只信单次冠军&quot;的原因
+
+=== 5. 缓存与可复现性：调优结果是一张 key → 调度表 ===
+  冷启动 key=matmul_1024_1024_1024_f32_cuda
+    → {&quot;tiles&quot;: [64, 64, 1], &quot;order&quot;: &quot;ijk&quot;, &quot;vec&quot;: 4, &quot;unroll&quot;: 4, &quot;candidates&quot;: 72, &quot;repeats&quot;: 3, &quot;samples&quot;: 216}
+  同一 key 再跑 4 次：缓存命中 4 次；累计候选 72 条、实测样本 216 个
+  一次性成本 = 72 条候选 × 3 次样本 = 216 次真测，约 864 ms；命中缓存后每次只花查表时间
+  可复现性清单：硬件标识 + 驱动/编译器版本 + 精度 + 搜索种子 + 输入 shape，缺任何一项都复现不出同一条调度</code></pre>
+<p>四处可核对的结论：<strong>成本随样本数线性涨</strong>（12 条候选 × 1/3/10 次样本 → 48/144/480 ms），而<strong>结果并不随样本数线性变好</strong>（1.84 → 1.80 → 1.80），说明多测几次前要先确认目标还值得测；<strong>预算收益是 S 形</strong>（5 条命中 1/12，36 条 6/12，72 条 12/12）；<strong>噪声会吞掉好调度之间的差距</strong>（σ=0.20 时只有 5/10 落在最优 2% 以内，最差一次挑到 1.60 倍）；<strong>缓存把一次性成本摊零</strong>（一次 216 次真测 ≈ 864 ms，之后 4 次同 key 调用全部命中）。</p>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选，需自备或云上按需：在真实工具链上把这三笔账测出来 ----
+# Apache TVM（pip install apache-tvm）：调优记录落成 tuning log（JSON），
+#   可用 auto_schedule / meta_schedule 的 apply-history 复用；同一 log 也能打印每条候选的实测值。
+# TorchInductor（PyTorch 自带，CPU 亦可）：TORCH_LOGS=&quot;inductor&quot; 观察 Triton autotune 与
+#   cudagraphs/编译缓存目录（默认在 ~/.cache/torch/inductor），改 shape 会看到缓存 key 变化。
+#   python3 -c &quot;import torch; f=torch.compile(lambda x: torch.relu(x@x)); print(f(torch.randn(64,64)).shape)&quot;
+# ncu（需 GPU）：对同一条被选中的调度重复测 5 次，观察 dram__bytes 的抖动 —— 这就是本课 σ 的现实来源。
+# 本机若无 GPU / 无 torch，上面的模拟已经把&quot;预算—噪声—缓存&quot;三条曲线画出来了。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：给 <code>Tuner</code> 加 <code>budget_s</code>（秒）与 deadline 检查：时间耗尽即停止遍历、返回当前最优，并记录&quot;实际测了几条、因超时跳过几条&quot;；用 <code>measure_ms=4</code> 验证它真会在预算处停下。</li>
+<li><strong>解释</strong>：为什么第 2 节里 k 从 1 加到 10 只把结果从 1.84 降到 1.80，而 12 条候选扩到 72 条却从 1.80 降到 1.00？提示：前者改的是估计精度，后者改的是覆盖区域。</li>
+<li><strong>对比/验证</strong>：把 <code>Tuner.cache</code> 的 key 改成只含 tile 不含 shape，用两个不同 shape 调用，观察第二个是否&quot;错误命中&quot;第一个的结果；再修正 key，并写出你认为必须进 key 的字段清单。</li>
+<li><strong>思考</strong>：本课的&quot;真测&quot;是解析模型加噪声。换成真实 GPU 后噪声来源会变成什么（时钟频率、缓存状态、其他进程、功耗墙）？哪些能靠测量方法消除，哪些只能靠记录与统计处理？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Lianmin Zheng et al., <em>Ansor: Generating High-Performance Tensor Programs for Deep Learning</em>（OSDI&#39;20；调优预算与多个子图并行调度的工程考虑）：<a href="https://www.usenix.org/conference/osdi20/presentation/zheng" target="_blank" rel="noopener noreferrer">https://www.usenix.org/conference/osdi20/presentation/zheng</a></li>
+<li>Tianqi Chen et al., <em>TVM: An Automated End-to-End Optimizing Compiler for Deep Learning</em>（OSDI&#39;18；调优记录复用与端到端部署时&quot;一次调优、多次使用&quot;的动机）：<a href="https://www.usenix.org/conference/osdi18/presentation/chen" target="_blank" rel="noopener noreferrer">https://www.usenix.org/conference/osdi18/presentation/chen</a></li>
+<li>Apache TVM, <em>MetaSchedule: Search-Based Auto-Tuning</em>（采样式自动调优的调优记录与后续复用，是&quot;缓存键&quot;思路的官方实现）：<a href="https://tvm.apache.org/docs/deep_dive/tensor_ir/tutorials/meta_schedule.html" target="_blank" rel="noopener noreferrer">https://tvm.apache.org/docs/deep_dive/tensor_ir/tutorials/meta_schedule.html</a></li>
+<li>PyTorch 官方文档, <em>torch.compile</em>（编译缓存与重编译的工程行为；本课&quot;缓存键&quot;在框架侧的对应物）：<a href="https://pytorch.org/docs/stable/torch.compiler.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/docs/stable/torch.compiler.html</a></li>
+</ul>
+<p><a href="../chapter-7/index.md">下一章：后端与代码生成</a></p>

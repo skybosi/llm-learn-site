@@ -1,0 +1,112 @@
+<h2 id="h-交叉注意力">交叉注意力<a class="anchor" href="#h-交叉注意力" aria-label="本节链接">#</a></h2>
+<p>自注意力是&quot;自己看自己&quot;，Q、K、V 都来自同一个序列。而 Transformer 的解码器里还有第二类注意力，它是整个&quot;编码器—解码器&quot;架构的<strong>桥梁</strong>：Query 来自解码器（目标语言），Key 和 Value 来自编码器（源语言）。这就是<strong>交叉注意力（cross-attention）</strong>，也常叫&quot;编码器—解码器注意力&quot;。正是它让解码器在生成目标语言的每个词时，能够&quot;回头&quot;去查阅源句子的相关信息——就像翻译 <code>I have a cat</code> 时，生成&quot;猫&quot;之前要先去源句子里找到 <code>cat</code>。这一课讲清它和自注意力的本质区别，并实现一个最小例子。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-三种注意力三种信息流">1. 三种注意力，三种&quot;信息流&quot;<a class="anchor" href="#h-1-三种注意力三种信息流" aria-label="本节链接">#</a></h4>
+<p>先把编码器—解码器架构里的三处注意力摆在一起，看它们各自的 Q、K、V 从哪来：</p>
+<table>
+<thead>
+<tr>
+<th>类型</th>
+<th>Query 来自</th>
+<th>Key 来自</th>
+<th>Value 来自</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>编码器自注意力</td>
+<td>源序列</td>
+<td>源序列</td>
+<td>源序列</td>
+<td>源句子内部建模（双向）</td>
+</tr>
+<tr>
+<td>解码器自注意力</td>
+<td>目标序列</td>
+<td>目标序列</td>
+<td>目标序列</td>
+<td>目标句子内部建模（因果）</td>
+</tr>
+<tr>
+<td><strong>交叉注意力</strong></td>
+<td><strong>目标序列</strong></td>
+<td><strong>源序列</strong></td>
+<td><strong>源序列</strong></td>
+<td><strong>连接两种语言/两种序列</strong></td>
+</tr>
+</tbody></table>
+<p>关键在最后一行：<strong>Query 是&quot;我要找什么&quot;，Key/Value 是&quot;我能提供什么&quot;</strong>。解码器拿着自己当前的表示当 Query，去编码器输出的&quot;源语言记忆&quot;里检索，把检索到的 Value 加权求和，融合进自己的表示。</p>
+<h4 id="h-2-为什么要q-在解码器kv-在编码器">2. 为什么要&quot;Q 在解码器、K/V 在编码器&quot;<a class="anchor" href="#h-2-为什么要q-在解码器kv-在编码器" aria-label="本节链接">#</a></h4>
+<p>这是交叉注意力最容易背混、也最值得想明白的一点。直觉如下：</p>
+<ul>
+<li><strong>Query 代表&quot;查询方&quot;的需求</strong>：解码器当前要生成的这个词，需要知道&quot;源句子里哪部分对我有用&quot;。</li>
+<li><strong>Key 代表&quot;被查方的索引&quot;</strong>：编码器为源句子的每个位置提供一个 key，供查询方来匹配。</li>
+<li><strong>Value 代表&quot;被查方的实际内容&quot;</strong>：匹配到之后，真正取走的是源位置的内容向量。</li>
+</ul>
+<p>所以，是<strong>解码器在提问、编码器在作答</strong>。把 Q 和 K/V 的来源对调（用编码器当 Q、解码器当 K/V）在数学上当然也能算，但那就不再是&quot;生成时查阅源句子&quot;的语义了，也就丧失了架构设计的本意。</p>
+<h4 id="h-3-形状上的一点差别">3. 形状上的一点差别<a class="anchor" href="#h-3-形状上的一点差别" aria-label="本节链接">#</a></h4>
+<p>自注意力里 Q、K、V 长度相同（都是序列长 <code>T</code>），得到的注意力权重是 <code>(T, T)</code> 方阵。交叉注意力里，Query 的长度是<strong>目标序列长度 <code>T_tgt</code></strong>，Key/Value 的长度是<strong>源序列长度 <code>T_src</code></strong>，二者通常不相等：</p>
+<pre><code>scores = Q(tgt) @ K(src)^T / sqrt(d_k)    # 形状 (T_tgt, T_src)
+weights = softmax(scores, dim=-1)          # 每行：某个目标位置对全体源位置的关注
+output  = weights @ V(src)                 # 形状 (T_tgt, d_model)</code></pre>
+<p>权重矩阵是 <code>(T_tgt, T_src)</code> 的长方形，不再是方阵。每个目标位置都拥有一个&quot;对整条源序列的关注分布&quot;——这正是&quot;翻译时逐词对齐&quot;的几何表现。</p>
+<p><figure><img class="md-img" src="content/courses/attention-transformer/assets/chapter-5-figure-02.svg" alt="交叉注意力示意图：Q 来自解码器、K/V 来自编码器，箭头表示每个目标位置对源位置的关注" loading="lazy" decoding="async"><figcaption>交叉注意力示意图：Q 来自解码器、K/V 来自编码器，箭头表示每个目标位置对源位置的关注</figcaption></figure>
+</p>
+<h4 id="h-4-交叉注意力不需要因果掩码">4. 交叉注意力不需要因果掩码<a class="anchor" href="#h-4-交叉注意力不需要因果掩码" aria-label="本节链接">#</a></h4>
+<p>上一课说过，因果掩码只用于&quot;禁止看未来&quot;，而交叉注意力看的<strong>不是未来，而是另一条完全已知的序列</strong>——编码器早已把整条源句子读完了。因此在生成目标位置 <code>t</code> 时，让它看源句子的任意位置都是合法的。交叉注意力唯一可能需要的掩码是 <strong>padding 掩码</strong>（源序列里的 <code>&lt;pad&gt;</code> 不应被关注）。</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>先写一个最小的交叉注意力，手动看清 Q、K、V 的来源和形状。</p>
+<pre data-lang="python"><code class="language-python">import torch
+import torch.nn.functional as F
+
+def cross_attention(query, key, value):
+    &quot;&quot;&quot;query 来自解码器，key/value 来自编码器&quot;&quot;&quot;
+    d = query.shape[-1]
+    scores = query @ key.T / (d ** 0.5)   # (T_tgt, T_src)
+    weights = F.softmax(scores, dim=-1)    # 每个目标位置对源位置的关注分布
+    return weights @ value, weights
+
+d = 8
+src = torch.randn(6, d)   # 编码器输出（源序列），长度 T_src=6
+tgt = torch.randn(4, d)   # 解码器当前的表示（目标序列），长度 T_tgt=4
+
+out, w = cross_attention(tgt, src, src)   # Q=解码器, K/V=编码器
+print(&quot;交叉注意力权重形状:&quot;, w.shape)      # (4, 6)：目标长度 × 源长度
+print(&quot;输出形状:&quot;, out.shape)              # (4, 8)：仍是目标长度 × d_model
+print(&quot;每行关注分布之和:&quot;, w.sum(dim=-1))   # 全为 1</code></pre>
+<p>注意输出形状是 <code>(4, 8)</code>——<strong>长度由 Query（目标序列）决定</strong>，而不是由 Key/Value（源序列）决定。这也再次印证&quot;Q 是主导方&quot;。</p>
+<p>接下来用 <code>nn.MultiheadAttention</code> 把同一个交叉注意力写成&quot;生产可用&quot;的形式，并和自注意力做一个对照：</p>
+<pre data-lang="python"><code class="language-python">import torch.nn as nn
+
+mha = nn.MultiheadAttention(embed_dim=d, num_heads=2, batch_first=True)
+
+# 交叉注意力：query 用目标序列，key/value 用源序列
+cross_out, cross_w = mha(query=tgt.unsqueeze(0),     # (1, 4, 8)
+                         key=src.unsqueeze(0),       # (1, 6, 8)
+                         value=src.unsqueeze(0),
+                         need_weights=True)
+print(&quot;nn 交叉注意力输出:&quot;, cross_out.shape)          # (1, 4, 8)
+print(&quot;nn 交叉注意力权重:&quot;, cross_w.shape)            # (1, 4, 6)
+
+# 自注意力对照：query/key/value 全部用目标序列自己
+self_out, self_w = mha(query=tgt.unsqueeze(0),
+                       key=tgt.unsqueeze(0),
+                       value=tgt.unsqueeze(0),
+                       need_weights=True)
+print(&quot;nn 自注意力权重:&quot;, self_w.shape)               # (1, 4, 4) 方阵</code></pre>
+<p>两相对比一目了然：自注意力的权重是 <code>(4, 4)</code> 方阵，交叉注意力是 <code>(4, 6)</code> 长方形，且长短边分别对应目标长和源长。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>把 <code>src</code> 的长度改成 10、<code>tgt</code> 改成 3，重跑上面的交叉注意力，确认权重形状变为 <code>(3, 10)</code>，并解释为什么输出的&quot;行数&quot;始终等于目标长度。</li>
+<li>写一个&quot;多步对齐&quot;的演示：固定同一个 <code>src</code>，让 <code>tgt</code> 依次是 3 个不同的查询向量，观察每次查询得到的关注分布如何变化，说明&quot;不同目标词会关注源句子的不同部分&quot;。</li>
+<li>思考：如果交叉注意力的 Key/Value 不直接等于编码器最终输出，而是再经过一层线性变换（<code>W_k</code>、<code>W_v</code>），这与直接用原始输出有什么区别？参数量和表达能力如何变化？</li>
+<li>在 <code>nn.MultiheadAttention</code> 里给交叉注意力传入一个源序列的 padding 掩码（<code>key_padding_mask</code>），观察被 pad 的源位置权重是否归零。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>论文《Attention Is All You Need》3.2.3 节（Encoder-Decoder Attention）：<a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1706.03762</a></li>
+<li>The Illustrated Transformer（Jay Alammar）· Decoder 的 Encoder-Decoder Attention：<a href="https://jalammar.github.io/illustrated-transformer/" target="_blank" rel="noopener noreferrer">https://jalammar.github.io/illustrated-transformer/</a></li>
+<li>PyTorch 官方文档 · MultiheadAttention：<a href="https://pytorch.org/docs/stable/generated/torch.nn.MultiheadAttention.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/docs/stable/generated/torch.nn.MultiheadAttention.html</a></li>
+<li>The Annotated Transformer（Harvard NLP）· Decoder 实现：<a href="https://nlp.seas.harvard.edu/annotated-transformer/" target="_blank" rel="noopener noreferrer">https://nlp.seas.harvard.edu/annotated-transformer/</a></li>
+</ul>
+<p><a href="#/l/attn-ch5-l3">下一课：训练与推理差异</a></p>

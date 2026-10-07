@@ -1,0 +1,366 @@
+<h2 id="h-从-ast-降到-ir一次完整的-lowering">从 AST 降到 IR：一次完整的 lowering<a class="anchor" href="#h-从-ast-降到-ir一次完整的-lowering" aria-label="本节链接">#</a></h2>
+<p>前三课分别讲清了三件零件：三地址码（形状）、CFG 与基本块（结构）、SSA 与支配关系（分析友好性）。这一课把它们装成一条能被观察的流水线：源码 → AST → 三地址码（带标签）→ 基本块 → CFG。它会顺带回答一个很容易被跳过、但决定编译器正确性的问题：<strong>降级（lowering）改变了表示，但必须保住什么？</strong></p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-lowering把高层结构换成一串原语">1. lowering：把高层结构换成一串原语<a class="anchor" href="#h-1-lowering把高层结构换成一串原语" aria-label="本节链接">#</a></h4>
+<p><strong>lowering</strong>（降级）指把高层语言结构翻译成更接近机器、语义等价的低层原语。Crafting Interpreters 第 2 章把编译写成&quot;翻过山头、再下山&quot;的过程，lowering 就是下山那段的主旋律：语义不变，表示越来越简单。</p>
+<p>这里有个关键判断：lowering 的<strong>目标形态</strong>是设计选择，不是自然规律。同一门语言可以降到三地址码 + 标签（本课），也可以直接降到 LLVM IR（真实前端），还可以降到栈式字节码。选哪种形态，取决于后端和后续优化想看到什么。</p>
+<h4 id="h-2-常见降级清单">2. 常见降级清单<a class="anchor" href="#h-2-常见降级清单" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>源结构</th>
+<th>降级后</th>
+<th>关键点</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>if (c) s1 else s2</code></td>
+<td>三个标签 + 两条 <code>goto</code> 合流</td>
+<td>合流标签就是 CFG 的汇合块</td>
+</tr>
+<tr>
+<td><code>while (c) s</code></td>
+<td>条件块在前，体末尾 <code>goto</code> 回条件块</td>
+<td>回边由标签实现</td>
+</tr>
+<tr>
+<td><code>for (init; c; step)</code></td>
+<td><code>init; while (c) { s; step }</code></td>
+<td>步进必须搬进体末尾</td>
+</tr>
+<tr>
+<td><code>c1 &amp;&amp; c2</code>（条件位置）</td>
+<td>标签序列：<code>c1</code> 为假直接跳到假出口</td>
+<td>短路必须是&quot;真跳转&quot;</td>
+</tr>
+<tr>
+<td><code>c1 || c2</code></td>
+<td><code>c1</code> 为真直接跳到真出口</td>
+<td>同上</td>
+</tr>
+<tr>
+<td><code>a[i]</code></td>
+<td>地址算术 <code>base + i * sizeof(T)</code> 再 load</td>
+<td>数组访问变成指针算术</td>
+</tr>
+</tbody></table>
+<p>清单里最值得琢磨的是 <code>for</code>。一个自然的想法是<strong>在 parser 里就直接展开成 while</strong>——AST 里干脆不要 <code>for</code> 节点。真实编译器通常不这么做：AST 保留源语言结构，错误信息才能说清&quot;是 <code>for</code> 的哪一段出错&quot;，后续 pass 也才有机会对 <code>for</code> 整体做循环识别、步长分析。本课代码里 <code>parse()</code> 产出的顶层语句仍是 <code>(&#39;for&#39;, ...)</code>，展开发生在 <code>Lower.run()</code> 里。</p>
+<h4 id="h-3-语义保持的三条硬约束">3. 语义保持的三条硬约束<a class="anchor" href="#h-3-语义保持的三条硬约束" aria-label="本节链接">#</a></h4>
+<p>lowering 是&quot;保持语义的改写&quot;。验收它不能靠&quot;看起来对&quot;，要靠三条硬约束：</p>
+<ol>
+<li><strong>求值顺序</strong>：左右子表达式按源码顺序求值。把 <code>f() + g()</code> 降成先 <code>g</code> 后 <code>f</code> 会改变可观察行为。</li>
+<li><strong>副作用时机</strong>：调用、赋值、可能出错的运算（除零、越界）不能被提前、延后或重复执行。</li>
+<li><strong>短路</strong>：<code>c1 &amp;&amp; c2</code> 里的 <code>c2</code> 只在 <code>c1</code> 为真时求值。这意味着条件位置上的 <code>&amp;&amp;</code> <strong>不能</strong>降成&quot;先算两个布尔值再合并&quot;——那会在 <code>a == 0</code> 时照样执行 <code>b / a</code>。</li>
+</ol>
+<p>第 3 条最容易被当成优化技巧，其实它是语义要求。本课代码的例子里，源码写的是 <code>if (a != 0 &amp;&amp; sum / a &gt; 2)</code>：降级后除法的指令只落在&quot;<code>a != 0</code> 为真才到达&quot;的块里，这才是正确实现。判断标准很简单——<strong>短路是&quot;不执行本不该执行的运算&quot;，不是&quot;少算一次&quot;</strong>。</p>
+<h4 id="h-4-一条完整流水线29-条指令--11-个基本块">4. 一条完整流水线：29 条指令 → 11 个基本块<a class="anchor" href="#h-4-一条完整流水线29-条指令--11-个基本块" aria-label="本节链接">#</a></h4>
+<p>下面代码对一段带 <code>for</code> 循环与短路条件的源码跑完四步，并打印每一步的结果。观察四件事：</p>
+<ul>
+<li><strong><code>for</code> 已经不存在了</strong>：<code>i = 1</code> 落在入口块 B1，<code>t3 = i + 1; i = t3</code> 落在循环体 B4 末尾，<code>goto L1</code> 形成回边。</li>
+<li><strong>短路在 CFG 里可见</strong>：<code>if t4 goto L7</code> 是 <code>a != 0</code> 的真分支，除法只出现在 B7；假分支直接去 else 块 B6。</li>
+<li><strong>出现一批&quot;只含 goto&quot;的块</strong>（B3、B6、B8）：naive lowering 的必然产物，块数与源码分支数不成正比，清理它们是后续 pass 的工作。</li>
+<li><strong>可见的&quot;低效&quot;</strong>：<code>t2 = sum + i; sum = t2</code>——赋值先算进临时名再 <code>copy</code> 回变量。这是最简单、也最不容易写错的 lowering 形态；复制传播（第 5 章）会把它消掉。</li>
+</ul>
+<p><figure><img class="md-img" src="content/courses/compiler-foundations/assets/chapter-4-figure-04.svg" alt="一次完整 lowering：源码结构降成原语、三地址码标签与 CFG" loading="lazy" decoding="async"><figcaption>一次完整 lowering：源码结构降成原语、三地址码标签与 CFG</figcaption></figure>
+</p>
+<h4 id="h-5-与-llvm-对照alloca-与-mem2reg">5. 与 LLVM 对照：alloca 与 mem2reg<a class="anchor" href="#h-5-与-llvm-对照alloca-与-mem2reg" aria-label="本节链接">#</a></h4>
+<p>真实前端（clang）走的是同一条路，只是目标 IR 更精细。它在 <code>-O0</code> 下把局部变量放在栈上（<code>alloca</code> + <code>load</code>/<code>store</code>），因为 <code>-O0</code> 的首要目标是调试友好与编译速度；进入优化级别后，<code>mem2reg</code> 把<strong>未被取地址</strong>的 <code>alloca</code> 提升成 SSA 寄存器值。本课四课手工做的&quot;切块 → 支配关系 → φ → 重命名&quot;，正是 <code>mem2reg</code> 内部做的事——只不过它还要额外处理&quot;变量被取地址&quot;这类逃逸情况。</p>
+<h4 id="h-6-常见坑">6. 常见坑<a class="anchor" href="#h-6-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>标签靠源码名字拼</strong>：lowering 里标签必须由计数器生成，用变量名拼标签必然冲突。</li>
+<li><strong>条件位置与非条件位置混用</strong>：<code>x = (a &amp;&amp; b)</code> 需要把布尔值落进临时名，不能复用&quot;只发跳转&quot;的 cond 路径。</li>
+<li><strong>忘记 fall-through</strong>：<code>if</code> 的 then 分支末尾不补 <code>goto</code> 就会直接掉进 else 块。</li>
+<li><strong>一次降太多层</strong>：把 <code>for</code> 直接降到机器码级细节（寄存器、帧布局）会让错误定位与调试信息全丢，分层降级是为可维护性服务的。</li>
+<li><strong>不做验证</strong>：写完 lowering 至少要对&quot;每个块最多一个入口&quot;和&quot;所有跳转目标存在&quot;两条做断言，这是最便宜的正确性护栏。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>这段纯 Python（无第三方依赖）实现了完整的四阶段流水线。它把上一课的 <code>split_blocks</code> 与 CFG 构造也包含进来，因此可以一口气看到从源码到图的全过程。</p>
+<pre data-lang="python"><code class="language-python"># ---- 一次完整的 lowering：AST → 三地址码（带标签）→ 基本块 → CFG ----
+# 纯 Python，无第三方依赖。源码见下方 SRC。
+import re
+
+TOKEN = re.compile(r&#39;(\d+)|([a-zA-Z_]\w*)|(==|!=|&lt;=|&gt;=|&amp;&amp;|\|\||[-+*/()&lt;&gt;=;{}])&#39;)
+WS = re.compile(r&#39;\s*&#39;)
+KW = {&#39;if&#39;, &#39;else&#39;, &#39;while&#39;, &#39;for&#39;, &#39;print&#39;}
+OPNAME = {&#39;+&#39;: &#39;add&#39;, &#39;-&#39;: &#39;sub&#39;, &#39;*&#39;: &#39;mul&#39;, &#39;/&#39;: &#39;div&#39;}
+
+# ---------- 1. 前端：token → AST ----------
+def tokenize(src):
+    out, i = [], 0
+    while i &lt; len(src):
+        i = WS.match(src, i).end()                # 空白与换行不产生 token
+        if i &gt;= len(src):
+            break
+        m = TOKEN.match(src, i)
+        if not m:
+            raise SyntaxError(f&#39;非法字符 {src[i]!r} at {i}&#39;)
+        i = m.end()
+        num, name, op = m.groups()
+        out.append((&#39;NUM&#39;, int(num)) if num else
+                   (&#39;NAME&#39;, name) if name else (&#39;OP&#39;, op))
+    return out
+
+def parse(tokens):
+    pos = 0
+    def peek(): return tokens[pos] if pos &lt; len(tokens) else (None, None)
+    def eat(kind, value=None):
+        nonlocal pos
+        k, v = peek()
+        if k != kind or (value is not None and v != value):
+            raise SyntaxError(f&#39;期望 {kind}{value or &quot;&quot;}，得到 {(k, v)}&#39;)
+        pos += 1; return v
+    def block():
+        eat(&#39;OP&#39;, &#39;{&#39;); body = []
+        while peek() != (&#39;OP&#39;, &#39;}&#39;):
+            body.append(stmt())
+        eat(&#39;OP&#39;, &#39;}&#39;); return body
+    def stmt():
+        k, v = peek()
+        if k == &#39;NAME&#39; and v in KW:
+            if v == &#39;print&#39;:
+                eat(&#39;NAME&#39;); e = expr(); eat(&#39;OP&#39;, &#39;;&#39;); return (&#39;print&#39;, e)
+            if v == &#39;if&#39;:
+                eat(&#39;NAME&#39;); eat(&#39;OP&#39;, &#39;(&#39;); c = expr(); eat(&#39;OP&#39;, &#39;)&#39;)
+                then = block(); els = []
+                if peek() == (&#39;NAME&#39;, &#39;else&#39;):
+                    eat(&#39;NAME&#39;); els = block()
+                return (&#39;if&#39;, c, then, els)
+            if v == &#39;while&#39;:
+                eat(&#39;NAME&#39;); eat(&#39;OP&#39;, &#39;(&#39;); c = expr(); eat(&#39;OP&#39;, &#39;)&#39;)
+                return (&#39;while&#39;, c, block())
+            eat(&#39;NAME&#39;); eat(&#39;OP&#39;, &#39;(&#39;)
+            var = eat(&#39;NAME&#39;); eat(&#39;OP&#39;, &#39;=&#39;); e1 = expr(); eat(&#39;OP&#39;, &#39;;&#39;)
+            cond = expr(); eat(&#39;OP&#39;, &#39;;&#39;)
+            v2 = eat(&#39;NAME&#39;); eat(&#39;OP&#39;, &#39;=&#39;); e2 = expr(); eat(&#39;OP&#39;, &#39;)&#39;)
+            return (&#39;for&#39;, var, e1, cond, v2, e2, block())
+        name = eat(&#39;NAME&#39;); eat(&#39;OP&#39;, &#39;=&#39;); e = expr(); eat(&#39;OP&#39;, &#39;;&#39;)
+        return (&#39;assign&#39;, name, e)
+    def expr():                                   # || &lt; &amp;&amp; &lt; 比较 &lt; +- &lt; */ &lt; atom
+        node = and_()
+        while peek() == (&#39;OP&#39;, &#39;||&#39;):
+            eat(&#39;OP&#39;); node = (&#39;or&#39;, node, and_())
+        return node
+    def and_():
+        node = cmp_()
+        while peek() == (&#39;OP&#39;, &#39;&amp;&amp;&#39;):
+            eat(&#39;OP&#39;); node = (&#39;and&#39;, node, cmp_())
+        return node
+    def cmp_():
+        node = add()
+        if peek()[0] == &#39;OP&#39; and peek()[1] in (&#39;&lt;&#39;, &#39;&gt;&#39;, &#39;&lt;=&#39;, &#39;&gt;=&#39;, &#39;==&#39;, &#39;!=&#39;):
+            op = eat(&#39;OP&#39;); node = (&#39;cmp&#39;, op, node, add())
+        return node
+    def add():
+        node = mul()
+        while peek() in ((&#39;OP&#39;, &#39;+&#39;), (&#39;OP&#39;, &#39;-&#39;)):
+            node = (&#39;bin&#39;, eat(&#39;OP&#39;), node, mul())
+        return node
+    def mul():
+        node = atom()
+        while peek() in ((&#39;OP&#39;, &#39;*&#39;), (&#39;OP&#39;, &#39;/&#39;)):
+            node = (&#39;bin&#39;, eat(&#39;OP&#39;), node, atom())
+        return node
+    def atom():
+        k, v = peek()
+        if k == &#39;NUM&#39;:  eat(&#39;NUM&#39;);  return (&#39;num&#39;, v)
+        if k == &#39;NAME&#39;: eat(&#39;NAME&#39;); return (&#39;var&#39;, v)
+        if (k, v) == (&#39;OP&#39;, &#39;(&#39;):
+            eat(&#39;OP&#39;, &#39;(&#39;); node = expr(); eat(&#39;OP&#39;, &#39;)&#39;); return node
+        raise SyntaxError(f&#39;表达式起始处意外 token {(k, v)}&#39;)
+    prog = []
+    while pos &lt; len(tokens):
+        prog.append(stmt())
+    return prog
+
+# ---------- 2. 中端：AST → 三地址码 ----------
+class Lower:
+    def __init__(self):
+        self.code, self.nt, self.nl = [], 0, 0
+    def tmp(self):
+        self.nt += 1; return f&#39;t{self.nt}&#39;
+    def label(self):
+        self.nl += 1; return f&#39;L{self.nl}&#39;
+    def emit(self, *ins):
+        self.code.append(ins)
+    def gen(self, node):
+        k = node[0]
+        if k == &#39;num&#39;: return (&#39;const&#39;, node[1])
+        if k == &#39;var&#39;: return (&#39;name&#39;, node[1])
+        _, op, l, r = node
+        a1, a2 = self.gen(l), self.gen(r)         # 先子后父：求值顺序 = 源码顺序
+        t = self.tmp()
+        self.emit(OPNAME[op] if k == &#39;bin&#39; else &#39;cmp&#39;, op, a1, a2, t)
+        return (&#39;name&#39;, t)
+    def cond(self, node, lt, lf):
+        &quot;&quot;&quot;条件下降：只发跳转，不发&quot;布尔值&quot;；&amp;&amp; / || 靠标签实现短路&quot;&quot;&quot;
+        k = node[0]
+        if k == &#39;or&#39;:
+            mid = self.label()
+            self.cond(node[1], lt, mid); self.emit(&#39;label&#39;, mid)
+            self.cond(node[2], lt, lf)
+        elif k == &#39;and&#39;:
+            mid = self.label()
+            self.cond(node[1], mid, lf); self.emit(&#39;label&#39;, mid)
+            self.cond(node[2], lt, lf)
+        else:
+            v = self.gen(node)                     # 比较表达式 → 一个临时布尔
+            self.emit(&#39;ifgoto&#39;, v, lt); self.emit(&#39;goto&#39;, lf)
+    def stmt(self, s):
+        k = s[0]
+        if k == &#39;assign&#39;:
+            self.emit(&#39;copy&#39;, self.gen(s[2]), None, s[1])
+        elif k == &#39;print&#39;:
+            self.emit(&#39;print&#39;, self.gen(s[1]))
+        elif k == &#39;if&#39;:
+            lt, lf, le = self.label(), self.label(), self.label()
+            self.cond(s[1], lt, lf)
+            self.emit(&#39;label&#39;, lt)
+            for x in s[2]: self.stmt(x)
+            self.emit(&#39;goto&#39;, le)
+            self.emit(&#39;label&#39;, lf)
+            for x in s[3]: self.stmt(x)
+            self.emit(&#39;goto&#39;, le); self.emit(&#39;label&#39;, le)
+        elif k == &#39;while&#39;:
+            ls, lb, le = self.label(), self.label(), self.label()
+            self.emit(&#39;label&#39;, ls); self.cond(s[1], lb, le)
+            self.emit(&#39;label&#39;, lb)
+            for x in s[2]: self.stmt(x)
+            self.emit(&#39;goto&#39;, ls); self.emit(&#39;label&#39;, le)
+        elif k == &#39;for&#39;:
+            # 降级发生在 lowering：for → 初始化 + while + 步进（AST 里仍保留 for）
+            _, var, e1, cond, v2, e2, body = s
+            self.stmt((&#39;assign&#39;, var, e1))
+            self.stmt((&#39;while&#39;, cond, body + [(&#39;assign&#39;, v2, e2)]))
+    def run(self, prog):
+        for s in prog: self.stmt(s)
+        return self.code
+
+# ---------- 3. 基本块与 CFG ----------
+SYM = {v: k for k, v in OPNAME.items()}
+
+def val(x): return str(x[1])
+def fmt(ins):
+    t = ins[0]
+    if t == &#39;copy&#39;:   return f&#39;{ins[3]} = {val(ins[1])}&#39;
+    if t in SYM:      return f&#39;{ins[4]} = {val(ins[2])} {SYM[t]} {val(ins[3])}&#39;
+    if t == &#39;cmp&#39;:    return f&#39;{ins[4]} = {val(ins[2])} {ins[1]} {val(ins[3])}&#39;
+    if t == &#39;goto&#39;:   return f&#39;goto {ins[1]}&#39;
+    if t == &#39;ifgoto&#39;: return f&#39;if {val(ins[1])} goto {ins[2]}&#39;
+    if t == &#39;print&#39;:  return f&#39;print {val(ins[1])}&#39;
+    if t == &#39;label&#39;:  return f&#39;{ins[1]}:&#39;
+    return str(ins)
+
+def leaders(prog):
+    lead = {0}
+    for i, ins in enumerate(prog):
+        if ins[0] == &#39;goto&#39;:
+            lead.add(i + 1); lead.add(next(j for j, x in enumerate(prog) if x == (&#39;label&#39;, ins[1])))
+        elif ins[0] == &#39;ifgoto&#39;:
+            lead.add(i + 1); lead.add(next(j for j, x in enumerate(prog) if x == (&#39;label&#39;, ins[2])))
+    return sorted(i for i in lead if i &lt; len(prog))
+
+def split_blocks(prog, lead):
+    blocks, label2block = [], {}
+    for k, start in enumerate(lead):
+        end = lead[k + 1] if k + 1 &lt; len(lead) else len(prog)
+        bid = f&#39;B{k+1}&#39;
+        for ins in prog[start:end]:
+            if ins[0] == &#39;label&#39;: label2block[ins[1]] = bid
+        blocks.append((bid, [i for i in prog[start:end] if i[0] != &#39;label&#39;]))
+    return blocks, label2block
+
+def build_cfg(blocks, label2block):
+    names = [b for b, _ in blocks]; succ = {}
+    for idx, (bid, body) in enumerate(blocks):
+        last = body[-1] if body else None
+        fall = names[idx + 1] if idx + 1 &lt; len(names) else None
+        if last and last[0] == &#39;goto&#39;:       succ[bid] = [label2block[last[1]]]
+        elif last and last[0] == &#39;ifgoto&#39;:   succ[bid] = [label2block[last[2]]] + ([fall] if fall else [])
+        else:                                succ[bid] = [fall] if fall else []
+    return succ
+
+SRC = &quot;&quot;&quot;sum = 0;
+for (i = 1; i &lt;= 3; i = i + 1) { sum = sum + i; }
+if (a != 0 &amp;&amp; sum / a &gt; 2) { r = 1; } else { r = 0; }
+print r;
+&quot;&quot;&quot;
+ast = parse(tokenize(SRC))
+ir = Lower().run(ast)
+blocks, label2block = split_blocks(ir, leaders(ir))
+succ = build_cfg(blocks, label2block)
+
+print(f&#39;AST 顶层语句: {[s[0] for s in ast]}&#39;)
+print(f&#39;\n三地址码（{len(ir)} 条指令）:&#39;)
+for i, ins in enumerate(ir):
+    print(f&#39;  {i:&gt;2} {ins[0]:&lt;7} {fmt(ins)}&#39;)
+print(f&#39;\n基本块（{len(blocks)} 个）与 CFG:&#39;)
+for bid, body in blocks:
+    print(f&#39;  {bid}: &#39; + &#39;；&#39;.join(fmt(i) for i in body) + f&#39;  → {succ[bid]}&#39;)</code></pre>
+<p>运行结果：</p>
+<pre><code>AST 顶层语句: [&#39;assign&#39;, &#39;for&#39;, &#39;if&#39;, &#39;print&#39;]
+
+三地址码（29 条指令）:
+   0 copy    sum = 0
+   1 copy    i = 1
+   2 label   L1:
+   3 cmp     t1 = i &lt;= 3
+   4 ifgoto  if t1 goto L2
+   5 goto    goto L3
+   6 label   L2:
+   7 add     t2 = sum + i
+   8 copy    sum = t2
+   9 add     t3 = i + 1
+  10 copy    i = t3
+  11 goto    goto L1
+  12 label   L3:
+  13 cmp     t4 = a != 0
+  14 ifgoto  if t4 goto L7
+  15 goto    goto L5
+  16 label   L7:
+  17 div     t5 = sum / a
+  18 cmp     t6 = t5 &gt; 2
+  19 ifgoto  if t6 goto L4
+  20 goto    goto L5
+  21 label   L4:
+  22 copy    r = 1
+  23 goto    goto L6
+  24 label   L5:
+  25 copy    r = 0
+  26 goto    goto L6
+  27 label   L6:
+  28 print   print r
+
+基本块（11 个）与 CFG:
+  B1: sum = 0；i = 1  → [&#39;B2&#39;]
+  B2: t1 = i &lt;= 3；if t1 goto L2  → [&#39;B4&#39;, &#39;B3&#39;]
+  B3: goto L3  → [&#39;B5&#39;]
+  B4: t2 = sum + i；sum = t2；t3 = i + 1；i = t3；goto L1  → [&#39;B2&#39;]
+  B5: t4 = a != 0；if t4 goto L7  → [&#39;B7&#39;, &#39;B6&#39;]
+  B6: goto L5  → [&#39;B10&#39;]
+  B7: t5 = sum / a；t6 = t5 &gt; 2；if t6 goto L4  → [&#39;B9&#39;, &#39;B8&#39;]
+  B8: goto L5  → [&#39;B10&#39;]
+  B9: r = 1；goto L6  → [&#39;B11&#39;]
+  B10: r = 0；goto L6  → [&#39;B11&#39;]
+  B11: print r  → []</code></pre>
+<p>沿着这份输出可以核对三件事：B4 末尾的 <code>goto L1</code> 是回边，循环头是 B2；除法只出现在 B7，而进入 B7 的唯一路径要求 <code>a != 0</code>（短路正确）；B9 与 B10 都汇合到 B11，符合 if-else 的菱形结构。</p>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选（需本机有 clang / opt）：与真实工具链对照 ----
+# 把 SRC 改写成 C 存为 demo.c（把 print 换成 return，for/if 不变），然后：
+#   clang -O0 -S -emit-llvm demo.c -o demo_O0.ll      # 看 alloca / load / store
+#   opt -passes=mem2reg -S demo_O0.ll -o demo_ssa.ll  # 看 phi 与 SSA 名字
+#   diff demo_O0.ll demo_ssa.ll
+# 没有 clang 不影响本课：上面的 Python 版把 AST → IR → 基本块 → CFG 全跑通了。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：给 <code>Lower</code> 增加 <code>break</code>（提示：维护一个&quot;当前循环出口标签&quot;的栈，块结构上 <code>break</code> 只是一条 <code>goto</code>，但 AST 阶段需要它）。</li>
+<li><strong>解释</strong>：为什么 <code>for</code> 的步进语句即使遇到 <code>continue</code> 也必须执行，而 <code>while</code> 的循环体不同？这决定了 <code>continue</code> 在两种结构里分别该跳到哪个标签。</li>
+<li><strong>对比/验证</strong>：把 SRC 里的 <code>a != 0 &amp;&amp; sum / a &gt; 2</code> 改成&quot;先算两个布尔再合并&quot;的降级方式（自己实现一版），比较两版 CFG 中除法所在块的前驱，说明为什么第二版是错的。</li>
+<li><strong>思考</strong>：如果语言有异常，<code>try { ... } catch { ... }</code> 需要给 CFG 补哪些隐式边？为什么&quot;基本块只有一个出口&quot;这个假设会被打破，编译器通常怎么处理？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>LLVM 官方 Kaleidoscope 教程（从 AST 生成 IR、优化到目标代码的完整链路）：<a href="https://llvm.org/docs/tutorial/" target="_blank" rel="noopener noreferrer">https://llvm.org/docs/tutorial/</a></li>
+<li>LLVM <code>opt</code> 命令行指南（<code>-passes=mem2reg</code> 等 pass 的调用方式）：<a href="https://llvm.org/docs/CommandGuide/opt.html" target="_blank" rel="noopener noreferrer">https://llvm.org/docs/CommandGuide/opt.html</a></li>
+<li>Robert Nystrom, <em>Crafting Interpreters</em> 第 2 章「A Map of the Territory」（前端/中端/后端与&quot;下山&quot;式降级）：<a href="https://craftinginterpreters.com/a-map-of-the-territory.html" target="_blank" rel="noopener noreferrer">https://craftinginterpreters.com/a-map-of-the-territory.html</a></li>
+<li>Aho, Lam, Sethi, Ullman, <em>Compilers: Principles, Techniques, and Tools</em>（龙书）第 6 章「Intermediate-Code Generation」（三地址码生成与布尔表达式的短路翻译）：<a href="https://suif.stanford.edu/dragonbook/" target="_blank" rel="noopener noreferrer">https://suif.stanford.edu/dragonbook/</a></li>
+</ul>
+<p><a href="#/learn/../chapter-5/lesson-01">下一章：优化</a></p>

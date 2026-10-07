@@ -1,0 +1,78 @@
+<h2 id="h-梯度计算">梯度计算<a class="anchor" href="#h-梯度计算" aria-label="本节链接">#</a></h2>
+<p>上一课我们见到了 <code>.backward()</code> 的&quot;魔法&quot;，但它有不少细节需要掌握才能真正用于训练：梯度会<strong>累加</strong>、对<strong>非标量</strong>求导要传一个方向向量、以及如何临时关闭梯度。这些不是边角料——训练循环里天天都要跟它们打交道。本课逐个讲透，并给出对应的正确写法。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-梯度是累加的">1. 梯度是累加的<a class="anchor" href="#h-1-梯度是累加的" aria-label="本节链接">#</a></h4>
+<p>调用一次 <code>backward()</code>，得到的梯度会<strong>加到</strong> <code>.grad</code> 上，而不是覆盖。原因：某些场景需要在同一个图上对多个损失分别反向（例如多任务学习的多个损失相加后一次反向，或某些需要多次反向的算法），PyTorch 选择了&quot;累加&quot;这一更灵活的默认行为。</p>
+<p>后果是：<strong>每个训练 step 开始前必须清零梯度</strong>，否则上一次的梯度会污染本次更新。清零方式：</p>
+<ul>
+<li>对某个张量：<code>w.grad.zero_()</code>；</li>
+<li>对整个模型（第 3 章会大量使用）：<code>optimizer.zero_grad()</code>。</li>
+</ul>
+<h4 id="h-2-对非标量求导需要方向向量">2. 对非标量求导需要&quot;方向向量&quot;<a class="anchor" href="#h-2-对非标量求导需要方向向量" aria-label="本节链接">#</a></h4>
+<p><code>backward()</code> 只能对一个<strong>标量</strong>（0 维）直接调用。若输出是向量/矩阵（例如 <code>y</code> 形状 <code>(3,)</code>），直接 <code>y.backward()</code> 会报错。此时要传入与 <code>y</code> 同形状的 <code>gradient</code> 参数，表示&quot;沿这个方向加权求和&quot;：</p>
+<ul>
+<li>标量输出：<code>loss.backward()</code>，等价于乘以 1。</li>
+<li>非标量输出：<code>y.backward(torch.ones_like(y))</code>，等于把各分量导数按权重相加。</li>
+</ul>
+<p>这在&quot;雅可比向量积&quot;语境下很自然：反向传播本质是计算雅可比矩阵与一个向量的乘积，而不是直接计算整个雅可比。</p>
+<h4 id="h-3-保留计算图retain_graph">3. 保留计算图：retain_graph<a class="anchor" href="#h-3-保留计算图retain_graph" aria-label="本节链接">#</a></h4>
+<p>默认 <code>backward()</code> 跑完后会释放计算图（释放中间结果的缓存），因此<strong>对同一个输出调用两次 <code>backward()</code> 会报错</strong>。若确实需要再次反向，第一次调用时加 <code>retain_graph=True</code>。多数训练场景不需要它，只在&quot;要对同一前向多次求导&quot;（如某些对抗训练、二阶方法）时才用。</p>
+<h4 id="h-4-临时关闭梯度no_grad-与-detach">4. 临时关闭梯度：no_grad 与 detach<a class="anchor" href="#h-4-临时关闭梯度no_grad-与-detach" aria-label="本节链接">#</a></h4>
+<ul>
+<li><code>torch.no_grad()</code> 上下文：在其内部所有运算都不构建计算图、不追踪梯度。推理、评估、手工更新参数时用它，省内存、提速。</li>
+<li><code>.detach()</code>：从当前计算图里&quot;摘出&quot;一个张量的副本（共享数据，但不再携带梯度历史）。常用于把需要梯度的张量转成纯数值使用。</li>
+</ul>
+<p>图 2-2 概括了本课四组概念的适用场景。</p>
+<p><figure><img class="md-img" src="content/courses/pytorch-fundamentals/assets/chapter-2-figure-02.svg" alt="backward 流程与梯度累加、清零、no_grad 的关系" loading="lazy" decoding="async"><figcaption>backward 流程与梯度累加、清零、no_grad 的关系</figcaption></figure>
+</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<pre data-lang="python"><code class="language-python">import torch
+
+# ---- 1. 梯度累加与清零 ----
+w = torch.tensor(2.0, requires_grad=True)
+loss = w ** 2                    # L = w^2, dL/dw = 2w = 4
+loss.backward()
+print(&quot;第一次 backward 后 w.grad =&quot;, w.grad)   # 4.0
+
+loss.backward()                  # 再来一次：梯度累加
+print(&quot;第二次 backward 后 w.grad =&quot;, w.grad)   # 8.0（4 被加了两次）
+
+w.grad.zero_()                   # 清零
+loss.backward()
+print(&quot;清零后   backward 后 w.grad =&quot;, w.grad)   # 4.0
+
+# ---- 2. 非标量求导：传入方向向量 ----
+x = torch.tensor(2.0, requires_grad=True)
+y = x ** torch.tensor([1.0, 2.0, 3.0])   # y = [x, x^2, x^3]，形状 (3,)
+# 各分量导数 = [1, 2x, 3x^2] = [1, 4, 12]
+y.backward(torch.ones(3))                 # 用全 1 方向：求和 = 1+4+12
+print(&quot;\n非标量 backward(ones) 后 x.grad =&quot;, x.grad)   # 17.0
+
+# ---- 3. 临时关闭梯度 ----
+z = torch.tensor(3.0, requires_grad=True)
+with torch.no_grad():
+    q = z * z                    # no_grad 内不建图
+print(&quot;\nno_grad 内结果 requires_grad =&quot;, q.requires_grad)  # False
+print(&quot;q.grad_fn =&quot;, q.grad_fn)  # None
+
+# ---- 4. detach：摘出纯数值 ----
+p = torch.tensor(2.0, requires_grad=True)
+r = p ** 2
+r_detached = r.detach()          # 数值相同，但不再追踪梯度
+print(&quot;\nr =&quot;, r, &quot;| r_detached.requires_grad =&quot;, r_detached.requires_grad)  # False</code></pre>
+<p>运行要点：第一次 <code>backward</code> 后 <code>w.grad=4</code>，第二次直接 <code>backward</code> 会变成 8（累加）；<code>x.grad=17</code> 对应非标量加权的链式结果。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>写一个两行的&quot;训练步&quot;骨架：定义 <code>w</code>（需要梯度）、算损失、反向、清零梯度，并说明清零放在反向之后的意义。</li>
+<li>设 <code>x = torch.tensor([1.0, 2.0, 3.0], requires_grad=True)</code>，<code>y = (x ** 2).sum()</code>。<code>y</code> 是标量吗？直接 <code>y.backward()</code> 能得到什么？<code>x.grad</code> 应是多少？</li>
+<li>对一个非标量输出 <code>y = x ** 2</code>（<code>x</code> 形状 <code>(3,)</code>），直接 <code>y.backward()</code> 会怎样？改用 <code>torch.ones_like(y)</code> 后结果如何，解释其数学含义。</li>
+<li>什么场景下需要 <code>retain_graph=True</code>？为什么默认释放计算图对显存友好？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>PyTorch 官方文档 · torch.Tensor.backward：<a href="https://pytorch.org/docs/stable/generated/torch.Tensor.backward.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/docs/stable/generated/torch.Tensor.backward.html</a></li>
+<li>PyTorch 官方文档 · torch.autograd.grad：<a href="https://pytorch.org/docs/stable/generated/torch.autograd.grad.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/docs/stable/generated/torch.autograd.grad.html</a></li>
+<li>PyTorch 官方文档 · torch.no_grad / Tensor.detach：<a href="https://pytorch.org/docs/stable/generated/torch.no_grad.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/docs/stable/generated/torch.no_grad.html</a></li>
+<li>PyTorch 官方教程 · Automatic Differentiation：<a href="https://pytorch.org/tutorials/beginner/basics/autogradqs_tutorial.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/tutorials/beginner/basics/autogradqs_tutorial.html</a></li>
+</ul>
+<p><a href="#/l/torch-ch2-l3">下一课：计算图</a></p>

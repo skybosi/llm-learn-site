@@ -1,0 +1,127 @@
+<h2 id="h-批处理与并发调优">批处理与并发调优<a class="anchor" href="#h-批处理与并发调优" aria-label="本节链接">#</a></h2>
+<p>上一课我们靠量化&quot;省&quot;资源，这一课靠<strong>调度</strong>把已有资源榨得更干。同样一张卡、同一个模型，参数调得对不对，吞吐能差出数倍。核心是理解连续批处理（continuous batching）下的几个关键旋钮，以及它们背后那条绕不开的曲线：<strong>并发越高吞吐越高，但延迟也随之恶化</strong>——你要做的，是在这条曲线上找到自己的甜点。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-连续批处理为什么能榨干-gpu">1. 连续批处理为什么能榨干 GPU<a class="anchor" href="#h-1-连续批处理为什么能榨干-gpu" aria-label="本节链接">#</a></h4>
+<p>回顾推理优化课：传统静态批处理要求一个 batch 里的请求&quot;同时开始、同时结束&quot;，短请求必须等长请求，GPU 大量时间在空转。<strong>连续批处理</strong>则把 batch 当作一个动态池——每个调度步（step）推进 1 个 token，有请求结束就立刻让排队的请求补位，几乎无缝。于是 GPU 在 decode 阶段始终保持&quot;满 batch&quot;，吞吐大幅提升。</p>
+<p>理解这一点后，调优的核心就变成了：<strong>给引擎多大的&quot;批&quot;、多长的&quot;队列&quot;，才能在吞吐和延迟之间取得平衡</strong>。</p>
+<h4 id="h-2-四个关键旋钮">2. 四个关键旋钮<a class="anchor" href="#h-2-四个关键旋钮" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>参数</th>
+<th>含义</th>
+<th>调大 →</th>
+<th>调小 →</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>max_num_seqs</code></td>
+<td>同时服务的最大序列数（batch 上限）</td>
+<td>吞吐↑，显存↑，延迟↑</td>
+<td>吞吐↓，延迟↓</td>
+</tr>
+<tr>
+<td><code>max_num_batched_tokens</code></td>
+<td>单步最多处理的 token 数（含 prefill chunk）</td>
+<td>prefill 更快，但单步更慢</td>
+<td>单步更快，prefill 更慢</td>
+</tr>
+<tr>
+<td><code>gpu_memory_utilization</code></td>
+<td>显存中划给 KV Cache 的比例（0~1）</td>
+<td>容纳更多 KV → 并发↑</td>
+<td>留更多余量，更稳</td>
+</tr>
+<tr>
+<td><code>enable_chunked_prefill</code></td>
+<td>长 prompt 的 prefill 是否分块</td>
+<td>长 prompt 不阻塞 decode</td>
+<td>prefill 完整算完</td>
+</tr>
+</tbody></table>
+<p>几个直觉：</p>
+<ul>
+<li><strong><code>max_num_seqs</code> 是最主要的吞吐/延迟旋钮</strong>。它决定 decode 阶段能同时推进多少个序列，直接影响吞吐上限；但并发越大，每个请求被&quot;轮着&quot;推进，单请求延迟自然上升；</li>
+<li><strong><code>gpu_memory_utilization</code> 决定池子有多大</strong>。KV Cache 池越大，能同时容纳的序列越多；但给太高（如 0.98）可能 OOM，要留缓冲；</li>
+<li><strong><code>enable_chunked_prefill</code> 是长文场景的救星</strong>。不开启时，一个 32K token 的长 prompt 会在 prefill 阶段独占 GPU，把其它请求的 decode 全部卡住；分块后长 prompt 被切成小块，与 decode 交替执行，短请求的 TTFT 明显改善。</li>
+</ul>
+<h4 id="h-3-那条绕不开的曲线吞吐-vs-延迟">3. 那条绕不开的曲线：吞吐 vs 延迟<a class="anchor" href="#h-3-那条绕不开的曲线吞吐-vs-延迟" aria-label="本节链接">#</a></h4>
+<p>随着并发从 1 逐渐升高，会发生三件事：</p>
+<ol>
+<li><strong>吞吐先升</strong>：GPU 从&quot;吃不饱&quot;到&quot;吃饱&quot;；</li>
+<li><strong>吞吐触顶</strong>：GPU 饱和后，吞吐不再随并发增长（受算力/带宽上限约束）；</li>
+<li><strong>延迟持续恶化</strong>：请求在队列里排队等待的时间越来越长，P99 延迟指数式上升。</li>
+</ol>
+<p>所以&quot;甜点&quot;通常在<strong>吞吐接近上限、但延迟仍满足 SLA 的那个并发区间</strong>。超过甜点继续加并发，只是把请求塞进更长的队列，吞吐不涨、体验崩坏。这就是为什么要做<strong>并发扫描（concurrency sweep）</strong>。</p>
+<h4 id="h-4-排队理论的一点点直觉">4. 排队理论的一点点直觉<a class="anchor" href="#h-4-排队理论的一点点直觉" aria-label="本节链接">#</a></h4>
+<p>可以把服务近似看成一个排队系统：到达率 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">λ</span></span></span></span>（每秒来多少请求）、服务率 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">μ</span></span></span></span>（每秒能处理多少请求）。当 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">λ</span></span></span></span> 接近甚至超过 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">μ</span></span></span></span>（利用率趋近 100%）时，队列长度会急剧增长，平均等待时间发散——这就是&quot;延迟爆炸&quot;的数学根源。<strong>永远不要让你的服务长时间跑在 100% 利用率上</strong>，要给突发流量留出缓冲。</p>
+<p><figure><img class="md-img" src="content/courses/llm-deployment-practice/assets/chapter-5-figure-02.svg" alt="吞吐与延迟随并发变化的曲线图：横轴&quot;并发数&quot;、纵轴左侧&quot;吞吐(req/s)&quot;右侧&quot;延迟(ms)&quot;；蓝色吞吐曲线先快速上升后趋于平缓（触顶），橙色延迟曲线缓慢上升后在某个并发点后指数式陡增；两条曲线之间用绿色阴影标注&quot;SLA 甜点区间&quot;；底部一句话&quot;吞吐触顶后，再加并发只是让请求排队&quot;" loading="lazy" decoding="async"><figcaption>吞吐与延迟随并发变化的曲线图：横轴&quot;并发数&quot;、纵轴左侧&quot;吞吐(req/s)&quot;右侧&quot;延迟(ms)&quot;；蓝色吞吐曲线先快速上升后趋于平缓（触顶），橙色延迟曲线缓慢上升后在某个并发点后指数式陡增；两条曲线之间用绿色阴影标注&quot;SLA 甜点区间&quot;；底部一句话&quot;吞吐触顶后，再加并发只是让请求排队&quot;</figcaption></figure>
+</p>
+<h3 id="h-二可运行示例">二、可运行示例<a class="anchor" href="#h-二可运行示例" aria-label="本节链接">#</a></h3>
+<h4 id="h-示例-1启动时设置调度参数">示例 1：启动时设置调度参数<a class="anchor" href="#h-示例-1启动时设置调度参数" aria-label="本节链接">#</a></h4>
+<pre data-lang="bash"><code class="language-bash"># 显式指定批处理与显存相关参数
+vllm serve meta-llama/Llama-3.1-8B-Instruct \
+  --served-model-name llama-8b \
+  --max-model-len 8192 \
+  --max-num-seqs 64 \                 # 最多同时跑 64 个序列
+  --max-num-batched-tokens 4096 \     # 单步最多处理 4096 token
+  --gpu-memory-utilization 0.85 \     # 85% 显存划给 KV Cache
+  --enable-chunked-prefill            # 长 prompt 分块 prefill</code></pre>
+<h4 id="h-示例-2并发扫描画出吞吐-延迟曲线">示例 2：并发扫描，画出吞吐-延迟曲线<a class="anchor" href="#h-示例-2并发扫描画出吞吐-延迟曲线" aria-label="本节链接">#</a></h4>
+<pre data-lang="python"><code class="language-python"># -*- coding: utf-8 -*-
+# 对同一服务做并发扫描：从低到高测吞吐与 P99 延迟，找到甜点区间
+import time, asyncio, aiohttp
+
+async def one_request(session, url, payload):
+    t0 = time.perf_counter()
+    async with session.post(url, json=payload) as r:
+        await r.json()
+    return time.perf_counter() - t0
+
+async def sweep(base, model, concurrency, n_req=40):
+    url = f&quot;{base}/v1/chat/completions&quot;
+    payload = {&quot;model&quot;: model,
+               &quot;messages&quot;: [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;用 100 字介绍缓存。&quot;}],
+               &quot;max_tokens&quot;: 150, &quot;temperature&quot;: 0.0}
+    async with aiohttp.ClientSession() as sess:
+        sem = asyncio.Semaphore(concurrency)
+        async def run():
+            async with sem:
+                return await one_request(sess, url, payload)
+        t0 = time.perf_counter()
+        latencies = await asyncio.gather(*[run() for _ in range(n_req)])
+        wall = time.perf_counter() - t0
+    latencies.sort()
+    p99 = latencies[int(len(latencies) * 0.99)]
+    return n_req / wall, p99 * 1000
+
+async def main():
+    print(f&quot;{&#39;并发&#39;:&gt;4} | {&#39;吞吐(req/s)&#39;:&gt;12} | {&#39;P99(ms)&#39;:&gt;9}&quot;)
+    for c in [1, 2, 4, 8, 16, 32, 64, 128]:
+        thr, p99 = await sweep(&quot;http://localhost:8000&quot;, &quot;llama-8b&quot;, c)
+        print(f&quot;{c:&gt;4} | {thr:&gt;12.2f} | {p99:&gt;9.0f}&quot;)
+
+asyncio.run(main())</code></pre>
+<p>观察输出：吞吐会先升后平，P99 则持续上升。找到&quot;吞吐基本触顶、P99 仍低于你的 SLA 目标&quot;的那个最大并发，就是你的甜点。</p>
+<h4 id="h-示例-3对比开关-chunked-prefill">示例 3：对比开关 chunked prefill<a class="anchor" href="#h-示例-3对比开关-chunked-prefill" aria-label="本节链接">#</a></h4>
+<pre data-lang="bash"><code class="language-bash"># 用一批&quot;长 prompt + 短 prompt 混合&quot;的请求压测，对比两种配置
+# 配置 A：不开分块
+vllm serve .../Llama-3.1-8B-Instruct --max-num-seqs 32
+# 配置 B：开分块
+vllm serve .../Llama-3.1-8B-Instruct --max-num-seqs 32 --enable-chunked-prefill</code></pre>
+<p>重点观察<strong>短请求的 P99 TTFT</strong>：开了分块后，短请求不再被长 prompt 的 prefill 卡住，TTFT 应显著下降。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>用示例 2 的脚本，固定并发 64，把 <code>max_tokens</code> 从 150 改成 500，观察吞吐怎么变，解释&quot;输出变长&quot;为何降低吞吐（提示：decode 总步数变多）。</li>
+<li>保持并发不变，把服务的 <code>--max-num-seqs</code> 从 64 降到 16，重跑扫描，观察吞吐上限是否下降，验证 <code>max_num_seqs</code> 是吞吐上限的主要约束。</li>
+<li>构造一组&quot;1 个 8000 token 长 prompt + 多个短 prompt&quot;的混合请求，对比开关 <code>enable_chunked_prefill</code> 时短请求的 TTFT，说明分块的价值。</li>
+<li>思考：一个客服机器人白天高峰 QPS 是凌晨低谷的 10 倍。从排队理论角度，为什么&quot;按峰值常驻&quot;比&quot;按均值常驻&quot;更安全？这会给下一课的成本核算埋下什么伏笔？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>vLLM · 引擎参数说明：<a href="https://docs.vllm.ai/en/latest/serving/engine_args.html" target="_blank" rel="noopener noreferrer">https://docs.vllm.ai/en/latest/serving/engine_args.html</a></li>
+<li>vLLM · 架构概览（连续批处理）：<a href="https://docs.vllm.ai/en/latest/design/arch_overview.html" target="_blank" rel="noopener noreferrer">https://docs.vllm.ai/en/latest/design/arch_overview.html</a></li>
+<li>vLLM · 基准测试与压测：<a href="https://docs.vllm.ai/en/latest/benchmarking/" target="_blank" rel="noopener noreferrer">https://docs.vllm.ai/en/latest/benchmarking/</a></li>
+<li>排队论入门（Little&#39;s Law）：<a href="https://en.wikipedia.org/wiki/Little%27s_law" target="_blank" rel="noopener noreferrer">https://en.wikipedia.org/wiki/Little%27s_law</a></li>
+</ul>
+<p><a href="#/l/deploy-ch5-l3">下一课：成本核算与降本</a></p>

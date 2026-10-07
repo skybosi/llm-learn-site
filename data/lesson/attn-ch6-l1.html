@@ -1,0 +1,201 @@
+<h2 id="h-用-pytorch-实现-transformer">用 PyTorch 实现 Transformer<a class="anchor" href="#h-用-pytorch-实现-transformer" aria-label="本节链接">#</a></h2>
+<p>前面几课分别讲清了位置编码、掩码注意力和交叉注意力。这一课把它们<strong>拼装成一个完整的 Transformer</strong>。我们会从零写起：多头注意力、前馈网络、编码器层、解码器层，再到把它们叠起来的完整模型。全部用 PyTorch 的 <code>nn.Module</code> 手工实现，而不是直接调 <code>nn.Transformer</code>——因为只有亲手写过一遍，你才真正清楚每一处 Q、K、V 的来源和每一层残差、归一化的位置。代码统一采用 <code>batch_first=True</code> 的 <code>(batch, seq_len, d_model)</code> 形状，读起来更直观。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-完整结构回顾">1. 完整结构回顾<a class="anchor" href="#h-1-完整结构回顾" aria-label="本节链接">#</a></h4>
+<p>一个标准的 Transformer 由这些积木组成：</p>
+<ul>
+<li><strong>输入嵌入 + 位置编码</strong>：把 token id 变成 <code>d_model</code> 维向量，再叠加位置信息（第 4 章）。</li>
+<li><strong>N 层编码器</strong>：每层 = 多头自注意力（双向） + 前馈网络，各配残差连接与 LayerNorm。</li>
+<li><strong>N 层解码器</strong>：每层 = 因果自注意力 + 交叉注意力 + 前馈网络，同样各配残差与 LayerNorm。</li>
+<li><strong>输出投影</strong>：把 <code>d_model</code> 维的最终表示映射回词表大小，得到每个位置的 logits。</li>
+</ul>
+<p><figure><img class="md-img" src="content/courses/attention-transformer/assets/chapter-6-figure-01.svg" alt="完整 Transformer 架构框图：N 层编码器与 N 层解码器，以及三处注意力" loading="lazy" decoding="async"><figcaption>完整 Transformer 架构框图：N 层编码器与 N 层解码器，以及三处注意力</figcaption></figure>
+</p>
+<h4 id="h-2-残差连接与-layernorm-的摆放">2. 残差连接与 LayerNorm 的摆放<a class="anchor" href="#h-2-残差连接与-layernorm-的摆放" aria-label="本节链接">#</a></h4>
+<p>每个子层（注意力或前馈）都被&quot;残差 + 归一化&quot;包裹。这里有个实现细节值得注意：归一化放在子层<strong>前<strong>还是</strong>后</strong>。</p>
+<ul>
+<li>原论文用的是 <strong>Post-LN</strong>：<code>x = LayerNorm(x + Sublayer(x))</code>。</li>
+<li>现在更主流的是 <strong>Pre-LN</strong>：<code>x = x + Sublayer(LayerNorm(x))</code>。</li>
+</ul>
+<p>Pre-LN 训练更稳定、对学习率不那么敏感，所以现代实现（包括 PyTorch 的默认 <code>norm_first=True</code> 之外的自定义版本）大多用它。本课代码采用 Pre-LN，并保留残差连接，你可以在练习里改成 Post-LN 对比。</p>
+<h4 id="h-3-多头注意力把-qkv-拆成-h-份">3. 多头注意力：把 Q、K、V 拆成 h 份<a class="anchor" href="#h-3-多头注意力把-qkv-拆成-h-份" aria-label="本节链接">#</a></h4>
+<p>多头注意力的本质是&quot;把一个大空间拆成 h 个小空间分别做注意力，再拼回来&quot;。实现上就是四步：投影 → 拆分 → 独立计算 → 拼接投影。</p>
+<pre><code>Q = x @ W_q;  K = x @ W_k;  V = x @ W_v      # 投影到 d_model 维
+把每个都 view 成 (batch, heads, seq, d_k)      # d_k = d_model / heads
+scores = Q @ K^T / sqrt(d_k)                  # 各头独立算注意力
+拼接各头输出，再过 W_o                          # 还原回 d_model 维</code></pre>
+<p>这段代码是后面第 3 课&quot;可视化注意力&quot;的根基：只要把中间的注意力权重返回出来，就能画热力图。</p>
+<h4 id="h-4-为什么还要写一个-seq2seq-包装层">4. 为什么还要写一个 Seq2Seq 包装层<a class="anchor" href="#h-4-为什么还要写一个-seq2seq-包装层" aria-label="本节链接">#</a></h4>
+<p><code>Transformer</code> 核心类只处理已经嵌入好的 <code>d_model</code> 维向量。真正做任务时，输入是 token id，输出要是词表上的概率。所以再包一层 <code>Seq2SeqTransformer</code>：负责 token 嵌入、调用核心 Transformer、最后投影回词表。这样&quot;编码器—解码器骨架&quot;和&quot;具体任务&quot;就解耦了。</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面从零实现，代码较长，但每段都标了中文注释。可以整段复制运行。</p>
+<pre data-lang="python"><code class="language-python">import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# ---------- 1. 多头注意力 ----------
+class MultiHeadAttention(nn.Module):
+    def __init__(self, d_model, n_heads):
+        super().__init__()
+        assert d_model % n_heads == 0, &quot;d_model 必须能被头数整除&quot;
+        self.n_heads = n_heads
+        self.d_k = d_model // n_heads
+        self.W_q = nn.Linear(d_model, d_model)
+        self.W_k = nn.Linear(d_model, d_model)
+        self.W_v = nn.Linear(d_model, d_model)
+        self.W_o = nn.Linear(d_model, d_model)
+
+    def forward(self, q, k, v, mask=None, return_attn=False):
+        # q/k/v: (batch, seq, d_model)；mask 为加性掩码（0 保留，-inf 屏蔽）
+        b = q.size(0)
+        # 投影后按头拆分：(batch, seq, heads, d_k) -&gt; (batch, heads, seq, d_k)
+        q = self.W_q(q).view(b, -1, self.n_heads, self.d_k).transpose(1, 2)
+        k = self.W_k(k).view(b, -1, self.n_heads, self.d_k).transpose(1, 2)
+        v = self.W_v(v).view(b, -1, self.n_heads, self.d_k).transpose(1, 2)
+
+        scores = q @ k.transpose(-2, -1) / math.sqrt(self.d_k)   # (batch, heads, t, s)
+        if mask is not None:
+            scores = scores + mask          # 加性掩码：-inf 处 softmax 后归零
+        attn = F.softmax(scores, dim=-1)    # 每行是一个关注分布
+        out = attn @ v                      # (batch, heads, t, d_k)
+        out = out.transpose(1, 2).contiguous().view(b, -1, self.n_heads * self.d_k)
+        out = self.W_o(out)
+        return (out, attn) if return_attn else out
+
+# ---------- 2. 前馈网络 ----------
+class FeedForward(nn.Module):
+    def __init__(self, d_model, dim_ff):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d_model, dim_ff),
+            nn.ReLU(),
+            nn.Linear(dim_ff, d_model),
+        )
+    def forward(self, x):
+        return self.net(x)
+
+# ---------- 3. 编码器层 ----------
+class EncoderLayer(nn.Module):
+    def __init__(self, d_model, n_heads, dim_ff):
+        super().__init__()
+        self.self_attn = MultiHeadAttention(d_model, n_heads)
+        self.ff = FeedForward(d_model, dim_ff)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+
+    def forward(self, x, mask=None):
+        # Pre-LN：先归一化再进子层，最后加残差
+        a = self.self_attn(self.norm1(x), self.norm1(x), self.norm1(x), mask)
+        x = x + a
+        x = x + self.ff(self.norm2(x))
+        return x
+
+# ---------- 4. 解码器层 ----------
+class DecoderLayer(nn.Module):
+    def __init__(self, d_model, n_heads, dim_ff):
+        super().__init__()
+        self.self_attn = MultiHeadAttention(d_model, n_heads)   # 因果自注意力
+        self.cross_attn = MultiHeadAttention(d_model, n_heads)  # 交叉注意力
+        self.ff = FeedForward(d_model, dim_ff)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+
+    def forward(self, x, memory, tgt_mask=None, memory_mask=None):
+        # 1) 因果自注意力：Q=K=V 都来自目标序列自己
+        a = self.self_attn(self.norm1(x), self.norm1(x), self.norm1(x), tgt_mask)
+        x = x + a
+        # 2) 交叉注意力：Q 来自目标序列，K/V 来自编码器输出 memory
+        a = self.cross_attn(self.norm2(x), memory, memory, memory_mask)
+        x = x + a
+        # 3) 前馈网络
+        x = x + self.ff(self.norm3(x))
+        return x
+
+# ---------- 5. 位置编码（正弦，来自第 4 章） ----------
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(max_len).unsqueeze(1).float()
+        div = torch.exp(torch.arange(0, d_model, 2).float()
+                        * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div)
+        pe[:, 1::2] = torch.cos(position * div)
+        self.register_buffer(&quot;pe&quot;, pe.unsqueeze(0))   # (1, max_len, d_model)
+
+    def forward(self, x):
+        # x: (batch, seq, d_model)，取前 seq 个位置逐元素相加
+        return x + self.pe[:, :x.size(1)]
+
+# ---------- 6. 完整 Transformer ----------
+class Transformer(nn.Module):
+    def __init__(self, d_model, n_heads, n_layers, dim_ff, max_len=5000):
+        super().__init__()
+        self.pos_enc = PositionalEncoding(d_model, max_len)
+        self.encoder = nn.ModuleList(
+            [EncoderLayer(d_model, n_heads, dim_ff) for _ in range(n_layers)])
+        self.decoder = nn.ModuleList(
+            [DecoderLayer(d_model, n_heads, dim_ff) for _ in range(n_layers)])
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, src, tgt, tgt_mask=None, src_mask=None):
+        # src/tgt: 已嵌入的 (batch, seq, d_model)
+        src = self.pos_enc(src)
+        tgt = self.pos_enc(tgt)
+        for layer in self.encoder:
+            src = layer(src, src_mask)
+        memory = self.norm(src)               # 编码器最终输出，供解码器交叉注意力使用
+        for layer in self.decoder:
+            tgt = layer(tgt, memory, tgt_mask, src_mask)
+        return self.norm(tgt)
+
+# ---------- 7. Seq2Seq 包装层 ----------
+class Seq2SeqTransformer(nn.Module):
+    def __init__(self, vocab_size, d_model=128, n_heads=8, n_layers=3, dim_ff=512):
+        super().__init__()
+        self.d_model = d_model
+        self.embed = nn.Embedding(vocab_size, d_model)
+        self.transformer = Transformer(d_model, n_heads, n_layers, dim_ff)
+        self.proj = nn.Linear(d_model, vocab_size)
+
+    def forward(self, src, tgt, tgt_mask=None, src_mask=None):
+        # 原论文在嵌入后乘 sqrt(d_model)，缓解嵌入与位置编码的尺度差异
+        src_emb = self.embed(src) * math.sqrt(self.d_model)
+        tgt_emb = self.embed(tgt) * math.sqrt(self.d_model)
+        out = self.transformer(src_emb, tgt_emb, tgt_mask, src_mask)
+        return self.proj(out)</code></pre>
+<p>现在构造一个随机输入，跑一次完整前向，验证形状并统计参数量。</p>
+<pre data-lang="python"><code class="language-python">torch.manual_seed(0)
+VOCAB = 100
+model = Seq2SeqTransformer(vocab_size=VOCAB, d_model=32, n_heads=4, n_layers=2, dim_ff=64)
+
+src = torch.randint(0, VOCAB, (2, 6))   # batch=2，源序列长度 6
+tgt = torch.randint(0, VOCAB, (2, 5))   # batch=2，目标序列长度 5
+
+# 解码器自注意力的因果掩码：(5, 5) 下三角为 0、上三角为 -inf
+tgt_mask = torch.triu(torch.full((5, 5), float(&quot;-inf&quot;)), diagonal=1)
+
+out = model(src, tgt, tgt_mask=tgt_mask)
+print(&quot;输出形状:&quot;, out.shape)            # torch.Size([2, 5, 100]) = (batch, tgt_len, vocab)
+
+total = sum(p.numel() for p in model.parameters())
+print(&quot;总参数量:&quot;, total)                # 小模型，约几十万量级</code></pre>
+<p>输出形状 <code>(2, 5, 100)</code> 说明：2 条样本、5 个目标位置，每个位置给 100 个词的 logits。这个模型就是第 2、3 课要拿去训练和可视化的完整骨架。若想验证正确性，可以把同样配置的 <code>nn.Transformer</code> 跑一遍，前向输出的形状应该完全一致。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>把 <code>n_layers</code> 从 2 改成 4、<code>n_heads</code> 改成 8，重新统计参数量，解释哪些参数随层数线性增长、哪些随头数不变（提示：多头注意力的总投影参数与头数无关）。</li>
+<li>把 Pre-LN 改成 Post-LN（<code>x = LayerNorm(x + Sublayer(x))</code>），用同一组随机输入训练几步，观察两种写法下 loss 曲线的稳定性差异。</li>
+<li>给 <code>Seq2SeqTransformer</code> 增加权重共享（把 <code>embed</code> 与 <code>proj</code> 的权重绑定），重新统计参数量，说明省掉了哪一部分参数，以及共享的前提（嵌入维必须等于模型维）。</li>
+<li>用 <code>torch.nn.Transformer</code> 复现同样的 <code>(2, 6) -&gt; (2, 5)</code> 前向，把它的输出与你自己模型的输出做形状对比，并指出两者在&quot;mask 传入方式&quot;上的 API 差异。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>论文《Attention Is All You Need》Figure 1 与 3.x 节：<a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1706.03762</a></li>
+<li>The Annotated Transformer（Harvard NLP）· 完整实现：<a href="https://nlp.seas.harvard.edu/annotated-transformer/" target="_blank" rel="noopener noreferrer">https://nlp.seas.harvard.edu/annotated-transformer/</a></li>
+<li>The Illustrated Transformer（Jay Alammar）：<a href="https://jalammar.github.io/illustrated-transformer/" target="_blank" rel="noopener noreferrer">https://jalammar.github.io/illustrated-transformer/</a></li>
+<li>PyTorch 官方文档 · Transformer：<a href="https://pytorch.org/docs/stable/generated/torch.nn.Transformer.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/docs/stable/generated/torch.nn.Transformer.html</a></li>
+<li>PyTorch 官方文档 · LayerNorm：<a href="https://pytorch.org/docs/stable/generated/torch.nn.LayerNorm.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/docs/stable/generated/torch.nn.LayerNorm.html</a></li>
+</ul>
+<p><a href="#/l/attn-ch6-l2">下一课：一个小任务</a></p>

@@ -1,0 +1,261 @@
+<h2 id="h-性能工程方法论基线--profile--优化--回归何时不值得优化">性能工程方法论：基线 → profile → 优化 → 回归；何时不值得优化<a class="anchor" href="#h-性能工程方法论基线--profile--优化--回归何时不值得优化" aria-label="本节链接">#</a></h2>
+<p>&quot;我把这个 kernel 优化了三倍&quot;——若没有<strong>基线、profile 证据、可复现的测量协议</strong>，这句话在工程上等于零：kernel 快 3 倍、端到端可能只快 4%；也可能这次&quot;快&quot;只是噪声。这一课建立<strong>把性能主张变成可判定结论</strong>的流程，以及何时<strong>不该</strong>继续优化。</p>
+<p><figure><img class="md-img" src="content/courses/gpu-cuda-kernels/assets/chapter-1-figure-01.svg" alt="从基线到回归：一次完整的性能闭环" loading="lazy" decoding="async"><figcaption>从基线到回归：一次完整的性能闭环</figcaption></figure>
+</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-闭环的四步以及每步的产出物">1. 闭环的四步，以及每步的产出物<a class="anchor" href="#h-1-闭环的四步以及每步的产出物" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>步骤</th>
+<th>做什么</th>
+<th>产出物（没有它这一步就没做完）</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>① 基线</td>
+<td>在<strong>固定</strong>的输入、dtype、形状、计次与预热条件下测当前实现</td>
+<td>基线数字 + 它的波动范围（标准差/分位数）</td>
+</tr>
+<tr>
+<td>② profile</td>
+<td>先 <code>nsys</code> 看端到端时间线，再 <code>ncu</code> 看热点 kernel 内部</td>
+<td>时间分解表：kernel / 拷贝 / 启动 / 同步 / 框架各占多少</td>
+</tr>
+<tr>
+<td>③ 优化</td>
+<td>只针对<strong>占比最大且可改</strong>的那一项动手</td>
+<td>改动 + 预期收益（用第一课的账本预估上限）</td>
+</tr>
+<tr>
+<td>④ 回归</td>
+<td>重新测量并做<strong>显著性判定</strong>；同时跑正确性回归</td>
+<td>&quot;变化 X% ± Y%，判定为真/无法判定&quot; + 正确性结论</td>
+</tr>
+</tbody></table>
+<p>第 ① 步里最容易被跳过的是&quot;波动范围&quot;。<strong>不知道噪声，就没法判断任何差异是不是真的</strong>——这正是第 4 步的判据基础。</p>
+<h4 id="h-2-测量协议预热重复配对看分布">2. 测量协议：预热、重复、配对、看分布<a class="anchor" href="#h-2-测量协议预热重复配对看分布" aria-label="本节链接">#</a></h4>
+<p>四条纪律，缺一条结论就不可靠：</p>
+<ol>
+<li><strong>预热（warmup）</strong>：首次运行包含 context 初始化、显存分配、PTX JIT、库惰性加载，必须排除。</li>
+<li><strong>重复（repeat）+ 看分布</strong>：报<strong>中位数</strong>而不是均值。长尾（调度、降频）会把均值抬高，中位数不会被单个坏样本带跑。</li>
+<li><strong>配对（paired）</strong>：A/B <strong>交替</strong>测（A、B、A、B……），用同一 run 的差值比较；同一时刻的机器状态对两者影响相同，公共噪声相减时被抵消。</li>
+<li><strong>显著性判定</strong>：用配对差值的 <code>t</code> 统计量（<code>t = 差值中位 / (差值标准差 / √n)</code>）对照临界值，并<strong>报告胜场数</strong>（12 次里 B 赢几次）。</li>
+</ol>
+<h4 id="h-3-用-nsys-拆时间为什么只优化-kernel常常没用">3. 用 nsys 拆时间：为什么&quot;只优化 kernel&quot;常常没用<a class="anchor" href="#h-3-用-nsys-拆时间为什么只优化-kernel常常没用" aria-label="本节链接">#</a></h4>
+<p>先看一个具体的账本（代码里会真实打印）：</p>
+<table>
+<thead>
+<tr>
+<th>环节</th>
+<th>耗时</th>
+<th>占端到端</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>kernel 执行</td>
+<td>100 µs</td>
+<td>12.5%</td>
+</tr>
+<tr>
+<td>kernel 启动开销</td>
+<td>5 µs</td>
+<td>0.6%</td>
+</tr>
+<tr>
+<td>H2D 拷贝（主机→设备）</td>
+<td>300 µs</td>
+<td>37.5%</td>
+</tr>
+<tr>
+<td>D2H 拷贝（设备→主机）</td>
+<td>300 µs</td>
+<td>37.5%</td>
+</tr>
+<tr>
+<td>Python/框架调度</td>
+<td>40 µs</td>
+<td>5.0%</td>
+</tr>
+<tr>
+<td>同步与事件</td>
+<td>55 µs</td>
+<td>6.9%</td>
+</tr>
+<tr>
+<td><strong>合计</strong></td>
+<td><strong>800 µs</strong></td>
+<td>100%</td>
+</tr>
+</tbody></table>
+<p><strong>Amdahl 定律</strong>给出残酷结论：把 100 µs 的 kernel 优化到 0，端到端最多从 800 降到 700 µs，上限 <strong>12.5%</strong>；而把两次拷贝合并或让计算留在设备上，收益大得多。所以&quot;先 profile 再优化&quot;不是流程洁癖，而是<strong>收益排序</strong>：不拆时间线，你不知道自己在优化 12.5% 还是 87.5% 的那一段。</p>
+<p><figure><img class="md-img" src="content/courses/gpu-cuda-kernels/assets/chapter-1-figure-04.svg" alt="Amdahl 账本：kernel 只占 12.5%，先改占比最大的那一段" loading="lazy" decoding="async"><figcaption>Amdahl 账本：kernel 只占 12.5%，先改占比最大的那一段</figcaption></figure>
+</p>
+<h4 id="h-4-显著性把看起来变快变成可判定">4. 显著性：把&quot;看起来变快&quot;变成&quot;可判定&quot;<a class="anchor" href="#h-4-显著性把看起来变快变成可判定" aria-label="本节链接">#</a></h4>
+<p>配对测量的判定流程（本课代码可跑）：</p>
+<ol>
+<li>算每对样本的差值 <code>d_i = t_baseline,i − t_candidate,i</code>（正数表示新版更快）。</li>
+<li>取 <code>d</code> 的中位数为收益估计、标准差为噪声估计。</li>
+<li><code>t = median(d) / (stdev(d) / √n)</code>；<code>n = 12</code> 时双侧 95% 的临界值约 <strong>2.2</strong>（查表值）。</li>
+<li>附带<strong>胜场数</strong>以免误读：<code>12/12</code> 与 <code>7/12</code> 含义完全不同。</li>
+</ol>
+<p>代码给出两组真实打印：<strong>12% 提升 → t = 8.71，显著</strong>；<strong>2% 提升 → t = 1.60，落在噪声地板内</strong>。后者才是工程中最常见的情形。</p>
+<h4 id="h-5-什么时候不该优化">5. 什么时候<strong>不该</strong>优化<a class="anchor" href="#h-5-什么时候不该优化" aria-label="本节链接">#</a></h4>
+<p>这一条比&quot;怎么优化&quot;更省时间。出现下列任一情况就该停手：</p>
+<ul>
+<li><strong>改动部分占端到端比例太小</strong>：kernel 占 5%，优化它 2 倍 → 端到端 2.5%，小于噪声地板。</li>
+<li><strong>收益小于噪声地板</strong>：本机 RSD 约 2.9%（代码真实测得），判定 2% 差异需要极多次重复。</li>
+<li><strong>瓶颈不可改</strong>：数据必须往返主机、必须保持 fp32、受上游接口限制。</li>
+<li><strong>已接近账本上限</strong>：实测带宽已达器件可达带宽九成以上，继续调只在噪声里打转。</li>
+<li><strong>维护成本不划算</strong>：手写 kernel 有正确性、可移植性成本；能用 <code>cuBLAS</code>/<code>CUTLASS</code> 覆盖时，&quot;用库&quot;通常就是最优解（第 7 章）。</li>
+<li><strong>该换的是算法不是 kernel</strong>：O(n²) 换 O(n log n)、减少搬运、换 dtype，收益常大于任何微调。</li>
+</ul>
+<h4 id="h-6-常见坑">6. 常见坑<a class="anchor" href="#h-6-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>一次测量一个数字</strong>：没有分布就没有判据。</li>
+<li><strong>拿带长尾的样本比均值</strong>：一个 9.8 ms 的坏样本能把均值从 4.02 抬到 4.49，中位数几乎不动。</li>
+<li><strong>不配对、顺序测</strong>：先测 A 再测 B，把&quot;机器变热/变慢&quot;的漂移记成 A 的劣势。</li>
+<li><strong>忘了正确性回归</strong>：性能改动常引入数值差异；快而错等于没做。</li>
+<li><strong>只在一种形状/dtype 上验证</strong>：真实输入分布会变，收益可能在别的形状下倒退。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面这段<strong>纯标准库</strong>代码把第 2～4 节变成可运行产物：同一份测量数据在&quot;配对 + 中位数 + t 判据&quot;下得出两种结论（显著 / 无法判定），并打印噪声地板与成本拆解。它<strong>不需要 GPU 与 numpy</strong>——方法论与硬件无关。</p>
+<pre data-lang="python"><code class="language-python"># ---- 性能工程闭环：把「看起来变快了」变成「可判定的结论」----
+import re, statistics as st
+
+JIT_A = [0.10, -0.12, 0.18, -0.05, 0.08, -0.15, 0.14, -0.09, 0.06, 0.02, -0.11, 0.13]
+JIT_B = [0.13, -0.17, 0.09, 0.16, -0.08, 0.11, -0.14, 0.05, 0.19, -0.06, 0.07, -0.21]
+T95 = 2.2      # df=11 时双侧 95% 的 t 临界值（查表值）
+
+def build_log(gain):
+    &quot;&quot;&quot;模拟 12 次配对测量：同一 run 下 baseline 与 candidate 各测一次（ms）&quot;&quot;&quot;
+    lines = []
+    for i in range(12):
+        lines.append(f&#39;run={i:02d} variant=baseline  ms={4.00 + JIT_A[i]:.2f}&#39;)
+        lines.append(f&#39;run={i:02d} variant=candidate ms={4.00 + JIT_B[i] - gain:.2f}&#39;)
+    return &#39;\n&#39;.join(lines)
+
+def parse(log):
+    out = {}
+    for line in log.strip().splitlines():
+        m = re.match(r&#39;run=(\d+)\s+variant=(\w+)\s+ms=([\d.]+)&#39;, line)
+        if m:
+            out.setdefault(m.group(2), {})[int(m.group(1))] = float(m.group(3))
+    return out
+
+def report(tag, log):
+    d = parse(log)
+    keys = sorted(set(d[&#39;baseline&#39;]) &amp; set(d[&#39;candidate&#39;]))
+    a = [d[&#39;baseline&#39;][k] for k in keys]
+    b = [d[&#39;candidate&#39;][k] for k in keys]
+    diff = [x - y for x, y in zip(a, b)]      # 配对：同一 run 相减，公共噪声被抵消
+    med_a, med_b, med_diff = st.median(a), st.median(b), st.median(diff)
+    sd, n = st.stdev(diff), len(diff)
+    t = med_diff / (sd / n ** 0.5)
+    wins = sum(1 for v in diff if v &gt; 0)
+    print(f&#39;--- {tag} ---&#39;)
+    print(f&#39;  baseline 中位={med_a:.3f} ms   candidate 中位={med_b:.3f} ms&#39;)
+    print(f&#39;  配对差值：中位={med_diff:+.3f} ms（{med_diff/med_a*100:+.1f}%）  &#39;
+          f&#39;标准差={sd:.3f} ms  胜场 candidate {wins}/{n}&#39;)
+    print(f&#39;  配对 t 统计量={t:.2f}（df={n-1}，双侧 95% 临界值 {T95}）&#39;
+          f&#39;  →  {&quot;显著&quot; if t &gt; T95 else &quot;落在噪声地板内，不能下结论&quot;}\n&#39;)
+
+print(&#39;== 1. 配对测量：把「两次跑分」变成一次可判定的比较 ==&#39;)
+report(&#39;12% 提升&#39;, build_log(0.48))
+report(&#39;2% 提升（低于噪声地板）&#39;, build_log(0.08))
+
+print(&#39;== 2. 噪声地板：同一段代码重复测 12 次，波动有多大 ==&#39;)
+base = [4.00 + j for j in JIT_A]
+rsd = st.stdev(base) / st.median(base) * 100
+outlier = base[:8] + [9.80] + base[9:]
+print(f&#39;  12 次样本：中位={st.median(base):.3f} ms  标准差={st.stdev(base):.3f} ms  相对波动 RSD={rsd:.1f}%&#39;)
+print(f&#39;  混入一个 9.80 ms 长尾（调度抖动）：均值 {st.mean(base):.3f} → {st.mean(outlier):.3f} 被抬高，&#39;
+      f&#39;中位 {st.median(base):.3f} → {st.median(outlier):.3f} 基本不动&#39;)
+print(f&#39;  可检出的最小加速比 ≈ {T95} × RSD / sqrt(n) ≈ {T95 * rsd / len(base) ** 0.5:.1f}%&#39;)
+
+print()
+print(&#39;== 3. 成本拆解：kernel 只有 100 µs，为什么端到端是 800 µs ==&#39;)
+parts = [(&#39;kernel 执行&#39;, 100), (&#39;kernel 启动开销&#39;, 5), (&#39;H2D 拷贝&#39;, 300),
+         (&#39;D2H 拷贝&#39;, 300), (&#39;Python/框架调度&#39;, 40), (&#39;同步与事件&#39;, 55)]
+total = sum(v for _, v in parts)
+for name, us in parts:
+    print(f&#39;  {name:&lt;16}{us:&gt;5} µs {us/total*100:&gt;5.1f}%  &#39; + &#39;#&#39; * max(1, round(us / 20)))
+print(f&#39;  合计 {total} µs；只优化 kernel（100 µs），端到端天花板是 {100/total*100:.0f}%&#39;)</code></pre>
+<p>真实运行输出：</p>
+<pre><code>== 1. 配对测量：把「两次跑分」变成一次可判定的比较 ==
+--- 12% 提升 ---
+  baseline 中位=4.040 ms   candidate 中位=3.580 ms
+  配对差值：中位=+0.490 ms（+12.1%）  标准差=0.195 ms  胜场 candidate 12/12
+  配对 t 统计量=8.71（df=11，双侧 95% 临界值 2.2）  →  显著
+
+--- 2% 提升（低于噪声地板） ---
+  baseline 中位=4.040 ms   candidate 中位=3.980 ms
+  配对差值：中位=+0.090 ms（+2.2%）  标准差=0.195 ms  胜场 candidate 7/12
+  配对 t 统计量=1.60（df=11，双侧 95% 临界值 2.2）  →  落在噪声地板内，不能下结论
+
+== 2. 噪声地板：同一段代码重复测 12 次，波动有多大 ==
+  12 次样本：中位=4.040 ms  标准差=0.115 ms  相对波动 RSD=2.9%
+  混入一个 9.80 ms 长尾（调度抖动）：均值 4.016 → 4.494 被抬高，中位 4.040 → 4.050 基本不动
+  可检出的最小加速比 ≈ 2.2 × RSD / sqrt(n) ≈ 1.8%
+
+== 3. 成本拆解：kernel 只有 100 µs，为什么端到端是 800 µs ==
+  kernel 执行         100 µs  12.5%  #####
+  kernel 启动开销         5 µs   0.6%  #
+  H2D 拷贝            300 µs  37.5%  ###############
+  D2H 拷贝            300 µs  37.5%  ###############
+  Python/框架调度        40 µs   5.0%  ##
+  同步与事件              55 µs   6.9%  ###
+  合计 800 µs；只优化 kernel（100 µs），端到端天花板是 12%</code></pre>
+<p>两个必须读出来的结论：</p>
+<ol>
+<li><strong>同样&quot;看起来快了&quot;，一个显著、一个不显著</strong>：12% 提升的 <code>t</code> 是 8.71，2% 提升只有 1.60——判据在你开口之前就把话说死了。</li>
+<li><strong>&quot;最小可检出加速比 1.8%&quot; 与 2% 案例只差一点点</strong>：在 RSD = 2.9%、n = 12 的条件下，2% 处在判定边缘；想稳就得增加重复次数或降低噪声（锁频、独占机器、固定输入）。</li>
+</ol>
+<p>第 3 节的账本解释了为什么&quot;先 nsys 再 ncu&quot;：不先拆端到端，你连该不该动 kernel 都不知道。以下两条是<strong>可选路径</strong>（需自备 GPU 或云上按需），没有 GPU 不影响本课结论。</p>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选（需自备或云上按需）：系统级 / kernel 级的两级 profile ----
+nsys profile -o baseline --force-overwrite=true python3 train_step.py
+#   → 打开生成的 baseline.nsys-rep，先看时间线：kernel / memcpy / 同步各占多少
+ncu --set full -k my_kernel --launch-count 3 python3 train_step.py
+#   → 只看名叫 my_kernel 的 kernel：带宽利用率、算力利用率、是否 memory-bound
+#   注意：ncu 会显著改变执行速度，它的绝对值只当量级看，趋势与比值更可信。
+#           先 nsys 定位「谁最贵」，再 ncu 回答「它为什么贵」——顺序反了会浪费大量时间。</code></pre>
+<pre data-lang="python"><code class="language-python"># ---- 可选（需自备 GPU 或云上按需）：用 CUDA event 把 kernel 时间和端到端时间分开 ----
+# 关键点：CUDA 是异步的，计时必须用 event 或 synchronize 把 kernel 真正等到结束。
+import time, torch
+
+x = torch.randn(4096, 4096, device=&#39;cuda&#39;)
+for _ in range(3):
+    y = x + 1.0                                  # 预热
+torch.cuda.synchronize()
+
+t0 = time.perf_counter()
+for _ in range(50):
+    y = x + 1.0
+torch.cuda.synchronize()                         # 端到端：含所有启动开销
+print(f&#39;端到端 平均 {((time.perf_counter() - t0) / 50) * 1e6:.1f} µs&#39;)
+
+start = torch.cuda.Event(enable_timing=True)
+end = torch.cuda.Event(enable_timing=True)
+start.record()
+for _ in range(50):
+    y = x + 1.0
+end.record()
+torch.cuda.synchronize()
+print(f&#39;设备侧 平均 {start.elapsed_time(end) / 50 * 1e3:.1f} µs&#39;)
+# 两个数字的差 = 主机侧调度/启动开销；把它和「kernel 实际执行时间」对齐，
+# 就能回答：优化 kernel 到底能拿到多少端到端收益（对应 §3 的账本）。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：把 <code>report()</code> 改成<strong>报告胜场数与分位数</strong>（差值中位数与 90 分位），并加&quot;显著 / 不显著 / 数据不足&quot;三态结论（<code>n &lt; 8</code> 时输出&quot;数据不足&quot;）。</li>
+<li><strong>解释</strong>：为什么配对测量比&quot;各测 20 次比均值&quot;更灵敏？并举一个会让配对失效的场景（提示：两版本交错测互相干扰，如显存占用差异）。</li>
+<li><strong>对比/验证</strong>：把 <code>report(&#39;12% 提升&#39;, ...)</code> 的 <code>gain</code> 依次改成 <code>0.48</code>、<code>0.20</code>、<code>0.08</code>、<code>0.03</code>，记录每次的 <code>t</code> 与结论，找出刚好跨过临界值的 <code>gain</code>，解释它与&quot;最小可检出加速比&quot;的关系。</li>
+<li><strong>思考</strong>：一个 kernel 占端到端 40%，优化 25%（该段降到 75%）后端到端提升多少？若噪声地板是 5%，能判定吗？若它同时是最难维护的手写实现，你做还是不做？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>NVIDIA, <em>CUDA C++ Best Practices Guide</em>（&quot;Assessing Your Application&quot; 与 &quot;Performance Metrics&quot;：基线、profiling 驱动优化与测量纪律）：<a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/contents.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/contents.html</a></li>
+<li>NVIDIA, <em>Nsight Compute Documentation</em>（<code>--set full</code>、<code>-k</code>、<code>--launch-count</code> 等参数与 kernel 级指标；先定位再深挖的依据）：<a href="https://docs.nvidia.com/nsight-compute/" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/nsight-compute/</a></li>
+<li>NVIDIA, <em>Nsight Systems User Guide</em>（时间线与系统级开销拆解，对应 §3 的账本）：<a href="https://docs.nvidia.com/nsight-systems/" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/nsight-systems/</a></li>
+<li>NVIDIA, <em>CUDA C++ Programming Guide</em>（§2.5 &quot;Asynchronous Execution&quot; 与 event / <code>cudaDeviceSynchronize</code> 语义：解释为什么计时必须等到设备完成）：<a href="https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html</a></li>
+</ul>
+<p><a href="../chapter-2/index.md">下一章：CUDA 执行模型</a></p>

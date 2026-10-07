@@ -1,0 +1,197 @@
+<h2 id="h-激活重计算显存-算力权衡的定量分析">激活重计算：显存-算力权衡的定量分析<a class="anchor" href="#h-激活重计算显存-算力权衡的定量分析" aria-label="本节链接">#</a></h2>
+<p>上一课把模型状态（参数、梯度、优化器状态）切干净之后，往往还剩一笔账没解决：<strong>激活值</strong>。它和参数不同——参数只与模型大小有关，激活值却随 batch 与序列长度线性增长，而且中间还藏着一个随序列长度<strong>平方增长</strong>的矩阵。一个 2048 序列长度的 GPT-3 量级配置，光是把注意力打分矩阵留住，每层就要 1.5 GiB。这一课把&quot;哪些张量值得留、哪些应该重算&quot;变成可以算出来的决定。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-激活值为什么必须存反向要用">1. 激活值为什么必须存：反向要用<a class="anchor" href="#h-1-激活值为什么必须存反向要用" aria-label="本节链接">#</a></h4>
+<p>训练一步包含前向与反向。反向计算某层的权重梯度需要该层的<strong>输入激活</strong>，计算当前层的输入梯度还需要该层内部的中间量。做前向时这些张量都出现过，但默认会被释放；如果要保留下来，就在显存里一直占着，直到反向用完。</p>
+<p>单层要留的张量（以 Transformer block 为例）是：</p>
+<table>
+<thead>
+<tr>
+<th>张量</th>
+<th>形状</th>
+<th>为什么要留</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>block 输入</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">[</span><span class="mord mathnormal">b</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">s</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">h</span><span class="mclose">]</span></span></span></span></td>
+<td>反向算该层第一个线性层的权重梯度</td>
+</tr>
+<tr>
+<td>注意力 4 个投影输出 Q/K/V/O</td>
+<td>各 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">[</span><span class="mord mathnormal">b</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">s</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">h</span><span class="mclose">]</span></span></span></span></td>
+<td>反向算投影权重梯度</td>
+</tr>
+<tr>
+<td>注意力打分矩阵</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">[</span><span class="mord mathnormal">b</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">a</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">s</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">s</span><span class="mclose">]</span></span></span></span></td>
+<td>反向算 softmax 的输入梯度</td>
+</tr>
+<tr>
+<td>MLP 中间张量（gate/up 与激活后）</td>
+<td>各 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">[</span><span class="mord mathnormal">b</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">s</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="mord mathnormal">n</span><span class="mclose">]</span></span></span></span></td>
+<td>反向算 MLP 权重梯度</td>
+</tr>
+<tr>
+<td>MLP 输入</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">[</span><span class="mord mathnormal">b</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">s</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">h</span><span class="mclose">]</span></span></span></span></td>
+<td>反向算 MLP 第一层权重梯度</td>
+</tr>
+</tbody></table>
+<p><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">b</span></span></span></span> 是 batch，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span></span></span></span> 是序列长度，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">h</span></span></span></span> 是 hidden 维度，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">a</span></span></span></span> 是注意力头数，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="mord mathnormal">n</span></span></span></span> 是前馈中间维度。把这张表按 bf16（2 B/元素）加总就是单层激活值，再乘层数 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span></span></span></span> 就是全模型。<strong>&quot;激活值随序列平方增长&quot;的出处就在这里</strong>：只有打分矩阵那一项带 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span>。</p>
+<h4 id="h-2-重计算用一次前向换掉全部中间张量">2. 重计算：用一次前向换掉全部中间张量<a class="anchor" href="#h-2-重计算用一次前向换掉全部中间张量" aria-label="本节链接">#</a></h4>
+<p>激活重计算（activation recomputation，也叫 gradient checkpointing）的思路很简单：前向时只保存每个 block 的<strong>输入</strong>，反向要用中间张量时把该 block 的前向<strong>再算一遍</strong>（算完立刻释放）。</p>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>保留什么</th>
+<th>每层激活值</th>
+<th>额外算力</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>全部保留</td>
+<td>上表全部</td>
+<td>最大</td>
+<td>0</td>
+</tr>
+<tr>
+<td>逐层重计算</td>
+<td>只留 block 输入</td>
+<td>约 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord">2</span><span class="mord mathnormal">b</span><span class="mord mathnormal">s</span><span class="mord mathnormal">h</span><span class="mord">⋅</span></span></span></span>字节</td>
+<td>多一次前向</td>
+</tr>
+<tr>
+<td>选择性重计算</td>
+<td>留 block 输入 + 注意力输出，重算 MLP</td>
+<td>中等</td>
+<td>只重算 MLP</td>
+</tr>
+<tr>
+<td>FlashAttention 式</td>
+<td>不构造打分矩阵</td>
+<td>去掉 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span> 项</td>
+<td>反向重算注意力块</td>
+</tr>
+</tbody></table>
+<p>算力账是<strong>严格可算的</strong>：训练一步的前向/反向 FLOPs 约为前向的 3 倍（前向 1 份、反向 2 份）。逐层重计算在反向里多跑一次前向，因此总算力变成 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">3</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">→</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4</span></span></span></span> 份，即<strong>多付 33%</strong>。选择性重计算只重算 MLP：若 MLP 占该层参数 75%，则只多付 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">0.75/3</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">25%</span></span></span></span>。这就是&quot;用三成算力换十倍显存&quot;的来源。</p>
+<p><figure><img class="md-img" src="content/courses/distributed-training-systems/assets/chapter-6-figure-03.svg" alt="重计算用算力换显存，长序列下该重算谁" loading="lazy" decoding="async"><figcaption>重计算用算力换显存，长序列下该重算谁</figcaption></figure>
+</p>
+<h4 id="h-3-长序列时该重算谁注意力矩阵才是主项">3. 长序列时该重算谁：注意力矩阵才是主项<a class="anchor" href="#h-3-长序列时该重算谁注意力矩阵才是主项" aria-label="本节链接">#</a></h4>
+<p>把上面两张表代进实际数字（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord">2048</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">h</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">12288</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">a</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord">96</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="mord mathnormal">n</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord">4</span><span class="mord mathnormal">h</span></span></span></span>，bf16，单层）：</p>
+<ul>
+<li>保留全部（含打分矩阵）：<strong>2352 MiB</strong>，其中打分矩阵 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">[</span><span class="mord">1</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">96</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">2048</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">2048</span><span class="mclose">]</span></span></span></span> 占 <strong>1536 MiB（65%）</strong>；</li>
+<li>不构造打分矩阵：816 MiB；</li>
+<li>逐层重计算只留 block 输入：96 MiB，即前者的 <strong>1/24</strong>、全模型 9.00 GiB。</li>
+</ul>
+<p>序列继续变长时，打分矩阵迅速吃掉一切：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">8192</span></span></span></span> 时它占 88%，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">32768</span></span></span></span> 时占 <strong>96.8%</strong>（此时单层不打分矩阵是 12.8 GiB，打分矩阵是 384 GiB）。结论很硬：<strong>长序列训练里，重算注意力的收益远大于重算 MLP</strong>。Megatron 那篇论文的原话是：配合序列并行，选择性重计算把激活显存减少 5 倍，同时把重计算的执行时间开销削减 90% 以上（530B 模型在 2240 张 A100 上，MFU 从 42.1% 提到 54.2%）。</p>
+<h4 id="h-4-工程上必须处理的两件事rng-与粒度">4. 工程上必须处理的两件事：RNG 与粒度<a class="anchor" href="#h-4-工程上必须处理的两件事rng-与粒度" aria-label="本节链接">#</a></h4>
+<p>重计算要求&quot;重算出的前向结果与第一次完全一致&quot;，否则梯度就错了。所以：<strong>随机数状态（RNG state）必须保存与恢复</strong>——dropout 等操作在前向里消耗随机数，重算时要消耗同一串，PyTorch 的 <code>torch.utils.checkpoint</code> 默认会处理这一点；<strong>粒度决定取舍</strong>——太细则重算次数与启动开销抬升，太粗则峰值显存降不下来，常见做法是按 block 或按&quot;注意力块 / MLP 块&quot;分别 checkpoint。</p>
+<h4 id="h-5-常见坑">5. 常见坑<a class="anchor" href="#h-5-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>以为重计算省的是参数显存</strong>：它只影响激活值；模型状态要靠 ZeRO / FSDP 解决。</li>
+<li><strong>拿重计算当免费午餐</strong>：逐层重计算固定多 33% 算力，在 GPU 已打满的任务上直接变成 33% 的墙钟时间。</li>
+<li><strong>忘了 RNG 一致性</strong>：带 dropout 的模型若手工重算而没恢复 RNG，训练会静默发散。</li>
+<li><strong>在小序列上套用长序列结论</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">512</span></span></span></span> 时打分矩阵只占 32%，此时优先该省的往往是 MLP 中间张量。</li>
+<li><strong>只测峰值显存不测算力</strong>：必须同时记录 tokens/s 与峰值显存，否则无法判断是否划算。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>纯 Python，不需要 GPU。它把激活值账本（含&quot;哪些张量值得留&quot;）与重计算的算力代价一起算出来。</p>
+<pre data-lang="python"><code class="language-python"># ===== 示例：激活值账本与&quot;重计算换显存&quot;的定量取舍 =====
+MB = 2**20; GB = 2**30
+
+def layer_cost(s, h, a, ffn, b=1, dt=2, keep_attn=True):
+    &quot;&quot;&quot;单层激活值字节数（bf16）。
+    保留下来的张量：4 个注意力投影输出 + 3 个 MLP 中间张量 + 1 个 block 输入，
+    以及（可选）注意力打分矩阵 [b, a, s, s]。&quot;&quot;&quot;
+    lin = (4 * b * s * h + 3 * b * s * ffn + b * s * h) * dt
+    att = (2 * b * a * s * s) * dt if keep_attn else 0
+    return lin + att
+
+def fwd_flops_layer(s, h, ffn, b=1):
+    &quot;&quot;&quot;单层前向 FLOPs ≈ 2 × (该层参数量) × token 数。&quot;&quot;&quot;
+    n_layer = 4 * h * h + 3 * h * ffn
+    return 2 * n_layer * b * s
+
+cfg = dict(s=2048, h=12288, a=96, ffn=4 * 12288)
+L = 96
+print(f&quot;配置：s={cfg[&#39;s&#39;]}, h={cfg[&#39;h&#39;]}, a={cfg[&#39;a&#39;]}, ffn={cfg[&#39;ffn&#39;]}, L={L}, bf16（单卡单层）&quot;)
+base = layer_cost(**cfg)
+print(f&quot;  单层激活值（保留注意力矩阵）  {base/MB:9.1f} MiB&quot;)
+print(f&quot;    其中注意力矩阵 [1,96,2048,2048] {2*1*96*2048*2048*2/MB:9.1f} MiB&quot;
+      f&quot;（占 {2*1*96*2048*2048*2/base:.0%}）&quot;)
+print(f&quot;  单层激活值（不保留注意力矩阵，FlashAttention 式）{layer_cost(**cfg, keep_attn=False)/MB:9.1f} MiB&quot;)
+print(f&quot;  全模型 {L} 层（保留注意力矩阵）{base*L/GB:9.1f} GiB；&quot;
+      f&quot;不保留 {layer_cost(**cfg, keep_attn=False)*L/GB:8.1f} GiB&quot;)
+
+ckpt = 2 * 1 * cfg[&quot;s&quot;] * cfg[&quot;h&quot;] * 2          # 逐层重计算：只存 block 输入（两个张量）
+print(f&quot;\n逐层重计算：每层只存 block 输入 {ckpt/MB:.1f} MiB → 全模型 {ckpt*L/GB:.2f} GiB，&quot;
+      f&quot;是「不重算且不存注意力」的 1/{layer_cost(**cfg, keep_attn=False)/ckpt:.0f}&quot;)
+
+f = fwd_flops_layer(cfg[&#39;s&#39;], cfg[&#39;h&#39;], cfg[&#39;ffn&#39;])
+print(f&quot;\n算力账：单层前向 ≈ 2·N_layer·tokens = {f/1e12:.2f} TFLOP（tokens={cfg[&#39;s&#39;]}）&quot;)
+print(f&quot;  训练一步（前向 1× + 反向 2×）≈ {3*f/1e12:.2f} TFLOP / 层&quot;)
+print(f&quot;  逐层重计算多跑一次前向 → 多付 {f/(3*f):.1%}（即 4/3 倍）&quot;)
+r = 3*cfg[&#39;h&#39;]*cfg[&#39;ffn&#39;]/(4*cfg[&#39;h&#39;]**2+3*cfg[&#39;h&#39;]*cfg[&#39;ffn&#39;])
+print(f&quot;  只重算 MLP（MLP 占该层参数 {r:.0%}）→ 多付 {r/3:.1%}；&quot;
+      f&quot;选择性重计算存注意力输出、重算 MLP，省的是注意力矩阵那份&quot;)
+
+print(&quot;\n序列越长，注意力矩阵越是主项（b=1, h=12288, a=96, bf16）：&quot;)
+for s in (512, 2048, 8192, 32768):
+    c = dict(cfg); c[&quot;s&quot;] = s
+    with_att = layer_cost(**c); without = layer_cost(**c, keep_attn=False)
+    print(f&quot;  s={s:&lt;6} 不含注意力 {without/MB:8.1f} MiB  注意力矩阵 &quot;
+          f&quot;{2*96*s*s*2/MB:9.1f} MiB  注意力占比 {(with_att-without)/with_att:6.1%}&quot;)
+
+print(&quot;\n单层重算的墙钟代价（示例算力，仅看量级）：&quot;)
+for tf in (1000, 400, 100):
+    print(f&quot;  设备 {tf:&gt;4} TFLOP/s：{f/(tf*1e12)*1e3:8.2f} ms / 层 / 设备&quot;)</code></pre>
+<p>在 Python 3.14.5（仅标准库）下实际运行结果：</p>
+<pre data-lang="text"><code class="language-text">配置：s=2048, h=12288, a=96, ffn=49152, L=96, bf16（单卡单层）
+  单层激活值（保留注意力矩阵）     2352.0 MiB
+    其中注意力矩阵 [1,96,2048,2048]    1536.0 MiB（占 65%）
+  单层激活值（不保留注意力矩阵，FlashAttention 式）    816.0 MiB
+  全模型 96 层（保留注意力矩阵）    220.5 GiB；不保留     76.5 GiB
+
+逐层重计算：每层只存 block 输入 96.0 MiB → 全模型 9.00 GiB，是「不重算且不存注意力」的 1/8
+
+算力账：单层前向 ≈ 2·N_layer·tokens = 9.90 TFLOP（tokens=2048）
+  训练一步（前向 1× + 反向 2×）≈ 29.69 TFLOP / 层
+  逐层重计算多跑一次前向 → 多付 33.3%（即 4/3 倍）
+  只重算 MLP（MLP 占该层参数 75%）→ 多付 25.0%；选择性重计算存注意力输出、重算 MLP，省的是注意力矩阵那份
+
+序列越长，注意力矩阵越是主项（b=1, h=12288, a=96, bf16）：
+  s=512    不含注意力    204.0 MiB  注意力矩阵      96.0 MiB  注意力占比  32.0%
+  s=2048   不含注意力    816.0 MiB  注意力矩阵    1536.0 MiB  注意力占比  65.3%
+  s=8192   不含注意力   3264.0 MiB  注意力矩阵   24576.0 MiB  注意力占比  88.3%
+  s=32768  不含注意力  13056.0 MiB  注意力矩阵  393216.0 MiB  注意力占比  96.8%
+
+单层重算的墙钟代价（示例算力，仅看量级）：
+  设备 1000 TFLOP/s：    9.90 ms / 层 / 设备
+  设备  400 TFLOP/s：   24.74 ms / 层 / 设备
+  设备  100 TFLOP/s：   98.96 ms / 层 / 设备</code></pre>
+<p>两行关键数字：<strong>注意力占比从 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">512</span></span></span></span> 的 32% 涨到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">32768</span></span></span></span> 的 96.8%</strong>，以及<strong>逐层重计算把全模型激活值从 76.5 GiB 压到 9.00 GiB，代价是 33% 算力</strong>。这两条决定了重计算策略应该&quot;优先对付 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span> 项&quot;。</p>
+<p><strong>可选，需要自备或云上按需 1<del>2 卡</strong>（无卡也能完成本课）：想看真实显存曲线，用 1</del>2 卡跑一个小模型，对比开关 checkpoint 前后的峰值显存与 tokens/s：</p>
+<pre data-lang="bash"><code class="language-bash"># 若环境里有 torch，可先在 CPU 上验证&quot;重算得到与首次前向相同的结果&quot;：
+# import torch, torch.utils.checkpoint as cp
+# lin = torch.nn.Linear(8, 8); x = torch.randn(4, 8, requires_grad=True)
+# def block(t): return torch.dropout(torch.relu(lin(t)), 0.5, train=True)
+# print(torch.allclose(block(x), cp.checkpoint(block, x, use_reentrant=False)))
+# —— checkpoint 会保存并恢复 RNG 状态，dropout 才会一致；手工重算而不恢复就会不一致。
+nvidia-smi -l 1                       # 另开一个终端观察显存与利用率
+# torchrun --standalone --nproc_per_node=1 train_ckpt.py   # 单卡即可，开关各跑几十步</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：把 <code>layer_cost</code> 扩展成&quot;按张量逐项列出&quot;的版本（每一项打印形状与字节数），并算出 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4096</span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">h</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">8192</span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">a</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">64</span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="mord mathnormal">n</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord">4</span><span class="mord mathnormal">h</span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">80</span></span></span></span> 时每一项的占比排名。</li>
+<li><strong>解释</strong>：为什么逐层重计算的额外算力恰好是 33%，而它省下的显存却是 8 倍以上？分别用&quot;算力只与前向 FLOPs 成正比&quot;和&quot;激活值含 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span> 项&quot;回答。</li>
+<li><strong>对比/验证</strong>：在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">512</span></span></span></span> 与 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">32768</span></span></span></span> 两个配置下，分别比较&quot;重算 MLP&quot;与&quot;不重算 MLP&quot;的显存收益；说明为什么两个配置该做的选择相反。</li>
+<li><strong>思考</strong>：一个任务把重计算粒度从&quot;每层一次&quot;改成&quot;每层两次&quot;（前后半段各一次），显存与算力各会怎么变？再说明它与流水线并行（PP）的 1F1B 调度为什么需要一起考虑。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>V. Korthikanti et al., <em>Reducing Activation Recomputation in Large Transformer Models</em>, MLSys 2023（序列并行与选择性重计算两项技术，以及&quot;激活显存减少 5 倍、重计算时间开销削减 90% 以上、530B 模型 MFU 42.1%→54.2%&quot;的实验结论；本课第 2~3 节）：<a href="https://arxiv.org/abs/2205.05198" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2205.05198</a></li>
+<li>PyTorch, <em>torch.utils.checkpoint</em>（激活重计算的官方接口：<code>use_reentrant</code> 语义、RNG 状态的保存与恢复；本课第 4 节）：<a href="https://pytorch.org/docs/stable/checkpoint.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/docs/stable/checkpoint.html</a></li>
+<li>T. Dao et al., <em>FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness</em>, NeurIPS 2022（不构造 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal">s</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span></span></span></span> 打分矩阵的分块注意力，本课&quot;去掉 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span> 项&quot;的依据）：<a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2205.14135</a></li>
+</ul>
+<p><a href="lesson-03.md">下一课：混合精度 / FP8 训练：数值与工程要点</a></p>

@@ -1,0 +1,108 @@
+<h2 id="h-序列生成">序列生成<a class="anchor" href="#h-序列生成" aria-label="本节链接">#</a></h2>
+<p>分类是&quot;读进一句话、吐出一个标签&quot;，而<strong>序列生成</strong>是&quot;给定一个开头，逐字逐词地吐出一段新文本&quot;。它比分类多了一个关键环节：模型要<strong>一个词一个词地自己写下去</strong>，每一步的预测又成为下一步的输入。这一课我们搞懂&quot;训练时&quot;和&quot;生成时&quot;两套不同的玩法——teacher forcing 与自回归采样，并亲手训练一个字符级生成器。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-语言模型预测下一个词">1. 语言模型：预测下一个词<a class="anchor" href="#h-1-语言模型预测下一个词" aria-label="本节链接">#</a></h4>
+<p>序列生成的核心是一个<strong>语言模型（language model）</strong>：给定前面已经出现的字符或词，预测<strong>下一个</strong>最可能是什么。用条件概率表示：</p>
+<pre><code>P(w₁, w₂, …, w_T) = P(w₁) · P(w₂|w₁) · P(w₃|w₁,w₂) · … · P(w_T|w₁…wₜ₋₁)</code></pre>
+<p>整段文本的概率，被拆成一连串&quot;已知上文、猜下一个&quot;的乘积。用 LSTM/GRU 实现语言模型非常自然：每一步输入当前字符，输出对&quot;下一个字符&quot;的概率分布，训练目标就是让这个分布尽量命中真实的下一个字符。</p>
+<h4 id="h-2-训练时的-teacher-forcing">2. 训练时的 teacher forcing<a class="anchor" href="#h-2-训练时的-teacher-forcing" aria-label="本节链接">#</a></h4>
+<p>训练语言模型时，每一步都要预测&quot;下一个词&quot;，那<strong>输入给网络的&quot;当前词&quot;用谁</strong>？有两种选择：</p>
+<ul>
+<li><strong>Teacher forcing</strong>：每一步都喂<strong>真实的历史词</strong>（老师给的答案），而不是模型自己上一步的预测。这样训练稳定、收敛快，是默认做法。</li>
+<li><strong>不用 teacher forcing</strong>：把模型自己上一步的预测喂给下一步，更接近真实生成场景，但训练初期预测很烂，误差会一路累积，很难收敛。</li>
+</ul>
+<p>实际训练几乎都采用 teacher forcing：把整段文本<strong>整体</strong>喂进去，让网络一次输出每个位置对&quot;下一个字符&quot;的预测，再和错开一位的真实序列算交叉熵。PyTorch 里这只是一次前向传播，非常高效。</p>
+<p><figure><img class="md-img" src="content/courses/deep-learning-architectures/assets/chapter-6-figure-02.svg" alt="teacher forcing 训练：每一步都喂真实历史词" loading="lazy" decoding="async"><figcaption>teacher forcing 训练：每一步都喂真实历史词</figcaption></figure>
+</p>
+<h4 id="h-3-生成时的自回归采样">3. 生成时的自回归采样<a class="anchor" href="#h-3-生成时的自回归采样" aria-label="本节链接">#</a></h4>
+<p>训练用的是真实历史，但<strong>生成时没有老师</strong>，只能自回归：从一个起始字符（种子）出发，每一步把&quot;当前已有序列&quot;喂给模型，取预测出的下一个字符，拼到序列末尾，再重复。如此循环，直到生成指定长度或遇到结束符。</p>
+<p><strong>关键问题：怎么从概率分布里挑下一个字符？</strong> 有三种采样策略：</p>
+<ul>
+<li><strong>贪心（greedy）</strong>：每步都取概率最大的那个。简单，但容易陷入重复、单调；</li>
+<li><strong>随机采样</strong>：按概率分布随机抽。多样，但可能出乱码；</li>
+<li><strong>带温度采样（temperature）</strong>：把 logits 除以温度 <code>T</code> 再 softmax。<code>T</code> 越小越接近贪心、越确定；<code>T</code> 越大分布越平滑、越多样。这是实际生成时最常用的旋钮。</li>
+</ul>
+<p><figure><img class="md-img" src="content/courses/deep-learning-architectures/assets/chapter-6-figure-03.svg" alt="自回归生成：把每步预测拼回输入，循环往复" loading="lazy" decoding="async"><figcaption>自回归生成：把每步预测拼回输入，循环往复</figcaption></figure>
+</p>
+<h4 id="h-4-训练与生成的分工">4. 训练与生成的分工<a class="anchor" href="#h-4-训练与生成的分工" aria-label="本节链接">#</a></h4>
+<p>一句话总结：</p>
+<blockquote>
+<p><strong>训练用 teacher forcing（并行、喂真实历史），生成用自回归采样（串行、喂自己的预测）。</strong></p>
+</blockquote>
+<p>这个&quot;两套模式&quot;的分工，是理解所有生成式模型（从字符 RNN 到 GPT）的第一块敲门砖。它们共享同一个网络，只是&quot;数据怎么流&quot;的方式不同。</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面训练一个<strong>字符级 LSTM 语言模型</strong>：给它一段文本，让它学会每个字符后面最可能跟什么，然后用不同的采样策略生成新文本。为了可复现，语料用一段重复性较强的简单文本。</p>
+<pre data-lang="python"><code class="language-python">import torch
+import torch.nn as nn
+
+torch.manual_seed(0)
+
+# 1) 语料：一段有规律的文本，让模型学出&quot;字符间的依赖&quot;
+text = &quot;abcdefghij abcdefghij abcdefghij abcdefghij&quot;
+chars = sorted(set(text))
+c2i = {c: i for i, c in enumerate(chars)}
+i2c = {i: c for c, i in c2i.items()}
+data = torch.tensor([c2i[c] for c in text])
+
+class CharLM(nn.Module):
+    def __init__(self, vocab_size, hidden):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, 8)
+        self.lstm = nn.LSTM(8, hidden, batch_first=True)
+        self.fc = nn.Linear(hidden, vocab_size)
+
+    def forward(self, x, h=None):
+        # x: (batch, seq_len) -&gt; 输出每个位置对下一个字符的预测
+        out, h = self.lstm(self.embed(x), h)
+        return self.fc(out), h
+
+model = CharLM(len(chars), hidden=32)
+loss_fn = nn.CrossEntropyLoss()
+opt = torch.optim.Adam(model.parameters(), lr=0.01)
+
+# 2) 训练：teacher forcing。输入 data[:-1]，目标是 data[1:]
+seq_len = 16
+for step in range(500):
+    # 随机截一段作为 batch（batch=1，这里简化）
+    i = torch.randint(0, len(data) - seq_len - 1, (1,)).item()
+    x = data[i:i + seq_len].unsqueeze(0)        # (1, 16)
+    y = data[i + 1:i + seq_len + 1].unsqueeze(0)
+    logits, _ = model(x)
+    loss = loss_fn(logits.reshape(-1, len(chars)), y.reshape(-1))
+    opt.zero_grad()
+    loss.backward()
+    opt.step()
+
+print(f&quot;训练完成，最终损失：{loss.item():.4f}&quot;)
+
+# 3) 生成：自回归 + 带温度采样
+def generate(model, seed, length, temperature=1.0):
+    model.eval()
+    idxs = [c2i[c] for c in seed]
+    with torch.no_grad():
+        for _ in range(length):
+            x = torch.tensor([idxs[-seq_len:]]).long()   # 只取最近 seq_len 步
+            logits, _ = model(x)
+            logits = logits[0, -1] / temperature          # 最后一步 + 温度
+            probs = torch.softmax(logits, dim=0)
+            nxt = torch.multinomial(probs, 1).item()      # 按概率抽样
+            idxs.append(nxt)
+    return &quot;&quot;.join(i2c[i] for i in idxs)
+
+print(&quot;贪心（温度 0.5）：&quot;, generate(model, &quot;abc&quot;, 12, temperature=0.5))
+print(&quot;随机（温度 1.5）：&quot;, generate(model, &quot;abc&quot;, 12, temperature=1.5))</code></pre>
+<p>运行后你会看到：低温度下的生成更像语料里的规律（&quot;abcdefghij&quot;循环），而高温度下会出现更多随机、甚至不存在的组合。这正是温度旋钮的作用——<strong>在&quot;确定&quot;与&quot;多样&quot;之间做取舍</strong>。真实文本生成（写诗、写代码）都靠这套机制调出想要的效果。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>把语料换成一句自然语言（如重复一段中文拼音），重新训练，观察生成结果是否比字母循环更&quot;像话&quot;；说说为什么语料的规律性会影响生成质量。</li>
+<li>分别用 <code>temperature=0.1</code>、<code>1.0</code>、<code>2.0</code> 各生成 3 次，对比输出的确定性与多样性，并解释温度如何改变了 softmax 的概率分布。</li>
+<li>把采样策略从 <code>torch.multinomial</code> 改成贪心（每步取 <code>argmax</code>），生成一段长文本，观察是否出现重复循环，说说贪心为什么容易&quot;卡住&quot;。</li>
+<li>思考：teacher forcing 训练出的模型，在自回归生成时为什么会&quot;越走越偏&quot;？这种现象叫什么，有什么缓解思路？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>PyTorch 官方文档 · LSTM：<a href="https://pytorch.org/docs/stable/generated/torch.nn.LSTM.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/docs/stable/generated/torch.nn.LSTM.html</a></li>
+<li>PyTorch 官方文档 · multinomial：<a href="https://pytorch.org/docs/stable/generated/torch.multinomial.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/docs/stable/generated/torch.multinomial.html</a></li>
+<li>PyTorch 官方教程 · 字符级 RNN 生成名字：<a href="https://pytorch.org/tutorials/intermediate/char_rnn_generation_tutorial.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/tutorials/intermediate/char_rnn_generation_tutorial.html</a></li>
+</ul>
+<p><a href="#/l/dl-ch6-l3">下一课：综合项目</a></p>

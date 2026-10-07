@@ -1,0 +1,370 @@
+<h2 id="h-强度削减循环展开与向量化预备与-gpu-tiling-呼应">强度削减、循环展开与向量化预备（与 GPU tiling 呼应）<a class="anchor" href="#h-强度削减循环展开与向量化预备与-gpu-tiling-呼应" aria-label="本节链接">#</a></h2>
+<p>前几课的改写都在&quot;少算几条指令&quot;的量级上。真正决定性能的是循环：循环体里少一条乘法，乘以迭代次数就是可观的工作量；而循环能不能<strong>向量化</strong>（vectorization），决定同一段时间里一条指令处理几个数据。这一课讲三个必须连起来看的变换——强度削减（乘法换成加法）、循环展开（用代码体积换并行素材）、向量化的可行性判据；最后把&quot;连续访存&quot;这个前提推进到 <strong>tiling</strong>，你会看到它和 GPU 上分块复用数据是同一件事的两种后端。</p>
+<p><figure><img class="md-img" src="content/courses/compiler-foundations/assets/chapter-5-figure-02.svg" alt="循环优化的次序：先识别，再削减与展开，最后才谈向量化" loading="lazy" decoding="async"><figcaption>循环优化的次序：先识别，再削减与展开，最后才谈向量化</figcaption></figure>
+</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-强度削减先找归纳变量再替换派生计算">1. 强度削减：先找归纳变量，再替换派生计算<a class="anchor" href="#h-1-强度削减先找归纳变量再替换派生计算" aria-label="本节链接">#</a></h4>
+<p><strong>归纳变量</strong>（induction variable）是在循环里按固定步长变化的变量，形如 <code>i = i + k</code>（k 为常量）。它的派生值几乎都能用&quot;再加一个常量&quot;代替：</p>
+<ul>
+<li><code>i * m</code>：每轮固定增加 <code>k * m</code>；</li>
+<li><code>base + i * m</code>：每轮固定增加 <code>k * m</code>（地址算术，最典型的用法）。</li>
+</ul>
+<p>前提三条缺一不可：步长 <code>k</code> 必须是编译期常量；初值能算出来；派生变量必须和归纳变量<strong>同步更新</strong>（<code>i</code> 在循环体里被改写多次时，每轮净变化不再是 <code>k</code>）。</p>
+<p>本课代码实测：循环体里 <code>t2 = i * 4</code> 变成 preheader 的 <code>p_t2 = 0</code> 加循环内的 <code>p_t2 = p_t2 + 4</code>，<strong>循环体内乘法 1 → 0</strong>，加法 2 → 3。更通用的版本由 LLVM 的 Scalar Evolution（SCEV）处理：整条地址算术链从&quot;每轮重算&quot;变成&quot;每轮加常数&quot;。</p>
+<h4 id="h-2-循环展开用代码体积换两类收益">2. 循环展开：用代码体积换两类收益<a class="anchor" href="#h-2-循环展开用代码体积换两类收益" aria-label="本节链接">#</a></h4>
+<p>展开（loop unrolling）把循环体复制 k 份，归纳变量步长改成 k：</p>
+<ul>
+<li>收益一：<strong>减少循环控制开销</strong>——本课实测每 2 次迭代的条件判断从 2 次降到 1 次，主循环体指令 6 → 11。</li>
+<li>收益二：<strong>把不同迭代的独立指令摆到一起</strong>，给指令调度与向量化提供素材（LLVM 的向量化器自己也会做 partial unrolling）。</li>
+</ul>
+<p>代价同样明确：代码体积约 ×k（余数循环本课再补 6 条）、寄存器压力上升、trip count 不整除时必须补<strong>余数循环</strong>（epilogue）。展开因子是代价模型的输出，不该照抄。</p>
+<h4 id="h-3-向量化的四个前置条件">3. 向量化的四个前置条件<a class="anchor" href="#h-3-向量化的四个前置条件" aria-label="本节链接">#</a></h4>
+<p>向量化把&quot;多条相同运算的标量指令&quot;换成一条向量指令。能不能做，先查这张清单：</p>
+<table>
+<thead>
+<tr>
+<th>条件</th>
+<th>不满足时的表现</th>
+<th>本课检查器的判定</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>循环可数（trip count / 步长已知）</td>
+<td>无法确定向量宽度与余数</td>
+<td><code>L5</code> 链表遍历 → 否</td>
+</tr>
+<tr>
+<td>访存步长为 1（连续）</td>
+<td>需要 gather/scatter，代价模型通常否决</td>
+<td><code>L3</code> 步长 4 → 否</td>
+</tr>
+<tr>
+<td>无循环携带依赖</td>
+<td>第 i 次依赖第 i-1 次，不能并行重排</td>
+<td><code>L2</code> <code>A[i] = A[i-1] + 1</code> → 否</td>
+</tr>
+<tr>
+<td>归约允许重排</td>
+<td>整型可重排；浮点不满足结合律</td>
+<td><code>L4</code> 归约 → 可（浮点需 fast-math）</td>
+</tr>
+</tbody></table>
+<p>LLVM 的自动向量化文档把后两条讲得很具体：归约能被向量化，但&quot;完全向量化归约需要重排运算&quot;，而浮点不满足结合律，因此 LLVM 只在启用 <code>-fassociative-math -fno-signed-zeros -fno-trapping-math</code> 这组 fast-math 时才向量化浮点归约。文档还指出：两个指针可能重叠（无法证明不别名）时，向量化必须插入<strong>运行时指针检查</strong>，检查失败就退化为标量版本——所以&quot;能向量化&quot;有时意味着&quot;代码里多了一段判断&quot;。</p>
+<p>展开与向量化不是重复劳动：展开把多个标量迭代<strong>并排</strong>放，向量化把它们真的<strong>塞进</strong>一条指令。一般经验：先做完强度削减与不变量外提（让循环体更干净、依赖更少），再考虑展开与向量化。</p>
+<h4 id="h-4-tiling把连续变成可向量可映射到线程的维度">4. tiling：把&quot;连续&quot;变成可向量/可映射到线程的维度<a class="anchor" href="#h-4-tiling把连续变成可向量可映射到线程的维度" aria-label="本节链接">#</a></h4>
+<p>以 <code>for i in 0..1000: A[i] = B[i] + K</code> 为例，按 T = 8 分块后：</p>
+<pre><code>for io in 0..1000 step 8:        # 外层 125 轮（1000 能被 8 整除，无余数）
+    for ii in 0..8:              # 内层 8 轮 ≈ 一个向量宽度
+        A[io + ii] = B[io + ii] + K</code></pre>
+<p>内层循环连续访问、无跨迭代依赖，因此可以整块向量化。把这个形状搬到 GPU：CUDA 的 tiling 让 <code>threadIdx.x</code> 沿连续维取数，使一个 warp 的一次访存覆盖连续地址（合并访存），每个线程还能一次搬 4 个元素。<strong>同一件事、两种后端</strong>：CPU 用 SIMD 指令与向量寄存器，GPU 用多线程 + 合并访存；共通前提都是&quot;内层连续、无跨迭代依赖&quot;，差别只在效率来源（一条指令几个元素 vs 数据复用与合并访存）。</p>
+<h4 id="h-5-常见坑">5. 常见坑<a class="anchor" href="#h-5-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>展开后忘了余数循环</strong>：trip count 不整除时漏算或越界。</li>
+<li><strong>归纳变量被多次改写</strong>：<code>i</code> 在循环体里改了两回，累加变量的步长必须按每轮净变化算。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面这段纯 Python 分三部分：强度削减（含外提前后的对照）、因子 2 的循环展开（含余数循环）、把四个前置条件写成判定的向量化检查器，最后打印 tiling 后的循环结构。</p>
+<pre data-lang="python"><code class="language-python"># ---- 强度削减 / 循环展开 / 向量化可行性检查 / tiling（纯 Python，无第三方依赖）----
+BIN = {&#39;add&#39;, &#39;sub&#39;, &#39;mul&#39;, &#39;div&#39;}
+
+
+def nm(x):
+    return (&#39;name&#39;, x)
+
+
+def ct(k):
+    return (&#39;const&#39;, k)
+
+
+def op_str(x):
+    return str(x[1]) if x else &#39;-&#39;
+
+
+def fmt(ins):
+    op = ins[0]
+    if op == &#39;copy&#39;:
+        return f&#39;{ins[3]} = {op_str(ins[1])}&#39;
+    if op in BIN:
+        return f&#39;{ins[3]} = {op_str(ins[1])} {op} {op_str(ins[2])}&#39;
+    if op == &#39;cmp&#39;:
+        return f&#39;{ins[4]} = {op_str(ins[2])} {ins[1]} {op_str(ins[3])}&#39;
+    if op == &#39;ifgoto&#39;:
+        return f&#39;if {op_str(ins[1])} goto {ins[2]} else {ins[3]}&#39;
+    if op == &#39;goto&#39;:
+        return f&#39;goto {ins[1]}&#39;
+    if op == &#39;load&#39;:
+        return f&#39;{ins[3]} = {op_str(ins[1])}[{op_str(ins[2])}]&#39;
+    if op == &#39;store&#39;:
+        return f&#39;{op_str(ins[1])}[{op_str(ins[2])}] = {op_str(ins[3])}&#39;
+    if op == &#39;return&#39;:
+        return f&#39;return {op_str(ins[1])}&#39;
+    return str(ins)
+
+
+def def_use(ins):
+    op = ins[0]
+    if op == &#39;copy&#39;:
+        return ins[3], [ins[1]]
+    if op in BIN:
+        return ins[3], [ins[1], ins[2]]
+    if op == &#39;cmp&#39;:
+        return ins[4], [ins[2], ins[3]]
+    if op == &#39;load&#39;:
+        return ins[3], [ins[1], ins[2]]
+    if op == &#39;store&#39;:
+        return None, [ins[1], ins[2], ins[3]]          # 有副作用：不能删
+    if op in (&#39;ifgoto&#39;, &#39;return&#39;):
+        return None, [ins[1]]
+    return None, []
+
+
+def show(prog, title):
+    print(title)
+    for b in prog:
+        for ins in prog[b]:
+            print(f&#39;  {b}: {fmt(ins)}&#39;)
+
+
+def subst(ins, old, new):
+    &quot;&quot;&quot;把指令里所有&quot;使用 old&quot;的操作数换成 new（定义名是裸字符串，不动）&quot;&quot;&quot;
+    out = []
+    for x in ins:
+        if isinstance(x, tuple) and x[0] == &#39;name&#39; and x[1] == old:
+            out.append(nm(new))
+        elif isinstance(x, list):
+            out.append([nm(new) if (isinstance(y, tuple) and y[0] == &#39;name&#39; and y[1] == old) else y
+                        for y in x])
+        else:
+            out.append(x)
+    return tuple(out)
+
+
+# ============ 第一部分：归纳变量 + 强度削减（i*4 → 每轮加 4）============
+# 循环：for (i = 0; i &lt; n; i = i + 1) A[i * 4] = A[i * 4] + 1;
+LOOP = {
+    &#39;B1&#39;: [(&#39;copy&#39;, ct(0), None, &#39;i&#39;), (&#39;goto&#39;, &#39;B2&#39;)],
+    &#39;B2&#39;: [(&#39;cmp&#39;, &#39;&lt;&#39;, nm(&#39;i&#39;), nm(&#39;n&#39;), &#39;t1&#39;),
+           (&#39;ifgoto&#39;, nm(&#39;t1&#39;), &#39;B3&#39;, &#39;B5&#39;)],
+    &#39;B3&#39;: [(&#39;mul&#39;, nm(&#39;i&#39;), ct(4), &#39;t2&#39;),
+           (&#39;load&#39;, nm(&#39;A&#39;), nm(&#39;t2&#39;), &#39;x&#39;),
+           (&#39;add&#39;, nm(&#39;x&#39;), ct(1), &#39;y&#39;),
+           (&#39;store&#39;, nm(&#39;A&#39;), nm(&#39;t2&#39;), nm(&#39;y&#39;)),
+           (&#39;add&#39;, nm(&#39;i&#39;), ct(1), &#39;i&#39;),
+           (&#39;goto&#39;, &#39;B2&#39;)],
+    &#39;B5&#39;: [(&#39;return&#39;, ct(0))],
+}
+
+
+def strength_reduce(prog, iv, step, pre=&#39;B1&#39;, latch=&#39;B3&#39;):
+    &quot;&quot;&quot;iv: 归纳变量名；step: 每轮步长；把循环内 iv*常量 换成累加变量&quot;&quot;&quot;
+    init = 0
+    for ins in prog[pre]:
+        if ins[0] == &#39;copy&#39; and ins[3] == iv and ins[1][0] == &#39;const&#39;:
+            init = ins[1][1]
+    report, loop_blocks = [], [b for b in prog if b not in (pre,)]
+    for b in list(prog):
+        for ins in [x for x in prog[b] if x[0] == &#39;mul&#39; and x[1] == nm(iv) and x[2][0] == &#39;const&#39;]:
+            m, t, p = ins[2][1], ins[3], f&#39;p_{ins[3]}&#39;
+            for bb in loop_blocks:                      # 循环内所有用到 t 的地方改读 p
+                prog[bb] = [subst(x, t, p) for x in prog[bb]]
+            prog[b] = [x for x in prog[b] if x != ins]  # 删掉乘法本身
+            pos = len(prog[pre]) - 1                    # 循环前算一次初值
+            prog[pre] = prog[pre][:pos] + [(&#39;copy&#39;, ct(init * m), None, p)] + prog[pre][pos:]
+            prog[latch] = prog[latch][:-1] + [(&#39;add&#39;, nm(p), ct(step * m), p)] + [prog[latch][-1]]
+            report.append(f&#39;  {iv} 每轮 +{step}，{fmt(ins)} 的右值每轮固定加 {step * m} → &#39;
+                          f&#39;用累加变量 {p}（初值 {init * m}）代替&#39;)
+    return prog, report
+
+
+print(&#39;=== 强度削减：把循环里的乘法换成加法 ===&#39;)
+show(LOOP, &#39;削减前：&#39;)
+reduced, rep = strength_reduce({b: list(v) for b, v in LOOP.items()}, &#39;i&#39;, 1)
+for line in rep:
+    print(line)
+show(reduced, &#39;削减后：&#39;)
+count = lambda body, op: sum(1 for i in body if i[0] == op)
+print(f&#39;  循环体内乘法：{count(LOOP[&quot;B3&quot;], &quot;mul&quot;)} → {count(reduced[&quot;B3&quot;], &quot;mul&quot;)}；&#39;
+      f&#39;循环体内加法：{count(LOOP[&quot;B3&quot;], &quot;add&quot;)} → {count(reduced[&quot;B3&quot;], &quot;add&quot;)}&#39;
+      f&#39;（多出来的是累加变量的自增）\n&#39;)
+
+# ============ 第二部分：循环展开（因子 2 + 余数循环）============
+BODY = [(&#39;mul&#39;, nm(&#39;@i@&#39;), ct(4), &#39;off&#39;),
+        (&#39;load&#39;, nm(&#39;A&#39;), nm(&#39;off&#39;), &#39;x&#39;),
+        (&#39;add&#39;, nm(&#39;x&#39;), ct(1), &#39;y&#39;),
+        (&#39;store&#39;, nm(&#39;A&#39;), nm(&#39;off&#39;), nm(&#39;y&#39;))]
+
+
+def rename(instrs, suffix, index=&#39;i&#39;):
+    d = {&#39;@i@&#39;: index, &#39;off&#39;: f&#39;off{suffix}&#39;, &#39;x&#39;: f&#39;x{suffix}&#39;, &#39;y&#39;: f&#39;y{suffix}&#39;}
+
+    def opd(x):
+        return nm(d[x[1]]) if x and x[0] == &#39;name&#39; and x[1] in d else x
+    out = []
+    for ins in instrs:
+        op = ins[0]
+        if op == &#39;mul&#39;:
+            out.append((&#39;mul&#39;, opd(ins[1]), ins[2], d.get(ins[3], ins[3])))
+        elif op == &#39;load&#39;:
+            out.append((&#39;load&#39;, ins[1], opd(ins[2]), d.get(ins[3], ins[3])))
+        elif op == &#39;add&#39;:
+            out.append((&#39;add&#39;, opd(ins[1]), ins[2], d.get(ins[3], ins[3])))
+        elif op == &#39;store&#39;:
+            out.append((&#39;store&#39;, ins[1], opd(ins[2]), opd(ins[3])))
+    return out
+
+
+unrolled = {
+    &#39;B1&#39;: [(&#39;copy&#39;, ct(0), None, &#39;i&#39;), (&#39;goto&#39;, &#39;B2&#39;)],
+    &#39;B2&#39;: [(&#39;add&#39;, nm(&#39;i&#39;), ct(1), &#39;i_next&#39;),
+           (&#39;cmp&#39;, &#39;&lt;&#39;, nm(&#39;i_next&#39;), nm(&#39;n&#39;), &#39;c2&#39;),
+           (&#39;ifgoto&#39;, nm(&#39;c2&#39;), &#39;B3&#39;, &#39;B4&#39;)],
+    &#39;B3&#39;: rename(BODY, &#39;_1&#39;) + [(&#39;add&#39;, nm(&#39;i&#39;), ct(1), &#39;i&#39;)] +
+          rename(BODY, &#39;_2&#39;) + [(&#39;add&#39;, nm(&#39;i&#39;), ct(1), &#39;i&#39;), (&#39;goto&#39;, &#39;B2&#39;)],
+    &#39;B4&#39;: [(&#39;cmp&#39;, &#39;&lt;&#39;, nm(&#39;i&#39;), nm(&#39;n&#39;), &#39;c1&#39;),
+           (&#39;ifgoto&#39;, nm(&#39;c1&#39;), &#39;B5&#39;, &#39;B6&#39;)],
+    &#39;B5&#39;: rename(BODY, &#39;_r&#39;) + [(&#39;add&#39;, nm(&#39;i&#39;), ct(1), &#39;i&#39;), (&#39;goto&#39;, &#39;B4&#39;)],
+    &#39;B6&#39;: [(&#39;return&#39;, ct(0))],
+}
+print(&#39;=== 循环展开（因子 2 + 余数循环兜住 0/1 个剩余迭代）===&#39;)
+show({&#39;B2&#39;: LOOP[&#39;B2&#39;], &#39;B3&#39;: LOOP[&#39;B3&#39;]}, &#39;展开前的一个循环：&#39;)
+show(unrolled, &#39;展开后：&#39;)
+print(f&#39;  主循环体指令：{len(LOOP[&quot;B3&quot;])} → {len(unrolled[&quot;B3&quot;])}&#39;
+      f&#39;（两份体各 {len(BODY)} 条 + 2 次自增 + 1 条回边）&#39;)
+print(f&#39;  每 2 次迭代的条件判断：2 次 → 1 次；代价：代码体积约 ×2（余数循环再补 &#39;
+      f&#39;{len(unrolled[&quot;B5&quot;])} 条），同时活跃的中间值变多 → 寄存器压力上升\n&#39;)
+
+# ============ 第三部分：向量化可行性检查 + tiling ============
+CAND = [
+    {&#39;name&#39;: &#39;L1  A[i] = B[i] + K&#39;, &#39;stride&#39;: 1, &#39;carried&#39;: False, &#39;trip_known&#39;: True, &#39;reduc&#39;: False},
+    {&#39;name&#39;: &#39;L2  A[i] = A[i-1] + 1&#39;, &#39;stride&#39;: 1, &#39;carried&#39;: True, &#39;trip_known&#39;: True, &#39;reduc&#39;: False},
+    {&#39;name&#39;: &#39;L3  A[4*i] = B[4*i] + K&#39;, &#39;stride&#39;: 4, &#39;carried&#39;: False, &#39;trip_known&#39;: True, &#39;reduc&#39;: False},
+    {&#39;name&#39;: &#39;L4  s = s + A[i]&#39;, &#39;stride&#39;: 1, &#39;carried&#39;: True, &#39;trip_known&#39;: True, &#39;reduc&#39;: True},
+    {&#39;name&#39;: &#39;L5  while (p) A[i] = *p, p = p-&gt;next&#39;, &#39;stride&#39;: 0, &#39;carried&#39;: True,
+     &#39;trip_known&#39;: False, &#39;reduc&#39;: False},
+]
+print(&#39;=== 向量化可行性检查（每条给结论与理由）===&#39;)
+for c in CAND:
+    if not c[&#39;trip_known&#39;]:
+        ok, why = False, &#39;循环次数未知且访问步长不固定（无法确定向量宽度与余数）&#39;
+    elif c[&#39;stride&#39;] != 1:
+        ok, why = False, f&#39;步长 {c[&quot;stride&quot;]} ≠ 1（跨步访问，需要 gather/scatter，代价模型通常否决）&#39;
+    elif c[&#39;carried&#39;] and not c[&#39;reduc&#39;]:
+        ok, why = False, &#39;存在循环携带依赖（第 i 次用到第 i-1 次的结果），不能并行重排&#39;
+    elif c[&#39;carried&#39;] and c[&#39;reduc&#39;]:
+        ok, why = True, &#39;是归约：整型可向量化（允许重排）；浮点需 fast-math 才允许重排&#39;
+    else:
+        ok, why = True, &#39;步长 1、无携带依赖 → 可向量化（若指针可能重叠，还需运行时指针检查）&#39;
+    print(f&#39;  {c[&quot;name&quot;]:&lt;40} {&quot;可&quot; if ok else &quot;否&quot;:&lt;2} ← {why}&#39;)
+
+print(&#39;\n=== tiling：把步长 1 的循环切成两层 ===&#39;)
+n, T = 1000, 8
+print(f&#39;  原循环：for i in 0..{n}: A[i] = B[i] + K        （每次迭代 1 次读 + 1 次写）&#39;)
+print(f&#39;  tiling：for io in 0..{n} step {T}: for ii in 0..{T}: A[io+ii] = B[io+ii] + K&#39;)
+print(f&#39;  外层 {n // T} 轮（{n} 能被 {T} 整除，无余数）× 内层 {T} 轮：&#39;
+      f&#39;内层正好 1 个向量宽度，可整块向量化&#39;)
+print(&#39;  对照：这个&quot;外层 tile + 内层连续&quot;的形状，与 GPU 上 tiling 后&#39;
+      &#39;&quot;块内线程沿连续维取数&quot;是同一件事的两种后端（见第 4 章 GPU tiling）&#39;)</code></pre>
+<p>运行结果：</p>
+<pre><code>=== 强度削减：把循环里的乘法换成加法 ===
+削减前：
+  B1: i = 0
+  B1: goto B2
+  B2: t1 = i &lt; n
+  B2: if t1 goto B3 else B5
+  B3: t2 = i mul 4
+  B3: x = A[t2]
+  B3: y = x add 1
+  B3: A[t2] = y
+  B3: i = i add 1
+  B3: goto B2
+  B5: return 0
+  i 每轮 +1，t2 = i mul 4 的右值每轮固定加 4 → 用累加变量 p_t2（初值 0）代替
+削减后：
+  B1: i = 0
+  B1: p_t2 = 0
+  B1: goto B2
+  B2: t1 = i &lt; n
+  B2: if t1 goto B3 else B5
+  B3: x = A[p_t2]
+  B3: y = x add 1
+  B3: A[p_t2] = y
+  B3: i = i add 1
+  B3: p_t2 = p_t2 add 4
+  B3: goto B2
+  B5: return 0
+  循环体内乘法：1 → 0；循环体内加法：2 → 3（多出来的是累加变量的自增）
+
+=== 循环展开（因子 2 + 余数循环兜住 0/1 个剩余迭代）===
+展开前的一个循环：
+  B2: t1 = i &lt; n
+  B2: if t1 goto B3 else B5
+  B3: t2 = i mul 4
+  B3: x = A[t2]
+  B3: y = x add 1
+  B3: A[t2] = y
+  B3: i = i add 1
+  B3: goto B2
+展开后：
+  B1: i = 0
+  B1: goto B2
+  B2: i_next = i add 1
+  B2: c2 = i_next &lt; n
+  B2: if c2 goto B3 else B4
+  B3: off_1 = i mul 4
+  B3: x_1 = A[off_1]
+  B3: y_1 = x_1 add 1
+  B3: A[off_1] = y_1
+  B3: i = i add 1
+  B3: off_2 = i mul 4
+  B3: x_2 = A[off_2]
+  B3: y_2 = x_2 add 1
+  B3: A[off_2] = y_2
+  B3: i = i add 1
+  B3: goto B2
+  B4: c1 = i &lt; n
+  B4: if c1 goto B5 else B6
+  B5: off_r = i mul 4
+  B5: x_r = A[off_r]
+  B5: y_r = x_r add 1
+  B5: A[off_r] = y_r
+  B5: i = i add 1
+  B5: goto B4
+  B6: return 0
+  主循环体指令：6 → 11（两份体各 4 条 + 2 次自增 + 1 条回边）
+  每 2 次迭代的条件判断：2 次 → 1 次；代价：代码体积约 ×2（余数循环再补 6 条），同时活跃的中间值变多 → 寄存器压力上升
+
+=== 向量化可行性检查（每条给结论与理由）===
+  L1  A[i] = B[i] + K                      可  ← 步长 1、无携带依赖 → 可向量化（若指针可能重叠，还需运行时指针检查）
+  L2  A[i] = A[i-1] + 1                    否  ← 存在循环携带依赖（第 i 次用到第 i-1 次的结果），不能并行重排
+  L3  A[4*i] = B[4*i] + K                  否  ← 步长 4 ≠ 1（跨步访问，需要 gather/scatter，代价模型通常否决）
+  L4  s = s + A[i]                         可  ← 是归约：整型可向量化（允许重排）；浮点需 fast-math 才允许重排
+  L5  while (p) A[i] = *p, p = p-&gt;next     否  ← 循环次数未知且访问步长不固定（无法确定向量宽度与余数）
+
+=== tiling：把步长 1 的循环切成两层 ===
+  原循环：for i in 0..1000: A[i] = B[i] + K        （每次迭代 1 次读 + 1 次写）
+  tiling：for io in 0..1000 step 8: for ii in 0..8: A[io+ii] = B[io+ii] + K
+  外层 125 轮（1000 能被 8 整除，无余数）× 内层 8 轮：内层正好 1 个向量宽度，可整块向量化
+  对照：这个&quot;外层 tile + 内层连续&quot;的形状，与 GPU 上 tiling 后&quot;块内线程沿连续维取数&quot;是同一件事的两种后端（见第 4 章 GPU tiling）</code></pre>
+<p>注意第二部分的余数循环 <code>B4</code>/<code>B5</code>：主循环在 <code>i + 1 &lt; n</code> 时每次吃 2 个元素，退出后由 <code>B4</code> 判断还剩 0 个还是 1 个——这就是&quot;展开必须补余数&quot;的具体写法。第三部分的检查器对 5 个候选循环给出可/否与理由，<code>L4</code>（归约）判定为&quot;可&quot;并注明浮点需要 fast-math。</p>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选（需本机有 clang / opt）：看真实向量化器的报告 ----
+#   clang -O2 -Rpass=loop-vectorize -Rpass-missed=loop-vectorize -Rpass-analysis=loop-vectorize vec.c
+#   opt -passes=&#39;loop-unroll,loop-vectorize&#39; -S vec.ll
+#   opt -passes=&#39;loop-vectorize&#39; -force-vector-width=8 -S vec.ll   # 强制宽度，绕开代价模型
+# 把本课 L1~L5 那五个循环写成 C 函数，就能看到谁的 remark 是 &quot;vectorized&quot;、谁的
+# remark 会指出 &quot;loop not vectorized: ...&quot;（例如存在跨迭代依赖）。没有 clang/opt
+# 不影响本课：上面的 Python 版把判据与理由逐条打印了出来。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：给 <code>strength_reduce</code> 增加 <code>base + i * m</code> 形式的支持（现在只处理裸 <code>i * m</code>），并处理 <code>i</code> 在循环体里被改写多次的情况——提示：按&quot;每轮回到 header 时 i 的净变化&quot;计算累加变量的步长。</li>
+<li><strong>解释</strong>：为什么展开能提升向量化的机会，而向量化本身又常常需要先做 partial unrolling（interleave）？两者各自解决的是&quot;哪种资源不够&quot;？</li>
+<li><strong>对比/验证</strong>：把 tiling 的 T 从 8 改成 7 再手算一遍（1000 = 142 × 7 + 6），说明为什么向量化必须补 epilogue；再把 <code>L1</code> 改成 <code>A[i] = A[i-1] + K</code> 跑检查器，观察结论与理由的变化。</li>
+<li><strong>思考</strong>：CPU 的 SIMD 宽度固定（一条指令处理固定个元素），GPU 的一个 warp 固定 32 个线程。为什么两边都要求&quot;内层循环连续访存&quot;？两边&quot;效率的来源&quot;分别是什么（一条指令搬多个元素 vs 一次访存覆盖连续地址）？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Aho, Lam, Sethi, Ullman, <em>Compilers: Principles, Techniques, and Tools</em>（龙书）第 9 章 §9.1「The Principal Sources of Optimization」（归纳变量与强度削减）：<a href="https://suif.stanford.edu/dragonbook/" target="_blank" rel="noopener noreferrer">https://suif.stanford.edu/dragonbook/</a></li>
+<li>LLVM <em>Auto-Vectorization in LLVM</em>（Loop Vectorizer 与 SLP 的分工、运行时指针检查、归约与 fast-math 限制、代价模型与 <code>-force-vector-width</code>、<code>-Rpass-*</code> 诊断）：<a href="https://llvm.org/docs/Vectorizers.html" target="_blank" rel="noopener noreferrer">https://llvm.org/docs/Vectorizers.html</a></li>
+<li>LLVM <em>Loop Terminology (and Canonical Forms)</em>（循环规范形态——preheader、单回边、专用出口，展开与向量化都依赖它）：<a href="https://llvm.org/docs/LoopTerminology.html" target="_blank" rel="noopener noreferrer">https://llvm.org/docs/LoopTerminology.html</a></li>
+<li>LLVM <code>opt</code> 命令行指南（<code>loop-unroll</code>、<code>loop-vectorize</code> 等 pass 的调用方式）：<a href="https://llvm.org/docs/CommandGuide/opt.html" target="_blank" rel="noopener noreferrer">https://llvm.org/docs/CommandGuide/opt.html</a></li>
+</ul>
+<p><a href="#/l/cf-ch5-l5">下一课：优化的正确性：如何证明一个 pass 没改语义</a></p>

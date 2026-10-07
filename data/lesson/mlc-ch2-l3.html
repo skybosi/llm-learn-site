@@ -1,0 +1,207 @@
+<h2 id="h-动态形状guard重编译与编译缓存">动态形状：guard、重编译与编译缓存<a class="anchor" href="#h-动态形状guard重编译与编译缓存" aria-label="本节链接">#</a></h2>
+<p>第 1 课里那条 <code>guard(&#39;T&#39;, &#39;命中分支&#39;)</code> 节点埋着一个麻烦：编译器为了生成高效代码，需要<strong>具体的 shape 与 dtype</strong>（决定 tile、向量化宽度、寄存器占用）；而推理服务的输入长度天然是变的——今天 128、明天 300，同一个函数就落进不同的编译假设。于是每个前端都要回答三个问题：<strong>这次编译结果在什么条件下才有效（guard）、条件不成立时怎么办（重编译）、结果存在哪里复用（缓存）</strong>。本课用纯标准库实现一个编译器式 shape 缓存，把&quot;特化 / 桶化 / 符号形状&quot;三种策略的编译次数与补零代价算成表。</p>
+<p><figure><img class="md-img" src="content/courses/ml-compilers/assets/chapter-2-figure-02.svg" alt="一次执行触发图断裂的全过程" loading="lazy" decoding="async"><figcaption>一次执行触发图断裂的全过程</figcaption></figure>
+</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-什么时候必须按具体形状编译">1. 什么时候必须按具体形状编译<a class="anchor" href="#h-1-什么时候必须按具体形状编译" aria-label="本节链接">#</a></h4>
+<p>代码生成要做两类决定：<strong>循环怎么切</strong>（tile 大小、展开因子、向量宽度）和<strong>内存怎么算</strong>（要几个缓冲、偏移怎么算）。两者都依赖 shape 的<strong>具体值</strong>，而不仅是 rank。一个 <code>(B,T)</code> 的 GEMM，<code>T=128</code> 时适合的 tile 与 <code>T=4096</code> 时不同；<code>T</code> 是符号时，生成器只能写出&quot;通用循环&quot;，把 tiling 交给运行时的动态分支。</p>
+<p>所以&quot;支持动态形状&quot;实际是&quot;<strong>允许同一份编译结果服务于一批不同的具体形状</strong>&quot;，前提是你敢为这批形状的共同点作保。这个&quot;作保&quot;就是 guard。</p>
+<h4 id="h-2-guard-的三件套">2. guard 的三件套<a class="anchor" href="#h-2-guard-的三件套" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>组件</th>
+<th>内容</th>
+<th>例子</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>条件</td>
+<td>一组关于输入的判断</td>
+<td><code>dtype == float32</code>、<code>rank == 2</code>、<code>T % 16 == 0</code></td>
+</tr>
+<tr>
+<td>key</td>
+<td>由条件求值出的缓存标识</td>
+<td><code>(float32, 2, 128)</code></td>
+</tr>
+<tr>
+<td>动作</td>
+<td>命中 → 直接跑；未命中 → 编译新版本并记入缓存</td>
+<td>命中率决定&quot;编译开销摊薄了几次&quot;</td>
+</tr>
+</tbody></table>
+<p>粒度是设计变量：<code>rank==2 &amp; dtype==f32</code> 粗而稳，命中率高但代码通用性差；<code>T==300</code> 细而准，命中率高时很划算，形状频繁变化时就把缓存放满了。<strong>guard 的粒度直接等价于&quot;缓存条目数 × 单条代码质量&quot;这个乘积的取舍。</strong></p>
+<h4 id="h-3-三种抓-shape-的策略">3. 三种抓 shape 的策略<a class="anchor" href="#h-3-三种抓-shape-的策略" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>策略</th>
+<th>编译次数随时间</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>按形状特化</td>
+<td>每种 shape 一次，最坏 O(N)</td>
+<td>缓存膨胀、重编译风暴</td>
+</tr>
+<tr>
+<td>桶化</td>
+<td>按档位取整，最多是档位数</td>
+<td>补零浪费算力</td>
+</tr>
+<tr>
+<td>符号形状</td>
+<td>rank 相同就共用一份</td>
+<td>代码通用性下降，运行时多分支</td>
+</tr>
+</tbody></table>
+<p>桶化的账可以手算：序列长度 <code>[100,130,200,257,300]</code>、档位取 2 的幂 <code>{1…512}</code> 时，被算成 <code>128+256+256+512+512=1664</code> 个元素，而真实需要 987 个——<strong>多算 68.6%</strong>。档位放到 <code>{1024}</code> 这一档，变成 5120 个，多算 418.7%。<strong>桶越粗，编译越少，算力浪费越大</strong>，这就是要拿实测数字调的那条曲线。</p>
+<p><figure><img class="md-img" src="content/courses/ml-compilers/assets/chapter-2-figure-04.svg" alt="三种抓 shape 策略的取舍：按形状特化、桶化、符号形状，桶越粗编译越少但浪费越大" loading="lazy" decoding="async"><figcaption>三种抓 shape 策略的取舍：按形状特化、桶化、符号形状，桶越粗编译越少但浪费越大</figcaption></figure>
+</p>
+<h4 id="h-4-重编译风暴与缓存上限">4. 重编译风暴与缓存上限<a class="anchor" href="#h-4-重编译风暴与缓存上限" aria-label="本节链接">#</a></h4>
+<p>最坏的情况不是&quot;形状多&quot;，而是&quot;形状在两个值之间来回跳&quot;。本课实验：100 次调用、两种形状交替、缓存上限为 1 时，<strong>每次调用都重编译（100 次）</strong>；上限放到 2 以上，只需 2 次编译。这正是深度学习框架里 <code>recompile_limit</code> 一类配置要防的场景——它通常不解决&quot;编译慢&quot;，而是把&quot;抖动&quot;变成显式的报错或警告，让使用者去固定形状。</p>
+<h4 id="h-5-常见坑">5. 常见坑<a class="anchor" href="#h-5-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>以为 guard 是免费的</strong>：每次调用都要把 guard 条件求值一遍，条件集越大、&quot;检查&quot;本身越贵。</li>
+<li><strong>把缓存上限当成性能旋钮</strong>：调大上限只是不报错，形状抖动时的编译开销照旧；真正的解法是固定形状或桶化。</li>
+<li><strong>忽略 dtype/device 也在 guard 里</strong>：混用 fp32/fp16 或在 CPU/GPU 间搬张量，会各自触发一次编译。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面用纯标准库（本机 python3.10 与 python3.14 输出一致）实现一个 <code>ShapeCache</code>：<code>mode</code> 决定 key 怎么算，<code>run()</code> 模拟&quot;一次调用&quot;，统计编译次数、命中次数与补零浪费。</p>
+<pre data-lang="python"><code class="language-python"># ===== 动态形状：guard 命中率、桶化与&quot;重编译风暴&quot;的定量对照 =====
+# 纯标准库实现（本机 python3.10 与 python3.14 输出一致）
+import collections
+
+# ---------- 1. 一个极简编译缓存：key = guard 的条件集合 ----------
+class ShapeCache:
+    def __init__(self, mode, buckets=None):
+        buckets = buckets or (1, 2, 4, 8, 16, 32, 64, 128)
+        self.mode, self.buckets = mode, tuple(buckets)
+        self.cache, self.compiles, self.hits, self.pad_elems = {}, 0, 0, 0
+        self.real_elems = 0
+
+    def bucket(self, n):
+        for b in self.buckets:
+            if n &lt;= b: return b
+        return n                                     # 超出档位表就按原值算
+
+    def key(self, shape):
+        if self.mode == &#39;specialize&#39;:
+            return shape                             # 精确 guard：每个形状一条
+        if self.mode == &#39;bucket&#39;:
+            return tuple(self.bucket(n) for n in shape)
+        return (&#39;*&#39;,) * len(shape)                   # 符号形状：同 rank 共用一个 key
+
+    def run(self, shape):
+        k = self.key(shape)
+        eff = tuple(self.bucket(n) for n in shape) if self.mode == &#39;bucket&#39; else shape
+        elems, real = eff[0] * eff[1], shape[0] * shape[1]
+        if k in self.cache:
+            self.hits += 1
+        else:
+            self.cache[k] = elems; self.compiles += 1
+        self.pad_elems += elems - real               # 只为补零多算的部分
+        self.real_elems += real
+        return elems
+
+# ---------- 2. 三种策略跑同一串输入 ----------
+SHAPES = [(8, 128), (8, 128), (10, 200), (16, 128), (8, 128), (12, 300), (10, 200), (24, 512), (8, 128)]
+BIG = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512)
+print(&#39;=== 同一串 9 次调用（shape 见下），三种抓 shape 策略的账 ===&#39;)
+print(&#39;  调用序列：&#39;, &#39; &#39;.join(f&#39;{a}x{b}&#39; for a, b in SHAPES))
+for mode, name in ((&#39;specialize&#39;, &#39;按形状特化&#39;), (&#39;bucket&#39;, &#39;桶化（2 的幂档位）&#39;), (&#39;symbolic&#39;, &#39;符号形状（一个 key）&#39;)):
+    c = ShapeCache(mode, BIG)
+    for sh in SHAPES: c.run(sh)
+    waste = c.pad_elems / c.real_elems if c.real_elems else 0.0
+    print(f&#39;  {name:&lt;22} 编译 {c.compiles} 次（缓存 {len(c.cache)} 项），命中 {c.hits} 次，&#39;
+          f&#39;为补零多算 {waste:+.1%}&#39;)
+
+# ---------- 3. 重编译风暴：N 种形状逐个变，编译次数随 N 增长 ----------
+print(&#39;\n=== 形状每次都不一样（最坏情况）时，编译次数的增长 ===&#39;)
+for N in (1, 4, 16, 64, 256):
+    shapes = [(4, 100 + i) for i in range(N)]
+    line = f&#39;  N={N:&gt;3}  &#39;
+    for mode in (&#39;specialize&#39;, &#39;bucket&#39;, &#39;symbolic&#39;):
+        c = ShapeCache(mode)
+        for sh in shapes: c.run(sh)
+        line += f&#39;{mode:&lt;11} 编译 {c.compiles:&gt;3} 次   &#39;
+    print(line)
+
+# ---------- 4. 桶化的补零浪费：档位越粗，省编译但费算力 ----------
+def waste(buckets, sizes):
+    tot = sum(next((b for b in buckets if b &gt;= n), n) for n in sizes)
+    return tot, sum(sizes)
+for buckets in ((1, 2, 4, 8, 16, 32, 64, 128), (1, 2, 4, 8, 16, 32, 64, 128, 256, 512), (128, 512), (1024,)):
+    pad, real = waste(buckets, [100, 130, 200, 257, 300])
+    print(f&#39;\n  档位 {buckets}：长度 {[100,130,200,257,300]} 被算成 {pad} 个元素，&#39;
+          f&#39;真实需要 {real}，多算 {pad / real - 1:+.1%}&#39;)
+
+# ---------- 5. guard 失败之后：缓存上限一到就&quot;抖动&quot;（compile → evict → compile） ----------
+def steady_state(cache_limit, pattern=(&#39;a&#39;, &#39;b&#39;)):
+    cache, compiled = collections.OrderedDict(), 0
+    for step in range(100):
+        k = pattern[step % len(pattern)]
+        if k in cache:
+            cache.move_to_end(k)
+        else:
+            compiled += 1
+            if len(cache) &gt;= cache_limit: cache.popitem(last=False)
+            cache[k] = True
+    return compiled
+print(&#39;\n=== 100 次调用在两种形状之间交替，缓存上限的影响 ===&#39;)
+for limit in (1, 2, 4, 64):
+    n = steady_state(limit)
+    note = &#39;（上限放不下两个 key，于是每次都重编译）&#39; if limit &lt; 2 else &#39;&#39;
+    print(f&#39;  缓存上限 {limit:&gt;2}：100 次调用共编译 {n:&gt;3} 次{note}&#39;)</code></pre>
+<p>实际运行结果（python3.10.16，与 python3.14.5 一致）：</p>
+<pre data-lang="text"><code class="language-text">=== 同一串 9 次调用（shape 见下），三种抓 shape 策略的账 ===
+  调用序列： 8x128 8x128 10x200 16x128 8x128 12x300 10x200 24x512 8x128
+  按形状特化                  编译 5 次（缓存 5 项），命中 4 次，为补零多算 +0.0%
+  桶化（2 的幂档位）             编译 5 次（缓存 5 项），命中 4 次，为补零多算 +49.5%
+  符号形状（一个 key）           编译 1 次（缓存 1 项），命中 8 次，为补零多算 +0.0%
+
+=== 形状每次都不一样（最坏情况）时，编译次数的增长 ===
+  N=  1  specialize  编译   1 次   bucket      编译   1 次   symbolic    编译   1 次   
+  N=  4  specialize  编译   4 次   bucket      编译   1 次   symbolic    编译   1 次   
+  N= 16  specialize  编译  16 次   bucket      编译   1 次   symbolic    编译   1 次   
+  N= 64  specialize  编译  64 次   bucket      编译  36 次   symbolic    编译   1 次   
+  N=256  specialize  编译 256 次   bucket      编译 228 次   symbolic    编译   1 次   
+
+  档位 (1, 2, 4, 8, 16, 32, 64, 128)：长度 [100, 130, 200, 257, 300] 被算成 1015 个元素，真实需要 987，多算 +2.8%
+
+  档位 (1, 2, 4, 8, 16, 32, 64, 128, 256, 512)：长度 [100, 130, 200, 257, 300] 被算成 1664 个元素，真实需要 987，多算 +68.6%
+
+  档位 (128, 512)：长度 [100, 130, 200, 257, 300] 被算成 2176 个元素，真实需要 987，多算 +120.5%
+
+  档位 (1024,)：长度 [100, 130, 200, 257, 300] 被算成 5120 个元素，真实需要 987，多算 +418.7%
+
+=== 100 次调用在两种形状之间交替，缓存上限的影响 ===
+  缓存上限  1：100 次调用共编译 100 次（上限放不下两个 key，于是每次都重编译）
+  缓存上限  2：100 次调用共编译   2 次
+  缓存上限  4：100 次调用共编译   2 次
+  缓存上限 64：100 次调用共编译   2 次</code></pre>
+<p>三张表各说一件事。<strong>第一张</strong>：同一串 9 次调用，特化与桶化都编译 5 次，但桶化多算 49.5% 的零——桶化的价值不在&quot;少编译&quot;，而在&quot;形状连续变化时最多只编译档位数那么多次&quot;。<strong>第二张</strong>是那个边界：形状每次都不重复时，特化是 O(N)（N=256 就编译 256 次），桶化被档位表兜住（228 次），符号形状恒定 1 次。<strong>第三张</strong>：档位从&quot;2 的幂到 128&quot;放宽到&quot;单一 1024&quot;，多算从 2.8% 涨到 418.7%——<strong>档位表就是&quot;编译次数换算力浪费&quot;的那个旋钮</strong>。最后一张表是工程现场最常见的坑：缓存上限为 1 时两种形状交替，100 次调用触发 100 次编译。</p>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选，需自备能装 torch 的环境（本机未装 torch）----
+# 官方工具里看真实的 guard 与重编译（会打印 shape 相关的 guard 条件与重编译次数）：
+#   TORCH_LOGS=guards,recompiles python3 demo.py
+# demo.py：用 torch.compile 包一个对 (B,T) 敏感的算子，然后依次喂 T=128、256、300。
+# 想直接控制动态形状标记：torch._dynamo.mark_dynamic(x, 1) 之后重跑，观察编译次数变化；
+# 相关配置项（如重编译上限）以本机 torch._dynamo.config 打印出的字段名为准。
+# 没有 torch 也能完成本课：上面的 ShapeCache 已把三种策略的账算完。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：给 <code>ShapeCache</code> 加第四种模式 <code>bucket+shape</code>——按档位建 key，但把真实 shape 也记进同一 key 的集合，命中时检查是否首次见到该精确 shape；统计这样能省下多少编译、又丢了多少命中。</li>
+<li><strong>解释</strong>：为什么&quot;缓存上限调大&quot;不能解决重编译风暴？在什么真实场景下形状会来回抖动（提示：变长序列 + padding 策略）？</li>
+<li><strong>对比/验证</strong>：把 <code>SHAPES</code> 换成连续变化的 64 个形状，重跑第二张表；解释 <code>mode=&#39;bucket&#39;</code> 的编译次数为什么是 36 而不是 64。</li>
+<li><strong>思考</strong>：如果给一个 transformer 推理服务定编译策略，你会选符号形状 + 桶化中的哪一个组合？用本课的&quot;编译次数 / 补零浪费&quot;两组数字说明取舍。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>PyTorch 官方文档, <em>torch.compiler_dynamic_shapes</em>（动态形状的行为、guard 与重编译、<code>mark_dynamic</code> 一类控制手段）：<a href="https://docs.pytorch.org/docs/stable/torch.compiler_dynamic_shapes.html" target="_blank" rel="noopener noreferrer">https://docs.pytorch.org/docs/stable/torch.compiler_dynamic_shapes.html</a></li>
+<li>PyTorch 官方文档, <em>torch.compiler_dynamo_deepdive</em>（Dynamo 在字节码层产生 guard 的位置与粒度）：<a href="https://docs.pytorch.org/docs/stable/torch.compiler_dynamo_deepdive.html" target="_blank" rel="noopener noreferrer">https://docs.pytorch.org/docs/stable/torch.compiler_dynamo_deepdive.html</a></li>
+<li>JAX 官方文档, <em>Just-in-time compilation</em>（<code>jit</code> 的静态与抽象求值、形状如何参与编译与缓存）：<a href="https://jax.readthedocs.io/en/latest/jit-compilation.html" target="_blank" rel="noopener noreferrer">https://jax.readthedocs.io/en/latest/jit-compilation.html</a></li>
+<li>Chen 等, <em>TVM: An Automated End-to-End Optimizing Compiler for Deep Learning</em>（OSDI&#39;18；静态 shape 假设与算子调度参数的关系）：<a href="https://www.usenix.org/conference/osdi18/presentation/chen" target="_blank" rel="noopener noreferrer">https://www.usenix.org/conference/osdi18/presentation/chen</a></li>
+</ul>
+<p><a href="#/l/mlc-ch2-l4">下一课：图断裂（graph break）——成因、代价与诊断</a></p>

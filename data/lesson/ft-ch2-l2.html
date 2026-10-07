@@ -1,0 +1,148 @@
+<h2 id="h-数据准备">数据准备<a class="anchor" href="#h-数据准备" aria-label="本节链接">#</a></h2>
+<p>微调效果的上限，很大程度由数据决定——&quot;垃圾进，垃圾出&quot;在微调里体现得尤其明显。本课讲清指令微调（SFT）数据的<strong>格式、质量、清洗与分词</strong>这一整套准备流程。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-sft-数据长什么样">1. SFT 数据长什么样<a class="anchor" href="#h-1-sft-数据长什么样" aria-label="本节链接">#</a></h4>
+<p>指令微调数据最常见的结构是&quot;指令 + 输入 + 输出&quot;三元组：</p>
+<pre data-lang="text"><code class="language-text">instruction（指令）: 让模型做什么
+input（输入）:       可选的任务上下文
+output（输出）:      期望的参考答案</code></pre>
+<p>一个典型样本：</p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>内容</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>instruction</td>
+<td>把下面的句子翻译成英文</td>
+</tr>
+<tr>
+<td>input</td>
+<td>今天天气很好。</td>
+</tr>
+<tr>
+<td>output</td>
+<td>The weather is nice today.</td>
+</tr>
+</tbody></table>
+<p>在训练时，这些字段会被拼成一段<strong>对话（chat）格式</strong>文本，并用 chat template 编码，再按&quot;只对回答部分算损失&quot;的方式做标签掩码（上一课已讲）。字段本身不必拘泥于这三个名字，核心是&quot;<strong>给模型一段上下文，教它输出什么</strong>&quot;。</p>
+<p><figure><img class="md-img" src="content/courses/llm-fine-tuning/assets/chapter-2-figure-03.svg" alt="SFT 样本的 instruction/input/output 结构" loading="lazy" decoding="async"><figcaption>SFT 样本的 instruction/input/output 结构</figcaption></figure>
+</p>
+<h4 id="h-2-数据质量比数据量更重要">2. 数据质量比数据量更重要<a class="anchor" href="#h-2-数据质量比数据量更重要" aria-label="本节链接">#</a></h4>
+<p>一个常见的误区是&quot;数据越多越好&quot;。对 SFT 而言，<strong>几千到几万条高质量、多样、覆盖目标分布的样本</strong>，往往比几十万条低质量样本更有效。质量维度包括：</p>
+<ul>
+<li><strong>正确性</strong>：参考答案本身要准确，否则模型会学到错误行为。</li>
+<li><strong>格式一致</strong>：同类任务输出格式要统一（例如都用 JSON、都用&quot;结论 + 理由&quot;）。</li>
+<li><strong>多样性</strong>：覆盖不同的指令类型、表达方式、难度，避免模型过拟合单一模板。</li>
+<li><strong>与目标一致</strong>：答案要符合你期望的语气、长度、风格。</li>
+<li><strong>无泄露/无污染</strong>：剔除与评测集重复的样本，避免&quot;背答案&quot;假象。</li>
+</ul>
+<h4 id="h-3-数据清洗流水线">3. 数据清洗流水线<a class="anchor" href="#h-3-数据清洗流水线" aria-label="本节链接">#</a></h4>
+<p>拿到原始数据后，一般按顺序做：</p>
+<ol>
+<li><strong>去重</strong>：按文本相似度去重，去掉重复样本（重复会放大某些模式、导致过拟合）。</li>
+<li><strong>长度过滤</strong>：过滤过长/过短样本，避免超长序列浪费显存、过短样本无信息量。</li>
+<li><strong>语言/格式过滤</strong>：剔除乱码、非目标语言、HTML 标签残留等。</li>
+<li><strong>规则过滤</strong>：按业务规则剔除不合规内容（隐私、敏感词等）。</li>
+<li><strong>质量打分</strong>：用规则或模型对样本打分，保留高分样本（例如用大模型评估&quot;回答是否优质&quot;）。</li>
+<li><strong>去污染</strong>：与评测集做 n-gram 重叠检测，去掉重复的污染样本。</li>
+</ol>
+<h4 id="h-4-数据配比与混合">4. 数据配比与混合<a class="anchor" href="#h-4-数据配比与混合" aria-label="本节链接">#</a></h4>
+<p>如果数据来自多个任务/领域，需要控制<strong>配比</strong>。例如：70% 主任务 + 20% 通用对话 + 10% 其他任务。混入少量通用数据能缓解灾难性遗忘；给核心任务更高权重能保证重点能力。配比是&quot;调出来的&quot;，通常要配合在验证集上的评测来迭代。</p>
+<h4 id="h-5-训练验证划分与分词">5. 训练/验证划分与分词<a class="anchor" href="#h-5-训练验证划分与分词" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>划分</strong>：留出一部分数据做验证集（如 5%–10%），用于监控过拟合、选超参数和早停。划分时注意<strong>不要</strong>让验证集和训练集有内容重叠。</li>
+<li><strong>分词与 chat template</strong>：用模型对应的 <code>apply_chat_template</code> 把样本转成模型训练时看到的文本格式，再 tokenize。不同模型的 chat template 不同，<strong>必须用配套的模板</strong>，否则格式错配会显著损害效果。</li>
+<li><strong>padding/截断</strong>：batch 内 padding 到最大长度，超长序列按 <code>truncation</code> 截断；label 中对 padding 位置同样置 -100。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面演示一个完整的&quot;从原始三元组到可分词的 Dataset&quot;流程。</p>
+<pre data-lang="python"><code class="language-python">from datasets import Dataset
+from transformers import AutoTokenizer
+
+tokenizer = AutoTokenizer.from_pretrained(&quot;Qwen/Qwen2.5-0.5B&quot;)
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+
+# 1) 原始 SFT 数据（instruction / input / output）
+raw = [
+    {&quot;instruction&quot;: &quot;把下面的句子翻译成英文&quot;, &quot;input&quot;: &quot;今天天气很好。&quot;, &quot;output&quot;: &quot;The weather is nice today.&quot;},
+    {&quot;instruction&quot;: &quot;把下面的句子翻译成英文&quot;, &quot;input&quot;: &quot;我喜欢学习编程。&quot;, &quot;output&quot;: &quot;I like learning to program.&quot;},
+    {&quot;instruction&quot;: &quot;总结下面这句话&quot;, &quot;input&quot;: &quot;模型在大量文本上预训练后，再用任务数据微调。&quot;, &quot;output&quot;: &quot;预训练后再微调。&quot;},
+    {&quot;instruction&quot;: &quot;总结下面这句话&quot;, &quot;input&quot;: &quot;下雨天道路湿滑，请减速慢行。&quot;, &quot;output&quot;: &quot;雨天路滑，注意减速。&quot;},
+]
+
+def build_messages(example):
+    &quot;&quot;&quot;把三元组转成 chat 消息列表&quot;&quot;&quot;
+    return {
+        &quot;messages&quot;: [
+            {&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: example[&quot;instruction&quot;] + &quot;\n&quot; + example[&quot;input&quot;]},
+            {&quot;role&quot;: &quot;assistant&quot;, &quot;content&quot;: example[&quot;output&quot;]},
+        ]
+    }
+
+dataset = Dataset.from_list(raw).map(build_messages)
+
+# 2) 用 chat template 拼接 + 分词，并构造 label 掩码
+def tokenize_fn(example):
+    # prompt 部分：只有 user 消息，末尾加生成提示
+    prompt_text = tokenizer.apply_chat_template(
+        example[&quot;messages&quot;][:-1], tokenize=False, add_generation_prompt=True
+    )
+    # 完整对话：user + assistant
+    full_text = tokenizer.apply_chat_template(example[&quot;messages&quot;], tokenize=False)
+
+    prompt_ids = tokenizer(prompt_text, add_special_tokens=False)[&quot;input_ids&quot;]
+    full_ids = tokenizer(full_text, add_special_tokens=False)[&quot;input_ids&quot;]
+
+    # prompt 部分不计算损失，置为 -100
+    labels = [-100] * len(prompt_ids) + full_ids[len(prompt_ids):]
+    return {&quot;input_ids&quot;: full_ids, &quot;labels&quot;: labels}
+
+tokenized = dataset.map(tokenize_fn, remove_columns=[&quot;messages&quot;, &quot;instruction&quot;, &quot;input&quot;, &quot;output&quot;])
+print(&quot;分词后的第一条样本：&quot;)
+print(&quot;  input_ids 长度:&quot;, len(tokenized[0][&quot;input_ids&quot;]))
+print(&quot;  前几个 label:&quot;, tokenized[0][&quot;labels&quot;][:5], &quot;（-100 表示 prompt 部分不参与损失）&quot;)</code></pre>
+<p>再演示两个数据准备中的常见操作：<strong>去重</strong> 和 <strong>长度过滤</strong>。</p>
+<pre data-lang="python"><code class="language-python"># 3) 去重：按 instruction 文本去重（真实场景可用语义相似度）
+def dedup(rows):
+    seen, kept = set(), []
+    for r in rows:
+        key = r[&quot;instruction&quot;].strip()
+        if key not in seen:
+            seen.add(key)
+            kept.append(r)
+    return kept
+
+raw_dup = raw + [raw[0]]   # 故意加入一条重复样本
+print(&quot;\n去重前样本数:&quot;, len(raw_dup), &quot; 去重后样本数:&quot;, len(dedup(raw_dup)))
+
+# 4) 长度过滤：过滤输出过短或过长的样本（阈值按业务定）
+def length_ok(example, min_len=4, max_len=256):
+    n = len(example[&quot;output&quot;])
+    return min_len &lt;= n &lt;= max_len
+
+filtered = [r for r in raw if length_ok(r)]
+print(&quot;长度过滤后样本数:&quot;, len(filtered))</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>填空</strong>：SFT 数据最常见的三元组结构是 <strong><strong>、</strong></strong>、____；训练时用 ____ 把样本拼成对话文本，并对 ____ 部分做 label 掩码（置 -100）。</li>
+<li><strong>判断</strong>：下列说法是否正确？为什么？<ul>
+<li>(a) 数据越多，微调效果一定越好。</li>
+<li>(b) 只要参考答案正确，输出格式不一致也没关系。</li>
+<li>(c) 验证集可以和训练集有部分重叠，只要比例不高。</li>
+</ul>
+</li>
+<li><strong>动手实验</strong>：给上面的 <code>raw</code> 增加一条<strong>格式不一致</strong>的样本（例如&quot;总结&quot;任务的 output 写成一整段冗长的话），思考：这种不一致会对模型学习产生什么影响？</li>
+<li><strong>思考题</strong>：为什么&quot;去污染&quot;（剔除与评测集重复的样本）很重要？如果不做，会出现什么评估假象？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Hugging Face Datasets 文档：<a href="https://huggingface.co/docs/datasets/index" target="_blank" rel="noopener noreferrer">https://huggingface.co/docs/datasets/index</a></li>
+<li>Hugging Face 指令微调教程（SFT）：<a href="https://huggingface.co/docs/transformers/training" target="_blank" rel="noopener noreferrer">https://huggingface.co/docs/transformers/training</a></li>
+<li>Hugging Face chat template 文档：<a href="https://huggingface.co/docs/transformers/chat_templating" target="_blank" rel="noopener noreferrer">https://huggingface.co/docs/transformers/chat_templating</a></li>
+<li>Alpaca 数据集论文（Stanford）：<a href="https://crfm.stanford.edu/2023/03/13/alpaca.html" target="_blank" rel="noopener noreferrer">https://crfm.stanford.edu/2023/03/13/alpaca.html</a></li>
+</ul>
+<p><a href="#/l/ft-ch2-l3">下一课：训练配置</a></p>

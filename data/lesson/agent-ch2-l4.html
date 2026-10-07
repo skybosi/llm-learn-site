@@ -1,0 +1,709 @@
+<h2 id="h-可观测性轨迹因果链每一步的输入输出与代价">可观测性：轨迹、因果链、每一步的输入输出与代价<a class="anchor" href="#h-可观测性轨迹因果链每一步的输入输出与代价" aria-label="本节链接">#</a></h2>
+<h3 id="h-这一节要解决什么">这一节要解决什么<a class="anchor" href="#h-这一节要解决什么" aria-label="本节链接">#</a></h3>
+<p>前三节把循环跑起来了、也停得下来了。现在面对一个更根本的问题：<strong>你怎么知道它为什么这么跑、为什么在这儿停？</strong></p>
+<p>一个 Agent 出了一次事故，你要回答的问题是具体的：</p>
+<pre><code>&quot;第 7 步它为什么调用了 send_email 而不是先做校验？&quot;
+&quot;它在第 7 步看到的那份数据，是从哪一步来的？&quot;
+&quot;这次运行比 p50 贵了 18 倍，钱花在哪一步？&quot;
+&quot;我把这个提示词改一个字，结论会变吗？&quot;</code></pre>
+<p>如果轨迹里没有对应的字段，<strong>这些问题一个都答不了</strong> —— 而它们正是第 7 章&quot;失效归因四象限&quot;的输入。</p>
+<p>这一节要把可观测性从&quot;打日志&quot;变成<strong>三个具体的数据结构问题</strong>：</p>
+<ol>
+<li><strong>轨迹（trace）</strong>：记什么字段？为什么它必须是&quot;事件流&quot;而不是&quot;最终状态&quot;？</li>
+<li><strong>因果链（causal chain）</strong>：怎么知道第 7 步用的信息来自第 3 步？这里有一个真正困难的技术点（引用 vs 复制）。</li>
+<li><strong>代价归因（cost attribution）</strong>：怎么找出&quot;最贵的步骤&quot;和&quot;被浪费的步骤&quot;？</li>
+<li><strong>可重放（replay）</strong>：<strong>确定性边界</strong>在哪里？什么能重放、什么永远不能？—— 这一节最需要诚实的地方。</li>
+</ol>
+<p>学完这一节你应该能回答：</p>
+<ul>
+<li>为什么&quot;在循环结束后把状态 dump 出来&quot;<strong>不能</strong>当作轨迹？</li>
+<li>日志里有全部的工具返回，为什么还是定位不了&quot;它为什么这么做&quot;？</li>
+<li>为什么 Agent 的成本归因必须能区分&quot;有效成本&quot;和&quot;无效成本&quot;？怎么自动识别无效步？</li>
+<li><code>temperature=0</code> 就能复现了吗？（答案是不能，原因不止一个。）</li>
+<li>为了让 L3 可重放，你的代码必须付出哪些额外的约束？</li>
+</ul>
+<h3 id="h-一可观测的四个层级以及每层的数据结构后果">一、可观测的四个层级，以及每层的数据结构后果<a class="anchor" href="#h-一可观测的四个层级以及每层的数据结构后果" aria-label="本节链接">#</a></h3>
+<p>第 1 章给过 L1~L4 的层级。这一节的关键补充是：<strong>每一层不是一个&quot;开关&quot;，而是一组具体的数据结构要求。</strong> 选错层级，不是&quot;记少了一点&quot;，而是&quot;问题从可答变成不可答&quot;。</p>
+<table>
+<thead>
+<tr>
+<th>层级</th>
+<th>数据结构要求</th>
+<th>能回答</th>
+<th><strong>不能</strong>回答</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>L1 事件轨迹</strong></td>
+<td>只追加的 step 事件流（每步一行）</td>
+<td>第几步？做了什么？花了多少？</td>
+<td>它为什么这么做？它看到了什么？</td>
+</tr>
+<tr>
+<td><strong>L2 因果链</strong></td>
+<td>每个决策输入片段带<strong>来源引用</strong>（<code>src=step3.result.x</code>）</td>
+<td>这个决定基于哪一步的哪个数据？</td>
+<td>换个参数结果会变吗？</td>
+</tr>
+<tr>
+<td><strong>L3 可重放</strong></td>
+<td>输入快照 + 模型配置 + 随机种子 + <strong>工具桩</strong></td>
+<td>微小改动的影响是什么？</td>
+<td>人工介入后它会怎么走？</td>
+</tr>
+<tr>
+<td><strong>L4 可干预</strong></td>
+<td>断点/暂停/状态恢复（与第 2.1 节的 Suspend 同构）</td>
+<td>我在这里纠正它会怎样？</td>
+<td>——</td>
+</tr>
+</tbody></table>
+<p><strong>回归本节的核心区分</strong>：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:2.0208em;vertical-align:-1.3263em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.6944em;"><span style="top:-1.6737em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">L1</span><span class="mord cjk_fallback mtight">，多数团队止步于此</span></span></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.6944em;"><span class="svg-align" style="top:-2.352em;"><span class="pstrut" style="height:3em;"></span><span class="stretchy" style="height:0.548em;min-width:1.6em;"><span class="brace-left" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMinYMin slice"><path d="M0 6l6-6h17c12.688 0 19.313.3 20 1 4 4 7.313 8.3 10 13
+ 35.313 51.3 80.813 93.8 136.5 127.5 55.688 33.7 117.188 55.8 184.5 66.5.688
+ 0 2 .3 4 1 18.688 2.7 76 4.3 172 5h399450v120H429l-6-1c-124.688-8-235-61.7
+-331-161C60.687 138.7 32.312 99.3 7 54L0 41V6z"/></svg></span><span class="brace-center" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMidYMin slice"><path d="M199572 214
+c100.7 8.3 195.3 44 280 108 55.3 42 101.7 93 139 153l9 14c2.7-4 5.7-8.7 9-14
+ 53.3-86.7 123.7-153 211-199 66.7-36 137.3-56.3 212-62h199568v120H200432c-178.3
+ 11.7-311.7 78.3-403 201-6 8-9.7 12-11 12-.7.7-6.7 1-18 1s-17.3-.3-18-1c-1.3 0
+-5-4-11-12-44.7-59.3-101.3-106.3-170-141s-145.3-54.3-229-60H0V214z"/></svg></span><span class="brace-right" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMaxYMin slice"><path d="M399994 0l6 6v35l-6 11c-56 104-135.3 181.3-238 232-57.3
+ 28.7-117 45-179 50H-300V214h399897c43.3-7 81-15 113-26 100.7-33 179.7-91 237
+-174 2.7-5 6-9 10-13 .7-1 7.3-1 20-1h17z"/></svg></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord text"><span class="mord cjk_fallback">记了</span><span class="mord">&quot;</span><span class="mord cjk_fallback">发生了什么</span><span class="mord">&quot;</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.648em;"><span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.3263em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:1em;"></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel"><span class="mrel"><span class="mord vbox"><span class="thinbox"><span class="rlap"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="inner"><span class="mord"><span class="mrel"></span></span></span><span class="fix"></span></span></span></span></span><span class="mspace nobreak"></span><span class="mrel">=</span></span><span class="mspace" style="margin-right:1em;"></span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.0208em;vertical-align:-1.3263em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.6944em;"><span style="top:-1.6737em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">L2 </span><span class="mord cjk_fallback mtight">起</span></span></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.6944em;"><span class="svg-align" style="top:-2.352em;"><span class="pstrut" style="height:3em;"></span><span class="stretchy" style="height:0.548em;min-width:1.6em;"><span class="brace-left" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMinYMin slice"><path d="M0 6l6-6h17c12.688 0 19.313.3 20 1 4 4 7.313 8.3 10 13
+ 35.313 51.3 80.813 93.8 136.5 127.5 55.688 33.7 117.188 55.8 184.5 66.5.688
+ 0 2 .3 4 1 18.688 2.7 76 4.3 172 5h399450v120H429l-6-1c-124.688-8-235-61.7
+-331-161C60.687 138.7 32.312 99.3 7 54L0 41V6z"/></svg></span><span class="brace-center" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMidYMin slice"><path d="M199572 214
+c100.7 8.3 195.3 44 280 108 55.3 42 101.7 93 139 153l9 14c2.7-4 5.7-8.7 9-14
+ 53.3-86.7 123.7-153 211-199 66.7-36 137.3-56.3 212-62h199568v120H200432c-178.3
+ 11.7-311.7 78.3-403 201-6 8-9.7 12-11 12-.7.7-6.7 1-18 1s-17.3-.3-18-1c-1.3 0
+-5-4-11-12-44.7-59.3-101.3-106.3-170-141s-145.3-54.3-229-60H0V214z"/></svg></span><span class="brace-right" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMaxYMin slice"><path d="M399994 0l6 6v35l-6 11c-56 104-135.3 181.3-238 232-57.3
+ 28.7-117 45-179 50H-300V214h399897c43.3-7 81-15 113-26 100.7-33 179.7-91 237
+-174 2.7-5 6-9 10-13 .7-1 7.3-1 20-1h17z"/></svg></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord text"><span class="mord cjk_fallback">记了</span><span class="mord">&quot;</span><span class="mord cjk_fallback">为什么发生</span><span class="mord">&quot;</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.648em;"><span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.3263em;"><span></span></span></span></span></span></span></span></span></span></p>
+<p><strong>绝大多数 Agent 事故定位不了，不是因为没记日志，而是因为记的是 L1。</strong> L1 告诉你&quot;第 7 步发了邮件&quot;，但说不出&quot;它为什么判断应该发&quot;。要回答后者，必须记录<strong>决策时它看到的那份输入，以及这份输入里每一段的来源</strong>。</p>
+<h3 id="h-二轨迹为什么必须是事件流">二、轨迹：为什么必须是事件流<a class="anchor" href="#h-二轨迹为什么必须是事件流" aria-label="本节链接">#</a></h3>
+<h4 id="h-21-状态-dump-不是轨迹">2.1 状态 dump 不是轨迹<a class="anchor" href="#h-21-状态-dump-不是轨迹" aria-label="本节链接">#</a></h4>
+<p>最常见的错误做法：循环结束（或崩溃）时把当前 state 序列化下来当&quot;轨迹&quot;。<strong>它不够用的原因有三条</strong>：</p>
+<ol>
+<li><strong>丢掉了被覆写的中间值</strong>。状态是收缩的（第 1 章），KV 的旧值被覆盖了。而 bug 往往正好藏在&quot;第 3 步写进去、第 5 步被正确值覆盖&quot;的那个瞬间。</li>
+<li><strong>丢掉了顺序</strong>。因果关系依赖顺序：&quot;先校验后执行&quot;和&quot;先执行后校验&quot;的状态可能一样，安全性完全不同。</li>
+<li><strong>丢掉了失败路径</strong>。状态 dump 只反映成功收敛后的样子；而失败的那几次尝试（被重试覆盖掉的）恰恰是归因的关键。</li>
+</ol>
+<p><strong>规则：轨迹是只追加（append-only）的事件流，与状态存储物理分离。</strong> 这也解释了第 1 章那条设计决策（state 收缩 / trace 扩张）在这里的用处。</p>
+<h4 id="h-22-轨迹的-schema每个字段都对应一个无法被替代的问题">2.2 轨迹的 schema：每个字段都对应一个<strong>无法被替代的问题</strong><a class="anchor" href="#h-22-轨迹的-schema每个字段都对应一个无法被替代的问题" aria-label="本节链接">#</a></h4>
+<p>下面是 L2 级别的最小可用 schema。<strong>读法是&quot;字段 → 它让你能回答的问题&quot;</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>类型</th>
+<th>它让你能回答</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>step</code></td>
+<td>int</td>
+<td>第几步出的问题</td>
+</tr>
+<tr>
+<td><code>span_id</code> / <code>parent_id</code></td>
+<td>str</td>
+<td>这是子调用还是主循环的步（支持嵌套子 Agent，第 6 章）</td>
+</tr>
+<tr>
+<td><code>ts_start</code> / <code>ts_end</code></td>
+<td>float</td>
+<td>时延归因；卡在哪一步</td>
+</tr>
+<tr>
+<td><code>decision_kind</code></td>
+<td>enum(<code>tool</code>/<code>final</code>/<code>wait</code>/<code>plan</code>)</td>
+<td>是决策错了还是执行错了</td>
+</tr>
+<tr>
+<td><code>tool</code> / <code>args</code></td>
+<td>str / dict</td>
+<td>它做了什么</td>
+</tr>
+<tr>
+<td><strong><code>args_src</code></strong></td>
+<td>dict[str, ref]</td>
+<td><strong>每个参数值来自哪一步的哪个字段</strong> ← 因果链的核心</td>
+</tr>
+<tr>
+<td><code>result_ok</code></td>
+<td>bool</td>
+<td>行动段的真实结果</td>
+</tr>
+<tr>
+<td><code>error_kind</code></td>
+<td>enum</td>
+<td>参数错 / 权限错 / 目标不存在 / 超时 / 上游 5xx（第 3 章的错误分类）</td>
+</tr>
+<tr>
+<td><code>hint</code></td>
+<td>str</td>
+<td>反馈给模型的可行动诊断（原始内容）</td>
+</tr>
+<tr>
+<td><code>tokens_in</code> / <code>tokens_out</code></td>
+<td>int</td>
+<td>成本归因的基本量</td>
+</tr>
+<tr>
+<td><code>cost</code></td>
+<td>float</td>
+<td>折算后的成本（便于跨模型比较）</td>
+</tr>
+<tr>
+<td><strong><code>context_ids</code></strong></td>
+<td>list[str]</td>
+<td>本步送进模型的上下文片段（内容寻址）← L2 的核心</td>
+</tr>
+<tr>
+<td><code>model</code> / <code>prompt_ver</code></td>
+<td>str</td>
+<td>归因&quot;是模型变了还是提示词变了&quot;</td>
+</tr>
+<tr>
+<td><code>temp</code> / <code>seed</code></td>
+<td>float / int</td>
+<td>复现的前提</td>
+</tr>
+<tr>
+<td><code>tool_ver</code></td>
+<td>str</td>
+<td>工具实现变了没有</td>
+</tr>
+<tr>
+<td><code>state_digest</code></td>
+<td>str</td>
+<td>决策时刻的状态指纹（不存全量，见隐私取舍）</td>
+</tr>
+<tr>
+<td><code>validations</code></td>
+<td>list</td>
+<td>本步通过的硬约束检查（第 3 节的判据执行记录）</td>
+</tr>
+</tbody></table>
+<p><strong>两个字段值得单独说明</strong>：</p>
+<ul>
+<li><strong><code>context_ids</code>（内容寻址）</strong>：不存上下文的原文，存<strong>片段的 ID/哈希</strong>。原文存在一个可单独做脱敏与过期策略的片段库里。这样轨迹本身不携带 PII（第 1 章 L2 的隐私取舍），但要复盘时能取回片段。<strong>代价</strong>：片段库过期后轨迹的语义就丢失了 —— 这是一个必须写进设计文档的已知盲区。</li>
+<li><strong><code>state_digest</code></strong>：状态指纹而不是全量状态。用途是&quot;判断两次运行是否在同一个状态上分叉&quot;，代价是无法从轨迹完整恢复状态（要恢复就得靠 L3 的输入快照）。</li>
+</ul>
+<h4 id="h-23-一个容易忽略的要求失败路径也要记">2.3 一个容易忽略的要求：<strong>失败路径也要记</strong><a class="anchor" href="#h-23-一个容易忽略的要求失败路径也要记" aria-label="本节链接">#</a></h4>
+<pre><code>✓ 记：ok / 参数错 / 权限拒 / 超时 / 重试 / 被用户中断 / 硬约束违反 / 挂起
+✗ 常见遗漏：只记成功的工具调用</code></pre>
+<p><strong>为什么失败路径的价值高于成功路径</strong>：成功路径已经在结果里体现了（任务完成）；失败路径是<strong>唯一能解释&quot;为什么多花了 15 步&quot;的数据</strong>。而且从统计上看，失败步的数量常常占总步数的一半以上（第 1 章 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathbb">E</span><span class="mopen">[</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.109em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">r</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">]</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.3783em;vertical-align:-0.4811em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8972em;"><span style="top:-2.655em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight"><span class="mord mathnormal mtight">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1645em;"><span style="top:-2.357em;margin-left:0em;margin-right:0.0714em;"><span class="pstrut" style="height:2.5em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">r</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.143em;"><span></span></span></span></span></span></span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.4461em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">1</span><span class="mbin mtight">−</span><span class="mord mtight"><span class="mord mathnormal mtight">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1645em;"><span style="top:-2.357em;margin-left:0em;margin-right:0.0714em;"><span class="pstrut" style="height:2.5em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">r</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.143em;"><span></span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.4811em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mclose">)</span></span></span></span> 里的第二项全是失败步）。</p>
+<p><figure><img class="md-img" src="content/courses/agent-systems/assets/chapter-2-figure-04.svg" alt="L1 记发生了什么，L2 记为什么发生" loading="lazy" decoding="async"><figcaption>L1 记发生了什么，L2 记为什么发生</figcaption></figure>
+</p>
+<h3 id="h-三因果链从记录到可归因">三、因果链：从&quot;记录&quot;到&quot;可归因&quot;<a class="anchor" href="#h-三因果链从记录到可归因" aria-label="本节链接">#</a></h3>
+<p>这是本节技术上最难的一段。</p>
+<h4 id="h-31-问题陈述">3.1 问题陈述<a class="anchor" href="#h-31-问题陈述" aria-label="本节链接">#</a></h4>
+<p>L1 轨迹能告诉你：第 7 步执行了 <code>send_email(to=&quot;alice@x.com&quot;)</code>。但它回答不了：<strong>这个 <code>to</code> 的值是从哪儿来的？</strong> 可能来自：</p>
+<ul>
+<li>第 2 步工具的返回（用户提供的收件人）；</li>
+<li>第 5 步模型自己<strong>编造的</strong>（幻觉）；</li>
+<li>状态里一个很早就写入、从未被验证过的字段。</li>
+</ul>
+<p><strong>这三种情况的修复方向完全不同</strong>（工具错 / 模型错 / 记忆错 —— 正好是第 7 章四象限里的三类）。所以因果链不是&quot;锦上添花&quot;，它是<strong>归因的前提</strong>。</p>
+<h4 id="h-32-填法一让模型自报来源不可靠但有用">3.2 填法一：让模型自报来源（不可靠，但有用）<a class="anchor" href="#h-32-填法一让模型自报来源不可靠但有用" aria-label="本节链接">#</a></h4>
+<p>最省事的做法是在工具的 schema 里要求模型标出来源：</p>
+<pre data-lang="json"><code class="language-json">{&quot;tool&quot;: &quot;send_email&quot;, &quot;args&quot;: {&quot;to&quot;: &quot;alice@x.com&quot;}, &quot;provenance&quot;: {&quot;to&quot;: &quot;step2.result.contact&quot;}}</code></pre>
+<p><strong>问题</strong>：这是模型<strong>自报</strong>的，它会编（尤其在长轨迹里它自己也&quot;记不清&quot;）。所以它可以作为<strong>线索</strong>，不能作为<strong>证据</strong>。</p>
+<h4 id="h-33-填法二结构绑定推荐的默认做法">3.3 填法二：结构绑定（推荐的默认做法）<a class="anchor" href="#h-33-填法二结构绑定推荐的默认做法" aria-label="本节链接">#</a></h4>
+<p>正确做法是<strong>从数据流上自动推导</strong>，而不是问模型。两个实现路径：</p>
+<p><strong>路径 A：句柄式上下文（context as handles）。</strong> 送给模型的上下文不是纯文本，而是带 ID 的片段：</p>
+<pre><code>[ctx:step2.result] {&quot;contact&quot;: &quot;alice@x.com&quot;, &quot;name&quot;: &quot;Alice&quot;}
+[ctx:step5.memo]    &quot;根据上面的联系人，准备发送&quot;</code></pre>
+<p>模型在决策里引用这些句柄（<code>{&quot;to&quot;: {&quot;$ref&quot;: &quot;ctx:step2.result.contact&quot;}}</code>）。<strong>引用由你的代码解析成真实值</strong>，于是 <code>args_src</code> 是<strong>结构性记录</strong>的，不依赖模型诚实。代价是模型必须学会使用句柄（提示词与 schema 要把这一步做好），以及引用语法增加了模型出错的面。</p>
+<p><strong>路径 B：上下文组装器记账（assembler bookkeeping）。</strong> 不改模型输出，只改你的<strong>上下文组装代码</strong>：每次把片段拼进 prompt 时，记录&quot;这次 prompt 由哪些片段组成&quot;。</p>
+<pre><code>assemble(view) → (prompt_text, fragment_ids)
+decide(prompt_text) → decision
+trace.append({..., &quot;context_ids&quot;: fragment_ids})</code></pre>
+<p>这样你能知道&quot;第 7 步看到了哪些片段&quot;，但<strong>不能精确知道&quot;它用了哪一个&quot;</strong>。也就是说：<strong>能定位到&quot;候选来源集合&quot;，不能定位到单个来源。</strong></p>
+<table>
+<thead>
+<tr>
+<th>做法</th>
+<th>精度</th>
+<th>实现成本</th>
+<th>模型配合</th>
+<th>建议</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>模型自报</td>
+<td>低（会编）</td>
+<td>极低</td>
+<td>需要</td>
+<td>仅作线索</td>
+</tr>
+<tr>
+<td>组装器记账</td>
+<td>中（候选集合）</td>
+<td>低</td>
+<td>不需要</td>
+<td><strong>默认起点</strong></td>
+</tr>
+<tr>
+<td>句柄式引用</td>
+<td>高（精确到字段）</td>
+<td>中高</td>
+<td>需要</td>
+<td>关键字段（收件人、金额、ID、SQL 条件）</td>
+</tr>
+</tbody></table>
+<p><strong>实用的混合策略</strong>：<strong>对&quot;高副作用动作的关键参数&quot;强制句柄式引用，其余用组装器记账。</strong> 这是一条很好的工程线：把精确归因的成本花在真正要紧的字段上 —— 收件人错了会发给客户，日志级别传错了没人管。</p>
+<h4 id="h-34-从因果链到失效归因">3.4 从因果链到失效归因<a class="anchor" href="#h-34-从因果链到失效归因" aria-label="本节链接">#</a></h4>
+<p>有了 <code>args_src</code> + <code>context_ids</code>，就能构造<strong>因果图</strong>并回答&quot;这个错误值是从哪来的&quot;：</p>
+<pre><code>反查算法（事故现场的一个具体查询）：
+  错误参数 v 出现在 step 7
+  → args_src[&quot;to&quot;] = ctx:step2.result.contact        （句柄式）
+     → 若 step2 是工具返回：值是外部给的 → 工具/上游错（或工具契约错）
+     → 若 step2 是模型生成：值是模型造的 → 模型错（幻觉）
+  → 若用组装器记账：context_ids = [f3, f5, f9]
+     → 逐个检查哪个片段里含 v
+        → 若 v 只出现在 f9（模型自己的 memo）→ 记忆污染（第 4 章）
+        → 若 v 来自 f3（一个过期片段）        → 上下文组装错（选了过期数据）</code></pre>
+<p><strong>这张图直接对应第 7 章的四象限</strong>（模型错 / 工具错 / 规划错 / 记忆错）。<strong>没有因果链，四象限里只有&quot;模型错&quot;是能猜的</strong> —— 这就是为什么很多团队把一切失败都归给模型：不是模型总错，而是他们的轨迹只能支持这一个结论。</p>
+<h4 id="h-35-因果链的成本一个必须承认的取舍">3.5 因果链的成本：一个必须承认的取舍<a class="anchor" href="#h-35-因果链的成本一个必须承认的取舍" aria-label="本节链接">#</a></h4>
+<p>因果链不是免费的：</p>
+<table>
+<thead>
+<tr>
+<th>代价</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>上下文变大</td>
+<td>带 ID 的片段比纯文本啰嗦（句柄式尤甚）→ 成本上升、可能影响 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">decide</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span></td>
+</tr>
+<tr>
+<td>实现复杂</td>
+<td>组装器要重构成&quot;记账式&quot;；句柄要解析与校验</td>
+</tr>
+<tr>
+<td>模型可能用错句柄</td>
+<td>引用语法本身成为新的错误来源</td>
+</tr>
+<tr>
+<td>存了&quot;它看到了什么&quot;就存了敏感内容</td>
+<td>片段库需要脱敏与保留期策略</td>
+</tr>
+</tbody></table>
+<p><strong>判据</strong>：只有当<strong>失败归因的价值 &gt; 这些成本</strong>时才做。反过来：如果这个 Agent 的失败代价只是&quot;重跑一次&quot;，L1 够了；如果它的失败代价是&quot;给客户发了错邮件&quot;，因果链是必须的。</p>
+<h3 id="h-四代价归因找出最贵的那一步和被浪费的那一步">四、代价归因：找出最贵的那一步和被浪费的那一步<a class="anchor" href="#h-四代价归因找出最贵的那一步和被浪费的那一步" aria-label="本节链接">#</a></h3>
+<h4 id="h-41-三个维度分别归因不要合成一个钱">4.1 三个维度分别归因，不要合成一个&quot;钱&quot;<a class="anchor" href="#h-41-三个维度分别归因不要合成一个钱" aria-label="本节链接">#</a></h4>
+<p>第 1 章 2.5 说过：token、调用次数、时延的瓶颈可能只有一个。归因时同样<strong>分开</strong>：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7651em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord text"><span class="mord">cost</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0269em;">w</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:-0.0269em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.1389em;">T</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0269em;">w</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:-0.0269em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0715em;">C</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0269em;">w</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:-0.0269em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">L</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord"><span class="mord mathnormal">L</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span></span></p>
+<p>但<strong>分析时要看三个分量的占比</strong>，因为优化手段不同：</p>
+<table>
+<thead>
+<tr>
+<th>瓶颈分量</th>
+<th>优化手段</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>token</td>
+<td>上下文裁剪（第 4 章）、摘要、减少全量重传</td>
+</tr>
+<tr>
+<td>调用次数</td>
+<td>批量取回、合并工具、减少往返</td>
+</tr>
+<tr>
+<td>时延</td>
+<td>并行化互不依赖的步骤、缓存、挂起（而非轮询空转）</td>
+</tr>
+</tbody></table>
+<h4 id="h-42-有效成本-vs-无效成本自动识别被浪费的步骤">4.2 有效成本 vs 无效成本：自动识别&quot;被浪费的步骤&quot;<a class="anchor" href="#h-42-有效成本-vs-无效成本自动识别被浪费的步骤" aria-label="本节链接">#</a></h4>
+<p>这是代价归因里最有价值的分析。定义：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord cjk_fallback">浪费率</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.4528em;vertical-align:-0.9857em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.4671em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mop"><span class="mop op-symbol small-op" style="position:relative;top:0em;">∑</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.162em;"><span style="top:-2.4003em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2997em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord text"><span class="mord">cost</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.7171em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mop"><span class="mop op-symbol small-op" style="position:relative;top:0em;">∑</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1786em;"><span style="top:-2.4003em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">i</span><span class="mrel mtight">∈</span><span class="mord mathnormal mtight" style="margin-right:0.1389em;">W</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.3271em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord text"><span class="mord">cost</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.9857em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></p>
+<p>其中 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">W</span></span></span></span> 是&quot;无效步&quot;集合。<strong>关键在于：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">W</span></span></span></span> 可以被自动识别</strong>，用因果链的反向引用：</p>
+<pre><code>无效步的一个可计算定义：
+  step i 属于 W  ⟺  ① 它没有被任何后续步引用（context_ids / args_src 里没出现）
+                    ∧ ② 它的结果被后续步的同类调用覆盖（重复查询）
+                    ∧ ③ 或者它触发了重试/回退（其结果被丢弃）</code></pre>
+<table>
+<thead>
+<tr>
+<th>无效类型</th>
+<th>识别方式</th>
+<th>典型成因</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>未被引用的步</strong></td>
+<td>反向引用计数 = 0</td>
+<td>漂移：做了与目标无关的事</td>
+</tr>
+<tr>
+<td><strong>重复步</strong></td>
+<td>同类工具 + 相似参数（相似度阈值）</td>
+<td>无长期记忆：忘了自己查过（第 1 章边界二）</td>
+</tr>
+<tr>
+<td><strong>被回退的步</strong></td>
+<td>后续有对应的补偿/回滚记录</td>
+<td>计划错 / 工具失败</td>
+</tr>
+<tr>
+<td><strong>空转等待</strong></td>
+<td><code>decision_kind == wait</code> 且实际未阻塞</td>
+<td>轮询式等待（第 2.1 节）</td>
+</tr>
+</tbody></table>
+<p><strong>为什么这个分析重要</strong>：它把&quot;Agent 很贵&quot;这个模糊抱怨，变成&quot;<strong>37% 的成本花在未被引用的步骤上，其中大部分是重复查询同一个接口</strong>&quot; —— 这句话直接指向一个可修的 bug（缓存/去重），而不是&quot;换个便宜的模型&quot;。</p>
+<h4 id="h-43-长尾归因p99-的那些运行贵在哪">4.3 长尾归因：p99 的那些运行贵在哪<a class="anchor" href="#h-43-长尾归因p99-的那些运行贵在哪" aria-label="本节链接">#</a></h4>
+<p>成本分布是重尾的（第 1 章 2.5）。所以归因必须<strong>分开看 p50 和 p99</strong>：</p>
+<ul>
+<li><strong>p50 的构成</strong>告诉你&quot;正常路径的成本结构&quot; → 优化它对总账影响最大。</li>
+<li><strong>p99 的构成</strong>告诉你&quot;事故路径长什么样&quot; → 通常是&quot;重试循环&quot;或&quot;漂移导致的空转&quot;，而不是&quot;某一步特别贵&quot;。</li>
+</ul>
+<p><strong>一个实用的报表</strong>：</p>
+<pre><code>按终止状态分组统计成本分布：
+  done            p50=12k tokens  p99=31k
+  budget_steps    p50=58k tokens  p99=60k   ← 撞上预算上界（正常的）
+  violation       p50=8k  tokens  p99=45k   ← ★ 异常：违规前的漂移很贵
+  blocked         p50=5k  tokens  p99=9k    ← 挂起很省（符合预期）
+  error           p50=30k tokens  p99=61k   ← ★ 崩溃前的重试很贵</code></pre>
+<p><strong>这张报表能立刻指出钱花在哪</strong>：如果 <code>violation</code> 和 <code>error</code> 占了总成本的 40%，那优化对象不是&quot;正常路径&quot;，而是<strong>更早的违规检测</strong>（第 3 节的三把闸）与<strong>更稳的工具</strong>。</p>
+<h3 id="h-五可重放确定性边界在哪里">五、可重放：确定性边界在哪里<a class="anchor" href="#h-五可重放确定性边界在哪里" aria-label="本节链接">#</a></h3>
+<p>L3 可重放是最贵的一层，也最容易被承诺得过头。<strong>先说清楚它做不到什么。</strong></p>
+<h4 id="h-51-temperature0-不等于确定性">5.1 <code>temperature=0</code> 不等于确定性<a class="anchor" href="#h-51-temperature0-不等于确定性" aria-label="本节链接">#</a></h4>
+<p>一个流行的误解。即使把 temperature 设为 0（贪心解码），你仍会遇到：</p>
+<table>
+<thead>
+<tr>
+<th>非确定性来源</th>
+<th>能否消除</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>采样（temperature/top-p）</td>
+<td>✓ 可设 greedy</td>
+<td>但 greedy 只保证&quot;给定相同 logits 时取 argmax&quot;</td>
+</tr>
+<tr>
+<td>浮点非结合性</td>
+<td>✗ 不可消除</td>
+<td>归约顺序随批大小/硬件而变，logits 会有微小差异</td>
+</tr>
+<tr>
+<td>批处理效应（continuous batching）</td>
+<td>✗ 不可控</td>
+<td>同一请求在不同 batch 组成下可能落到不同的浮点路径</td>
+</tr>
+<tr>
+<td>硬件/驱动/kernel 版本</td>
+<td>~ 固定环境可</td>
+<td>换机器换版本就可能变</td>
+</tr>
+<tr>
+<td>服务端的静默模型更新</td>
+<td>✗ 不可控</td>
+<td>供应商侧更新权重或推理栈，你无从知晓</td>
+</tr>
+<tr>
+<td>采样之外的随机（如某些实现的 dropout、top-k 平局处理）</td>
+<td>~</td>
+<td>平局时的 argmax 选择可能不稳定</td>
+</tr>
+<tr>
+<td><strong>你自己的工具</strong></td>
+<td>✓ 可控（录制回放）</td>
+<td>但需要显式实现</td>
+</tr>
+<tr>
+<td><strong>时间/随机数/环境变量</strong></td>
+<td>✓ 可控（注入）</td>
+<td>但要在写代码时就把它们参数化</td>
+</tr>
+</tbody></table>
+<p><strong>结论：真正能提供的不是&quot;比特级重放&quot;，而是&quot;结构性重放&quot;。</strong> 这两个概念必须区分：</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>比特级重放</th>
+<th>结构性重放</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>目标</td>
+<td>输出逐字相同</td>
+<td>决策<strong>序列</strong>相同（调了哪些工具、什么顺序、什么参数）</td>
+</tr>
+<tr>
+<td>依赖</td>
+<td>要求模型与推理栈完全确定</td>
+<td>只要求工具与状态被冻结</td>
+</tr>
+<tr>
+<td>可行性</td>
+<td>实际不可行（供应商侧不可控）</td>
+<td><strong>可行且足够</strong></td>
+</tr>
+<tr>
+<td>用途</td>
+<td>——</td>
+<td>回归测试：&quot;改了提示词，工具调用序列变了吗？&quot;</td>
+</tr>
+</tbody></table>
+<p><strong>这个区分是本节最重要的实践结论</strong>：<strong>不要承诺&quot;可复现&quot;，要承诺&quot;结构性可重放&quot;</strong>，并把它作为回归测试的基础。第 7 章的评测集正是建立在这个承诺上。</p>
+<h4 id="h-52-为了让结构性重放成立代码必须付出的约束">5.2 为了让结构性重放成立，代码必须付出的约束<a class="anchor" href="#h-52-为了让结构性重放成立代码必须付出的约束" aria-label="本节链接">#</a></h4>
+<pre><code>① 所有随机性参数化：seed、temperature、时间戳、随机 id 都从注入的 context 取，
+   不直接调用 time.time() / random.random() / uuid4()
+② 所有工具可桩化（stub）：工具走统一的注册表入口，允许替换成&quot;录制-回放&quot;实现
+③ 工具版本入库：tool_ver 进轨迹，工具实现变更会被检测到（否则重放会静默失真）
+④ 输入冻结：任务输入、检索结果、外部 API 响应都录下来（录制的时点要标注）
+⑤ 状态可恢复：状态可序列化，能从任一步恢复（与第 2.1 节的 Suspend 共用机制）</code></pre>
+<p><strong>这五条的每一条都是对代码的约束</strong> —— 这就是 L3 的成本。<strong>它们必须在</strong>写代码时就满足，事后加不上：一个直接调用 <code>time.time()</code> 的 Agent 事后无法变成可重放的。</p>
+<p><strong>可重放的产物</strong>：一份&quot;回放包&quot; = 输入快照 + 模型配置 + 工具桩数据 + 版本清单。有了它，你可以在离线环境里重跑任意一条历史轨迹，并回答&quot;如果当时把提示词改成 X 会怎样&quot;。</p>
+<h4 id="h-53-重放能验证什么不能验证什么">5.3 重放能验证什么、不能验证什么<a class="anchor" href="#h-53-重放能验证什么不能验证什么" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>能验证</th>
+<th>不能验证</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>提示词/工具 schema 改动的<strong>行为差异</strong>（工具调用序列是否变化）</td>
+<td>真实环境下的性能（桩数据是旧的）</td>
+</tr>
+<tr>
+<td>失败是否可复现（同一个 bug 是否还在）</td>
+<td>上游服务的时序问题（桩不回放时序）</td>
+</tr>
+<tr>
+<td>成本变化（同样序列下的 token 数）</td>
+<td>模型版本更新后的行为（除非固定了模型）</td>
+</tr>
+<tr>
+<td>判据阈值调整的影响（离线评测集上）</td>
+<td>人工介入后的路径</td>
+</tr>
+</tbody></table>
+<h3 id="h-代码l2-轨迹--因果链--成本归因">代码：L2 轨迹 + 因果链 + 成本归因<a class="anchor" href="#h-代码l2-轨迹--因果链--成本归因" aria-label="本节链接">#</a></h3>
+<pre data-lang="python"><code class="language-python">import hashlib, json, time
+from dataclasses import dataclass, field, asdict
+from typing import Any, Optional
+
+# ============ 内容寻址的上下文片段库 ============
+class FragmentStore:
+    &quot;&quot;&quot;
+    ★ 设计决策：轨迹里只存片段的 id（内容哈希），不存原文。
+    好处：轨迹本身不含 PII；片段库可以单独做过期与脱敏策略。
+    代价（必须写进设计文档）：片段过期后轨迹的语义丢失 —— 已知盲区。
+    &quot;&quot;&quot;
+    def __init__(self, ttl_days: int = 30):
+        self.ttl_days, self._d = ttl_days, {}
+    def put(self, text: str) -&gt; str:
+        fid = &quot;f&quot; + hashlib.sha256(text.encode()).hexdigest()[:12]
+        self._d[fid] = {&quot;text&quot;: text, &quot;ts&quot;: time.time()}
+        return fid
+    def get(self, fid: str) -&gt; Optional[str]:
+        rec = self._d.get(fid)
+        return rec[&quot;text&quot;] if rec else None          # None = 已过期（语义丢失）
+
+# ============ L2 轨迹的一行 ============
+@dataclass
+class Span:
+    step: int
+    span_id: str
+    parent_id: Optional[str] = None
+    ts_start: float = 0.0
+    ts_end: float = 0.0
+    decision_kind: str = &quot;tool&quot;          # tool | final | wait | plan
+    tool: Optional[str] = None
+    args: dict = field(default_factory=dict)
+    args_src: dict = field(default_factory=dict)   # ★ 每个参数来自哪（因果链核心）
+    result_ok: bool = True
+    error_kind: Optional[str] = None     # bad_param | denied | timeout | upstream
+    hint: Optional[str] = None
+    tokens_in: int = 0
+    tokens_out: int = 0
+    cost: float = 0.0
+    context_ids: list = field(default_factory=list)  # 本步看到的片段（内容寻址）
+    model: str = &quot;&quot;
+    prompt_ver: str = &quot;&quot;
+    temp: float = 0.0
+    seed: Optional[int] = None
+    tool_ver: str = &quot;&quot;
+    state_digest: str = &quot;&quot;               # 状态指纹（不存全量）
+    validations: list = field(default_factory=list)  # 本步执行的硬约束检查
+
+def digest(state: dict) -&gt; str:
+    return hashlib.sha256(json.dumps(state, sort_keys=True,
+                                     ensure_ascii=False).encode()).hexdigest()[:16]
+
+# ============ 上下文组装器（路径 B：记账）============
+def assemble(view: dict, store: FragmentStore) -&gt; tuple[str, list[str]]:
+    &quot;&quot;&quot;
+    把状态视图组装成 prompt，并记录&#39;这次 prompt 由哪些片段组成&#39;。
+    ★ 设计决策：组装器负责记账 —— 不依赖模型诚实（模型自报来源会编）。
+    精度限制：只能给出&#39;候选来源集合&#39;，不能精确定位到单个片段。
+    要精确到字段，对关键参数改用句柄式引用（见 bind_handle）。
+    &quot;&quot;&quot;
+    parts, ids = [], []
+    for k, v in view.items():
+        text = f&quot;[{k}] {v}&quot;
+        fid = store.put(text)
+        parts.append(f&quot;[ctx:{fid}] {text}&quot;)
+        ids.append(fid)
+    return &quot;\n&quot;.join(parts), ids
+
+def bind_handle(value_ref: str, view_lookup: dict) -&gt; Any:
+    &quot;&quot;&quot;
+    路径 A：句柄式引用 —— 由代码解析，因而 args_src 是结构性记录（不靠模型诚实）。
+    ★ 只对高副作用动作的关键参数用（收件人/金额/ID/SQL 条件），
+      因为句柄语法本身会增加模型的出错面。
+    &quot;&quot;&quot;
+    assert value_ref.startswith(&quot;ctx:&quot;), f&quot;非法引用: {value_ref}&quot;
+    return view_lookup[value_ref]
+
+# ============ 成本归因与无效步识别 ============
+def attribute_cost(spans: list[Span]) -&gt; dict:
+    &quot;&quot;&quot;三维度分开归因 —— 合成一个&#39;钱&#39;会掩盖是哪个瓶颈。&quot;&quot;&quot;
+    tot = sum(s.cost for s in spans) or 1e-9
+    return {
+        &quot;总成本&quot;: round(tot, 3),
+        &quot;token&quot;: round(sum(s.tokens_in + s.tokens_out for s in spans), 1),
+        &quot;按决策类型&quot;: {k: round(sum(s.cost for s in spans if s.decision_kind == k), 3)
+                    for k in {s.decision_kind for s in spans}},
+        # ★ 分开看错误步成本：异常路径常常才是成本大头（撞预算/漂移/重试）
+        &quot;错误步成本占比&quot;: round(sum(s.cost for s in spans if not s.result_ok) / tot, 3),
+    }
+
+def find_wasted(spans: list[Span], sim_threshold: float = 0.9) -&gt; list[dict]:
+    &quot;&quot;&quot;
+    自动识别无效步 —— 把&#39;Agent 很贵&#39;这个模糊抱怨变成可修的 bug。
+    三类：未被引用 / 重复查询 / 被回退。
+    &quot;&quot;&quot;
+    # 反向引用计数：谁的产出被后续步的 args_src / context_ids 引用过
+    referenced = set()
+    for s in spans:
+        for src in list(s.args_src.values()) + list(s.context_ids):
+            referenced.add(str(src))
+    out = []
+    for s in spans:
+        sid = f&quot;ctx:{s.span_id}&quot;
+        reasons = []
+        if s.decision_kind == &quot;tool&quot; and sid not in referenced:
+            reasons.append(&quot;未被任何后续步引用（漂移型浪费）&quot;)
+        for p in spans[:s.step - 1]:
+            if p.tool == s.tool and _sim(p.args, s.args) &gt;= sim_threshold:
+                reasons.append(f&quot;与 step {p.step} 重复（无长期记忆型浪费）&quot;)
+                break
+        if reasons:
+            out.append({&quot;step&quot;: s.step, &quot;cost&quot;: s.cost, &quot;reasons&quot;: reasons})
+    return out
+
+def _sim(a: dict, b: dict) -&gt; float:
+    if not a and not b: return 1.0
+    ka = set(a) | set(b)
+    return sum(1 for k in ka if a.get(k) == b.get(k)) / max(len(ka), 1)
+
+# ============ 因果链反查（事故定位的核心查询）============
+def trace_back(spans: list[Span], step: int, arg: str) -&gt; dict:
+    &quot;&quot;&quot;
+    从&#39;第 step 步的错误参数&#39;反查到源头，并给出四象限归类。
+    ★ 这是把&#39;为什么模型总是被归因&#39;变成&#39;能区分模型/工具/记忆&#39;的关键函数。
+    &quot;&quot;&quot;
+    s = next(x for x in spans if x.step == step)
+    src = s.args_src.get(arg)
+    if src is None:
+        return {&quot;结论&quot;: &quot;无来源记录 → 只能猜&#39;模型错&#39;（这正是 L1 的局限）&quot;}
+    origin = next((x for x in spans if f&quot;ctx:{x.span_id}&quot; == str(src)), None)
+    if origin is None:
+        return {&quot;来源&quot;: src, &quot;结论&quot;: &quot;来源片段不在轨迹内（可能已过期或来自输入）&quot;}
+    if origin.decision_kind == &quot;tool&quot;:
+        return {&quot;来源&quot;: f&quot;step{origin.step} 工具 {origin.tool} 的返回&quot;,
+                &quot;归因&quot;: &quot;工具错 / 上游数据错（不是模型幻觉）&quot;}
+    return {&quot;来源&quot;: f&quot;step{origin.step} 模型生成&quot;,
+            &quot;归因&quot;: &quot;模型错（幻觉）或记忆污染（第 4 章）&quot;}
+
+# ============ 回放包（结构性重放）============
+@dataclass
+class ReplayPack:
+    &quot;&quot;&quot;
+    ★ 承诺&#39;结构性重放&#39;（决策序列相同），不承诺&#39;比特级重放&#39; ——
+      因为浮点非结合性、批处理效应、供应商侧静默更新都不可控。
+    这五件东西必须在写代码时就满足，事后加不上。
+    &quot;&quot;&quot;
+    input_snapshot: dict          # ① 冻结的任务输入
+    retrieved: list               # ② 冻结的检索/外部响应（含录制时点）
+    model: str                    # ③ 模型版本（固定，不跟随 latest）
+    prompt_ver: str
+    tool_stubs: dict              # ④ 工具录制数据（可回放）
+    env: dict                     # ⑤ 注入的随机种子/时间/环境变量
+    versions: dict                # tool_ver / kernel / 依赖清单
+    recorded_at: float
+
+    def to_json(self) -&gt; str:
+        return json.dumps(asdict(self), ensure_ascii=False, sort_keys=True)
+
+REQUIRED_INJECTED = [&quot;seed&quot;, &quot;now&quot;, &quot;rng&quot;, &quot;uuid&quot;]
+def check_replayable(code_grep_hits: list[str]) -&gt; dict:
+    &quot;&quot;&quot;
+    自检：代码里是否还在直接调用不可控的随机源？
+    ★ 一个直接调用 time.time() 的 Agent，事后无法变成可重放的。
+    &quot;&quot;&quot;
+    banned = [&quot;time.time()&quot;, &quot;random.random()&quot;, &quot;uuid.uuid4()&quot;, &quot;datetime.now()&quot;]
+    hits = [b for b in banned if b in code_grep_hits]
+    return {&quot;可结构性重放&quot;: not hits,
+            &quot;必须先参数化&quot;: hits or &quot;无（符合要求）&quot;}
+
+if __name__ == &quot;__main__&quot;:
+    store = FragmentStore()
+    prompt, cids = assemble({&quot;goal&quot;: &quot;发报价单&quot;, &quot;contact&quot;: &quot;alice@x.com&quot;}, store)
+    spans = [
+        Span(1, &quot;s1&quot;, decision_kind=&quot;tool&quot;, tool=&quot;search_contact&quot;,
+             args={}, context_ids=cids, result_ok=True, cost=1.0, tokens_in=800),
+        Span(2, &quot;s2&quot;, decision_kind=&quot;tool&quot;, tool=&quot;search_contact&quot;,
+             args={}, context_ids=cids, result_ok=True, cost=1.0, tokens_in=800),
+        Span(3, &quot;s3&quot;, decision_kind=&quot;tool&quot;, tool=&quot;send_email&quot;,
+             args={&quot;to&quot;: &quot;alice@x.com&quot;},
+             args_src={&quot;to&quot;: &quot;ctx:s1&quot;}, result_ok=True, cost=2.0, tokens_in=1200),
+    ]
+    print(&quot;成本归因:&quot;, attribute_cost(spans))
+    print(&quot;无效步:&quot;, find_wasted(spans))
+    print(&quot;因果反查:&quot;, trace_back(spans, 3, &quot;to&quot;))</code></pre>
+<p><strong>五处关键设计决策</strong>：</p>
+<ol>
+<li><code>FragmentStore</code> 只让轨迹存<strong>哈希 id</strong>。这直接兑现第 1 章 L2 的隐私取舍，同时把&quot;片段过期&quot;这个盲区变成显式参数（<code>ttl_days</code>）。</li>
+<li><code>assemble</code> 在<strong>组装时记账</strong>，而不是问模型。精度是&quot;候选集合&quot;—— 这个限制被明确写在文档字符串里，不假装更高精度。</li>
+<li><code>find_wasted</code> 用<strong>反向引用计数</strong>自动识别漂移型浪费。这是把可观测数据变成优化目标的关键一步。</li>
+<li><code>trace_back</code> 的返回里带<strong>四象限归类</strong> —— 这是第 7 章评测的直接输入。注意它明确标出&quot;无来源记录 → 只能猜模型错&quot;，把 L1 的局限说清楚。</li>
+<li><code>check_replayable</code> 用禁用清单自检。<strong>可重放不是事后能加的属性</strong> —— 它要求代码从一开始就不直接碰随机源。</li>
+</ol>
+<h3 id="h-练习">练习<a class="anchor" href="#h-练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>schema 审阅</strong>：下面这份轨迹缺了哪 4 个字段，导致哪 4 个问题无法回答？请补齐并说明每个字段的用途。
+<code>{step, tool, args, ok, tokens}</code> → 问题：无法回答&quot;参数来自哪&quot;、&quot;为什么选这个工具&quot;、&quot;这次比上次贵在哪&quot;、&quot;能不能复现&quot;。</li>
+<li><strong>因果链精度</strong>：某任务里 Agent 把 500 元转给了错误账户。用构造器记账法得到 <code>context_ids = [f2, f7, f9]</code>，用句柄法则得到 <code>args_src = {&quot;amount&quot;: &quot;ctx:s4.result.total&quot;}</code>。请分别写出两种情况下你的定位结论，并说明哪个结论更可行动。然后回答：如果<strong>只</strong>有构造器记账，你还需要什么额外信息才能定位到真正来源？</li>
+<li><strong>归因实战</strong>：一次运行的轨迹显示 22 步、58k tokens，其中 step 4~12 是同一个工具 <code>search_docs</code> 用不同关键词的 9 次调用，其产出<strong>没有任何后续步引用</strong>。请：(a) 判断这属于哪类无效成本；(b) 给出<strong>两个</strong>不同的修复方向（一个减少浪费、一个改变设计避免它发生）；(c) 说明哪个方向更根本。</li>
+<li><strong>可重放诚实评估</strong>：你的 Agent 用了三个外部 HTTP API 和一个会变化的数据库。请写出你的&quot;结构性重放&quot;方案：哪些能被冻结、哪些不能、不能冻结的部分怎么处理（提示：录制时点 + 桩 + 已知偏差声明）。然后写出一段<strong>给用户的诚实说明</strong>：这个系统能复现什么、不能复现什么。</li>
+<li><strong>成本报表设计</strong>：用第四节的&quot;按终止状态分组&quot;思路，为一个&quot;客服工单处理 Agent&quot;设计一张成本归因报表（要包含行维度、列维度、以及你会从哪些异常模式里读出什么问题）。要求至少包含一个&quot;看 p99 才能发现&quot;的模式。</li>
+<li><strong>反例</strong>：构造一个场景，说明<strong>过度可观测反而有害</strong>（提示：L2 上下文快照可能包含用户密钥而被写进日志；或者为了记录慢工具而引入的同步写入拖慢了热路径；或者日志本身成为提示注入的载体 —— 想想它会不会被回喂给模型）。</li>
+</ol>
+<h3 id="h-小结">小结<a class="anchor" href="#h-小结" aria-label="本节链接">#</a></h3>
+<ul>
+<li><strong>L1 记&quot;发生了什么&quot;，L2 起记&quot;为什么发生&quot;。</strong> 多数团队事故定位不了，不是没记日志，是只到 L1。</li>
+<li><strong>轨迹必须是只追加的事件流</strong>，与状态存储分离。状态 dump 丢掉三样东西：被覆写的中间值、顺序、失败路径 —— 而 bug 往往正在这三处。</li>
+<li><strong>失败路径的价值高于成功路径</strong>：失败步常常占总步数的一半以上，且是唯一能解释&quot;为什么多花 15 步&quot;的数据。</li>
+<li><strong>因果链的技术核心是&quot;引用 vs 复制&quot;</strong>：模型自报（会编，仅作线索）&lt; 组装器记账（候选集合，默认起点）&lt; 句柄式引用（精确到字段）。<strong>混合策略：高副作用动作的关键参数强制句柄，其余记账。</strong></li>
+<li><strong>没有因果链，四象限里只有&quot;模型错&quot;能被猜出来</strong> —— 这不是模型总错，而是数据只支持这一个结论。</li>
+<li><strong>代价归因三维度分开</strong>（token / 调用 / 时延），分析时看占比而不是合成一个&quot;钱&quot;。</li>
+<li><strong>无效成本可以自动识别</strong>（反向引用计数 = 0 → 漂移；重复同类调用 → 无长期记忆；被回退 → 计划错）。这让&quot;Agent 很贵&quot;变成一句可修的 bug 描述。</li>
+<li><strong>p50 与 p99 要分开归因</strong>：p99 的异常通常集中在 <code>violation</code> / <code>error</code> 这类终止状态上，指向&quot;更早的违规检测&quot;而不是&quot;更便宜的模型&quot;。</li>
+<li><strong><code>temperature=0</code> ≠ 确定性</strong>：浮点非结合性、批处理效应、供应商侧静默更新都不可控。所以承诺的是<strong>结构性重放</strong>（决策序列相同），不是比特级重放。</li>
+<li><strong>可重放是写代码时的约束，不是事后能加的功能</strong>：随机源必须注入、工具必须可桩化、输入必须冻结、版本必须入库、状态必须可恢复。</li>
+<li><strong>可观测有成本，也有风险</strong>：上下文快照可能携带密钥、同步写日志可能拖慢热路径、日志本身可能成为提示注入载体（若被回喂给模型）。<strong>按失败代价选层级，并把盲区写进设计文档。</strong></li>
+</ul>
+<blockquote>
+<p>本章到此结束。你已经有了一个能跑、能停、能追溯的循环。下一步是把循环里的&quot;行动&quot;段做扎实 —— 第 3 章「工具契约」：schema 设计、幂等与重试、错误的分类与对模型的反馈、以及多工具时的选择歧义。<strong>行动段是所有&quot;副作用&quot;进入系统的唯一入口，也是可靠性的地基。</strong></p>
+</blockquote>

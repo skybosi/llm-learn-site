@@ -1,0 +1,120 @@
+<h2 id="h-用-hugging-face-微调">用 Hugging Face 微调<a class="anchor" href="#h-用-hugging-face-微调" aria-label="本节链接">#</a></h2>
+<p>前面几章我们把 QLoRA、PEFT、SFT、评估拆开讲透了。这一章开始<strong>实战收口</strong>：把 Hugging Face 生态的 <code>transformers</code> + <code>datasets</code> + <code>peft</code> + <code>trl</code> 串成一条完整的微调流水线，从&quot;一堆原始数据&quot;到&quot;一个能用的模型&quot;，用一份可运行脚本走通。这一课聚焦端到端流程和工程细节——数据怎么进、tokenize 怎么做、训练怎么配、模型怎么存和推 Hub。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-hugging-face-微调的四块积木">1. Hugging Face 微调的四块积木<a class="anchor" href="#h-1-hugging-face-微调的四块积木" aria-label="本节链接">#</a></h4>
+<p>一次标准微调由四个库协同完成，各司其职：</p>
+<ul>
+<li><strong>datasets</strong>：加载、清洗、切分数据集，统一成 <code>Dataset</code> 对象，支持流式加载超大语料；</li>
+<li><strong>transformers</strong>：加载基座模型和分词器，提供 <code>Trainer</code> 训练循环；</li>
+<li><strong>peft</strong>：注入 LoRA 等适配器，把训练参数量压到千分之一；</li>
+<li><strong>trl</strong>：在 Trainer 之上再封装 SFT 等任务专用训练器。</li>
+</ul>
+<p>整条流水线的形状是固定的：<strong>数据 → 分词（含掩码）→ 注入适配器 → 配置 Trainer → 训练 → 保存/合并</strong>。掌握这条主线，换模型、换数据都不慌。</p>
+<h4 id="h-2-数据管道从文件到-dataset">2. 数据管道：从文件到 Dataset<a class="anchor" href="#h-2-数据管道从文件到-dataset" aria-label="本节链接">#</a></h4>
+<p>真实项目的数据通常在 JSON/JSONL 里，第一步是加载并做<strong>训练/验证切分</strong>（务必留出验证集）。<code>datasets</code> 的 <code>load_dataset(&quot;json&quot;, data_files=...)</code> 一步到位，<code>train_test_split()</code> 切分。若数据太大放不进内存，用 <code>streaming=True</code> 流式处理。</p>
+<h4 id="h-3-tokenize-与数据整理">3. Tokenize 与数据整理<a class="anchor" href="#h-3-tokenize-与数据整理" aria-label="本节链接">#</a></h4>
+<p>分词阶段要做三件事：</p>
+<ol>
+<li><strong>渲染对话</strong>：用 <code>apply_chat_template</code> 把 messages 转成训练文本；</li>
+<li><strong>截断/填充</strong>：<code>max_length</code> + <code>padding</code>，超长样本要截断（对长文档任务建议先分块再训练）；</li>
+<li><strong>构造 labels</strong>：把 prompt 部分掩成 <code>-100</code>，让损失只落在回答上。</li>
+</ol>
+<p>这些在 SFTTrainer 里被自动处理，但你仍需理解其原理（上一章已讲）才能在出问题时排查。</p>
+<h4 id="h-4-训练配置的关键项">4. 训练配置的关键项<a class="anchor" href="#h-4-训练配置的关键项" aria-label="本节链接">#</a></h4>
+<p><code>TrainingArguments</code> 里最影响结果和显存的几个参数：<code>learning_rate</code>、<code>per_device_train_batch_size</code>、<code>gradient_accumulation_steps</code>、<code>num_train_epochs</code>、<code>bf16/fp16</code>、<code>gradient_checkpointing</code>、<code>save_steps</code>/<code>eval_steps</code>。梯度检查点能大幅省显存（用时间换空间），配合 4-bit 量化是低配显卡的救命组合。</p>
+<h4 id="h-5-保存与共享">5. 保存与共享<a class="anchor" href="#h-5-保存与共享" aria-label="本节链接">#</a></h4>
+<p>训练产物是<strong>适配器权重</strong>（几 MB），用 <code>save_pretrained</code> 保存；想部署成普通模型就 <code>merge_and_unload</code>。要共享给团队或社区，用 <code>push_to_hub</code> 推到 Hugging Face Hub，配好 <code>README</code> 的 model card。</p>
+<p><figure><img class="md-img" src="content/courses/llm-fine-tuning/assets/chapter-6-figure-01.svg" alt="Hugging Face 微调完整流水线：数据 → 分词 → 注入 → 训练 → 保存" loading="lazy" decoding="async"><figcaption>Hugging Face 微调完整流水线：数据 → 分词 → 注入 → 训练 → 保存</figcaption></figure>
+</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面是一份完整、可跑的端到端脚本（依赖 <code>datasets</code>、<code>transformers</code>、<code>peft</code>、<code>trl</code>、<code>accelerate</code>、<code>bitsandbytes</code>）。用小型数据和 4-bit 量化，普通 T4 即可运行。</p>
+<pre data-lang="python"><code class="language-python">import torch
+from datasets import Dataset
+from transformers import (
+    AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, TrainingArguments
+)
+from peft import LoraConfig, prepare_model_for_kbit_training
+from trl import SFTTrainer
+
+# 1) 数据：构造几条指令样本（真实项目请 load_dataset(&quot;json&quot;, data_files=&quot;...&quot;)）
+raw = [
+    {&quot;messages&quot;: [
+        {&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;解释什么是梯度下降&quot;},
+        {&quot;role&quot;: &quot;assistant&quot;, &quot;content&quot;: &quot;梯度下降是一种通过沿负梯度方向迭代更新参数来最小化损失函数的优化算法。&quot;}]},
+    {&quot;messages&quot;: [
+        {&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;什么是学习率&quot;},
+        {&quot;role&quot;: &quot;assistant&quot;, &quot;content&quot;: &quot;学习率控制每次参数更新的步长，过大易震荡，过小收敛慢。&quot;}]},
+]
+dataset = Dataset.from_list(raw)
+dataset = dataset.train_test_split(test_size=0.2)  # 留出验证集
+
+model_id = &quot;HuggingFaceH4/zephyr-7b-beta&quot;  # 示例：换成你要微调的基座
+
+# 2) 量化加载（QLoRA），T4 也能跑 7B
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type=&quot;nf4&quot;,
+    bnb_4bit_use_double_quant=True,
+    bnb_4bit_compute_dtype=torch.bfloat16,
+)
+model = AutoModelForCausalLM.from_pretrained(
+    model_id, quantization_config=bnb_config, device_map=&quot;auto&quot;
+)
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+tokenizer.pad_token = tokenizer.eos_token
+model = prepare_model_for_kbit_training(model)
+
+# 3) LoRA 配置
+peft_config = LoraConfig(
+    r=16, lora_alpha=32,
+    target_modules=[&quot;q_proj&quot;, &quot;k_proj&quot;, &quot;v_proj&quot;, &quot;o_proj&quot;],
+    lora_dropout=0.05, bias=&quot;none&quot;, task_type=&quot;CAUSAL_LM&quot;,
+)
+
+# 4) 训练参数（含梯度检查点省显存）
+args = TrainingArguments(
+    output_dir=&quot;./hf-ft-output&quot;,
+    per_device_train_batch_size=1,
+    gradient_accumulation_steps=8,
+    learning_rate=2e-4,
+    num_train_epochs=1,
+    logging_steps=1,
+    save_strategy=&quot;epoch&quot;,
+    evaluation_strategy=&quot;no&quot;,
+    bf16=True,
+    gradient_checkpointing=True,
+    report_to=&quot;none&quot;,
+)
+
+# 5) SFTTrainer 训练
+trainer = SFTTrainer(
+    model=model,
+    args=args,
+    train_dataset=dataset[&quot;train&quot;],
+    tokenizer=tokenizer,
+    peft_config=peft_config,
+    max_seq_length=512,
+)
+trainer.train()
+
+# 6) 保存适配器，并演示合并
+trainer.save_model(&quot;./hf-ft-output&quot;)
+merged = trainer.model.merge_and_unload()
+merged.save_pretrained(&quot;./hf-ft-merged&quot;)
+print(&quot;适配器已保存到 ./hf-ft-output，合并模型已保存到 ./hf-ft-merged&quot;)</code></pre>
+<p>这份脚本就是本课程前几章所有知识的汇合：QLoRA（4-bit NF4 + 双重量化）、PEFT（LoraConfig + 注入）、SFT（chat template + 回答掩码）、训练工程（梯度检查点 + 累积）。跑通它，你就拥有了一套可复用到任何项目的微调骨架。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>把示例数据换成你自己的 JSONL 文件，用 <code>datasets.load_dataset(&quot;json&quot;, data_files=&quot;你的文件.jsonl&quot;)</code> 加载，并确认 <code>train_test_split</code> 能正确切出验证集。</li>
+<li>开启 <code>evaluation_strategy=&quot;steps&quot;</code> 与 <code>eval_steps</code>，传入 <code>eval_dataset</code>，训练时观察验证集 loss，判断是否过拟合。</li>
+<li>用 <code>push_to_hub</code>（先 <code>huggingface-cli login</code>）把适配器推到你的 Hub 空间，并写一个带&quot;模型用途、数据来源、局限性&quot;的 model card。</li>
+<li>对比&quot;只存适配器 + 运行时加载&quot;与&quot;merge_and_unload 后部署&quot;两种方式的加载耗时与磁盘占用，说明各自适用场景。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Hugging Face · Transformers 文档（Trainer）：<a href="https://huggingface.co/docs/transformers/training" target="_blank" rel="noopener noreferrer">https://huggingface.co/docs/transformers/training</a></li>
+<li>Hugging Face · Datasets 文档：<a href="https://huggingface.co/docs/datasets/index" target="_blank" rel="noopener noreferrer">https://huggingface.co/docs/datasets/index</a></li>
+<li>Hugging Face · TRL 文档（SFTTrainer）：<a href="https://huggingface.co/docs/trl/sft_trainer" target="_blank" rel="noopener noreferrer">https://huggingface.co/docs/trl/sft_trainer</a></li>
+<li>Hugging Face · PEFT 文档：<a href="https://huggingface.co/docs/peft/index" target="_blank" rel="noopener noreferrer">https://huggingface.co/docs/peft/index</a></li>
+</ul>
+<p><a href="#/l/ft-ch6-l2">下一课：领域适配</a></p>

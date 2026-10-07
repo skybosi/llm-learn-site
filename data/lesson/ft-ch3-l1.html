@@ -1,0 +1,108 @@
+<h2 id="h-低秩适配原理">低秩适配原理<a class="anchor" href="#h-低秩适配原理" aria-label="本节链接">#</a></h2>
+<p>LoRA（Low-Rank Adaptation，低秩适配）是当前最流行的参数高效微调方法之一。它的核心洞察只有一个：<strong>微调带来的权重变化 ΔW 可以近似成一个低秩矩阵</strong>。本课从数学原理讲清&quot;低秩&quot;是什么、LoRA 为什么有效、以及它怎样用 1% 的参数逼近全参数微调。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-微调的权重增量-w">1. 微调的权重增量 ΔW<a class="anchor" href="#h-1-微调的权重增量-w" aria-label="本节链接">#</a></h4>
+<p>回顾第 2 章：微调后的权重可以写成</p>
+<pre data-lang="text"><code class="language-text">W = W0 + ΔW</code></pre>
+<p>其中 W0 是冻结的预训练权重，ΔW 是训练产生的增量。全参数微调直接学习一个和 W0 同形状、同量级的 ΔW；而 LoRA 的思路是——<strong>不给 ΔW 这么大的自由度，而是假设它可以用两个小矩阵的乘积来表示</strong>。</p>
+<h4 id="h-2-低秩分解w--ba">2. 低秩分解：ΔW = BA<a class="anchor" href="#h-2-低秩分解w--ba" aria-label="本节链接">#</a></h4>
+<p>设原始权重矩阵 W0 ∈ R^(d×k)（例如注意力层的一个投影矩阵，输入维度 k、输出维度 d）。LoRA 把增量写成两个小矩阵的乘积：</p>
+<pre data-lang="text"><code class="language-text">ΔW = B · A
+A ∈ R^(r×k)，B ∈ R^(d×r)，其中 r ≪ min(d, k)</code></pre>
+<p>秩 r 通常取 4、8、16 这样的很小的数。于是可训练参数量从 d×k 降到 r×(d+k)，数量级大幅下降：</p>
+<pre data-lang="text"><code class="language-text">可训练参数减少比例 ≈ (d·k) / (r·(d+k))</code></pre>
+<p>以 d=k=4096、r=8 为例：原矩阵有 1677 万参数，而 A+B 只有约 6.5 万参数——减少了 99.6%。</p>
+<p><figure><img class="md-img" src="content/courses/llm-fine-tuning/assets/chapter-3-figure-01.svg" alt="LoRA 的低秩分解：ΔW = B·A，只训练 A 和 B" loading="lazy" decoding="async"><figcaption>LoRA 的低秩分解：ΔW = B·A，只训练 A 和 B</figcaption></figure>
+</p>
+<p><figure><img class="md-img" src="content/courses/llm-fine-tuning/assets/chapter-3-figure-02.svg" alt="不同秩 r 下的可训练参数保留比例" loading="lazy" decoding="async"><figcaption>不同秩 r 下的可训练参数保留比例</figcaption></figure>
+</p>
+<h4 id="h-3-前向传播原输出--低秩增量">3. 前向传播：原输出 + 低秩增量<a class="anchor" href="#h-3-前向传播原输出--低秩增量" aria-label="本节链接">#</a></h4>
+<p>加入 LoRA 后，这一层的前向计算变为：</p>
+<pre data-lang="text"><code class="language-text">h = W0·x + ΔW·x = W0·x + B·A·x</code></pre>
+<p>即：<strong>先用原权重正常算一遍（冻结，不更新），再加上低秩支路 B·A·x 的增量（只训练 A、B）</strong>。原权重全程冻结，梯度只流向 A 和 B，因此显存中不需要为 W0 保存梯度与优化器状态。</p>
+<p><figure><img class="md-img" src="content/courses/llm-fine-tuning/assets/chapter-3-figure-03.svg" alt="LoRA 前向传播：冻结原权重 + 低秩旁路" loading="lazy" decoding="async"><figcaption>LoRA 前向传播：冻结原权重 + 低秩旁路</figcaption></figure>
+</p>
+<h4 id="h-4-初始化与缩放系数-">4. 初始化与缩放系数 α<a class="anchor" href="#h-4-初始化与缩放系数-" aria-label="本节链接">#</a></h4>
+<p>两个关键设计细节：</p>
+<ul>
+<li><strong>初始化</strong>：A 用小的随机高斯初始化，B 初始化为<strong>全零</strong>。这样训练开始时 ΔW = B·A = 0，模型行为与原模型完全一致，训练从&quot;零扰动&quot;平稳起步。</li>
+<li><strong>缩放系数 α/r</strong>：前向时把低秩支路乘以 <code>α/r</code>（α 是超参数，常取 r 的 1~2 倍）。这样做的好处是<strong>改变 r 时不必重新调学习率</strong>——因为 α/r 归一化了支路的贡献幅度。实践上常用 α=16、r=8，即缩放 2。</li>
+</ul>
+<h4 id="h-5-为什么低秩就够用">5. 为什么低秩就够用<a class="anchor" href="#h-5-为什么低秩就够用" aria-label="本节链接">#</a></h4>
+<p>这是 LoRA 论文（Hu et al., 2021）的关键论据：研究者发现，预训练大模型在下游任务上微调时，权重更新矩阵 ΔW 的<strong>内在秩（intrinsic rank）很低</strong>——即便允许全参数更新，学到的 ΔW 也主要集中在少数几个主导方向上。既然如此，与其让 ΔW 拥有 d×k 的自由度，不如从一开始就把它的秩限制在 r。</p>
+<p>LoRA 的其他优势也随之而来：</p>
+<ul>
+<li><strong>极少的可训练参数</strong> → 显存需求大幅下降（第 3 课会量化对比）。</li>
+<li><strong>原权重不动的扰动小</strong> → 相对全参数微调，灾难性遗忘更轻。</li>
+<li><strong>可插拔</strong> → 不同任务各自存一份 A、B（通常只有几 MB），在同一个基座模型上快速切换。</li>
+<li><strong>可合并</strong> → 训练完可以把 BA 直接加回 W0（<code>merge</code>），推理时零额外延迟。</li>
+</ul>
+<p>一句话总结：<strong>LoRA 冻结原权重，假设权重增量 ΔW 是低秩的，用两个小矩阵 A、B 的乘积来近似它，从而把可训练参数和显存开销都压缩了 2~3 个数量级。</strong></p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面用 PyTorch 从零实现一个 <code>LoRALinear</code> 层，直观看到&quot;冻结原权重 + 低秩旁路&quot;是怎么回事。</p>
+<pre data-lang="python"><code class="language-python">import torch
+import torch.nn as nn
+
+class LoRALinear(nn.Module):
+    &quot;&quot;&quot;带低秩旁路的线性层：h = W0·x + (α/r)·B·A·x&quot;&quot;&quot;
+    def __init__(self, in_features, out_features, r=8, alpha=16):
+        super().__init__()
+        # 原始权重 W0：冻结，不参与训练
+        self.linear = nn.Linear(in_features, out_features, bias=False)
+        for p in self.linear.parameters():
+            p.requires_grad = False
+
+        # 低秩矩阵 A（r × in）和 B（out × r）
+        self.lora_A = nn.Parameter(torch.randn(r, in_features) * 0.01)  # 小随机初始化
+        self.lora_B = nn.Parameter(torch.zeros(out_features, r))        # 全零初始化
+        self.scaling = alpha / r
+
+    def forward(self, x):
+        # 原输出 + 低秩增量（开始时 ΔW=0，模型行为不变）
+        return self.linear(x) + (x @ self.lora_A.T @ self.lora_B.T) * self.scaling
+
+# 模拟一个 d=k=512 的投影矩阵，观察可训练参数变化
+layer = LoRALinear(in_features=512, out_features=512, r=8, alpha=16)
+
+total = sum(p.numel() for p in layer.parameters())
+trainable = sum(p.numel() for p in layer.parameters() if p.requires_grad)
+print(f&quot;该层总参数量:   {total}&quot;)
+print(f&quot;可训练参数量:   {trainable}&quot;)
+print(f&quot;可训练占比:     {trainable/total*100:.2f}%&quot;)
+
+# 验证前向传播和梯度流向
+x = torch.randn(4, 512)          # 一个 batch 的输入
+out = layer(x)
+out.sum().backward()             # 反向传播
+print(&quot;\nout 形状:&quot;, tuple(out.shape))
+print(&quot;lora_A 是否收到梯度:&quot;, layer.lora_A.grad is not None)
+print(&quot;原权重 W0 是否冻结:&quot;, layer.linear.weight.requires_grad)</code></pre>
+<p>再直观计算一下&quot;低秩近似能省多少参数&quot;，对比不同秩 r 的效果。</p>
+<pre data-lang="python"><code class="language-python">def param_reduction(d, k, r):
+    &quot;&quot;&quot;计算 LoRA 相对全参数微调的可训练参数保留比例&quot;&quot;&quot;
+    full = d * k
+    lora = r * (d + k)
+    return lora / full
+
+print(&quot;d=k=4096 的权重矩阵，不同秩 r 下的可训练参数保留比例：&quot;)
+for r in [4, 8, 16, 64]:
+    ratio = param_reduction(4096, 4096, r)
+    print(f&quot;  r={r:&gt;2} -&gt; 保留 {ratio*100:.2f}%（节省 {100 - ratio*100:.2f}%）&quot;)
+
+print(&quot;\n结论：即便 r=64，可训练参数也不到原矩阵的 3%；&quot;)
+print(&quot;     这正是 LoRA 能把显存和存储成本大幅压下来的原因。&quot;)</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>填空</strong>：LoRA 假设微调的权重增量 ΔW 是 ____ 的，并把它分解为 ΔW = ____ · ____，其中 r ≪ min(d, k)；训练时原权重 W0 被 ____（冻结/更新）。</li>
+<li><strong>推导</strong>：写出 LoRA 层的前向公式 h = ____，并说明为什么&quot;B 初始化为零&quot;能保证训练从与原模型一致的状态起步。</li>
+<li><strong>动手实验</strong>：把上面 <code>LoRALinear</code> 的 <code>r</code> 从 8 改成 64，重新运行，观察可训练参数量和占比的变化；再把 <code>alpha</code> 改成 8，思考 <code>scaling = alpha/r</code> 如何影响低秩支路的贡献。</li>
+<li><strong>思考题</strong>：为什么 LoRA 相对全参数微调能减轻灾难性遗忘？从&quot;原权重不被更新、扰动更小&quot;的角度解释。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>LoRA 原论文（Hu et al., 2021）：<a href="https://arxiv.org/abs/2106.09685" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2106.09685</a></li>
+<li>Hugging Face PEFT 文档（LoRA 概念）：<a href="https://huggingface.co/docs/peft/conceptual_guides/lora" target="_blank" rel="noopener noreferrer">https://huggingface.co/docs/peft/conceptual_guides/lora</a></li>
+<li>LoRA 官方代码仓库（microsoft/LoRA）：<a href="https://github.com/microsoft/LoRA" target="_blank" rel="noopener noreferrer">https://github.com/microsoft/LoRA</a></li>
+<li>Intrinsic Dimensionality 论文（Aghajanyan et al., 2020）：<a href="https://arxiv.org/abs/2012.13255" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2012.13255</a></li>
+</ul>
+<p><a href="#/l/ft-ch3-l2">下一课：LoRA 实现</a></p>

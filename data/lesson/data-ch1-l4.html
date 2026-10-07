@@ -1,0 +1,557 @@
+<h2 id="h-数据侧的常见错误图鉴从可观测性分类到体检清单">数据侧的常见错误图鉴：从可观测性分类到体检清单<a class="anchor" href="#h-数据侧的常见错误图鉴从可观测性分类到体检清单" aria-label="本节链接">#</a></h2>
+<h3 id="h-这一节要解决什么">这一节要解决什么<a class="anchor" href="#h-这一节要解决什么" aria-label="本节链接">#</a></h3>
+<p>前三节给了机制：质量如何改变行为、配比如何塑形能力、泄漏如何破坏排序。这一节把它们沉淀成<strong>可检索的工程目录</strong> —— 当你闻到&quot;数据有问题&quot;的味道时，能按图索骥找到最可能的几条。</p>
+<p>这一节的组织方式不是&quot;按管线阶段罗列注意事项&quot;。那种列表的问题是<strong>没有优先级</strong>：五十条并列的注意事项，读者记不住也用不上。这里用的是一条更实用的轴 —— <strong>可观测性</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>可观测性</th>
+<th>表现</th>
+<th>代价</th>
+<th>例子</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>立即报错</strong></td>
+<td>抛异常、结果为空</td>
+<td>最低（开发期发现）</td>
+<td>编码错误、字段缺失</td>
+</tr>
+<tr>
+<td><strong>指标变差</strong></td>
+<td>训练/评测指标直接下降</td>
+<td>中（能归因，但要时间）</td>
+<td>过滤过度、标签噪声过高</td>
+</tr>
+<tr>
+<td><strong>需要切片才可见</strong></td>
+<td>总体指标（含 AUC）正常，某些子集的<strong>校准或阈值化指标</strong>变差</td>
+<td>高（没有切片就永远看不到）</td>
+<td>依赖人群的标签噪声、群体采样不足</td>
+</tr>
+<tr>
+<td><strong>上线后才可见</strong></td>
+<td>离线一切正常，线上变差</td>
+<td>很高（含回滚与信誉成本）</td>
+<td>时间泄漏、目标泄漏、分布漂移</td>
+</tr>
+<tr>
+<td><strong>永远不可见</strong></td>
+<td>没有任何信号</td>
+<td><strong>最高</strong></td>
+<td>不可复现的管线、无版本的数据、许可与 PII 未审计</td>
+</tr>
+</tbody></table>
+<p><strong>最后一行才是这一节的重点。</strong> 抛异常的错误不值得我们花一节去讲；值得讲的是那些<strong>不会自己发出声音</strong>的错误 —— 它们不抛异常、不降低平均指标、也不出现在任何看板上，只能靠<strong>主动审计</strong>发现。所以本节的代码不是&quot;清洗脚本&quot;，而是一套<strong>体检工具</strong>：六个检查函数，每个对应一类静默错误。</p>
+<h3 id="h-一图鉴的使用方法">一、图鉴的使用方法<a class="anchor" href="#h-一图鉴的使用方法" aria-label="本节链接">#</a></h3>
+<p>每条错误的记录格式统一为五项：</p>
+<ul>
+<li><strong>症状</strong>：你实际会观察到什么（这是检索的入口）；</li>
+<li><strong>根因</strong>：机制上一句话讲清为什么会这样；</li>
+<li><strong>代价</strong>：它会污染哪个下游结论（不是&quot;数据变差&quot;这种空话）；</li>
+<li><strong>诊断</strong>：具体怎么测（尽可能给可执行的检查）；</li>
+<li><strong>修法</strong>：怎么修，以及修法的代价。</li>
+</ul>
+<p>编号格式 <code>E&lt;组号&gt;&lt;序号&gt;</code>，便于团队在评审里直接引用（&quot;这版有 E21 和 E33&quot;）。</p>
+<h3 id="h-二图鉴-a切分与泄漏">二、图鉴 A：切分与泄漏<a class="anchor" href="#h-二图鉴-a切分与泄漏" aria-label="本节链接">#</a></h3>
+<h4 id="h-e11-先清洗后切分">E11 先清洗后切分<a class="anchor" href="#h-e11-先清洗后切分" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>症状</strong>：去重/过滤报告说&quot;重复率 2%&quot;，但评测分数异常好。</li>
+<li><strong>根因</strong>：去重、过滤、语言识别、质量打分都在<strong>全量数据</strong>上做，于是这些步骤的统计量（去重阈值下的簇、过滤器阈值、语言分布）都吃到了测试集的信息（预处理泄漏）；更要紧的是<strong>切分之后近重复仍然跨 split</strong>，因为去重只按精确指纹做，改写/模板化副本不受影响。</li>
+<li><strong>代价</strong>：整个评测集的可信度作废；所有基于它比较的模型版本结论失效（第 3 节 3.3）。</li>
+<li><strong>诊断</strong>：把切分脚本按&quot;先切分、再各自清洗&quot;重跑一遍，比较两版的跨 split 重叠率（代码检查 1）。</li>
+<li><strong>修法</strong>：顺序固定为 <strong>分组 → 切分 → 组内清洗</strong>。代价：分组要能定义（有时实体不可得），且组内清洗会让各 split 的过滤阈值不完全一致。</li>
+</ul>
+<h4 id="h-e12-跨-split-去重">E12 跨 split 去重<a class="anchor" href="#h-e12-跨-split-去重" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>症状</strong>：训测重叠率不高（精确 0.3%），但近似重叠率高得多（10%+）。</li>
+<li><strong>根因</strong>：只做了精确指纹去重。模板化网页（同一站点的商品页）、同一新闻的多家转载、论文的预印本与正式版，都是<strong>近重复而非逐字重复</strong>。</li>
+<li><strong>代价</strong>：等于 E11 的部分泄漏，且因为量小而不被怀疑 —— 最坏的一类（第 3 节 3.4）。</li>
+<li><strong>诊断</strong>：对 train/test 做 MinHash 或 shingle-Jaccard 近邻检索，阈值扫描（代码检查 1 的 τ 两档对照）。</li>
+<li><strong>修法</strong>：切分前按<strong>连通簇</strong>（近重复图的连通分量）分配 split。代价：聚类阈值把自己变成一个新的调参对象，且簇的规模分布长尾（可能一个簇占掉 5% 数据）。</li>
+</ul>
+<h4 id="h-e13-按行随机切分带组时序的数据">E13 按行随机切分带组/时序的数据<a class="anchor" href="#h-e13-按行随机切分带组时序的数据" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>症状</strong>：测试指标很高，但模型上线后对新用户/新时段表现差。</li>
+<li><strong>根因</strong>：同一用户的多条记录、同一患者的多份病历、同一时间窗的相邻样本被随机分到两侧（组泄漏 + 时间泄漏的复合）。模型学的是&quot;认出实体/插值时间&quot;，不是规律。</li>
+<li><strong>代价</strong>：离线与线上之间的系统性落差，且落差大小无法从离线指标预测。</li>
+<li><strong>诊断</strong>：检查每个测试样本的&quot;实体是否在训练集出现过&quot;（代码检查 2），并比较&quot;见过实体&quot;与&quot;未见过实体&quot;两组的指标。如果差距巨大，就是它。</li>
+<li><strong>修法</strong>：GroupKFold / 时间切分。代价：评测方差变大；且如果<strong>部署时确实会遇到见过的实体</strong>，全分开会低估真实性能 —— 正确做法是<strong>两个数字都报</strong>（第 3 节 2.4）。</li>
+</ul>
+<h4 id="h-e14-用测试集调阈值选过滤器">E14 用测试集调阈值/选过滤器<a class="anchor" href="#h-e14-用测试集调阈值选过滤器" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>症状</strong>：阈值在测试集上&quot;扫出来&quot;的那一版，换一批数据就掉。</li>
+<li><strong>根因</strong>：阈值是一个被选择出来的参数，选择过程消耗了测试集的信息（选择泄漏 / winner&#39;s curse）。</li>
+<li><strong>代价</strong>：报告的分数与真实性能系统性偏离；偏离量随候选数增加 —— 代码里 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">K</span></span></span></span> 个候选的高估是 +1.25（K=5）到 +2.75 个点（K=100）。</li>
+<li><strong>诊断</strong>：记录&quot;这个数字是怎么选出来的&quot;，数一数测试集被看了几次。</li>
+<li><strong>修法</strong>：所有阈值只在验证集上定；测试集只在最终验收时看一次。</li>
+</ul>
+<h4 id="h-e15-早停用测试集">E15 早停用测试集<a class="anchor" href="#h-e15-早停用测试集" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>症状</strong>：训练曲线很平滑，但&quot;最优 checkpoint&quot;在别处复现不了。</li>
+<li><strong>根因</strong>：早停是一种模型选择，用测试集做就是选择泄漏。它的隐蔽性在于<strong>它看起来只是监控</strong>。</li>
+<li><strong>代价</strong>：每一轮训练都在测试集上做一次隐式梯度步。</li>
+<li><strong>诊断</strong>：看训练脚本里 <code>eval</code> 用的是哪个 loader。</li>
+<li><strong>修法</strong>：早停只看验证集；测试集在训练脚本里根本不可见（物理隔离）。</li>
+</ul>
+<h3 id="h-三图鉴-b清洗与过滤">三、图鉴 B：清洗与过滤<a class="anchor" href="#h-三图鉴-b清洗与过滤" aria-label="本节链接">#</a></h3>
+<h4 id="h-e21-过滤器阈值凭看起来合理定">E21 过滤器阈值凭&quot;看起来合理&quot;定<a class="anchor" href="#h-e21-过滤器阈值凭看起来合理定" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>症状</strong>：过滤比例正常（比如保留 60%），但删掉的样本里人工一看有不少好数据。</li>
+<li><strong>根因</strong>：阈值通常是跨领域抄来的（英文网页语料上定的长度/符号比/停用词比例），换到中文、代码、医学、对话上就系统性误删。</li>
+<li><strong>代价</strong>：方向性偏差 —— 删掉的是<strong>某一类</strong>数据，不是随机数据。表现为长尾能力、方言/口语能力退化，平均指标几乎看不出。</li>
+<li><strong>诊断</strong>：抽 200~500 条<strong>被删</strong>的样本人工看；按来源/语言/长度分片统计删除率。<strong>只看保留样本的质量是不够的，一定要看被删除的样本。</strong></li>
+<li><strong>修法</strong>：在目标语料上重新定阈值（用人工标注的&quot;该留/该删&quot;做 PR 曲线，见第 2 章第 3 节）。代价：标注成本，且阈值需要随数据更新而重标。</li>
+</ul>
+<h4 id="h-e22-过滤器去重阈值在小样本上过拟合">E22 过滤器/去重阈值在小样本上过拟合<a class="anchor" href="#h-e22-过滤器去重阈值在小样本上过拟合" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>症状</strong>：阈值在实验集上完美，全量跑起来效果差。</li>
+<li><strong>根因</strong>：阈值也是被拟合的参数；在 500 条上扫出来的最优阈值，其泛化误差与&quot;在测试集上选模型&quot;同构。</li>
+<li><strong>代价</strong>：调参的努力被浪费，且团队会以为&quot;过滤没用&quot;。</li>
+<li><strong>诊断</strong>：把标注样本切成&quot;调阈值&quot;与&quot;验证阈值&quot;两半，比较两半上的最优阈值。</li>
+<li><strong>修法</strong>：阈值搜索放进交叉验证；记录搜索了多少组。</li>
+</ul>
+<h4 id="h-e23-用模型打分过滤--自举偏见与分布坍缩">E23 用模型打分过滤 → 自举偏见与分布坍缩<a class="anchor" href="#h-e23-用模型打分过滤--自举偏见与分布坍缩" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>症状</strong>：过滤后数据&quot;更干净&quot;了，但模型的多样性下降（生成更单一、风格更一致），长尾能力变差。</li>
+<li><strong>根因</strong>：用模型 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">A</span></span></span></span> 的打分选数据训练模型 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0502em;">B</span></span></span></span>，再用 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0502em;">B</span></span></span></span> 选数据训练 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">C</span></span></span></span>……每一轮保留的都是&quot;当前模型认为好&quot;的子集，等价于把数据分布反复投影到同一个子空间（第 2 章第 3 节形式化）。</li>
+<li><strong>代价</strong>：多样性单调下降且<strong>不可逆</strong>（被删的数据不会再回来）。</li>
+<li><strong>诊断</strong>：跟踪唯一 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span>-gram 数、类型-令牌比、以及每个切片的保留率随轮次的变化。</li>
+<li><strong>修法</strong>：给每个切片设<strong>保留配额</strong>；多个互补过滤器；保留一定比例的&quot;低分但多样&quot;样本。代价：会放进一部分真噪声，需要下游容忍。</li>
+</ul>
+<h4 id="h-e24-洁癖把长尾方言口语全删了">E24 洁癖：把长尾、方言、口语全删了<a class="anchor" href="#h-e24-洁癖把长尾方言口语全删了" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>症状</strong>：模型在标准普通话/正式文体上很好，遇到方言、网络用语、口语就崩。</li>
+<li><strong>根因</strong>：所有质量启发式都在偏好&quot;正式书面语&quot;，而&quot;正式&quot;与&quot;覆盖部署分布&quot;是<strong>两个目标</strong>（第 1 节 1.2 的维度不可合成）。</li>
+<li><strong>代价</strong>：公平性与覆盖面问题，可能成为合规事故。</li>
+<li><strong>诊断</strong>：按语言变体/领域分片统计保留率与下游指标；宏平均 vs 微平均的差距。</li>
+<li><strong>修法</strong>：为低资源变体设保留下限。代价：这些数据会拉低一部分标准指标 —— 这是一个必须显式接受的取舍，要写进设计文档。</li>
+</ul>
+<h4 id="h-e25-规范化顺序错误">E25 规范化顺序错误<a class="anchor" href="#h-e25-规范化顺序错误" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>症状</strong>：去重率异常低（&quot;明明有很多重复&quot;），或同一份内容在两次运行里被判为不同。</li>
+<li><strong>根因</strong>：任何<strong>非确定性或有损</strong>的步骤放在去重之前，都会让同一内容产生不同指纹。典型：先做随机化的 PII 加噪再指纹（同一内容每次指纹不同）；或先做实体解码再进行第二次解码（<code>&amp;amp;amp;</code> 这类需要多次解码的情况）。</li>
+<li><strong>代价</strong>：去重失效、管线不可复现、且<strong>从指标上看不出原因</strong>（只会看到&quot;重复率很低&quot;）。</li>
+<li><strong>诊断</strong>：检查规范化函数的<strong>幂等性</strong> <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="mopen">(</span><span class="mord mathnormal">x</span><span class="mclose">))</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="mopen">(</span><span class="mord mathnormal">x</span><span class="mclose">)</span></span></span></span>（代码检查 6）；两次运行比较输出 hash。</li>
+<li><strong>修法</strong>：去重之前所有步骤必须<strong>确定性且幂等</strong>；非确定性变换（加噪、采样）放到去重之后。</li>
+</ul>
+<h4 id="h-e26-过度规范化丢信息">E26 过度规范化丢信息<a class="anchor" href="#h-e26-过度规范化丢信息" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>症状</strong>：模型在需要保格式的任务上变差（代码、数学、表格），或对全角/特殊符号不敏感。</li>
+<li><strong>根因</strong>：NFKC 是<strong>有损</strong>的（①②→12、ﬁ→fi、全角→半角、上标→普通数字）；小写化丢 NER 与代码标识符信息；去标点丢数学与代码语义。</li>
+<li><strong>代价</strong>：一部分任务的能力上限被提前削掉，而且这种损失<strong>不可通过加数据恢复</strong>。</li>
+<li><strong>诊断</strong>：对规范化前后的语料抽样做 diff，人工看被改变的部分里有多少是<strong>语义相关</strong>的。按任务分别测量。</li>
+<li><strong>修法</strong>：按域选择规范化强度（代码/数学用 NFC 或仅做空白与零宽清理；自然语言可用 NFKC）。代价：多套规范化意味着多套去重指纹与多套管线，工程复杂度上升。</li>
+</ul>
+<h3 id="h-四图鉴-c去重">四、图鉴 C：去重<a class="anchor" href="#h-四图鉴-c去重" aria-label="本节链接">#</a></h3>
+<h4 id="h-e31-只做精确去重">E31 只做精确去重<a class="anchor" href="#h-e31-只做精确去重" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>症状</strong>：唯一文档数很高，但模型逐字复读训练语料的概率也高。</li>
+<li><strong>根因</strong>：精确指纹只能抓逐字重复；模板化近重复（转载、镜像站、商品页）在字面上不同。</li>
+<li><strong>代价</strong>：有效数据量被高估（第 1 节 4.1 的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0278em;">D</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0278em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">eff</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>），算力被浪费在冗余 token 上，记忆化风险上升。</li>
+<li><strong>诊断</strong>：在精确去重之后<strong>再跑一次</strong> MinHash/LSH，看还能去掉多少（通常还有 20%~40%）。</li>
+<li><strong>修法</strong>：文档级 MinHash + LSH，参数按目标阈值解（第 2 章第 2 节）。</li>
+</ul>
+<h4 id="h-e32-去重阈值凭感觉不知道-precisionrecall">E32 去重阈值凭感觉，不知道 precision/recall<a class="anchor" href="#h-e32-去重阈值凭感觉不知道-precisionrecall" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>症状</strong>：说不清&quot;删掉的到底是不是重复&quot;。</li>
+<li><strong>根因</strong>：去重是一个<strong>二分类任务</strong>（是否重复），它的性能有 precision/recall，而只报&quot;删除了 X%&quot;不包含这个信息。</li>
+<li><strong>代价</strong>：FP（删掉不重复的独特数据）与 FN（留下重复）的代价不对称，无法据此优化。</li>
+<li><strong>诊断</strong>：人工标注一批&quot;重复/不重复&quot;对（几百对足够），扫描阈值画 PR 曲线。</li>
+<li><strong>修法</strong>：按 PR 曲线选阈值并把曲线存档。代价：标注成本；且&quot;是否重复&quot;本身有灰区（多少比例的改写算重复？需要事先定义）。</li>
+</ul>
+<h4 id="h-e33-去重时随机保留副本">E33 去重时随机保留副本<a class="anchor" href="#h-e33-去重时随机保留副本" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>症状</strong>：数据量与预期一致，但留下数据的平均质量下降。</li>
+<li><strong>根因</strong>：一个近重复簇里有多个副本（原始的权威版本 + 转载/镜像/被抓取的低质版本），随机保留等于<strong>以簇的大小为权重抽样副本</strong> —— 而&quot;副本多&quot;恰恰说明它被广泛转载，与质量无关，甚至负相关（低质内容更常被无脑转载）。</li>
+<li><strong>代价</strong>：静默的质量下降。代码里实测：随机保留的平均质量 0.266，按质量保留 0.473 —— <strong>接近一半的质量被扔掉，而任何指标都不会告诉你</strong>。</li>
+<li><strong>诊断</strong>：比较两种保留策略下留下数据的质量分布。</li>
+<li><strong>修法</strong>：簇内按质量分排序保留（并保留 doc_id 以便溯源）。代价：质量分本身有偏差（第 1 节 1.2、第 2 章第 3 节），会把质量分的偏见固化进数据。</li>
+</ul>
+<h4 id="h-e34-去重破坏了评测">E34 去重破坏了评测<a class="anchor" href="#h-e34-去重破坏了评测" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>症状</strong>：去重之后评测集变小、或某些题目消失。</li>
+<li><strong>根因</strong>：在全量（含测试集）上做去重，去重逻辑会按&quot;质量/长度&quot;选择保留哪个副本 —— 它可能删掉测试集题目、或者把测试集的题目替换成训练语料里的近重复版本。</li>
+<li><strong>代价</strong>：评测集被静默修改，跨版本不可比（第 3 节 3.3 的&quot;结论作废&quot;）。</li>
+<li><strong>诊断</strong>：对评测集计算指纹，检查它在去重前后是否逐字节不变。</li>
+<li><strong>修法</strong>：<strong>评测集永不进入任何清洗/去重流程</strong>；去重只在训练语料内部进行，并另做一次跨集重叠审计（E12）。</li>
+</ul>
+<h3 id="h-五图鉴-d配比与合成">五、图鉴 D：配比与合成<a class="anchor" href="#h-五图鉴-d配比与合成" aria-label="本节链接">#</a></h3>
+<h4 id="h-e41-没有目标函数就调配比">E41 没有目标函数就调配比<a class="anchor" href="#h-e41-没有目标函数就调配比" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>症状</strong>：反复换权重，说不清哪版更好（A 域涨、B 域掉）。</li>
+<li><strong>根因</strong>：这是一个多目标优化问题，却拒绝写下效用函数（第 2 节 1.3）。</li>
+<li><strong>代价</strong>：所有配比实验无法被继承；每次换人都从头试。</li>
+<li><strong>诊断</strong>：问&quot;如果 A 涨 2 点、B 掉 1 点，你选哪个？&quot; —— 答不上来就是没有目标函数。</li>
+<li><strong>修法</strong>：写下来（加权边际效用 或 minimax），并选出不参与搜索的 held-out 域。</li>
+</ul>
+<h4 id="h-e42-反复用同一评测调配比">E42 反复用同一评测调配比<a class="anchor" href="#h-e42-反复用同一评测调配比" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>症状</strong>：在评测上&quot;最优&quot;的配比换一批数据就失效。</li>
+<li><strong>根因</strong>：在评测上搜索就是在评测上做梯度下降；搜索轮数越多，过拟合越重（与 E14 同构，只是搜索空间从阈值变成单纯形）。</li>
+<li><strong>代价</strong>：整门课的配比结论都带偏。</li>
+<li><strong>诊断</strong>：统计&quot;为了定这个 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0269em;">w</span></span></span></span> 一共训了多少个模型、评估了多少次&quot;。</li>
+<li><strong>修法</strong>：留出不参与搜索的域与评测；限制轮数；记录全部尝试（而不是只记录胜者）。</li>
+</ul>
+<h4 id="h-e43-合成数据无去重无验证--模型自噬">E43 合成数据无去重、无验证 → 模型自噬<a class="anchor" href="#h-e43-合成数据无去重无验证--模型自噬" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>症状</strong>：用合成数据继续训练若干轮后，输出分布收窄、重复增多、罕见模式消失。</li>
+<li><strong>根因</strong>：合成数据的分布是&quot;教师模型分布&quot;的有损投影；把它当真实数据反复训练，每一代都会丢掉一部分尾部（模型坍缩）。且合成数据极易重复（同一 prompt 模板批量生成）。</li>
+<li><strong>代价</strong>：能力单项退化、多样性下降，且<strong>难以归因</strong>（看起来像&quot;训久了&quot;）。</li>
+<li><strong>诊断</strong>：合成数据内部去重率、与真实数据的分布距离（唯一 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span>-gram、熵）、以及&quot;真实数据占比&quot;这个超参的记录。</li>
+<li><strong>修法</strong>：合成数据必须去重、必须与真实数据混合（真实数据占比是一个必须显式记录的超参）、必须有 held-out 真实评测监控。代价：合成数据带来的收益会被稀释。</li>
+</ul>
+<h4 id="h-e44-蒸馏数据不筛教师错误被固化">E44 蒸馏数据不筛，教师错误被固化<a class="anchor" href="#h-e44-蒸馏数据不筛教师错误被固化" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>症状</strong>：学生模型在教师也错的样本上稳定地错，且比教师更自信。</li>
+<li><strong>根因</strong>：蒸馏把教师的<strong>全部</strong>输出（含错误与幻觉）当成监督信号，而且通常只保留&quot;高置信&quot;的输出 —— 教师的错误恰好常常是高置信的。</li>
+<li><strong>代价</strong>：错误被放大（学生无法区分&quot;教师知道&quot;与&quot;教师猜的&quot;）。</li>
+<li><strong>诊断</strong>：在教师也错的子集上比较学生与教师的准确率；比较两者的置信度分布。</li>
+<li><strong>修法</strong>：用真实标签校验合成标签（在有标签的地方）；保留教师的不确定性（logits/采样一致性）而不是只保留硬标签；对教师低一致性的样本直接丢弃。代价：需要教师 logits 或多次采样，成本上升。</li>
+</ul>
+<h4 id="h-e45-回放比例为零">E45 回放比例为零<a class="anchor" href="#h-e45-回放比例为零" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>症状</strong>：领域微调后，领域指标大涨，通用能力与安全行为（拒答、格式）退化。</li>
+<li><strong>根因</strong>：连续训练覆盖了旧分布（灾难性遗忘）；且微调数据的格式单一（全是指令-答案对），模型失去&quot;该输出自由文本时输出自由文本&quot;的行为。</li>
+<li><strong>代价</strong>：上线后出现&quot;新能力很强但整体不可用&quot;的模型。</li>
+<li><strong>诊断</strong>：通用能力评测 + 格式行为评测（自由续写、拒答、多轮）作为<strong>门禁</strong>，而不是可选监控。</li>
+<li><strong>修法</strong>：分阶段回放（早期高、后期低，第 2 节 3.3）。代价：领域学习变慢。</li>
+</ul>
+<h3 id="h-六图鉴-e工程与治理">六、图鉴 E：工程与治理<a class="anchor" href="#h-六图鉴-e工程与治理" aria-label="本节链接">#</a></h3>
+<h4 id="h-e51-数据不可版本化">E51 数据不可版本化<a class="anchor" href="#h-e51-数据不可版本化" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>症状</strong>：出问题时无法知道&quot;这次的训练数据到底是哪一份&quot;。</li>
+<li><strong>根因</strong>：用文件名/日期当版本（<code>data_v3_final.csv</code>），没有内容指纹；或者数据在对象存储里被<strong>原地覆盖</strong>。</li>
+<li><strong>代价</strong>：实验不可复现、结论不可归因 —— 这是所有其它静默错误的<strong>放大器</strong>（没有版本就无法二分定位）。</li>
+<li><strong>诊断</strong>：给同一份数据算两次内容 hash，看是否一致；能否从&quot;模型版本&quot;回查到&quot;训练数据指纹&quot;。</li>
+<li><strong>修法</strong>：数据版本 = <strong>输入指纹 + 管线版本 + 参数</strong>三元组；对象存储只追加不覆盖。</li>
+</ul>
+<h4 id="h-e52-管线不确定">E52 管线不确定<a class="anchor" href="#h-e52-管线不确定" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>症状</strong>：同样的输入、同样的代码，两次运行结果不同。</li>
+<li><strong>根因</strong>：多进程/多线程的完成顺序、<code>set</code>/<code>dict</code> 的遍历顺序、未固定的随机种子、把时间戳写进内容、浮点求和的顺序差异。</li>
+<li><strong>代价</strong>：无法做 A/B 对照实验（你连&quot;只有数据变了&quot;都无法保证）。</li>
+<li><strong>诊断</strong>：同输入跑两次，比较<strong>输出字节的 hash</strong>（代码检查 6 的幂等性检查是它的子集）。</li>
+<li><strong>修法</strong>：排序后再处理、固定种子、时间戳只记录不参与内容、聚合用确定性顺序。</li>
+</ul>
+<h4 id="h-e53-许可与-pii-未审计">E53 许可与 PII 未审计<a class="anchor" href="#h-e53-许可与-pii-未审计" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>症状</strong>：无法回答&quot;这份数据能不能用&quot;&quot;里面有没有个人信息&quot;。</li>
+<li><strong>根因</strong>：采集时没有记录来源与许可（第 2 章第 1 节），PII 从未扫描。</li>
+<li><strong>代价</strong>：法律风险 + 撤下时无法算影响面（不知道哪些样本来自哪个源）。</li>
+<li><strong>诊断</strong>：抽查看能否为每个样本填写 <code>source_id</code>；跑一次 PII 正则/NER 扫描看命中率。</li>
+<li><strong>修法</strong>：来源登记表 + 许可字段 + PII 检测进管线；产出数据卡。代价：前期工程量，以及一部分数据因为许可不明而必须弃用。</li>
+</ul>
+<h4 id="h-e54-只看平均不看切片或者只看-auc">E54 只看平均，不看切片（或者只看 AUC）<a class="anchor" href="#h-e54-只看平均不看切片或者只看-auc" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>症状</strong>：总指标与总 AUC 都正常，某个群体/来源的<strong>校准与阈值化准确率</strong>悄悄退化。</li>
+<li><strong>根因</strong>：两条机制叠加。① 第 1 节 2.4：人群内部的标签噪声若在片内均匀，<strong>连该人群的 AUC 都不变</strong> —— 坏掉的是概率尺度与固定阈值；② 噪声人群的梯度会经由<strong>共享参数</strong>把干净人群一起拖差（代码实测：干净人群 AUC 不动，阈值化准确率掉 2.8 点）。加上 E24 的采样偏差，三类缺陷都只在切片上可见。</li>
+<li><strong>代价</strong>：上线后才发现的公平性/可用性事故；而且因为 AUC 正常，团队会认为&quot;模型没问题&quot;。</li>
+<li><strong>诊断</strong>：固定一组&quot;必看切片&quot;（来源、语言变体、长度分位、业务分组、时间批次），<strong>每个切片同时报告 AUC、校准（ECE 或分桶曲线）、以及在业务阈值下的准确率/召回/精确率</strong>。只有 AUC 的报告等于没看。</li>
+<li><strong>修法</strong>：把切片的三项指标设为发布门禁。代价：切片多了会多重比较（有些&quot;显著下降&quot;是噪声），需要预先声明切片集合与显著性水平。</li>
+</ul>
+<h4 id="h-e55-数据改动不做变更记录">E55 数据改动不做变更记录<a class="anchor" href="#h-e55-数据改动不做变更记录" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>症状</strong>：模型变了，但说不清是数据变了还是代码变了。</li>
+<li><strong>根因</strong>：数据的改动不在 <code>git diff</code> 里（数据不在代码仓库），也没有变更日志。</li>
+<li><strong>代价</strong>：归因成本极高；同一团队反复踩同一个坑。</li>
+<li><strong>诊断</strong>：查看是否有&quot;数据变更记录&quot;这一产物。</li>
+<li><strong>修法</strong>：每次数据变更记录：改了什么、为什么、影响面（样本数/来源/指纹变化）、以及是否需要重跑哪条评测。代价：流程开销 —— 但它是最便宜的一项投入。</li>
+</ul>
+<p><figure><img class="md-img" src="content/courses/data-engineering/assets/chapter-1-figure-04.svg" alt="四种泄漏的代价量级完全不同" loading="lazy" decoding="async"><figcaption>四种泄漏的代价量级完全不同</figcaption></figure>
+</p>
+<h3 id="h-七把图鉴变成流程数据体检清单">七、把图鉴变成流程：数据体检清单<a class="anchor" href="#h-七把图鉴变成流程数据体检清单" aria-label="本节链接">#</a></h3>
+<p>把上面 25 条压成一份可以贴进 PR 模板的清单。<strong>每一项都要求给出数字或&quot;不适用+理由&quot;，不接受&quot;已检查&quot;。</strong></p>
+<p><strong>A. 切分（5 项）</strong></p>
+<ol>
+<li>切分发生在清洗之前吗？（否则 E11）</li>
+<li>跨 split 的精确重叠率 = ? 近似重叠率（τ=0.8 / 0.6 / 0.4 三档）= ?（E12）</li>
+<li>分组键是什么？测试集中&quot;实体已在训练集出现&quot;的比例 = ?（E13）</li>
+<li>测试集被用于哪些决策？次数 = ?（E14/E15）</li>
+<li>评测集在清洗流程中是否被修改？（指纹前后一致吗）（E34）</li>
+</ol>
+<p><strong>B. 清洗与过滤（6 项）</strong></p>
+<ol start="6">
+<li>过滤器阈值是在什么语料上定的？在本语料上的 precision/recall = ?（E21）</li>
+<li>阈值搜索用了多少组？有独立验证吗？（E22）</li>
+<li>是否有模型打分过滤？迭代了几轮？（E23）</li>
+<li>各切片（语言/来源/长度）保留率的最差值 = ?（E24）</li>
+<li>规范化函数是幂等的吗？两次运行输出 hash 一致吗？（E25/E52）</li>
+<li>规范化按域分开吗？代码/数学用了 NFKC 吗？（E26）</li>
+</ol>
+<p><strong>C. 去重（4 项）</strong></p>
+<ol start="12">
+<li>精确与近似去重各删了多少？近似去重是在精确之后跑的吗？（E31）</li>
+<li>去重阈值的 PR 曲线在哪？人工核验了多少对？（E32）</li>
+<li>簇内保留策略是什么？随机还是按质量？（E33）</li>
+<li>去重是否触及评测集？（E34）</li>
+</ol>
+<p><strong>D. 配比与合成（5 项）</strong></p>
+<ol start="16">
+<li>效用函数写下来了吗？held-out 域有哪些？（E41）</li>
+<li>为定配比训了多少个模型？全部记录了吗？（E42）</li>
+<li>合成数据的比例与去重率 = ? 有真实数据混合吗？（E43）</li>
+<li>蒸馏数据是否用真实标签抽检？教师错误的样本占比 = ?（E44）</li>
+<li>回放比例（按阶段）= ? 通用能力门禁是什么？（E45）</li>
+</ol>
+<p><strong>E. 工程与治理（5 项）</strong></p>
+<ol start="21">
+<li>数据版本三元组（输入指纹 + 管线版本 + 参数）是什么？（E51）</li>
+<li>同输入两次运行的输出 hash 一致吗？（E52）</li>
+<li>每个样本能填出 <code>source_id</code> 吗？PII 扫描命中率 = ?（E53）</li>
+<li>必看切片清单是什么？最差切片的指标 = ?（E54）</li>
+<li>这次的变更记录写了吗？（E55）</li>
+</ol>
+<h3 id="h-八与后续章节的映射">八、与后续章节的映射<a class="anchor" href="#h-八与后续章节的映射" aria-label="本节链接">#</a></h3>
+<p>本章建立的判据，会在后面的管线段落里逐个&quot;兑现&quot;：</p>
+<table>
+<thead>
+<tr>
+<th>本章的机制</th>
+<th>后续章节的实现</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>E53 许可与 PII</td>
+<td>第 2 章第 1 节：来源分类、许可传播、来源登记、采集工程</td>
+</tr>
+<tr>
+<td>E12/E31/E32/E33 去重</td>
+<td>第 2 章第 2 节：Jaccard、MinHash 无偏性推导、LSH 阈值、子串级去重、保留策略</td>
+</tr>
+<tr>
+<td>E21/E22/E23/E24 过滤</td>
+<td>第 2 章第 3 节：规则族、模型打分的偏差、自举坍缩、阈值与下游收益</td>
+</tr>
+<tr>
+<td>E25/E26/E52 规范化与确定性</td>
+<td>第 2 章第 4 节：Unicode 规范化、正文提取、管线顺序、幂等与可复现</td>
+</tr>
+<tr>
+<td>E11~E15 切分与泄漏</td>
+<td>第 3 节已给检测；工程化的切分/审计属于后续章节</td>
+</tr>
+<tr>
+<td>E41~E45 配比与合成</td>
+<td>第 2 节已给目标函数；完整的数据版本与实验管理属于后续章节</td>
+</tr>
+</tbody></table>
+<h3 id="h-代码六个静默错误的体检工具">代码：六个静默错误的体检工具<a class="anchor" href="#h-代码六个静默错误的体检工具" aria-label="本节链接">#</a></h3>
+<p>下面六个检查函数各自对应一类&quot;不会自己报警&quot;的错误。它们都是<strong>只读审计</strong>：不改数据，只输出可疑项与数字。刻意用最小实现（不依赖任何数据框架），便于贴进任何管线。</p>
+<pre data-lang="python"><code class="language-python"># -*- coding: utf-8 -*-
+&quot;&quot;&quot;数据体检：六个静默错误的检测器（每一条都不抛异常，只能靠主动审计发现）。&quot;&quot;&quot;
+import hashlib
+import re
+import unicodedata
+import numpy as np
+from collections import defaultdict
+
+# ---------- 工具：规范化 + 指纹（确定性是前提，见第 2 章第 4 节） ----------
+_WS = re.compile(r&quot;\s+&quot;)
+
+def canon(t: str) -&gt; str:
+    &quot;&quot;&quot;规范化：NFKC + 空白折叠 + 去首尾。任何有损操作都要有明确理由。&quot;&quot;&quot;
+    return _WS.sub(&quot; &quot;, unicodedata.normalize(&quot;NFKC&quot;, t)).strip()
+
+def fp(t: str) -&gt; str:
+    return hashlib.sha256(canon(t).encode(&quot;utf-8&quot;)).hexdigest()[:16]
+
+def shingles(t: str, k: int = 5) -&gt; set:
+    c = canon(t)
+    return {c[i:i + k] for i in range(max(0, len(c) - k + 1))}
+
+def jaccard(a: set, b: set) -&gt; float:
+    if not a or not b:
+        return 0.0
+    return len(a &amp; b) / len(a | b)
+
+# ---------- 检查 1：切分重叠（精确 + 近似，对应 E11/E12） ----------
+def check_split_overlap(train, test, k=5, tau=0.8):
+    &quot;&quot;&quot;train/test 是 [(id, text)]。返回 (精确重叠对, 近似重叠对)。&quot;&quot;&quot;
+    tr_fp = {fp(t): i for i, t in train}
+    exact = [(j, tr_fp[fp(t)]) for j, t in test if fp(t) in tr_fp]
+    sh_tr = {i: shingles(t, k) for i, t in train}
+    near = []
+    for j, t in test:
+        s = shingles(t, k)
+        for i, s2 in sh_tr.items():
+            if jaccard(s, s2) &gt;= tau:
+                near.append((j, i, round(jaccard(s, s2), 3)))
+    return exact, near
+
+# ---------- 检查 2：组泄漏（对应 E13） ----------
+def check_group_overlap(train_rows, test_rows, key=&quot;user_id&quot;):
+    g_tr = defaultdict(set)
+    for r in train_rows:
+        g_tr[r[key]].add(r[&quot;id&quot;])
+    hits = [r for r in test_rows if r[key] in g_tr]
+    return len(hits), len(test_rows), sorted({r[key] for r in hits})
+
+# ---------- 检查 3：时间泄漏（对应 E13） ----------
+def check_temporal(train_ts, test_ts):
+    return {&quot;train_max&quot;: max(train_ts), &quot;test_min&quot;: min(test_ts),
+            &quot;泄漏&quot;: max(train_ts) &gt;= min(test_ts)}
+
+# ---------- 检查 4：预处理作用域（对应 E11/E14） ----------
+def check_preprocessing_scope(X_tr, X_te, y_tr, y_te):
+    &quot;&quot;&quot;比较两种标准化的决策差异：全量 fit（泄漏） vs 只用训练集 fit。&quot;&quot;&quot;
+    def fit_apply(Xa, Xb):
+        mu, sd = Xa.mean(0), Xa.std(0) + 1e-9
+        return (Xb - mu) / sd
+    a_te = fit_apply(X_tr, X_te)                    # 只用训练集 fit
+    X_all = np.vstack([X_tr, X_te])                 # 在全量上 fit（泄漏）
+    b_te = (X_te - X_all.mean(0)) / (X_all.std(0) + 1e-9)
+    w = np.ones(X_tr.shape[1])                      # 一个固定的线性打分器
+    return int(np.sum((a_te @ w &gt; 0) != (b_te @ w &gt; 0))), len(X_te)
+
+# ---------- 检查 5：去重的保留策略（对应 E33） ----------
+def check_dedup_policy(items, tau=0.8, seed=0):
+    &quot;&quot;&quot;items = [(id, text, quality)]。同一簇里保留谁，决定留下数据的平均质量。&quot;&quot;&quot;
+    clusters, used = [], set()
+    for i, (_, t_i, _) in enumerate(items):
+        if i in used:
+            continue
+        cl, s_i = [i], shingles(t_i)
+        for j in range(i + 1, len(items)):
+            if j not in used and jaccard(s_i, shingles(items[j][1])) &gt;= tau:
+                cl.append(j)
+                used.add(j)
+        used.add(i)
+        clusters.append(cl)
+    keep_rand = [items[c[np.random.default_rng(seed + c[0]).integers(len(c))]] for c in clusters]
+    keep_best = [items[max(c, key=lambda x: items[x][2])] for c in clusters]
+    return (len(clusters),
+            float(np.mean([x[2] for x in keep_rand])),
+            float(np.mean([x[2] for x in keep_best])))
+
+# ---------- 检查 6：规范化的幂等性与确定性（对应 E25/E52） ----------
+def check_idempotent(f, samples):
+    &quot;&quot;&quot;幂等性是去重可复现的前提：f(f(x)) 必须等于 f(x)。&quot;&quot;&quot;
+    bad = [s for s in samples if f(f(s)) != f(s)]
+    return len(bad), bad[:3]
+
+def unescape_once(t: str) -&gt; str:
+    &quot;&quot;&quot;单趟 HTML 实体解码 —— 故意不幂等：&#39;&amp;amp;amp;&#39; 需要两次才还原。&quot;&quot;&quot;
+    return (t.replace(&quot;&amp;amp;&quot;, &quot;&amp;&quot;).replace(&quot;&amp;lt;&quot;, &quot;&lt;&quot;)
+             .replace(&quot;&amp;gt;&quot;, &quot;&gt;&quot;).replace(&quot;&amp;quot;&quot;, &#39;&quot;&#39;))
+
+if __name__ == &quot;__main__&quot;:
+    print(&quot;=== 1. 切分重叠 ===&quot;)
+    train = [(&quot;t1&quot;, &quot;深度学习模型的训练需要大量高质量数据&quot;),
+             (&quot;t2&quot;, &quot;本文提出一种新的注意力机制用于长文本建模&quot;),
+             (&quot;t3&quot;, &quot;数据去重可以显著降低模型的记忆化风险&quot;)]
+    test = [(&quot;e1&quot;, &quot;深度学习模型的训练需要大量高质量数据&quot;),           # 逐字复制
+            (&quot;e2&quot;, &quot;本文提出一种新的注意力机制，可用于长文本建模&quot;),    # 改写
+            (&quot;e3&quot;, &quot;强化学习中的奖励塑形是一个经典难题&quot;)]             # 全新
+    ex, ne6 = check_split_overlap(train, test, k=5, tau=0.6)
+    _, ne3 = check_split_overlap(train, test, k=5, tau=0.3)
+    print(f&quot;   精确重叠 {len(ex)} 对&quot;)
+    print(f&quot;   近似重叠 τ=0.6 -&gt; {[(a, b) for a, b, _ in ne6]}&quot;)
+    print(f&quot;   近似重叠 τ=0.3 -&gt; {[(a, b, s) for a, b, s in ne3]}&quot;)
+    print(&quot;   注意：改写的那条 e2 只在 τ=0.3 才被抓住 —— 阈值就是召回/误报的取舍&quot;)
+
+    print(&quot;\n=== 2. 组泄漏 ===&quot;)
+    rows = [{&quot;id&quot;: f&quot;r{i}&quot;, &quot;user_id&quot;: f&quot;u{i % 7}&quot;} for i in range(40)]
+    n_hit, n_all, gs = check_group_overlap(rows[:20], rows[20:], key=&quot;user_id&quot;)
+    print(f&quot;   test 中 {n_hit}/{n_all} 条来自训练集已出现的实体；实体 = {gs}&quot;)
+
+    print(&quot;\n=== 3. 时间泄漏 ===&quot;)
+    print(&quot;  &quot;, check_temporal(list(range(1000, 1100)), list(range(1050, 1150))))
+
+    print(&quot;\n=== 4. 预处理作用域 ===&quot;)
+    r = np.random.default_rng(3)
+    X_tr = r.normal(size=(100, 30)) * 5 + 1
+    X_te = r.normal(size=(100, 30)) * 5 + 4         # 测试分布有漂移
+    y_tr = r.integers(0, 2, 100); y_te = r.integers(0, 2, 100)
+    flip, n = check_preprocessing_scope(X_tr, X_te, y_tr, y_te)
+    print(f&quot;   全量 fit 与仅训练集 fit 相比，{flip}/{n} 条样本的决策被翻转&quot;)
+
+    print(&quot;\n=== 5. 去重保留策略 ===&quot;)
+    VOC = [chr(0x4e00 + i) for i in range(500)]
+    items = []
+    for c in range(50):
+        base = &quot;&quot;.join(r.choice(VOC, 40))            # 每簇一个独立的随机基串
+        q = r.random()
+        for v in range(2):                           # 每簇 2 份近重复，质量不同
+            items.append((f&quot;c{c}v{v}&quot;, base + &quot;！&quot; * (v + 1), round(q if v == 0 else q * 0.25, 3)))
+    nc, qr, qb = check_dedup_policy(items, tau=0.5, seed=0)
+    print(f&quot;   {nc} 个簇；随机保留的平均质量 = {qr:.3f}   按质量保留 = {qb:.3f}&quot;)
+
+    print(&quot;\n=== 6. 规范化幂等性 ===&quot;)
+    samples = [&quot;  多  空格 &quot;, &quot;ＡＢＣ&quot;, &quot;a\u200bb&quot;, &quot;&amp;amp;amp;x&quot;, &quot;&amp;lt;b&amp;gt;粗&amp;lt;/b&amp;gt;&quot;]
+    for name, f in ((&quot;canon(NFKC+空白折叠)&quot;, canon), (&quot;unescape_once(单趟实体解码)&quot;, unescape_once)):
+        bad, ex_bad = check_idempotent(f, samples)
+        print(f&quot;   {name:26s} 非幂等样本 {bad} 个 {ex_bad}&quot;)
+    print(&quot;   结论：把非幂等的步骤放在去重之前，同一内容会产生不同指纹 -&gt; 去重失效且不可复现&quot;)</code></pre>
+<p>实际输出：</p>
+<pre><code>=== 1. 切分重叠 ===
+   精确重叠 1 对
+   近似重叠 τ=0.6 -&gt; [(&#39;e1&#39;, &#39;t1&#39;)]
+   近似重叠 τ=0.3 -&gt; [(&#39;e1&#39;, &#39;t1&#39;, 1.0), (&#39;e2&#39;, &#39;t2&#39;, 0.545)]
+   注意：改写的那条 e2 只在 τ=0.3 才被抓住 —— 阈值就是召回/误报的取舍
+
+=== 2. 组泄漏 ===
+   test 中 20/20 条来自训练集已出现的实体；实体 = [&#39;u0&#39;, &#39;u1&#39;, &#39;u2&#39;, &#39;u3&#39;, &#39;u4&#39;, &#39;u5&#39;, &#39;u6&#39;]
+
+=== 3. 时间泄漏 ===
+   {&#39;train_max&#39;: 1099, &#39;test_min&#39;: 1050, &#39;泄漏&#39;: True}
+
+=== 4. 预处理作用域 ===
+   全量 fit 与仅训练集 fit 相比，8/100 条样本的决策被翻转
+
+=== 5. 去重保留策略 ===
+   50 个簇；随机保留的平均质量 = 0.266   按质量保留 = 0.473
+
+=== 6. 规范化幂等性 ===
+   canon(NFKC+空白折叠)           非幂等样本 0 个 []
+   unescape_once(单趟实体解码)      非幂等样本 1 个 [&#39;&amp;amp;amp;x&#39;]
+   结论：把非幂等的步骤放在去重之前，同一内容会产生不同指纹 -&gt; 去重失效且不可复现</code></pre>
+<p><strong>六个检查各自的关键设计决策：</strong></p>
+<ul>
+<li><strong>检查 1 用两档阈值</strong>：这是刻意的。只报一个阈值下的重叠率，等于把&quot;阈值选得对不对&quot;这个问题藏起来。τ=0.6 时只抓逐字复制，τ=0.3 时抓到改写（Jaccard 0.545）—— 而 τ 再低就会开始误报。<strong>跨 split 重叠率必须连阈值一起报。</strong></li>
+<li><strong>检查 2 的输出是&quot;实体列表&quot;而不是一个比例</strong>：因为 20/20 这个数字本身可能是设计使然（比如按时间切分但用户是长期用户）。要人工看那几个实体，判断&quot;这个重叠是必然的还是意外的&quot;。</li>
+<li><strong>检查 3 只看两个统计量</strong>（训练集最大时间戳 vs 测试集最小时间戳）。这一条极便宜，能拦住最常见的时间泄漏。它的局限也很清楚：<strong>它只能发现&quot;区间重叠&quot;，不能发现&quot;特征晚于标签&quot;</strong> —— 后者必须逐特征审计（第 3 节 4.5）。</li>
+<li><strong>检查 4 用&quot;决策翻转数&quot;而不是&quot;均值差&quot;</strong>：均值差是个无量纲的数，说不清危害；&quot;100 条里有 8 条因为标准化作用域而判反&quot;是可以直接汇报的。<strong>把统计差异翻译成受影响的样本数，是数据审计里最有用的一种翻译。</strong></li>
+<li><strong>检查 5 的实测差距是 0.266 vs 0.473</strong> —— 近一半的质量。而这件事在指标上完全不可见：两种策略的<strong>数据量完全相同</strong>，只有质量分布不同。这是&quot;静默错误&quot;的教科书案例。</li>
+<li><strong>检查 6 用幂等性作为可复现性的最小充分检查</strong>。<code>canon</code> 是幂等的（0 个），<code>unescape_once</code> 不是（<code>&amp;amp;amp;x</code> 需要两次解码）。<strong>幂等性是去重可复现的前提</strong>：如果指纹函数不幂等，同一内容在不同处理路径下会产生不同指纹。</li>
+<li>⚠️ 以上全部为<strong>合成/玩具数据</strong>：用途是演示审计工具的输出形态，不代表任何真实语料上的比率。</li>
+</ul>
+<h3 id="h-练习">练习<a class="anchor" href="#h-练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><p><strong>按图鉴排查</strong>：某团队报告&quot;新版本模型在内部评测上从 71 涨到 79，但上线后没有变化&quot;。按可观测性给出一条排查顺序（至少 5 步），并在每一步写出你预期看到什么、以及看到什么会排除哪条错误（E 编号）。</p>
+</li>
+<li><p><strong>切片设计</strong>：为一份&quot;中文网页 + 代码 + 客服对话&quot;的混合语料设计必看切片清单。
+（a）列出你的切片维度与取值；
+（b）说明为什么切片太多会引入多重比较问题，并提出一个控制方法；
+（c）为每类切片的<strong>保留率下限</strong>给出一个具体数字，并说明你的依据。</p>
+</li>
+<li><p><strong>去重保留策略</strong>：代码检查 5 里随机保留的平均质量是 0.266，按质量保留是 0.473。
+（a）推导在&quot;每簇 2 个副本、质量分别为 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">q</span></span></span></span> 与 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">0.25</span><span class="mord mathnormal" style="margin-right:0.0359em;">q</span></span></span></span>&quot;的假设下两种策略的期望质量，与实测对照；
+（b）如果质量分本身有 20% 的概率把高质副本判成低质（噪声），重算两种策略的期望质量，并说明结论是否改变；
+（c）在此基础上回答：<strong>为什么&quot;簇内按质量保留&quot;仍然可能是有偏的？</strong> 给出一个具体的偏差来源。</p>
+</li>
+<li><p><strong>幂等性与顺序</strong>：给定四个步骤 <code>strip_html</code>、<code>unescape</code>、<code>lowercase</code>、<code>collapse_ws</code>。
+（a）为每个步骤判断是否幂等，并给一个反例（不幂等的）；
+（b）设计一个顺序，使得整体流程幂等；再设计一个顺序，使得整体不幂等；
+（c）说明为什么&quot;不幂等&quot;在<strong>流式/增量</strong>管线里比在批处理里更危险（提示：同一文档可能被处理两次）。</p>
+</li>
+<li><p><strong>体检清单落地</strong>：为第七节的 25 项清单写一个最小的自动化实现方案。
+（a）哪些项可以完全自动化（给出判据）、哪些必须人工、哪些只能部分自动？
+（b）设计一条 CI 规则：哪些项失败必须阻塞合并、哪些只警告？
+（c）说明这个方案的两个绕过路径（人总能绕过的），以及你会用什么手段降低绕过概率。</p>
+</li>
+<li><p><strong>反例构造</strong>：构造一份数据与一个管线，使得第七节清单上的<strong>全部 25 项都通过</strong>，但模型上线后仍然失败。
+（a）写出你的构造；
+（b）指出哪一类错误是清单<strong>结构上无法覆盖</strong>的；
+（c）据此说明&quot;清单&quot;这类工具的能力边界，以及用什么补充它（不是&quot;再加 25 项&quot;）。</p>
+</li>
+</ol>
+<h3 id="h-小结">小结<a class="anchor" href="#h-小结" aria-label="本节链接">#</a></h3>
+<ul>
+<li><strong>按可观测性给数据错误排序</strong>：立即报错 &lt; 指标变差 &lt; 需要切片才可见 &lt; 上线后才可见 &lt; <strong>永远不可见</strong>。最贵的永远是最后一类，它们不抛异常、不动平均指标 —— 只能靠主动审计。</li>
+<li><strong>图鉴共 25 条，分五组</strong>：A 切分与泄漏（E11<del>E15）、B 清洗与过滤（E21</del>E26）、C 去重（E31<del>E34）、D 配比与合成（E41</del>E45）、E 工程与治理（E51~E55）。每条都有症状、根因、代价、诊断、修法五项，可直接在评审里引用。</li>
+<li><strong>几条最容易被忽视的</strong>：先清洗后切分（E11，顺序问题）；去重时随机保留副本（E33，代码实测质量 0.266 vs 0.473，<strong>指标上完全不可见</strong>）；非幂等的规范化放在去重之前（E25，让去重静默失效）；合成数据无去重无混合（E43，模型自噬）；只看平均（或只看 AUC）不看切片（E54）；数据不可版本化（E51，它是所有其它错误的<strong>放大器</strong>）。</li>
+<li><strong>修法都有代价</strong>，必须显式写下来：按质量保留会把质量分的偏差固化（E33）；为低资源变体设保留下限会拉低标准指标（E24）；分组切分会让评测方差变大，且如果部署时确实会遇到见过的实体就会低估性能（E13）。</li>
+<li><strong>把图鉴变成清单</strong>：25 项，每项要求给出数字或&quot;不适用 + 理由&quot;，不接受&quot;已检查&quot;。</li>
+<li><strong>清单有能力边界</strong>：它只能覆盖<strong>你已经想到过的</strong>错误模式。真正的新事故往往来自清单之外，所以清单必须与&quot;独立评测集 + 可复现管线 + 变更记录&quot;这三件基础设施配合 —— 前者负责不重复犯错，后者负责让新错误能被定位。</li>
+</ul>

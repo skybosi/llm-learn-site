@@ -1,0 +1,815 @@
+<h2 id="h-联合嵌入预测jepa-类与预测什么特征的争论">联合嵌入预测（JEPA 类）与&quot;预测什么特征&quot;的争论<a class="anchor" href="#h-联合嵌入预测jepa-类与预测什么特征的争论" aria-label="本节链接">#</a></h2>
+<h3 id="h-这一节要解决什么">这一节要解决什么<a class="anchor" href="#h-这一节要解决什么" aria-label="本节链接">#</a></h3>
+<p>上一节的代码里有一行数字很刺眼：<strong>共享低维瓶颈的重建模型，它的反事实分离度只有 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.500</span></span></span></span>，长时位置误差 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.983</span></span></span></span> 格，闭环回报 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">−</span><span class="mord">105.76</span></span></span></span>；而只预测&quot;目标位置&quot;的模型是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1.089</span></span></span></span> / <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.183</span></span></span></span> 格 / <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">−</span><span class="mord">49.44</span></span></span></span>。</strong> 两个模型的容量一样、规划器一样、数据一样 —— 唯一的差别是<strong>预测什么</strong>。</p>
+<p>这一节就沿着这条线走到底。它要回答：</p>
+<ol>
+<li><strong>在表征空间预测</strong>（联合嵌入预测，JEPA 类）到底改变了什么？为什么它能&quot;滤掉不可预测的细节&quot;，这条论证在什么条件下成立？</li>
+<li>在表征空间预测的第一个病是<strong>表征坍缩</strong>：为什么&quot;预测自己的输出&quot;存在平凡解？不对称性（EMA 目标编码器 + stop-gradient + 只在一边放 predictor）为什么能防住？代价是什么？</li>
+<li>I-JEPA / V-JEPA / V-JEPA 2 / DINO-WM 各自在做什么？它们的共同结构是什么？</li>
+<li><strong>争论本身</strong>：预测像素、预测自监督特征、预测价值（value equivalence）三方各自的论证是什么？<strong>可辨识性代价</strong>分别落在哪里？</li>
+<li>给定一个用途，怎么选？为什么&quot;<strong>不存在全局最优的预测目标</strong>&quot;是一个可以被论证的结论，而不是和稀泥？</li>
+</ol>
+<p>三条结论先放在这里：</p>
+<blockquote>
+<p><strong>① 预测目标的本质是&quot;谁来回答什么重要&quot;。</strong> 重建让<strong>观测方差</strong>回答（所以会把容量给高方差的无关细节）；自监督表征预测让<strong>可预测性</strong>回答（所以会丢掉不可预测但可能重要的信息）；价值等价让<strong>奖励</strong>回答（所以换奖励就不再等价）。三种回答都有代价，<strong>没有一种在信息论意义上更优。</strong>
+<strong>② 在表征空间预测必须有不对称性，否则有平凡解。</strong> 对称目标（两边用同一个在线编码器）允许&quot;把所有输入映成常数&quot;这个全局最优；本课代码把两端都量了出来 —— 小初值时嵌入维 std 从 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.079</span></span></span></span> 掉到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.0000</span></span></span></span>、解码 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">u</span></span></span></span> 的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0077em;">R</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span> 掉到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.000</span></span></span></span>。
+<strong>③ 防坍缩不是免费的。</strong> 方差正则会强迫嵌入去编码<strong>不可预测的部分</strong>，预测误差因此上升（本课代码：预测 MSE 从坍缩解的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.0000</span></span></span></span> 变成 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1.0321</span></span></span></span>）。<strong>&quot;不坍缩&quot;与&quot;预测准&quot;在有限容量下是两件事。</strong></p>
+</blockquote>
+<blockquote>
+<p>定位提醒：JEPA 是一个<strong>结构性主张</strong>（在表征空间预测），不是某一个模型。本节对它的讨论全部落在可确证的机制上（目标函数、不对称性、正则项、掩码方式）；对具体报告分数一律不作为结论。</p>
+</blockquote>
+<h3 id="h-一先把重建派的问题说清楚">一、先把重建派的问题说清楚<a class="anchor" href="#h-一先把重建派的问题说清楚" aria-label="本节链接">#</a></h3>
+<p>第 2 章第 1 节给过五条机制，这里只保留本节要用的<strong>一句统一表述</strong>：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathcal">L</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">recon</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.2em;vertical-align:-0.35em;"></span><span class="mord mathbb">E</span><span class="mord"><span class="delimsizing mult"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.85em;"><span style="top:-2.85em;"><span class="pstrut" style="height:3.2em;"></span><span style="width:0.556em;height:1.2em;"><svg xmlns="http://www.w3.org/2000/svg" width="0.556em" height="1.2em" viewBox="0 0 556 1200"><path d="M145 15 v585 v0 v585 c2.667,10,9.667,15,21,15
+c10,0,16.667,-5,20,-15 v-585 v0 v-585 c-2.667,-10,-9.667,-15,-21,-15
+c-10,0,-16.667,5,-20,15z M188 15 H145 v585 v0 v585 h43z
+M367 15 v585 v0 v585 c2.667,10,9.667,15,21,15
+c10,0,16.667,-5,20,-15 v-585 v0 v-585 c-2.667,-10,-9.667,-15,-21,-15
+c-10,0,-16.667,5,-20,15z M410 15 H367 v585 v0 v585 h43z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.35em;"><span></span></span></span></span></span></span><span class="mord mathnormal" style="margin-right:0.0278em;">D</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.044em;">z</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.404em;vertical-align:-0.35em;"></span><span class="mord mathnormal">o</span><span class="mord"><span class="mord"><span class="delimsizing mult"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.85em;"><span style="top:-2.85em;"><span class="pstrut" style="height:3.2em;"></span><span style="width:0.556em;height:1.2em;"><svg xmlns="http://www.w3.org/2000/svg" width="0.556em" height="1.2em" viewBox="0 0 556 1200"><path d="M145 15 v585 v0 v585 c2.667,10,9.667,15,21,15
+c10,0,16.667,-5,20,-15 v-585 v0 v-585 c-2.667,-10,-9.667,-15,-21,-15
+c-10,0,-16.667,5,-20,15z M188 15 H145 v585 v0 v585 h43z
+M367 15 v585 v0 v585 c2.667,10,9.667,15,21,15
+c10,0,16.667,-5,20,-15 v-585 v0 v-585 c-2.667,-10,-9.667,-15,-21,-15
+c-10,0,-16.667,5,-20,15z M410 15 H367 v585 v0 v585 h43z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.35em;"><span></span></span></span></span></span></span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:1.054em;"><span style="top:-3.3029em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:1em;"></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">⟹</span><span class="mspace" style="margin-right:1em;"></span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord cjk_fallback">容量按</span><span class="mord"> </span></span><span class="mord"><span class="mord mathrm">Var</span></span><span class="mopen">(</span><span class="mord mathnormal">o</span><span class="mclose">)</span><span class="mord text"><span class="mord"> </span><span class="mord cjk_fallback">分配，而不是按任务相关性分配</span></span><span class="mord">.</span></span></span></span></span></p>
+<p>五条机制都是这一句的推论：</p>
+<table>
+<thead>
+<tr>
+<th>机制</th>
+<th>与&quot;按方差分配&quot;的关系</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>无关细节吃容量</td>
+<td>高方差的纹理/光照比低方差的控制量&quot;值钱&quot;</td>
+</tr>
+<tr>
+<td>解码器作弊通道</td>
+<td>解码器可以独立补上高频细节，使 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.044em;">z</span></span></span></span> 不必携带它</td>
+</tr>
+<tr>
+<td>MSE 条件均值</td>
+<td>不可预测的部分被拟合成均值（模糊），梯度仍被它占用</td>
+</tr>
+<tr>
+<td>优化 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0785em;">I</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.044em;">z</span><span class="mpunct">;</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">o</span><span class="mclose">)</span></span></span></span> 而非 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0785em;">I</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.044em;">z</span><span class="mpunct">;</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord cjk_fallback">未来</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∣</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">a</span><span class="mclose">)</span></span></span></span></td>
+<td>目标里没有&quot;动作&quot;这一项，&quot;预测未来&quot;只是副产品</td>
+</tr>
+<tr>
+<td>与控制目标不对齐</td>
+<td>任务相关量与高方差量不一致时，重建<strong>正确地</strong>牺牲前者</td>
+</tr>
+</tbody></table>
+<p><strong>本节代码表 B 把最后一行量了出来，而且结果比直觉更强</strong>：合成环境里观测 12 维 = 任务坐标 2 维（方差 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.333</span></span></span></span>）+ 确定性干扰 6 维（方差 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1.003</span></span></span></span>）+ 噪声 4 维（方差 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.997</span></span></span></span>）。因为任务坐标的方差<strong>最低</strong>，对一个 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 维瓶颈的重建模型（在线性情形下它的最优解就是 PCA）而言，<strong>只要 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7335em;vertical-align:-0.0391em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&lt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">11</span></span></span></span>，任务坐标就会被整个丢掉</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>模型</th>
+<th>重建 MSE（全观测）</th>
+<th>五步任务坐标 MSE</th>
+<th>闭环累计回报</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>重建派 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.7233</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.503</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">−</span><span class="mord">44.60</span></span></span></span></td>
+</tr>
+<tr>
+<td>重建派 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">8</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.2241</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.510</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">−</span><span class="mord">43.38</span></span></span></span></td>
+</tr>
+<tr>
+<td>重建派 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">11</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.0286</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.433</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">−</span><span class="mord">19.48</span></span></span></span></td>
+</tr>
+<tr>
+<td>重建派 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">12</span></span></span></span>（全秩）</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.0000</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.2287</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">−</span><span class="mord">6.98</span></span></span></span></td>
+</tr>
+<tr>
+<td><strong>任务特征派 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2</span></span></span></span></strong></td>
+<td>—（不生成观测）</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord"><span class="mord mathbf">0.2287</span></span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord"><span class="mord">−</span><span class="mord mathbf">6.98</span></span></span></span></span></td>
+</tr>
+<tr>
+<td>价值派（一步贪心）</td>
+<td>—</td>
+<td>—</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">−</span><span class="mord">7.17</span></span></span></span></td>
+</tr>
+</tbody></table>
+<p><strong>重建质量从 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.7233</span></span></span></span> 一路降到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.0000</span></span></span></span>（越来越好），而闭环回报从 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">−</span><span class="mord">44.60</span></span></span></span> 只改善到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">−</span><span class="mord">6.98</span></span></span></span>；任务特征派用 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2</span></span></span></span> 维就拿到了全秩重建（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">12</span></span></span></span> 维）的水平。</strong> 这就是&quot;重建常常是错的激励&quot;的最干净形式：<strong>它把容量分配给了方差，而不是分配给了决策。</strong></p>
+<h3 id="h-二在表征空间预测机制">二、在表征空间预测：机制<a class="anchor" href="#h-二在表征空间预测机制" aria-label="本节链接">#</a></h3>
+<h4 id="h-21-目标函数">2.1 目标函数<a class="anchor" href="#h-21-目标函数" aria-label="本节链接">#</a></h4>
+<p>JEPA 类的目标可以统一写成&quot;能量&quot;形式：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathcal">L</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">JEPA</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.8em;vertical-align:-0.65em;"></span><span class="mord"><span class="delimsizing mult"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.15em;"><span style="top:-3.15em;"><span class="pstrut" style="height:3.8em;"></span><span style="width:0.556em;height:1.8em;"><svg xmlns="http://www.w3.org/2000/svg" width="0.556em" height="1.8em" viewBox="0 0 556 1800"><path d="M145 15 v585 v600 v585 c2.667,10,9.667,15,21,15
+c10,0,16.667,-5,20,-15 v-585 v-600 v-585 c-2.667,-10,-9.667,-15,-21,-15
+c-10,0,-16.667,5,-20,15z M188 15 H145 v585 v600 v585 h43z
+M367 15 v585 v600 v585 c2.667,10,9.667,15,21,15
+c10,0,16.667,-5,20,-15 v-585 v-600 v-585 c-2.667,-10,-9.667,-15,-21,-15
+c-10,0,-16.667,5,-20,15z M410 15 H367 v585 v600 v585 h43z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.65em;"><span></span></span></span></span></span></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0359em;">g</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">ϕ</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mord"><span class="delimsizing size1">(</span></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.1076em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">θ</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord mathnormal">x</span><span class="mclose">)</span><span class="mord"><span class="delimsizing size1">)</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:2.004em;vertical-align:-0.65em;"></span><span class="mord"><span class="mord mathrm" style="margin-right:0.0139em;">sg</span></span><span class="mord"><span class="delimsizing size1">(</span></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3448em;"><span style="top:-2.4629em;margin-left:-0.1076em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord accent mtight"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8312em;"><span style="top:-2.7em;"><span class="pstrut" style="height:2.7em;"></span><span class="mord mathnormal mtight" style="margin-right:0.0278em;">θ</span></span><span style="top:-2.9634em;"><span class="pstrut" style="height:2.7em;"></span><span class="accent-body" style="left:-0.1667em;"><span class="mord mtight">ˉ</span></span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2371em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0359em;">y</span><span class="mclose">)</span><span class="mord"><span class="delimsizing size1">)</span></span><span class="mord"><span class="mord"><span class="delimsizing mult"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.15em;"><span style="top:-3.15em;"><span class="pstrut" style="height:3.8em;"></span><span style="width:0.556em;height:1.8em;"><svg xmlns="http://www.w3.org/2000/svg" width="0.556em" height="1.8em" viewBox="0 0 556 1800"><path d="M145 15 v585 v600 v585 c2.667,10,9.667,15,21,15
+c10,0,16.667,-5,20,-15 v-585 v-600 v-585 c-2.667,-10,-9.667,-15,-21,-15
+c-10,0,-16.667,5,-20,15z M188 15 H145 v585 v600 v585 h43z
+M367 15 v585 v600 v585 c2.667,10,9.667,15,21,15
+c10,0,16.667,-5,20,-15 v-585 v-600 v-585 c-2.667,-10,-9.667,-15,-21,-15
+c-10,0,-16.667,5,-20,15z M410 15 H367 v585 v600 v585 h43z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.65em;"><span></span></span></span></span></span></span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:1.354em;"><span style="top:-3.6029em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span><span class="mpunct">,</span></span></span></span></span></p>
+<p>其中 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">x</span></span></span></span> 是上下文（或可见块），<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">y</span></span></span></span> 是目标（或被掩码块），<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.1076em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">θ</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 是<strong>在线编码器</strong>，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.9315em;vertical-align:-0.2371em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3448em;"><span style="top:-2.4629em;margin-left:-0.1076em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord accent mtight"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8312em;"><span style="top:-2.7em;"><span class="pstrut" style="height:2.7em;"></span><span class="mord mathnormal mtight" style="margin-right:0.0278em;">θ</span></span><span style="top:-2.9634em;"><span class="pstrut" style="height:2.7em;"></span><span class="accent-body" style="left:-0.1667em;"><span class="mord mtight">ˉ</span></span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2371em;"><span></span></span></span></span></span></span></span></span></span> 是<strong>目标编码器</strong>（通常是在线编码器的指数滑动平均，EMA），<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7167em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0359em;">g</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">ϕ</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span></span> 是<strong>预测器</strong>，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathrm" style="margin-right:0.0139em;">sg</span></span></span></span></span> 是 stop-gradient。</p>
+<p>与重建的差别只有一处，但它是全部差别的来源：<strong>目标不是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">y</span></span></span></span>，而是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3448em;"><span style="top:-2.4629em;margin-left:-0.1076em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord accent mtight"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8312em;"><span style="top:-2.7em;"><span class="pstrut" style="height:2.7em;"></span><span class="mord mathnormal mtight" style="margin-right:0.0278em;">θ</span></span><span style="top:-2.9634em;"><span class="pstrut" style="height:2.7em;"></span><span class="accent-body" style="left:-0.1667em;"><span class="mord mtight">ˉ</span></span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2371em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0359em;">y</span><span class="mclose">)</span></span></span></span>。</strong></p>
+<h4 id="h-22-为什么这样能滤掉不可预测的细节">2.2 为什么这样能&quot;滤掉不可预测的细节&quot;<a class="anchor" href="#h-22-为什么这样能滤掉不可预测的细节" aria-label="本节链接">#</a></h4>
+<p>论证是逐条可检验的：</p>
+<ol>
+<li><strong>没有解码器就没有&quot;容量必须覆盖全部观测&quot;的约束。</strong> <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.044em;">z</span></span></span></span> 只需要让<strong>预测</strong>成立，不需要让重构成立。于是&quot;要么编码它、要么在损失里承担它&quot;这个二选一消失了。</li>
+<li><strong>目标是可学习的、而且它在动。</strong> 目标编码器是学出来的（EMA），它会把自己调整到&quot;容易被预测&quot;的方向 —— 这个过程在文献里通常被描述为<strong>联合嵌入</strong>：预测器与目标表征共同寻找一个可预测的子空间。<strong>注意这条论证是有代价的</strong>：它没有保证这个子空间是&quot;任务相关&quot;的，只保证它&quot;可预测&quot;。</li>
+<li><strong>掩码（I-JEPA/V-JEPA）把&quot;预测&quot;从时间外推变成空间/时空补全。</strong> 掩码目标块的表征天然<strong>丢掉了块内部的细节</strong>（因为编码器是对整块编码的），于是模型不可能去拟合像素级噪声 —— 这个细节损失是<strong>设计出来的</strong>，不是意外。</li>
+<li><strong>不可预测的部分不再产生梯度。</strong> 如果目标编码器在某维上干脆不含信息，那一维的预测误差就没有下界压力去&quot;猜&quot;。这与重建的 MSE 条件均值形成对照：重建永远有梯度把不可预测部分推向均值。</li>
+</ol>
+<h4 id="h-23-为什么必须不对称坍缩与它的最小例子">2.3 为什么必须不对称：坍缩与它的最小例子<a class="anchor" href="#h-23-为什么必须不对称坍缩与它的最小例子" aria-label="本节链接">#</a></h4>
+<p>对称版本（两边用同一个在线编码器 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.1076em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">θ</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>，梯度同时压编码器和目标）的问题是<strong>存在平凡全局最优</strong>：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.1076em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">θ</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≡</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7073em;vertical-align:-0.024em;"></span><span class="mord text"><span class="mord cjk_fallback">常数</span></span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">⟹</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathcal">L</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">JEPA</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.</span></span></span></span></span></p>
+<p><strong>这不是&quot;训练不充分&quot;，是目标函数没排除它。</strong> 本课代码表 A 把两个解都抓到了 —— 同一个对称目标、只换初值：</p>
+<table>
+<thead>
+<tr>
+<th>配置</th>
+<th>预测 MSE</th>
+<th>解码 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">u</span></span></span></span> 的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0077em;">R</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span></th>
+<th>min std</th>
+<th>mean std</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>对称，小初值（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.05</span></span></span></span>），步 0</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.0192</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.231</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.0792</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.0984</span></span></span></span></td>
+</tr>
+<tr>
+<td>对称，小初值，步 6000</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.0000</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord"><span class="mord mathbf">0.000</span></span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord"><span class="mord mathbf">0.0000</span></span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord"><span class="mord mathbf">0.0000</span></span></span></span></span></td>
+</tr>
+<tr>
+<td>对称，常规初值（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.5</span></span></span></span>），步 6000</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.0000</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.271</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.0011</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.0015</span></span></span></span></td>
+</tr>
+<tr>
+<td>不对称 + 方差正则，步 6000</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1.0321</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.916</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1.0123</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1.0638</span></span></span></span></td>
+</tr>
+</tbody></table>
+<p>读法（三条，都要读出来）：</p>
+<ul>
+<li><strong>小初值 → 完全坍缩</strong>：嵌入维 std 全部到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.0000</span></span></span></span>，预测 MSE 也是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.0000</span></span></span></span>（因为两边都是零），解码 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">u</span></span></span></span> 的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0077em;">R</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span> 是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.000</span></span></span></span> —— <strong>损失完美、表征为零</strong>。这就是平凡解。</li>
+<li><strong>常规初值 → 不坍缩但会&quot;掉维&quot;</strong>：预测 MSE <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.0000</span></span></span></span>、解码 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0077em;">R</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span> 从 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.997</span></span></span></span> 掉到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.271</span></span></span></span>、min std 掉到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.0011</span></span></span></span>。<strong>损失依然完美，但有效维度在持续流失。</strong> 这说明对称目标的问题不是&quot;必然坍缩&quot;，而是&quot;<strong>没有任何机制阻止它坍缩</strong>&quot;——最优解集合里同时包含有信息的与退化的，优化过程停在哪由初值和动力学决定。</li>
+<li><strong>不对称 + 方差正则 → 不坍缩，但预测误差变大</strong>：min std <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1.0123</span></span></span></span>、mean std <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1.0638</span></span></span></span>（说明正则生效），解码 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0077em;">R</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span> <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.916</span></span></span></span>；但预测 MSE 是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1.0321</span></span></span></span>，比坍缩解的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.0000</span></span></span></span> 差得多。<strong>原因是方差正则要求每一维都有单位方差，而这强迫嵌入去&quot;编码&quot;那些不可预测的噪声维。</strong> 这是真实代价，不是 bug。</li>
+</ul>
+<p>于是防坍缩的手段清单以及各自的代价就清楚了：</p>
+<table>
+<thead>
+<tr>
+<th>手段</th>
+<th>机制</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>EMA 目标编码器 + stop-gradient</td>
+<td>目标移动慢，切断&quot;压目标&quot;的梯度</td>
+<td>只是<strong>削弱</strong>平凡解，不排除；需要配合别的机制</td>
+</tr>
+<tr>
+<td>预测器只放在一边（不对称）</td>
+<td>目标侧不可被预测器&quot;作弊&quot;</td>
+<td>学到的解没有唯一性（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span></span></span></span> 与 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">g</span></span></span></span> 的分解不唯一）</td>
+</tr>
+<tr>
+<td>方差/协方差正则（VICReg 式）</td>
+<td>直接给每维设方差下界、去相关</td>
+<td>强迫编码不可预测的维度 → <strong>预测误差上升</strong>（本课实测）</td>
+</tr>
+<tr>
+<td>白化 / Sinkhorn</td>
+<td>约束嵌入分布</td>
+<td>计算成本、需要批统计</td>
+</tr>
+<tr>
+<td>对比负样本</td>
+<td>用&quot;不相似对&quot;提供排斥力</td>
+<td>依赖大 batch / 队列；负样本质量影响大</td>
+</tr>
+<tr>
+<td>掩码 + 结构化目标</td>
+<td>目标本身丢掉细节</td>
+<td>掩码策略引入偏差（见 §5.2）</td>
+</tr>
+</tbody></table>
+<p><strong>一句话：所有防坍缩手段都是在&quot;让嵌入保持信息&quot;与&quot;让预测保持准确&quot;之间做交易。</strong> 这不是工程细节，而是这一支的核心张力 —— 与第 2 章第 4 节&quot;收缩性与记忆的张力&quot;是同一件事的两种说法。</p>
+<h3 id="h-三谱系i-jepa--v-jepa--v-jepa-2--dino-wm">三、谱系：I-JEPA / V-JEPA / V-JEPA 2 / DINO-WM<a class="anchor" href="#h-三谱系i-jepa--v-jepa--v-jepa-2--dino-wm" aria-label="本节链接">#</a></h3>
+<h4 id="h-31-共同结构">3.1 共同结构<a class="anchor" href="#h-31-共同结构" aria-label="本节链接">#</a></h4>
+<p>四个系统的骨架是同一个，差别只在&quot;预测什么目标&quot;与&quot;编码器从哪来&quot;：</p>
+<pre><code>表征（学出来 或 冻结）
+   ↓
+预测器：从&quot;上下文块的表征&quot;预测&quot;目标块的表征&quot;（EMA 目标编码器 + stop-gradient）
+   ↓
+（可选的）动力学：动作条件化的表征转移
+   ↓
+（可选的）规划：在表征空间里优化动作序列 / 预测子目标</code></pre>
+<h4 id="h-32-各自在做什么">3.2 各自在做什么<a class="anchor" href="#h-32-各自在做什么" aria-label="本节链接">#</a></h4>
+<p><strong>I-JEPA（图像）</strong>：把图像切成块，掩掉若干目标块，用可见块的表征预测被掩块的表征。动机是明确的：<strong>不需要像素解码器、不需要数据增广（对比学习的两大成本）</strong>，同时因为目标是&quot;块级表征&quot;，模型不会去拟合块内纹理。</p>
+<p><strong>V-JEPA（视频）</strong>：把同样的想法放到时空上（时空掩码），目标是从部分可见的视频预测被掩区域/未来区域的表征。论文报告它在若干视频理解任务上以冻结表征 + 线性探针就表现良好（<strong>报告口径</strong>，此处不引用数值），并且强调&quot;不重建像素&quot;这一点。</p>
+<p><strong>V-JEPA 2（动作条件 + 机器人规划）</strong>：在表征预测的基础上加<strong>动作条件</strong>，后训练成&quot;动作条件的表征预测器&quot;，再用它做规划：在表征空间里预测&quot;到达某个子目标后的表征&quot;，然后优化动作序列使预测表征靠近该子目标。这条线的意义在于：<strong>它把&quot;在表征空间预测&quot;从感知任务拉到了决策任务</strong> —— 也就是把 JEPA 变成了一个世界模型。<strong>报告口径</strong>：论文报告在机器人操作任务上以少量示范/交互取得效果，具体设定与分数不在此引用。</p>
+<p><strong>DINO-WM</strong>：这条路线更直接 —— <strong>不动编码器</strong>。用现成的自监督视觉特征（DINOv2 等，冻结），只学一个在特征空间里的<strong>动力学模型</strong>，然后在特征空间里做规划。它的价值在于把两个问题<strong>解耦</strong>：</p>
+<ul>
+<li>&quot;表征好不好&quot; → 交给大规模自监督预训练（冻结）；</li>
+<li>&quot;动力学准不准&quot; → 交给小的、任务特定的模型。</li>
+</ul>
+<p>这个解耦有一个明确的边界：<strong>上限由冻结的 backbone 决定</strong>。如果 backbone 的表征里不含某个任务需要的量（例如精确的深度、接触力），动力学模型再准也拿不到它 —— 这是 §5.2 的&quot;冻结编码器上限&quot;。</p>
+<h4 id="h-33-与上一节的对照">3.3 与上一节的对照<a class="anchor" href="#h-33-与上一节的对照" aria-label="本节链接">#</a></h4>
+<p>把这一节的模型与上一节放在一起看，谱系就很清楚：</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>预测空间</th>
+<th>状态载体</th>
+<th>是否需要奖励</th>
+<th>能否生成观测</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>PlaNet/Dreamer</td>
+<td>隐空间（可解码）</td>
+<td>RSSM 隐状态</td>
+<td>是（回报模型）</td>
+<td>能（有解码器）</td>
+</tr>
+<tr>
+<td>MuZero/TD-MPC</td>
+<td>隐空间（不重建）</td>
+<td>隐状态</td>
+<td>是</td>
+<td>不能</td>
+</tr>
+<tr>
+<td>Genie/GameNGen/DIAMOND</td>
+<td><strong>像素/token</strong></td>
+<td>上下文帧</td>
+<td>DIAMOND 需要</td>
+<td>能</td>
+</tr>
+<tr>
+<td>I-JEPA/V-JEPA/DINO-WM</td>
+<td><strong>自监督表征</strong></td>
+<td>表征（+ 学出的动力学）</td>
+<td>V-JEPA 2 在决策时需要</td>
+<td>不能（默认）</td>
+</tr>
+</tbody></table>
+<p><strong>四行的&quot;预测空间&quot;从左到右是：可解码的低维 → 不可解码的低维 → 高维像素 → 自监督特征。</strong> 本节要论证的是：这个顺序<strong>没有</strong>优劣，只有与用途的匹配。</p>
+<h3 id="h-四预测什么的三方论证">四、&quot;预测什么&quot;的三方论证<a class="anchor" href="#h-四预测什么的三方论证" aria-label="本节链接">#</a></h3>
+<p>这是本节的核心。三方各自的论证都必须给足，否则讨论会退化成口号。</p>
+<h4 id="h-41-重建派预测观测像素">4.1 重建派（预测观测/像素）<a class="anchor" href="#h-41-重建派预测观测像素" aria-label="本节链接">#</a></h4>
+<p><strong>论证：</strong></p>
+<ol>
+<li><strong>重建给了一个良定义的似然。</strong> 观测空间的概率模型（或像素 MSE）有规范化的目标，不依赖&quot;哪个自监督目标更好&quot;这种额外选择；训练信号稠密、可诊断（可以看重建）。</li>
+<li><strong>重建提供</strong>可检验的充分性<strong>代理。</strong> 如果一个表征能重建观测，那么&quot;观测里的信息没丢&quot;这件事是可检验的；而在纯表征预测里，你<strong>无法直接检验丢了什么</strong>（§5.1）。</li>
+<li><strong>生成能力本身就是目标。</strong> 数据增广、仿真、内容创作都要求能生成观测；纯表征预测默认没有解码器。</li>
+<li><strong>重建与下游任务常常一致。</strong> 当任务就是&quot;看清整个场景&quot;（例如需要精确几何、需要真实感渲染）时，高方差细节<strong>正是</strong>任务相关量 —— 这时&quot;按方差分配容量&quot;是<strong>正确</strong>的归纳偏置。</li>
+</ol>
+<p><strong>它的可检验承诺</strong>：如果重建目标真的在浪费容量，那么&quot;降低观测里与任务无关的方差&quot;应当让下游变好。这是一个可做的实验（本课代码表 B3 就是它的一个版本）。</p>
+<h4 id="h-42-预测表征派自监督特征预测">4.2 预测表征派（自监督特征预测）<a class="anchor" href="#h-42-预测表征派自监督特征预测" aria-label="本节链接">#</a></h4>
+<p><strong>论证：</strong></p>
+<ol>
+<li><strong>不可预测的细节不应被预测。</strong> 纹理、光照抖动、随机噪声——它们在给定历史下没有可约减的熵。逼模型去预测它们，等于把容量花在 aleatoric 不确定性上（第 2 章第 1 节机制三）。</li>
+<li><strong>它按&quot;可预测性&quot;而不是&quot;方差&quot;分配容量</strong>（§2.2），因此能在<strong>同一个</strong>观测里保留低方差但可预测的结构 —— 本课代码表 B 里任务坐标方差最低却被保住，就是这个机制。</li>
+<li><strong>它延长可预测视界。</strong> 表征空间里的动力学把&quot;不可预测细节&quot;从状态里剔掉，误差可以累积的量变小（对照第 1 章第 3 节的复合误差：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">ε</span></span></span></span> 变小、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span></span></span></span> 也可能变小）。</li>
+<li><strong>表征可以跨任务复用</strong>（尤其是冻结 backbone 的做法），因为它不由任何一个奖励定义。</li>
+</ol>
+<p><strong>它的代价：</strong></p>
+<ol>
+<li><strong>没有解码器 → 不能生成、不能直接诊断。</strong> 你无法回答&quot;这个表征丢了什么&quot;（除了用探针间接测）。</li>
+<li><strong>&quot;可预测&quot;与&quot;任务相关&quot;是两件事。</strong> 一个高可预测但任务无关的量会被保留（例如本课代码里确定性旋转的干扰项是<strong>完全可预测</strong>的 —— 如果它与任务坐标在同一目标里竞争，预测表征派也会分配容量给它）。<strong>这是预测表征派最容易被忽略的漏洞：它没有解决&quot;什么重要&quot;，只是把回答者从&quot;方差&quot;换成了&quot;可预测性&quot;。</strong></li>
+<li><strong>坍缩风险</strong>（§2.3）：必须引入不对称性与正则，而这些机制会牺牲预测精度。</li>
+<li><strong>对目标的依赖</strong>：表征的质量取决于预训练数据与目标（掩码策略、增广），换领域可能需要重训。</li>
+</ol>
+<h4 id="h-43-价值等价派预测价值决策相关量">4.3 价值等价派（预测价值/决策相关量）<a class="anchor" href="#h-43-价值等价派预测价值决策相关量" aria-label="本节链接">#</a></h4>
+<p><strong>论证：</strong></p>
+<ol>
+<li><strong>规划只需要价值等价</strong>（上一节 §6.2）：观测等价 ⇒ 轨迹等价 ⇒ 价值等价，反之不成立。既然规划器只比较动作，就没必要保留更多。</li>
+<li><strong>它按&quot;奖励&quot;分配容量 —— 这正是我们要的答案。</strong> 前两派都在用代理量（方差 / 可预测性）回答&quot;什么重要&quot;，价值派直接用<strong>任务本身</strong>回答。这是三方里唯一&quot;目标对齐&quot;的一派。</li>
+<li><strong>样本效率</strong>：不需要重建全部观测，容量与数据都花在决策相关量上。本课代码表 B 的&quot;重建派 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7335em;vertical-align:-0.0391em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&lt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">11</span></span></span></span> 就丢掉任务坐标&quot;正是它的反面证据。</li>
+<li><strong>可以接搜索</strong>：预测价值与策略的组合直接支撑 MCTS/MPC（MuZero/TD-MPC）。</li>
+</ol>
+<p><strong>它的代价：</strong></p>
+<ol>
+<li><strong>绑定奖励</strong>：换奖励函数可能就不再价值等价。<strong>本课代码表 B4 把这条量了出来</strong>：把目标从 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord">1.2</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">1.2</span><span class="mclose">)</span></span></span></span> 换成 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord">−</span><span class="mord">1.2</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">−</span><span class="mord">1.2</span><span class="mclose">)</span></span></span></span> 后，同一个策略模型改一下 goal 就能重新规划（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">−</span><span class="mord">6.77</span></span></span></span>），而价值模型<strong>不重新训练</strong>会继续朝旧目标走（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">−</span><span class="mord">86.68</span></span></span></span>，比随机还差）；用新目标重新训练后是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">−</span><span class="mord">6.97</span></span></span></span> —— <strong>需要新的奖励标签</strong>。</li>
+<li><strong>不可诊断、不可生成</strong>：没有解码器也没有生成能力。</li>
+<li><strong>稀疏奖励下学不动</strong>：唯一的学习信号是奖励/价值。</li>
+<li><strong>细节可能被&quot;正确地&quot;丢掉</strong>：如果某观测细节在训练奖励下从未影响价值，它就会被丢 —— 这是价值等价的定义使然，但迁移到新任务时会失效。</li>
+</ol>
+<h4 id="h-44-三方对照表">4.4 三方对照表<a class="anchor" href="#h-44-三方对照表" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>重建派</th>
+<th>预测表征派</th>
+<th>价值等价派</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>目标函数</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">∥</span><span class="mord mathnormal" style="margin-right:0.0278em;">D</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.044em;">z</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.0641em;vertical-align:-0.25em;"></span><span class="mord mathnormal">o</span><span class="mord"><span class="mord">∥</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span> 或观测似然</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">∥</span><span class="mord mathnormal" style="margin-right:0.0359em;">g</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.044em;">z</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.0641em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0359em;">y</span><span class="mclose">)</span><span class="mord"><span class="mord">∥</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span>（EMA + sg）</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">∥</span><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6944em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.1944em;"><span class="mord">^</span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.0641em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="mord"><span class="mord">∥</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">∥</span><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6944em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">v</span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.2222em;"><span class="mord">^</span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.0641em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">v</span><span class="mord"><span class="mord">∥</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathrm">KL</span></span><span class="mopen">(</span><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6944em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">π</span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.25em;"><span class="mord">^</span></span></span></span></span></span></span><span class="mord">∥</span><span class="mord mathnormal" style="margin-right:0.0359em;">π</span><span class="mclose">)</span></span></span></span></td>
+</tr>
+<tr>
+<td>谁回答&quot;什么重要&quot;</td>
+<td><strong>观测方差</strong></td>
+<td><strong>可预测性</strong>（+ 掩码/目标设计）</td>
+<td><strong>奖励</strong></td>
+</tr>
+<tr>
+<td>保留什么</td>
+<td>高方差的一切</td>
+<td>可预测且被目标编码器保留的</td>
+<td>决策相关量</td>
+</tr>
+<tr>
+<td>至少需要什么监督</td>
+<td>无（自监督）</td>
+<td>无（自监督）</td>
+<td><strong>奖励/价值标签</strong></td>
+</tr>
+<tr>
+<td>能否生成观测</td>
+<td>✓</td>
+<td>默认 ✗</td>
+<td>✗</td>
+</tr>
+<tr>
+<td>可诊断性（能否看丢了什么）</td>
+<td>高</td>
+<td>低</td>
+<td>最低</td>
+</tr>
+<tr>
+<td>跨任务迁移</td>
+<td>表征可复用</td>
+<td>好（尤其冻结 backbone）</td>
+<td><strong>差（绑定奖励）</strong></td>
+</tr>
+<tr>
+<td>主要失效模式</td>
+<td>无关细节吃容量（本课表 B）</td>
+<td>坍缩 / 保留&quot;可预测但无关&quot;的量</td>
+<td>奖励稀疏时学不动；换奖励失效（表 B4）</td>
+</tr>
+<tr>
+<td>理论承诺</td>
+<td>观测充分性（可检验）</td>
+<td>可预测子空间（无唯一解）</td>
+<td>价值等价（对<strong>给定奖励</strong>而言）</td>
+</tr>
+</tbody></table>
+<p><strong>三方有一个共同点，值得单独指出</strong>：它们都在做&quot;降维决策&quot;——决定隐空间里放什么。<strong>分歧不在&quot;要不要降维&quot;，而在&quot;由谁决定&quot;。</strong> 这也解释了为什么&quot;哪一派更好&quot;没有统一答案：这个决定<strong>必须</strong>与用途对齐。</p>
+<h3 id="h-五可辨识性这一支最容易被忽略的代价">五、可辨识性：这一支最容易被忽略的代价<a class="anchor" href="#h-五可辨识性这一支最容易被忽略的代价" aria-label="本节链接">#</a></h3>
+<h4 id="h-51-表征只在等价类里被确定">5.1 表征只在等价类里被确定<a class="anchor" href="#h-51-表征只在等价类里被确定" aria-label="本节链接">#</a></h4>
+<p>预测目标约束的是&quot;预测映射&quot; <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6389em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">g</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">∘</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span></span></span></span>，而不是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span></span></span></span> 本身。具体来说，若 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span></span></span></span> 是可逆线性变换，则</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.2em;vertical-align:-0.35em;"></span><span class="mord"><span class="delimsizing mult"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.85em;"><span style="top:-2.85em;"><span class="pstrut" style="height:3.2em;"></span><span style="width:0.556em;height:1.2em;"><svg xmlns="http://www.w3.org/2000/svg" width="0.556em" height="1.2em" viewBox="0 0 556 1200"><path d="M145 15 v585 v0 v585 c2.667,10,9.667,15,21,15
+c10,0,16.667,-5,20,-15 v-585 v0 v-585 c-2.667,-10,-9.667,-15,-21,-15
+c-10,0,-16.667,5,-20,15z M188 15 H145 v585 v0 v585 h43z
+M367 15 v585 v0 v585 c2.667,10,9.667,15,21,15
+c10,0,16.667,-5,20,-15 v-585 v0 v-585 c-2.667,-10,-9.667,-15,-21,-15
+c-10,0,-16.667,5,-20,15z M410 15 H367 v585 v0 v585 h43z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.35em;"><span></span></span></span></span></span></span><span class="mord mathnormal" style="margin-right:0.0359em;">g</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="mopen">(</span><span class="mord mathnormal">x</span><span class="mclose">))</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.404em;vertical-align:-0.35em;"></span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0359em;">y</span><span class="mclose">)</span><span class="mord"><span class="mord"><span class="delimsizing mult"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.85em;"><span style="top:-2.85em;"><span class="pstrut" style="height:3.2em;"></span><span style="width:0.556em;height:1.2em;"><svg xmlns="http://www.w3.org/2000/svg" width="0.556em" height="1.2em" viewBox="0 0 556 1200"><path d="M145 15 v585 v0 v585 c2.667,10,9.667,15,21,15
+c10,0,16.667,-5,20,-15 v-585 v0 v-585 c-2.667,-10,-9.667,-15,-21,-15
+c-10,0,-16.667,5,-20,15z M188 15 H145 v585 v0 v585 h43z
+M367 15 v585 v0 v585 c2.667,10,9.667,15,21,15
+c10,0,16.667,-5,20,-15 v-585 v0 v-585 c-2.667,-10,-9.667,-15,-21,-15
+c-10,0,-16.667,5,-20,15z M410 15 H367 v585 v0 v585 h43z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.35em;"><span></span></span></span></span></span></span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:1.054em;"><span style="top:-3.3029em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.2em;vertical-align:-0.35em;"></span><span class="mord"><span class="delimsizing mult"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.85em;"><span style="top:-2.85em;"><span class="pstrut" style="height:3.2em;"></span><span style="width:0.556em;height:1.2em;"><svg xmlns="http://www.w3.org/2000/svg" width="0.556em" height="1.2em" viewBox="0 0 556 1200"><path d="M145 15 v585 v0 v585 c2.667,10,9.667,15,21,15
+c10,0,16.667,-5,20,-15 v-585 v0 v-585 c-2.667,-10,-9.667,-15,-21,-15
+c-10,0,-16.667,5,-20,15z M188 15 H145 v585 v0 v585 h43z
+M367 15 v585 v0 v585 c2.667,10,9.667,15,21,15
+c10,0,16.667,-5,20,-15 v-585 v0 v-585 c-2.667,-10,-9.667,-15,-21,-15
+c-10,0,-16.667,5,-20,15z M410 15 H367 v585 v0 v585 h43z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.35em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0359em;">g</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">∘</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.1141em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8641em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">1</span></span></span></span></span></span></span></span></span><span class="mclose">)</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="mopen">(</span><span class="mord mathnormal">x</span><span class="mclose">))</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.404em;vertical-align:-0.35em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0359em;">y</span><span class="mclose">)</span><span class="mord"><span class="mord"><span class="delimsizing mult"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.85em;"><span style="top:-2.85em;"><span class="pstrut" style="height:3.2em;"></span><span style="width:0.556em;height:1.2em;"><svg xmlns="http://www.w3.org/2000/svg" width="0.556em" height="1.2em" viewBox="0 0 556 1200"><path d="M145 15 v585 v0 v585 c2.667,10,9.667,15,21,15
+c10,0,16.667,-5,20,-15 v-585 v0 v-585 c-2.667,-10,-9.667,-15,-21,-15
+c-10,0,-16.667,5,-20,15z M188 15 H145 v585 v0 v585 h43z
+M367 15 v585 v0 v585 c2.667,10,9.667,15,21,15
+c10,0,16.667,-5,20,-15 v-585 v0 v-585 c-2.667,-10,-9.667,-15,-21,-15
+c-10,0,-16.667,5,-20,15z M410 15 H367 v585 v0 v585 h43z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.35em;"><span></span></span></span></span></span></span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:1.054em;"><span style="top:-3.3029em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span><span class="mpunct">,</span></span></span></span></span></p>
+<p>所以 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">g</span><span class="mclose">)</span></span></span></span> 与 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="mpunct">,</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">g</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">∘</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.0641em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">1</span></span></span></span></span></span></span></span></span><span class="mclose">)</span></span></span></span> 的损失<strong>完全相同</strong>。更一般地，任何保持可预测性的双射都给出同一个目标值。由此得到三条具体后果：</p>
+<ol>
+<li><strong>没有解码器 → 无法唯一确定表征的&quot;含义&quot;。</strong> 两个损失相同的模型，隐空间的坐标轴可以完全不同。</li>
+<li><strong>无法直接诊断&quot;丢了什么&quot;</strong>。你只能用<strong>探针</strong>（把 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.044em;">z</span></span></span></span> 线性/非线性回归到某个量）间接测 —— 而探针本身有容量与数据的选择，测出来的&quot;信息量&quot;依赖探针（这正是表征学习评测的长期争议）。</li>
+<li><strong>不对称性让目标非对称</strong>，因此<strong>并不存在一个&quot;正确的&quot; <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">g</span><span class="mclose">)</span></span></span></span> 分解</strong>：predictor 与 encoder 之间的分工是可互换的一部分。这也是为什么同一套目标在不同超参下学出的表征差异会很大。</li>
+</ol>
+<p><strong>这不是缺陷，而是&quot;预测类目标&quot;的定义使然。</strong> 重建派之所以可辨识性更高，是因为解码器给出了一条&quot;把 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.044em;">z</span></span></span></span> 映射回可比较空间&quot;的通路。<strong>可诊断性是用容量买的</strong>（解码器要占参数、要占目标）。</p>
+<h4 id="h-52-冻结编码器的上限">5.2 冻结编码器的上限<a class="anchor" href="#h-52-冻结编码器的上限" aria-label="本节链接">#</a></h4>
+<p>DINO-WM 式的做法（冻结 backbone + 学动力学）有一个必须写清的天花板：</p>
+<ul>
+<li><strong>冻结编码器决定了可预测什么。</strong> 如果 backbone 的表征不含精确深度、接触状态或某个任务关键量，动力学模型<strong>无论多准</strong>都拿不到它。</li>
+<li><strong>它同时是优点</strong>：表征不需要为每个任务重训，动力学模型可以很小、很快、样本效率很高。</li>
+<li><strong>判断方法</strong>：在冻结表征上做<strong>线性探针</strong>，测一下任务关键量是否可解码。如果线性探针都测不出来，别指望动力学模型能补上（这条判据可以直接写进工程流程）。</li>
+</ul>
+<h4 id="h-53-掩码策略的偏差">5.3 掩码策略的偏差<a class="anchor" href="#h-53-掩码策略的偏差" aria-label="本节链接">#</a></h4>
+<p>I-JEPA/V-JEPA 用掩码定义&quot;预测什么&quot;，于是掩码分布成了新的归纳偏置：</p>
+<ul>
+<li>掩码比例、块大小、时空形状都会改变学到的表征（&quot;预测一个块&quot;与&quot;预测一个像素&quot;的信息量不同）；</li>
+<li><strong>掩码目标块的表征是&quot;块级&quot;的</strong>，块内的细节在这一步就被丢掉了 —— 这是设计目标（§2.2 第 3 条），但也意味着<strong>该细节在后续任何用到表征的地方都不存在</strong>；</li>
+<li>因此&quot;掩码策略&quot;事实上在做与&quot;预测目标选择&quot;同类的决定，只是它决定的是<strong>空间/时间粒度</strong>上的重要性。</li>
+</ul>
+<h3 id="h-六按用途选判据而不是口号">六、按用途选：判据，而不是口号<a class="anchor" href="#h-六按用途选判据而不是口号" aria-label="本节链接">#</a></h3>
+<p>把本节收成一张可执行的判据表：</p>
+<table>
+<thead>
+<tr>
+<th>用途</th>
+<th>该保留什么</th>
+<th>首选目标</th>
+<th>理由</th>
+<th>必须接受的代价</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>生成 / 仿真 / 数据增广</td>
+<td>观测的全部可预测细节</td>
+<td><strong>重建/观测似然</strong>（或 token 生成）</td>
+<td>生成能力本身要求解码</td>
+<td>容量会被高方差无关细节占用</td>
+</tr>
+<tr>
+<td>有限交互下做规划（有奖励）</td>
+<td>决策相关量</td>
+<td><strong>表征预测 + 价值/回报头</strong>（本课表 B：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2</span></span></span></span> 就够）</td>
+<td>不需要保留全观测；奖励提供对齐</td>
+<td>绑定奖励；需要奖励标签</td>
+</tr>
+<tr>
+<td>多任务共享的感知 backbone</td>
+<td>通用、可预测的结构</td>
+<td><strong>自监督表征预测（冻结）</strong></td>
+<td>不为任何单一奖励定义</td>
+<td>能力上限由 backbone 决定；不可生成</td>
+</tr>
+<tr>
+<td>只需决策、搜索可行（离散动作）</td>
+<td>价值等价类</td>
+<td><strong>价值等价（MuZero 式）</strong></td>
+<td>最激进的抽象，容量最省</td>
+<td>不可诊断；稀疏奖励难；换奖励失效</td>
+</tr>
+<tr>
+<td>必须理解观测细节（安全/几何）</td>
+<td>细节本身</td>
+<td><strong>重建 + 结构化监督</strong></td>
+<td>&quot;重要&quot;由任务直接给出，而非代理量</td>
+<td>成本高；需要标注</td>
+</tr>
+</tbody></table>
+<p>三条使用规则（与第 2 章第 4 节的&quot;三条决策规则&quot;呼应）：</p>
+<ol>
+<li><strong>先写清用途，再选目标。</strong> &quot;这个模型用来做什么&quot;决定了&quot;什么必须被保留&quot;；反过来（先选一个时髦目标再找用途）必然导致容量错配。</li>
+<li><strong>测可诊断性，再决定要不要解码器。</strong> 如果你的工程需要&quot;看它丢了什么&quot;，就必须付解码器的容量代价；如果不需要，就把这份容量省给动力学。</li>
+<li><strong>不要用单一标量评价表征。</strong> 必须同时报告：任务相关量的探针精度、长时 rollout 误差、<strong>闭环收益</strong>、以及（如果适用）生成质量。本课第 1 章 §4.2 的判据表在这里依然是唯一可靠的验收方式。</li>
+</ol>
+<h3 id="h-七设计空间表本章的收束">七、设计空间表（本章的收束）<a class="anchor" href="#h-七设计空间表本章的收束" aria-label="本节链接">#</a></h3>
+<p>把三章的方法折叠成一张表 —— <strong>任何一个世界模型都是这五个坐标上的一个点</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>坐标</th>
+<th>可选值</th>
+<th>代表</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>表征来源</strong></td>
+<td>重建（可解码） / 预测表征（自监督） / 价值（决策相关） / 手工状态</td>
+<td>VAE·RSSM / JEPA·DINO-WM / MuZero / 物理量</td>
+</tr>
+<tr>
+<td><strong>表征是否可解耦</strong></td>
+<td>可解码 / 不可解码但可探针 / 完全黑箱</td>
+<td>PlaNet / V-JEPA / MuZero</td>
+</tr>
+<tr>
+<td><strong>动力学形式</strong></td>
+<td>确定性 / 连续随机 / 离散随机（类别/码本） / 混合</td>
+<td>TD-MPC / DreamerV1 / DreamerV2 / Genie 隐动作</td>
+</tr>
+<tr>
+<td><strong>动作来源</strong></td>
+<td>真实动作 / 隐动作（学出来） / 无动作</td>
+<td>MBPO / Genie / 视频预测</td>
+</tr>
+<tr>
+<td><strong>规划方式</strong></td>
+<td>在线搜索（CEM/MCTS/MPPI） / 想象训练策略 / 短视界+终端价值 / 不做规划</td>
+<td>PlaNet / Dreamer / TD-MPC / V-JEPA</td>
+</tr>
+<tr>
+<td><strong>不确定性处理</strong></td>
+<td>无 / 集成 / 随机隐变量 / GP 后验 / 悲观惩罚</td>
+<td>MuZero / MBPO / Dreamer / PILCO / 第 2 章第 3 节</td>
+</tr>
+</tbody></table>
+<p><strong>用它做三件事</strong>：</p>
+<ol>
+<li><strong>读论文</strong>：把方法填进六个坐标，立刻能看到它选了哪些取舍、以及哪些格子是空的（空着的格子往往就是它失效的地方）。</li>
+<li><strong>做设计</strong>：先填<strong>用途</strong>，再让六个坐标与用途对齐；任何一格与用途冲突（例如&quot;要在有限数据下规划&quot;却选了&quot;重建 + 无价值头&quot;）都会表现为可预测的失败。</li>
+<li><strong>看谱系</strong>：本章第一节到第四节正好是这张表上从&quot;可解码低维表征 + 确定性动力学&quot;走到&quot;自监督表征 + 动作条件动力学&quot;的一条路径 —— <strong>每一代都换掉了表上的一格，并为此付了一格代价。</strong></li>
+</ol>
+<p><figure><img class="md-img" src="content/courses/world-models/assets/chapter-3-figure-03.svg" alt="设计空间的五个坐标" loading="lazy" decoding="async"><figcaption>设计空间的五个坐标</figcaption></figure>
+</p>
+<h3 id="h-代码三个预测目标同一套容量与规划器">代码：三个预测目标，同一套容量与规划器<a class="anchor" href="#h-代码三个预测目标同一套容量与规划器" aria-label="本节链接">#</a></h3>
+<p>下面的代码不调用任何 API，分成两段：</p>
+<ul>
+<li><strong>A 段（坍缩）</strong>：一个最小的线性联合嵌入预测任务，用同一个目标、不同初值，把&quot;平凡解&quot;与&quot;有信息的解&quot;都抓出来；再对比加了 EMA + stop-gradient + 方差正则之后的嵌入健康度。</li>
+<li><strong>B 段（目标之争）</strong>：观测 = 任务坐标（2 维，方差低）+ 确定性干扰（6 维）+ 噪声（4 维）。用<strong>同一个 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 维瓶颈</strong>和<strong>同一个穷举规划器</strong>，比较三种目标：<strong>重建全观测</strong>、<strong>预测任务坐标</strong>、<strong>只预测一步奖励</strong>。并且额外测两件事：数据量从 200 到 3000 的变化，以及<strong>换目标后不重新训练</strong>会发生什么。</li>
+</ul>
+<p>每一处注释写的是<strong>设计决策</strong>，不是实现细节。</p>
+<p>⚠️ <strong>数据全部为本代码合成，不代表任何真实数据集。</strong></p>
+<pre data-lang="python"><code class="language-python">&quot;&quot;&quot;WM ch3-l4 演示：A) 对称联合嵌入目标会坍缩；不对称 + 方差正则为什么能防住
+                    B) 预测什么：重建 / 任务特征 / 价值 —— 同一环境、同一规划器下的对照
+环境与数据全部为合成数据（⚠️ 不代表任何真实数据集），只依赖 numpy。
+运行：/opt/homebrew/bin/python3.10 &lt;file&gt;   环境：python 3.10.16 / numpy 1.26.2
+&quot;&quot;&quot;
+import itertools
+import numpy as np
+rng = np.random.default_rng(0)
+
+# ================= A. 表征坍缩 =================
+N, DIM, K = 2000, 8, 4
+TH = 0.4
+Mrot = np.array([[np.cos(TH), -np.sin(TH)], [np.sin(TH), np.cos(TH)]])
+u = rng.normal(0, 0.7, (N, 2))
+x = np.column_stack([u, rng.normal(0, 1.0, (N, 6))])                       # 前 2 维可预测，后 6 维纯噪声
+y = np.column_stack([u @ Mrot.T + rng.normal(0, 0.05, (N, 2)), rng.normal(0, 1.0, (N, 6))])
+print(&quot;[A 数据] 8 维观测里只有前 2 维可预测（后 6 维纯噪声）；用 4 维嵌入预测下一时刻&quot;)
+
+def run(mode, steps=6000, lr=0.02, beta=1.0, ema=0.99, seed=0, init=0.5):
+    &quot;&quot;&quot;mode=&#39;sym&#39;：目标也走在线编码器，梯度会同时压 W 与目标 —— 存在平凡解 W=0。
+       mode=&#39;asym&#39;：目标走 EMA 编码器 + stop-gradient，再加 VICReg 式方差正则。&quot;&quot;&quot;
+    r = np.random.default_rng(seed)
+    W = r.normal(0, init, (K, DIM)); A = r.normal(0, 0.5, (K, K)); Wt = W.copy()
+    log = []
+    for s in range(steps + 1):
+        Z = x @ W.T
+        E = Z @ A.T - y @ (W.T if mode == &#39;sym&#39; else Wt.T)
+        dP = (2 / N) * E.T @ x                      # dL/d(AW)
+        gA, gW = dP @ W.T, A.T @ dP
+        if mode == &#39;sym&#39;:
+            gW = gW - (2 / N) * E.T @ y              # 目标项对 W 的额外梯度：坍缩的来源
+        else:                                        # VICReg 式方差正则（只对 std&lt;1 的维施力）
+            std = Z.std(0) + 1e-6
+            coef = -beta * (std &lt; 1.0) / (N * std ** 2)
+            gW = gW + coef[:, None] * ((Z - Z.mean(0)).T @ x)
+        W -= lr * gW; A -= lr * gA
+        if mode != &#39;sym&#39;:
+            Wt = ema * Wt + (1 - ema) * W
+        if s % 2000 == 0 or s == steps:
+            Zc = x @ W.T
+            Zz, uu = Zc - Zc.mean(0), u - u.mean(0)
+            w_ = np.linalg.solve(Zz.T @ Zz + 0.05 * np.eye(K), Zz.T @ uu)   # ridge 探针：惩罚爆炸系数
+            R2 = 1 - ((Zz @ w_ - uu) ** 2).sum() / (uu ** 2).sum()
+            Tm = y @ (W.T if mode == &#39;sym&#39; else Wt.T)
+            log.append((s, float(np.mean((Zc @ A.T - Tm) ** 2)), float(R2),
+                        float(Zc.std(0).min()), float(Zc.std(0).mean())))
+    return log
+
+print(&quot;\n[表 A · 同一个目标、不同初值：对称目标的平凡解与有信息的解都是全局最优]&quot;)
+print(&quot;   配置                                   |   步数 | 预测 MSE | 解码 u R^2 | min std | mean std&quot;)
+for mode, tag, init in ((&#39;sym&#39;, &#39;对称, 小初值(0.05) &#39;, 0.05), (&#39;sym&#39;, &#39;对称, 常规初值(0.5)&#39;, 0.5),
+                        (&#39;asym&#39;, &#39;不对称+方差正则      &#39;, 0.05)):
+    for s, mse, r2, smin, smean in run(mode, init=init):
+        print(f&quot;   {tag:38} | {s:&gt;6} | {mse:&gt;8.4f} | {r2:&gt;10.3f} | {smin:&gt;7.4f} | {smean:&gt;8.4f}&quot;)
+
+# ================= B. 预测什么目标 =================
+# 观测 = [p(2, 可控) , d(6, 确定性旋转) , e(4, 纯噪声)]；奖励只看 p（-到目标距离^2）
+DIMP, GOAL, STEP, EP = 2, np.array([1.2, 1.2]), 0.4, 10
+DELTA = np.array([[-1.0, 0], [1.0, 0], [0, -1.0], [0, 1.0], [0, 0]])
+NACT = len(DELTA)
+BLK = [np.array([[np.cos(t), -np.sin(t)], [np.sin(t), np.cos(t)]]) for t in (0.5, 1.0, 1.5)]
+def advance(p, d, e, a):
+    p2 = p + STEP * DELTA[a]                 # 不加边界截断：误差只能来自&#39;表征丢了什么&#39;
+    d2 = np.concatenate([BLK[j] @ d[2 * j:2 * j + 2] for j in range(3)])
+    return p2, d2, e
+rew = lambda p: float(-np.sum((p - GOAL) ** 2))
+NTR = 3000
+P = rng.uniform(-1, 1, (NTR, DIMP)); D = rng.normal(0, 1.0, (NTR, 6)); E_ = rng.normal(0, 1.0, (NTR, 4))
+AA = rng.integers(0, NACT, NTR)
+P2 = np.empty_like(P); D2 = np.empty_like(D)
+for i in range(NTR):
+    P2[i], D2[i], _ = advance(P[i], D[i], E_[i], AA[i])
+O = np.column_stack([P, D, E_]); ON = np.column_stack([P2, D2, E_[rng.permutation(NTR)]])
+OH = np.eye(NACT)[AA]
+print(f&quot;\n[B 数据] 观测 12 维：任务坐标方差 {P.var():.3f} / 干扰项方差 {D.var():.3f} / 噪声方差 {E_.var():.3f}&quot;)
+
+def fit_latent(E_enc, targets_x, targets_xn, actions, lam=1e-6):
+    &quot;&quot;&quot;给定编码器 E_enc（k×12），用最小二乘拟合隐动力学 z&#39; = A z + B a + b
+    与读出器 p&#39; = D z&#39; + d。设计决策：编码器由**目标**决定，动力学一律最小二乘 —— 
+    这样两个模型的差别只剩&#39;保留了什么信息&#39;。&quot;&quot;&quot;
+    Z, ZN = O @ E_enc.T, ON @ E_enc.T
+    Xd = np.column_stack([Z, actions, np.ones(len(Z))])
+    AB = np.linalg.solve(Xd.T @ Xd + lam * np.eye(Xd.shape[1]), Xd.T @ ZN)
+    A_m, B_v, b_v = AB[:E_enc.shape[0]].T, AB[E_enc.shape[0]:E_enc.shape[0] + NACT].T, AB[-1]
+    U = Z @ A_m.T + actions @ B_v.T + b_v
+    Dd = np.linalg.lstsq(np.column_stack([U, np.ones(len(U))]), targets_xn, rcond=None)[0]
+    return dict(E=E_enc, A=A_m, B=B_v, b=b_v, D=Dd[:-1].T, d=Dd[-1])
+def pca_encoder(k, n_use=NTR):
+    return np.linalg.svd(O[:n_use] - O[:n_use].mean(0), full_matrices=False)[2][:k]
+def task_encoder(n_use=NTR):
+    W = np.linalg.lstsq(np.column_stack([O[:n_use], np.ones(n_use)]), P[:n_use], rcond=None)[0][:-1]
+    return W.T                       # 2 个方向：最能预测**当前**任务坐标的方向（与动作时序对齐）
+M_rec2 = fit_latent(pca_encoder(2), P, P2, OH)
+M_rec8 = fit_latent(pca_encoder(8), P, P2, OH)
+M_rec11 = fit_latent(pca_encoder(11), P, P2, OH)
+M_rec12 = fit_latent(np.eye(12), P, P2, OH)        # 全秩：什么也不丢
+M_task = fit_latent(task_encoder(), P, P2, OH)
+TASK_RANK = int(1 + (np.linalg.svd(O - O.mean(0), full_matrices=False)[1][:] &gt; P.var() * 0.9).sum())
+print(f&quot;   任务坐标方差 {P.var():.3f} 低于干扰/噪声方差 ~1.0：PCA 要保留任务坐标至少需要 k={11} 维&quot;)
+def val_feats(o, oh):
+    &#39;&#39;&#39;:param o: (n,12) 观测; oh: (n,5) 动作 one-hot
+    设计决策：把 状态×动作 的交互项显式给出来 —— 一步回报是 p 与 δ 的双线性函数，
+    没有交互项的话线性模型连它自己的目标都拟合不了，那比较的就不是&quot;目标之争&quot;而是&quot;函数类之争&quot;。&#39;&#39;&#39;
+    return np.column_stack([o, oh, (o[:, :, None] * oh[:, None, :]).reshape(len(o), -1), np.ones(len(o))])
+w_val = np.linalg.lstsq(val_feats(O, OH), np.array([rew(p) for p in P2]), rcond=None)[0]   # 只学一步奖励
+w_val_new = np.linalg.lstsq(val_feats(O, OH),
+                            np.array([-np.sum((p - (-GOAL)) ** 2) for p in P2]), rcond=None)[0]
+
+def true_seq(p, d, e, acts):
+    out = []
+    for a in acts:
+        p, d, e = advance(p, d, e, a); out.append(p.copy())
+    return np.array(out)
+def roll_p(m, o0, acts):
+    z, out = o0 @ m[&#39;E&#39;].T, []
+    for a in acts:
+        z = z @ m[&#39;A&#39;].T + OH[a][None, :] @ m[&#39;B&#39;].T + m[&#39;b&#39;]
+        out.append((z @ m[&#39;D&#39;].T + m[&#39;d&#39;])[:, 0])
+    return np.array(out)
+i0 = np.arange(200, 600)
+print(&quot;\n[表 B1 · 各自的目标空间里的一步误差 + 五步任务坐标 rollout 误差]&quot;)
+for tag, m, ok in ((&quot;重建派 k=2   &quot;, M_rec2, True), (&quot;重建派 k=8   &quot;, M_rec8, True),
+                   (&quot;重建派 k=11  &quot;, M_rec11, True), (&quot;重建派 k=12全秩&quot;, M_rec12, True),
+                   (&quot;任务特征派 k=2&quot;, M_task, False)):
+    recon = np.mean([np.mean((O[i] - m[&#39;E&#39;].T @ (m[&#39;E&#39;] @ O[i])) ** 2) for i in i0])
+    rs = f&quot;{recon:&gt;7.4f}&quot; if ok else &quot;   —   &quot;     # 这一派不产出观测，重建一栏不适用
+    r5 = np.mean([np.mean((roll_p(m, O[i][None, :], AA[i:i + 5]) - true_seq(P[i], D[i], E_[i], AA[i:i + 5])[:, 0]) ** 2) for i in i0])
+    print(f&quot;   {tag} | 全观测重建 MSE {rs} | 五步任务坐标 MSE {r5:&gt;9.5f}&quot;)
+print(&quot;   价值派       | 全观测重建 MSE     —   | 一步奖励 MSE &quot;
+      f&quot;{np.mean((np.array([rew(p) for p in P2])[i0] - val_feats(O[i0], OH[i0]) @ w_val) ** 2):.5f}&quot;)
+
+ALL = np.array(list(itertools.product(range(NACT), repeat=4)))
+def mpc(m, goal=GOAL, steps=EP, horizon=4):
+    &quot;&quot;&quot;设计决策：优化视界内的**累计回报**（不是只看到终点的距离）。
+    只看到终点会产生大量并列最优的序列，argmax 的字典序 tie-break 会让规划器&quot;原地不动&quot;。&quot;&quot;&quot;
+    rets = []
+    for i in i0[:100]:
+        z, p, d, e = (O[i][None, :] @ m[&#39;E&#39;].T), P[i].copy(), D[i].copy(), E_[i].copy()
+        tot = 0.0
+        for _ in range(steps):
+            zc = np.repeat(z, len(ALL), 0)
+            R = np.zeros(len(ALL))
+            for t in range(horizon):
+                zc = zc @ m[&#39;A&#39;].T + np.eye(NACT)[ALL[:, t]] @ m[&#39;B&#39;].T + m[&#39;b&#39;]
+                pp = zc @ m[&#39;D&#39;].T + m[&#39;d&#39;]
+                R -= np.sum((pp - goal) ** 2, 1)
+            a = int(ALL[int(np.argmax(R)), 0])
+            z = z @ m[&#39;A&#39;].T + np.eye(NACT)[a][None, :] @ m[&#39;B&#39;].T + m[&#39;b&#39;]
+            p, d, e = advance(p, d, e, a); tot += float(-np.sum((p - goal) ** 2))
+        rets.append(tot)
+    return float(np.mean(rets))
+def mpc_value(w, goal, steps=EP):
+    &quot;&quot;&quot;价值派：一步贪心。注意它**不含目标**——目标被烤进了奖励标签里。&quot;&quot;&quot;
+    rets = []
+    for i in i0[:100]:
+        p, d, e = P[i].copy(), D[i].copy(), E_[i].copy(); tot = 0.0
+        for _ in range(steps):
+            o = np.tile(np.concatenate([p, d, e]), (NACT, 1))
+            a = int(np.argmax(val_feats(o, np.eye(NACT)) @ w))
+            p, d, e = advance(p, d, e, a); tot += float(-np.sum((p - goal) ** 2))
+        rets.append(tot)
+    return float(np.mean(rets))
+print(&quot;\n[表 B2 · 闭环回报：模型内穷举 4 步、真实环境执行 10 步（奖励 = -到目标距离^2）]&quot;)
+for tag, m in ((&quot;重建派 k=2     &quot;, M_rec2), (&quot;重建派 k=8     &quot;, M_rec8), (&quot;重建派 k=11    &quot;, M_rec11),
+               (&quot;重建派 k=12全秩  &quot;, M_rec12), (&quot;任务特征派 k=2 &quot;, M_task)):
+    print(f&quot;   {tag}: {mpc(m):&gt;9.2f}&quot;)
+print(f&quot;   价值派(一步贪心): {mpc_value(w_val, GOAL):&gt;9.2f}   ← 视界只有 1 步&quot;)
+
+print(&quot;\n[表 B4 · 把目标换成 (-1.2,-1.2) 重新规划：动力学/特征是可复用的，烤进奖励的价值模型不是]&quot;)
+print(f&quot;   任务特征派（同一模型，改 goal 重新规划）: {mpc(M_task, goal=-GOAL):&gt;9.2f}&quot;)
+print(f&quot;   价值派（同一模型，不重新训练）          : {mpc_value(w_val, -GOAL):&gt;9.2f}  ← 它仍在朝旧目标走&quot;)
+print(f&quot;   价值派（用新目标重新训练，需新奖励标签）: {mpc_value(w_val_new, -GOAL):&gt;9.2f}&quot;)
+
+print(&quot;\n[表 B3 · 数据预算：&#39;重建丢掉了低方差的任务坐标&#39;是结构性偏差，数据再多也修不回来]&quot;)
+print(&quot;   训练转移数 | 重建派 k=2 | 重建派 k=11 | 重建派 k=12全秩 | 特征派 k=2&quot;)
+for n_use in (200, 600, 1500, 3000):
+    def fl(E_enc): return fit_latent(E_enc, P, P2, OH)
+    V = np.linalg.svd(O[:n_use] - O[:n_use].mean(0), full_matrices=False)[2]
+    mt = fl(np.linalg.lstsq(np.column_stack([O[:n_use], np.ones(n_use)]), P[:n_use], rcond=None)[0][:-1].T)
+    print(f&quot;   {n_use:&gt;10} | {mpc(fl(V[:2])):&gt;10.2f} | {mpc(fl(V[:11])):&gt;11.2f} | &quot;
+          f&quot;{mpc(fl(np.eye(12))):&gt;15.2f} | {mpc(mt):&gt;10.2f}&quot;)</code></pre>
+<p><strong>实测输出</strong>（本机 python 3.10.16 / numpy 1.26.2，随机种子见代码）：</p>
+<pre><code>[A 数据] 8 维观测里只有前 2 维可预测（后 6 维纯噪声）；用 4 维嵌入预测下一时刻
+
+[表 A · 同一个目标、不同初值：对称目标的平凡解与有信息的解都是全局最优]
+   配置                                   |   步数 | 预测 MSE | 解码 u R^2 | min std | mean std
+   对称, 小初值(0.05)                          |      0 |   0.0192 |      0.231 |  0.0792 |   0.0984
+   对称, 小初值(0.05)                          |   2000 |   0.0000 |      0.000 |  0.0000 |   0.0000
+   对称, 小初值(0.05)                          |   4000 |   0.0000 |      0.000 |  0.0000 |   0.0000
+   对称, 小初值(0.05)                          |   6000 |   0.0000 |      0.000 |  0.0000 |   0.0000
+   对称, 常规初值(0.5)                          |      0 |   1.7822 |      0.231 |  0.7916 |   0.9841
+   对称, 常规初值(0.5)                          |   2000 |   0.0000 |      0.997 |  0.0153 |   0.0204
+   对称, 常规初值(0.5)                          |   4000 |   0.0000 |      0.851 |  0.0040 |   0.0054
+   对称, 常规初值(0.5)                          |   6000 |   0.0000 |      0.271 |  0.0011 |   0.0015
+   不对称+方差正则                               |      0 |   0.1056 |      0.124 |  0.2737 |   0.2910
+   不对称+方差正则                               |   2000 |   1.0365 |      0.972 |  1.0446 |   1.0638
+   不对称+方差正则                               |   4000 |   1.0390 |      0.861 |  1.0379 |   1.0656
+   不对称+方差正则                               |   6000 |   1.0321 |      0.916 |  1.0123 |   1.0638
+
+[B 数据] 观测 12 维：任务坐标方差 0.333 / 干扰项方差 1.003 / 噪声方差 0.997
+   任务坐标方差 0.333 低于干扰/噪声方差 ~1.0：PCA 要保留任务坐标至少需要 k=11 维
+
+[表 B1 · 各自的目标空间里的一步误差 + 五步任务坐标 rollout 误差]
+   重建派 k=2    | 全观测重建 MSE  0.7233 | 五步任务坐标 MSE   0.50289
+   重建派 k=8    | 全观测重建 MSE  0.2241 | 五步任务坐标 MSE   0.51034
+   重建派 k=11   | 全观测重建 MSE  0.0286 | 五步任务坐标 MSE   0.43327
+   重建派 k=12全秩 | 全观测重建 MSE  0.0000 | 五步任务坐标 MSE   0.22870
+   任务特征派 k=2 | 全观测重建 MSE    —    | 五步任务坐标 MSE   0.22870
+   价值派       | 全观测重建 MSE     —   | 一步奖励 MSE 0.18464
+
+[表 B2 · 闭环回报：模型内穷举 4 步、真实环境执行 10 步（奖励 = -到目标距离^2）]
+   重建派 k=2     :    -44.60
+   重建派 k=8     :    -43.38
+   重建派 k=11    :    -19.48
+   重建派 k=12全秩  :     -6.98
+   任务特征派 k=2 :     -6.98
+   价值派(一步贪心):     -7.17   ← 视界只有 1 步
+
+[表 B4 · 把目标换成 (-1.2,-1.2) 重新规划：动力学/特征是可复用的，烤进奖励的价值模型不是]
+   任务特征派（同一模型，改 goal 重新规划）:     -6.77
+   价值派（同一模型，不重新训练）          :    -86.68  ← 它仍在朝旧目标走
+   价值派（用新目标重新训练，需新奖励标签）:     -6.97
+
+[表 B3 · 数据预算：&#39;重建丢掉了低方差的任务坐标&#39;是结构性偏差，数据再多也修不回来]
+   训练转移数 | 重建派 k=2 | 重建派 k=11 | 重建派 k=12全秩 | 特征派 k=2
+          200 |     -44.60 |      -15.87 |           -6.98 |      -6.98
+          600 |     -45.06 |      -18.64 |           -6.98 |      -6.98
+         1500 |     -45.06 |      -18.63 |           -6.98 |      -6.98
+         3000 |     -44.60 |      -19.48 |           -6.98 |      -6.98</code></pre>
+<p><strong>这段代码想让你看到的六件事</strong>：</p>
+<ol>
+<li><strong>平凡解是真的最优解，不是训练不充分。</strong> 表 A：小初值下嵌入维 std 从 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.0792</span></span></span></span> 降到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.0000</span></span></span></span>，预测 MSE 也是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.0000</span></span></span></span>，解码 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">u</span></span></span></span> 的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0077em;">R</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span> 是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.000</span></span></span></span> —— <strong>损失完美、表征为零</strong>。同一个目标在常规初值下却给出 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0077em;">R</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.997</span></span></span></span>（但 min std 已经掉到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.0011</span></span></span></span>，正在掉维）。<strong>目标函数不区分这两个解。</strong></li>
+<li><strong>防坍缩有明确代价。</strong> 不对称 + 方差正则下 min std <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1.0123</span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0077em;">R</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span> <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.916</span></span></span></span>（不坍缩），但预测 MSE 变成 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1.0321</span></span></span></span> —— 因为方差正则强迫嵌入去编码<strong>不可预测的噪声维</strong>。<strong>&quot;不坍缩&quot;与&quot;预测准&quot;在有限容量下是两件事。</strong></li>
+<li><strong>重建按方差分配容量，而任务坐标的方差最低。</strong> 表 B1：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">2/8/11/12</span></span></span></span> 的重建 MSE 是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">0.7233/0.2241/0.0286/0.0000</span></span></span></span>（越来越好），但五步任务坐标 MSE 在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7335em;vertical-align:-0.0391em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&lt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">12</span></span></span></span> 时几乎不动（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">0.503/0.510/0.433</span></span></span></span>），直到全秩才变成 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.2287</span></span></span></span>。<strong>任务特征派用 2 维就达到了全秩重建（12 维）的水平。</strong></li>
+<li><strong>结构性偏差不会被数据修好。</strong> 表 B3：重建派 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2</span></span></span></span> 的闭环回报在 200→3000 条转移之间是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">−</span><span class="mord">44.60</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">→</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">−</span><span class="mord">44.60</span></span></span></span>（几乎不动）；<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">11</span></span></span></span> 从 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">−</span><span class="mord">15.87</span></span></span></span> 改到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">−</span><span class="mord">19.48</span></span></span></span>（有改善但远不够）；全秩重建与任务特征派始终是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">−</span><span class="mord">6.98</span></span></span></span>。<strong>这不是样本量问题，是容量被分配到了哪里。</strong></li>
+<li><strong>价值派在&quot;对齐&quot;上最强，在&quot;迁移&quot;上最弱。</strong> 表 B2：一步贪心的价值模型拿到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">−</span><span class="mord">7.17</span></span></span></span>，与任务特征派的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">−</span><span class="mord">6.98</span></span></span></span> 基本并列 —— 在这个&quot;一步回报与目标一致&quot;的凸任务上，它不需要多步规划。但表 B4：把目标换成 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord">−</span><span class="mord">1.2</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">−</span><span class="mord">1.2</span><span class="mclose">)</span></span></span></span> 后，<strong>同一个价值模型不重新训练</strong>会继续朝旧目标走（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">−</span><span class="mord">86.68</span></span></span></span>），而策略/动力学模型只要改一下 goal 就能重新规划（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">−</span><span class="mord">6.77</span></span></span></span>）。<strong>&quot;奖励被烤进了模型&quot;——这是价值等价派的定义性代价。</strong></li>
+<li><strong>所以&quot;预测什么&quot;没有全局最优。</strong> 同一套容量与规划器下：要生成，只有重建派能做；要规划，任务特征派用最少的容量达到最优；要最省地决策且奖励明确，价值派够用；要迁移，价值派最差。<strong>分歧的本质是&quot;谁来决定什么重要&quot;，而这个决定必须与用途对齐</strong>（§6 的判据表）。</li>
+</ol>
+<blockquote>
+<p>⚠️ 诚实说明这个实验的边界：A 段的编码器是<strong>线性</strong>的（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">8</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">→</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4</span></span></span></span>），所以&quot;对称目标可以精确拟合可预测部分&quot;这条路也存在 —— 换成深非线性编码器时，坍缩会更普遍（文献里的经验），但<strong>&quot;对称目标不排除平凡解&quot;这个结构性事实与线性无关</strong>。B 段的重建最优解在<strong>线性</strong>情形下等价于 PCA，所以&quot;按方差分配容量&quot;是<strong>可证明</strong>的，而不是实现选择的产物；换成深度非线性模型，容量分配会变复杂，但&quot;重建目标用观测方差作权重、而任务相关性不进入权重&quot;这条不会变。所有规划都用穷举 4 步动作（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord"><span class="mord">5</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">4</span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">625</span></span></span></span> 条序列），因此三个模型的规划器完全相同，差异只能来自模型。<strong>它证明的是取舍的结构，不是任何具体系统的水平。</strong></p>
+</blockquote>
+<h3 id="h-练习">练习<a class="anchor" href="#h-练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>证明 PCA 等价。</strong> 在&quot;线性编码器 + 线性解码器 + <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 维瓶颈 + MSE 重建&quot;的设定下，证明最优编码器是观测协方差的前 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 个主方向（提示：先证明最优解可以写成 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6944em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal">o</span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.1944em;"><span class="mord">^</span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord">Π</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0315em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord mathnormal">o</span></span></span></span> 且 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord">Π</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0315em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 是秩 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 的正交投影，再对投影的迹做优化）。然后用这条结论解释本课表 B3 里&quot;<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7335em;vertical-align:-0.0391em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&lt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">11</span></span></span></span> 就丢掉任务坐标&quot;是<strong>可证明的</strong>，而不是调参运气。</li>
+<li><strong>把&quot;可预测性 vs 任务相关性&quot;的漏洞补出来。</strong> 构造一个合成环境，使得<strong>确定性但任务无关</strong>的干扰项方差<strong>低于</strong>任务相关量。重跑 B 段，说明预测表征派此时也会把容量给干扰项。写出你的环境参数，并给出&quot;什么条件下预测表征派才会稳定地保住任务量&quot;的判据。</li>
+<li><strong>坍缩的三张诊断图。</strong> 设计三个可视化/统计量来诊断表征坍缩，要求：一个在<strong>特征维度</strong>上（例如每维 std 或有效秩）、一个在<strong>样本维度</strong>上（例如嵌入的协方差条件数或成对相似度分布）、一个在<strong>下游</strong>上（探针精度）。对每一个说明&quot;坍缩时它长什么样&quot;以及&quot;它不能区分坍缩与什么&quot;。</li>
+<li><strong>不对称性消融。</strong> 在 A 段代码上做四组消融：① 对称；② 只加 stop-gradient；③ 只加 EMA；④ EMA + stop-gradient + 方差正则。对每组报告最终（min std、mean std、解码 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0077em;">R</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span>、预测 MSE），并解释哪一组是&quot;看起来不坍缩但实际无用&quot;。</li>
+<li><strong>价值等价的迁移实验设计。</strong> 设计一个实验来量化&quot;价值等价派换奖励后的性能损失&quot;：要求包含至少三个奖励函数（其中两个只在奖励的<strong>尺度</strong>上不同，一个改变了<strong>最优策略</strong>），并说明尺度变化与策略变化分别会造成什么。</li>
+<li><strong>给冻结 backbone 定验收线。</strong> 假设你要用 DINO-WM 式的方案（冻结视觉特征 + 学动力学）做机器人抓取。写出一份可执行的验收流程，第一步必须是&quot;线性探针能否从冻结表征里解出任务关键量&quot;，并给出：探什么量、探针容量怎么控、判据阈值、以及&quot;探不出来时该怎么办&quot;。</li>
+<li><strong>讨论题（有唯一答案）。</strong> &quot;既然重建会把容量花在无关细节上，那就应该全面改用表征预测。&quot;请给出至少三条反驳，每条必须指出<strong>一个具体的用途</strong>下表征预测会失败（提示：生成/仿真、需要精确几何的安全任务、可预测但无关的量、可诊断性要求）。</li>
+</ol>
+<h3 id="h-小结">小结<a class="anchor" href="#h-小结" aria-label="本节链接">#</a></h3>
+<ul>
+<li><strong>重建目标的问题可以统一写成一句话</strong>：容量按 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathrm">Var</span></span><span class="mopen">(</span><span class="mord mathnormal">o</span><span class="mclose">)</span></span></span></span> 分配，而不是按任务相关性分配。本课表 B1 是它的可证明版本（线性情形下重建最优解就是 PCA）：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">2/8/11</span></span></span></span> 时全观测重建 MSE 从 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.7233</span></span></span></span> 降到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.0286</span></span></span></span>（越来越好），而任务坐标的 rollout 误差几乎不动（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">0.503/0.510/0.433</span></span></span></span>），闭环回报 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">−</span><span class="mord">44.60/</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">43.38/</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">19.48</span></span></span></span>。<strong>重建质量与决策价值在容量受限时是脱钩的。</strong></li>
+<li><strong>JEPA 类的机制是&quot;在表征空间预测&quot;</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">∥</span><span class="mord mathnormal" style="margin-right:0.0359em;">g</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="mopen">(</span><span class="mord mathnormal">x</span><span class="mclose">))</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.0641em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathrm" style="margin-right:0.0139em;">sg</span></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3448em;"><span style="top:-2.4629em;margin-left:-0.1076em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord accent mtight"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8312em;"><span style="top:-2.7em;"><span class="pstrut" style="height:2.7em;"></span><span class="mord mathnormal mtight" style="margin-right:0.0278em;">θ</span></span><span style="top:-2.9634em;"><span class="pstrut" style="height:2.7em;"></span><span class="accent-body" style="left:-0.1667em;"><span class="mord mtight">ˉ</span></span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2371em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0359em;">y</span><span class="mclose">))</span><span class="mord"><span class="mord">∥</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span>。它按<strong>可预测性</strong>分配容量（而不是方差），因此能保住低方差但可预测的结构；代价是没有解码器（不能生成、难诊断），而且<strong>&quot;可预测&quot;与&quot;任务相关&quot;仍然是两件事</strong>。</li>
+<li><strong>对称目标有平凡解，必须靠不对称性 + 正则排除。</strong> 本课表 A：小初值下 std 与 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0077em;">R</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span> 双双掉到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.000</span></span></span></span>（损失 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.0000</span></span></span></span>）；常规初值下损失同样完美但 min std 掉到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.0011</span></span></span></span>（在掉维）。<strong>目标函数本身不区分&quot;有信息&quot;与&quot;退化&quot;两个全局最优。</strong></li>
+<li><strong>防坍缩有代价</strong>：方差正则强迫编码不可预测的维度，预测 MSE 从 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.0000</span></span></span></span> 变成 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1.0321</span></span></span></span>（表 A）。所有防坍缩手段（EMA+stop-grad、方差/协方差正则、白化、负样本、掩码）都是在&quot;保持信息&quot;与&quot;预测准确&quot;之间做交易。</li>
+<li><strong>谱系与共同结构</strong>：I-JEPA（图像块掩码）、V-JEPA（视频时空掩码）、V-JEPA 2（动作条件 + 机器人规划，把表征预测变成世界模型）、DINO-WM（<strong>冻结</strong>自监督特征 + 学特征空间动力学，把&quot;表征&quot;与&quot;动力学&quot;解耦，天花板由 backbone 决定）。</li>
+<li><strong>三方论证都必须给足</strong>：重建派强在良定义似然、可诊断、可生成、任务本身就是场景理解时正确；预测表征派强在按可预测性分配容量、延长可预测视界、可跨任务复用，弱在坍缩风险、不可生成、&quot;可预测≠重要&quot;；价值等价派强在<strong>唯一目标对齐</strong>（用奖励回答&quot;什么重要&quot;）、最省容量，弱在<strong>绑定奖励</strong>（表 B4：不重新训练时 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">−</span><span class="mord">86.68</span></span></span></span>，重新训练需新奖励标签）、稀疏奖励难、不可诊断。</li>
+<li><strong>可辨识性代价</strong>：预测目标只约束等价类（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span></span></span></span> 与 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span></span></span></span> 不可分），因此无解码器时表征没有唯一含义、只能靠探针间接验证；<strong>可诊断性是用容量买的。</strong> 冻结编码器有硬上限，掩码策略本身是新的归纳偏置。</li>
+<li><strong>不存在全局最优的预测目标</strong>：判据见 §6 —— 用<strong>用途</strong>决定保留什么，用<strong>可诊断性需求</strong>决定要不要解码器，并且验收必须同时报告探针精度、长 rollout 误差与<strong>闭环收益</strong>三样。</li>
+<li><strong>本章的收束是 §7 的设计空间表</strong>（表征来源 × 动力学形式 × 动作来源 × 规划方式 × 不确定性处理）。四节方法谱系恰好是这张表上&quot;每换一格、付一格代价&quot;的一条路径。<strong>它也是下一章的入口：规划与想象本身还没有被正面处理 —— 怎么用模型做决策，以及什么时候不该用模型。</strong></li>
+</ul>
+<blockquote>
+<p>下一节（第 4 章第一节，<code>wm-ch4-l1</code>）：前三章建立了判据、讲清了难点、也把方法谱系折叠成了一张设计空间表 —— 但<strong>&quot;怎么用模型做决策&quot;这件事本身还没有被正面处理</strong>。我们把规划当成了给定件（CEM、MCTS、MPPI），把想象当成了给定件（从真实状态分支、短 rollout）。第 4 章第一节要回到决策本身：给定一个世界模型，<strong>在线规划、想象训练、模型预测控制、只做模型评估</strong>这四种用法各自的适用条件是什么，规划视界该怎么定，搜索与学习的边界在哪里 —— 以及最重要的那一条：<strong>什么时候不该用模型</strong>（模型误差的方向、不确定性校准失败、以及混沌带来的可预测视界上限）。</p>
+</blockquote>

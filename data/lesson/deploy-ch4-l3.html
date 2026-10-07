@@ -1,0 +1,141 @@
+<h2 id="h-监控与日志">监控与日志<a class="anchor" href="#h-监控与日志" aria-label="本节链接">#</a></h2>
+<p>服务上线后，最怕的不是&quot;慢了&quot;，而是&quot;慢了却没人知道&quot;。前面学过的 TTFT、TPOT、吞吐这些指标，只有被<strong>持续采集、可视化、告警</strong>，才算真正进入生产状态。这一课讲 LLM 推理服务要盯哪些指标、vLLM 怎么暴露 Prometheus 指标、日志怎么记，以及如何串成 Grafana 大盘 + 告警。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-推理服务要盯的四个层面">1. 推理服务要盯的四个层面<a class="anchor" href="#h-1-推理服务要盯的四个层面" aria-label="本节链接">#</a></h4>
+<ol>
+<li><strong>硬件层</strong>：GPU 利用率、显存占用、温度、功耗。显存占用尤其关键——它决定了还能不能容纳更多 KV Cache；</li>
+<li><strong>引擎层</strong>：运行中的请求数、排队长度、KV Cache 使用块数/命中率、prefix cache 命中率、prefill/decode token 数；</li>
+<li><strong>服务质量层（SLO）</strong>：TTFT、TPOT、首 token 分位数（P50/P99）、端到端延迟、每秒吞吐、错误率。这是对用户承诺的核心；</li>
+<li><strong>业务层</strong>：请求总量、按客户/模型维度的 token 消耗、限流触发次数——这些直接关联到<strong>账单</strong>。</li>
+</ol>
+<p>记住一句话：<strong>监控不是&quot;看数字&quot;，而是&quot;为 SLA 和成本提供证据&quot;</strong>。没有 P99 TTFT 的历史曲线，你既无法证明自己达标，也无法在用户投诉时定位&quot;是哪个时刻、哪批请求慢了&quot;。</p>
+<h4 id="h-2-vllm-的-prometheus-指标">2. vLLM 的 Prometheus 指标<a class="anchor" href="#h-2-vllm-的-prometheus-指标" aria-label="本节链接">#</a></h4>
+<p>vLLM 内置 Prometheus 格式的指标暴露，默认挂在 <code>/metrics</code> 端点。常用指标：</p>
+<table>
+<thead>
+<tr>
+<th>指标名</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>vllm:num_requests_running</code></td>
+<td>正在运行的请求数（水位线）</td>
+</tr>
+<tr>
+<td><code>vllm:num_requests_waiting</code></td>
+<td>排队等待的请求数（拥塞信号）</td>
+</tr>
+<tr>
+<td><code>vllm:gpu_cache_usage_perc</code></td>
+<td>KV Cache 使用百分比</td>
+</tr>
+<tr>
+<td><code>vllm:time_to_first_token_seconds</code></td>
+<td>TTFT 直方图，可算 P50/P99</td>
+</tr>
+<tr>
+<td><code>vllm:time_per_output_token_seconds</code></td>
+<td>TPOT 直方图</td>
+</tr>
+<tr>
+<td><code>vllm:generation_tokens_total</code></td>
+<td>累计生成 token 数</td>
+</tr>
+<tr>
+<td><code>vllm:prompt_tokens_total</code></td>
+<td>累计输入 token 数</td>
+</tr>
+<tr>
+<td><code>vllm:request_success_total</code></td>
+<td>成功请求数</td>
+</tr>
+</tbody></table>
+<p>这些指标本质是把上一课的&quot;时序&quot;变成了&quot;可聚合的时间序列&quot;。通过 Prometheus 的 <code>histogram_quantile</code> 可以算出任意分位数，进而和 SLA 对齐。</p>
+<h4 id="h-3-日志结构化--请求链路">3. 日志：结构化 + 请求链路<a class="anchor" href="#h-3-日志结构化--请求链路" aria-label="本节链接">#</a></h4>
+<p>日志分两类：</p>
+<ul>
+<li><strong>引擎日志</strong>：vLLM 自身的启动、加载、调度信息，排障第一现场；</li>
+<li><strong>访问日志（access log）</strong>：每条请求的元信息——时间、模型名、输入/输出 token 数、TTFT、TPOT、状态码、耗时。<strong>这些字段是成本核算和用户计费的原始凭证</strong>，一定要结构化（JSON），方便后续聚合。</li>
+</ul>
+<p>生产上通常让容器把日志打到<strong>标准输出（stdout/stderr）</strong>，由编排层（K8s / docker 日志驱动 / fluent-bit）统一采集到 Loki / ELK。不要把日志写死在容器内的文件里——容器一重建就丢了。</p>
+<h4 id="h-4-告警要少而准">4. 告警要&quot;少而准&quot;<a class="anchor" href="#h-4-告警要少而准" aria-label="本节链接">#</a></h4>
+<p>告警不是越多越好。典型的 LLM 服务告警就三条：</p>
+<ol>
+<li><code>num_requests_waiting</code> 持续 &gt; 阈值（如 20）超过 5 分钟 → 排队拥塞，需要扩容或降载；</li>
+<li>P99 TTFT 超过 SLA 目标（如 3s）→ 体验劣化；</li>
+<li>错误率（5xx）超过 1% → 服务异常。</li>
+</ol>
+<p>每条告警都要能回答&quot;接到告警后我该做什么&quot;，否则就是噪音。</p>
+<p><figure><img class="md-img" src="content/courses/llm-deployment-practice/assets/chapter-4-figure-03.svg" alt="监控数据流图：左侧四个方块从上到下&quot;硬件层（GPU/显存）&quot;&quot;引擎层（排队/KV Cache）&quot;&quot;服务质量层（TTFT/TPOT/吞吐）&quot;&quot;业务层（token/账单）&quot;，中间一个紫色方块&quot;vLLM /metrics 端点&quot;，右侧串起&quot;Prometheus 采集 → Grafana 可视化 → 告警&quot;，底部一行字&quot;监控是为 SLA 与成本提供证据&quot;" loading="lazy" decoding="async"><figcaption>监控数据流图：左侧四个方块从上到下&quot;硬件层（GPU/显存）&quot;&quot;引擎层（排队/KV Cache）&quot;&quot;服务质量层（TTFT/TPOT/吞吐）&quot;&quot;业务层（token/账单）&quot;，中间一个紫色方块&quot;vLLM /metrics 端点&quot;，右侧串起&quot;Prometheus 采集 → Grafana 可视化 → 告警&quot;，底部一行字&quot;监控是为 SLA 与成本提供证据&quot;</figcaption></figure>
+</p>
+<h3 id="h-二可运行示例">二、可运行示例<a class="anchor" href="#h-二可运行示例" aria-label="本节链接">#</a></h3>
+<h4 id="h-示例-1查看-vllm-暴露的指标">示例 1：查看 vLLM 暴露的指标<a class="anchor" href="#h-示例-1查看-vllm-暴露的指标" aria-label="本节链接">#</a></h4>
+<pre data-lang="bash"><code class="language-bash"># 服务启动后，直接抓取 Prometheus 格式指标
+curl -s http://localhost:8000/metrics | grep -E &quot;vllm:(num_requests_waiting|gpu_cache_usage_perc|generation_tokens_total)&quot;</code></pre>
+<p>输出片段（示意）：</p>
+<pre data-lang="text"><code class="language-text">vllm:num_requests_waiting 0.0
+vllm:gpu_cache_usage_perc 32.5
+vllm:generation_tokens_total{model_name=&quot;llama-8b&quot;} 123456.0</code></pre>
+<h4 id="h-示例-2prometheus-抓取配置">示例 2：Prometheus 抓取配置<a class="anchor" href="#h-示例-2prometheus-抓取配置" aria-label="本节链接">#</a></h4>
+<pre data-lang="yaml"><code class="language-yaml"># prometheus.yml：让 Prometheus 周期拉取 vLLM 指标
+global:
+  scrape_interval: 15s
+scrape_configs:
+  - job_name: &quot;vllm&quot;
+    static_configs:
+      - targets: [&quot;vllm:8000&quot;]     # 容器网络里用服务名
+    metrics_path: /metrics</code></pre>
+<h4 id="h-示例-3用-python-算-p99-分位数演示直方图的用法">示例 3：用 Python 算 P99 分位数（演示直方图的用法）<a class="anchor" href="#h-示例-3用-python-算-p99-分位数演示直方图的用法" aria-label="本节链接">#</a></h4>
+<pre data-lang="python"><code class="language-python"># -*- coding: utf-8 -*-
+# 演示如何从一批 TTFT 观测值算出分位数，理解 P99 的意义
+import random
+
+# 模拟 1000 次请求的 TTFT（秒）：大部分很快，少量偶发慢
+random.seed(42)
+ttft = [0.3 + random.random() * 0.5 for _ in range(990)]
+ttft += [3.5 + random.random() * 2.0 for _ in range(10)]  # 10 个慢请求
+
+def percentile(vals, p):
+    s = sorted(vals)
+    k = (len(s) - 1) * p / 100.0
+    lo = int(k)
+    return s[lo] if lo == k else s[lo] + (s[lo + 1] - s[lo]) * (k - lo)
+
+print(f&quot;平均 TTFT = {sum(ttft)/len(ttft):.2f}s&quot;)          # 平均值：被少数慢请求掩盖
+print(f&quot;P50 TTFT  = {percentile(ttft, 50):.2f}s&quot;)
+print(f&quot;P99 TTFT  = {percentile(ttft, 99):.2f}s&quot;)         # P99：暴露了那 1% 的糟糕体验</code></pre>
+<p>跑一遍你会发现：平均 TTFT 可能只有 0.5s 左右，但 P99 已经冲到 4s 以上——这就是为什么 SLA 必须盯分位数而非平均值。</p>
+<h4 id="h-示例-4写一条结构化访问日志">示例 4：写一条结构化访问日志<a class="anchor" href="#h-示例-4写一条结构化访问日志" aria-label="本节链接">#</a></h4>
+<pre data-lang="python"><code class="language-python"># 请求完成后，落一条结构化日志，供成本核算与排障
+import json, time
+
+def log_request(model, in_tokens, out_tokens, ttft, tpot, status):
+    entry = {
+        &quot;ts&quot;: time.strftime(&quot;%Y-%m-%dT%H:%M:%S&quot;),
+        &quot;model&quot;: model,
+        &quot;prompt_tokens&quot;: in_tokens,
+        &quot;completion_tokens&quot;: out_tokens,
+        &quot;ttft_ms&quot;: round(ttft * 1000),
+        &quot;tpot_ms&quot;: round(tpot * 1000),
+        &quot;status&quot;: status,
+    }
+    # 结构化 JSON 便于后续聚合（Loki/ELK 直接解析）
+    print(json.dumps(entry, ensure_ascii=False))
+
+log_request(&quot;llama-8b&quot;, 128, 256, 0.42, 0.018, 200)</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>起一个 vLLM 服务，用 <code>curl /metrics</code> 观察 <code>num_requests_waiting</code> 在空载时是否为 0；再用并发脚本打一批请求，看它是否上涨，验证&quot;排队长度是拥塞信号&quot;。</li>
+<li>把示例 3 的慢请求占比从 1% 改成 10%，重算平均值和 P99，体会&quot;平均值的欺骗性&quot;随长尾加重而变大。</li>
+<li>基于示例 2 的配置，把 Prometheus + Grafana 起起来，画一张&quot;P99 TTFT 与 KV Cache 使用率&quot;双轴大盘，说明两者可能如何关联（cache 打满 → 排队 → TTFT 上升）。</li>
+<li>设计三条告警规则（排队长度、P99 TTFT、错误率），写出它们的 PromQL 表达式雏形，并说明每条告警触发后你的处理动作。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>vLLM · 指标与监控：<a href="https://docs.vllm.ai/en/latest/serving/metrics.html" target="_blank" rel="noopener noreferrer">https://docs.vllm.ai/en/latest/serving/metrics.html</a></li>
+<li>Prometheus 文档：<a href="https://prometheus.io/docs/" target="_blank" rel="noopener noreferrer">https://prometheus.io/docs/</a></li>
+<li>Grafana 文档：<a href="https://grafana.com/docs/" target="_blank" rel="noopener noreferrer">https://grafana.com/docs/</a></li>
+<li>OpenTelemetry · 可观测性入门：<a href="https://opentelemetry.io/docs/concepts/observability-primer/" target="_blank" rel="noopener noreferrer">https://opentelemetry.io/docs/concepts/observability-primer/</a></li>
+</ul>
+<p><a href="#/l/deploy-ch5-l1">下一课：量化对比实验</a></p>

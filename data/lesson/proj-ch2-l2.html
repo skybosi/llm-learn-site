@@ -1,0 +1,142 @@
+<h2 id="h-核心实现rag-问答系统">核心实现（RAG 问答系统）<a class="anchor" href="#h-核心实现rag-问答系统" aria-label="本节链接">#</a></h2>
+<p>本课实现 RAG 的四段核心管线：<strong>文档切块 → 向量化 → 检索 → LLM 生成</strong>。每一步都不止&quot;能跑&quot;，而要能解释&quot;为什么这么选&quot;，并预留可对比的开关，供下一课做实验评估。</p>
+<h3 id="h-一目标与步骤">一、目标与步骤<a class="anchor" href="#h-一目标与步骤" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>文档切块</strong>：实现可配置的大小/重叠切分，理解切块对检索的影响。</li>
+<li><strong>向量化</strong>：把文本块编码成向量，说明 embedding 选型。</li>
+<li><strong>检索</strong>：实现相似度检索与 MMR 去重，输出带来源的片段。</li>
+<li><strong>LLM 生成</strong>：写一个&quot;强制引用&quot;的提示词模板，让答案逐句有据可查。</li>
+</ol>
+<h3 id="h-二代码骨架与实现指导">二、代码骨架与实现指导<a class="anchor" href="#h-二代码骨架与实现指导" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-文档切块chunking">1. 文档切块（chunking）<a class="anchor" href="#h-1-文档切块chunking" aria-label="本节链接">#</a></h4>
+<p>切块是 RAG 最容易被忽略、却影响最大的环节。核心权衡：<strong>块太大</strong>→上下文噪声多、embedding 语义被稀释；<strong>块太小</strong>→信息断裂、一条事实被切散。中文文档建议从 <code>chunk_size=512</code>、<code>overlap=64</code> 起步：</p>
+<pre data-lang="python"><code class="language-python">from llama_index.core.node_parser import SentenceSplitter
+from llama_index.core import SimpleDirectoryReader
+
+documents = SimpleDirectoryReader(&quot;data/docs&quot;, recursive=True).load_data()
+
+def chunk_documents(documents, chunk_size=512, overlap=64):
+    &quot;&quot;&quot;按字符切块，块间重叠 overlap 以避免把关键句从中间切断。&quot;&quot;&quot;
+    parser = SentenceSplitter(chunk_size=chunk_size, chunk_overlap=overlap)
+    nodes = parser.get_nodes_from_documents(documents)
+    # 每个节点携带来源元数据（文件名/页码），供&quot;引用&quot;使用
+    for n in nodes:
+        n.metadata.setdefault(&quot;source&quot;, n.metadata.get(&quot;file_name&quot;, &quot;unknown&quot;))
+    return nodes
+
+nodes = chunk_documents(documents)
+print(f&quot;共 {len(nodes)} 个节点；平均长度 {sum(len(n.text) for n in nodes)/len(nodes):.0f} 字符&quot;)
+
+# 直观检查切块质量：打印一个节点，确认它语义完整、没有把标题孤零零切出去
+print(&quot;示例节点:\n&quot;, nodes[5].text[:200])</code></pre>
+<blockquote>
+<p>面试要点：能说出&quot;我用 512/64 是因为中文平均一段话的语义单元大约在这个量级，且 overlap 保证跨块断点不被切断&quot;。下一课会做 256/512/1024 的对比实验来<strong>验证</strong>这个选择，而不是拍脑袋。</p>
+</blockquote>
+<h4 id="h-2-向量化">2. 向量化<a class="anchor" href="#h-2-向量化" aria-label="本节链接">#</a></h4>
+<pre data-lang="python"><code class="language-python">from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+
+# 中文开源 embedding：bge 系列在中文检索评测中表现好，且可本地部署
+embed_model = HuggingFaceEmbedding(
+    model_name=&quot;BAAI/bge-small-zh-v1.5&quot;,
+    # 若显存/内存紧张可换成 bge-small；追求效果换 bge-base/large
+)
+# 对 query 与 document 是否用不同前缀：bge 系列建议 query 加 &quot;为这个句子生成表示&quot;
+# （通过 query_instruction 传入，部分封装已内置，务必查你的版本是否自动处理）</code></pre>
+<p>选型理由要落在&quot;中文 + 本地 + 效果/成本平衡&quot;三点上；如果项目跑在服务器、预算充足，可换 <code>bge-large-zh-v1.5</code> 或 API embedding，并说明换了会带来什么收益。</p>
+<h4 id="h-3-构建索引与检索">3. 构建索引与检索<a class="anchor" href="#h-3-构建索引与检索" aria-label="本节链接">#</a></h4>
+<pre data-lang="python"><code class="language-python">from llama_index.core import VectorStoreIndex, StorageContext
+from llama_index.vector_stores.chroma import ChromaVectorStore
+import chromadb
+
+# 建索引并持久化（lesson-01 已给过，这里补充&quot;可复现&quot;细节）
+db = chromadb.PersistentClient(path=&quot;data/chroma_db&quot;)
+collection = db.get_or_create_collection(&quot;rag_docs&quot;)
+vector_store = ChromaVectorStore(chroma_collection=collection)
+index = VectorStoreIndex(nodes, embed_model=embed_model,
+                         storage_context=StorageContext.from_defaults(vector_store=vector_store))
+
+# 检索器：similarity_top_k 控制召回数量，决定后续生成看到的上下文量
+retriever = index.as_retriever(similarity_top_k=5)
+
+# MMR 检索：在相似度之外加入&quot;多样性&quot;，避免返回 5 个几乎重复的片段
+from llama_index.core.retrievers import VectorIndexRetriever
+from llama_index.core.postprocessor import SimilarityPostprocessor
+
+mmr_retriever = VectorIndexRetriever(
+    index=index, similarity_top_k=10,  # 先多召回
+)
+# 后处理：相似度阈值过滤 + （可选）重排序
+postprocessor = SimilarityPostprocessor(similarity_cutoff=0.3)</code></pre>
+<p>检索质量是 RAG 的天花板：<strong>生成再强，也救不回检索错的内容</strong>。所以这里多召回（top-k=10）再过滤/重排，比&quot;只取 3 个最相似&quot;更稳。</p>
+<h4 id="h-4-llm-生成带引用的提示词">4. LLM 生成（带引用的提示词）<a class="anchor" href="#h-4-llm-生成带引用的提示词" aria-label="本节链接">#</a></h4>
+<p>核心是让模型<strong>只能依据检索片段回答，并逐条标注来源编号</strong>：</p>
+<pre data-lang="python"><code class="language-python">from llama_index.core import get_response_synthesizer
+from llama_index.core.prompts import PromptTemplate
+
+# 自定义提示词：强制&quot;逐句引用&quot;，回答不了就明说，不许编造
+QA_TEMPLATE = &quot;&quot;&quot;你是一名严谨的文档问答助手。请仅依据下面提供的【参考资料】回答问题。
+
+规则：
+1. 只使用参考资料中的信息，禁止使用你的先验知识补充或猜测。
+2. 每个关键结论后面用 [来源N] 标注出处，N 对应参考资料编号。
+3. 如果资料不足以回答，直接说&quot;根据现有资料无法确定&quot;，不要编造。
+
+【参考资料】
+{context_str}
+
+【问题】
+{query_str}
+
+【回答】&quot;&quot;&quot;
+
+qa_prompt = PromptTemplate(QA_TEMPLATE)
+synth = get_response_synthesizer(text_qa_template=qa_prompt)
+
+def answer(query):
+    &quot;&quot;&quot;检索 + 生成，返回带引用的回答与命中的来源片段。&quot;&quot;&quot;
+    retrieved = mmr_retriever.retrieve(query)
+    # 拼上下文时带上编号，供引用标注对齐
+    context = &quot;\n\n&quot;.join(
+        f&quot;[来源{i+1}] {n.text}&quot; for i, n in enumerate(retrieved)
+    )
+    response = synth.synthesize(query, retrieved)
+    return {
+        &quot;answer&quot;: str(response),
+        &quot;sources&quot;: [n.metadata.get(&quot;source&quot;) for n in retrieved],
+        &quot;context&quot;: context,
+    }
+
+result = answer(&quot;框架里如何自定义一个检索器？&quot;)
+print(&quot;回答:\n&quot;, result[&quot;answer&quot;])
+print(&quot;来源:&quot;, result[&quot;sources&quot;])</code></pre>
+<p>若生成端想换成 API（OpenAI 兼容），只需替换 LLM 对象；若用本地 Qwen，用 <code>HuggingFaceLLM</code> 加载 7B 模型。生成端的选择独立于检索端，<strong>这正是 RAG 可插拔的工程价值</strong>。</p>
+<p><figure><img class="md-img" src="content/courses/ai-projects/assets/chapter-2-figure-02.svg" alt="文档切块与检索生成的详细链路" loading="lazy" decoding="async"><figcaption>文档切块与检索生成的详细链路</figcaption></figure>
+</p>
+<h4 id="h-5-组装成可演示的接口">5. 组装成可演示的接口<a class="anchor" href="#h-5-组装成可演示的接口" aria-label="本节链接">#</a></h4>
+<pre data-lang="python"><code class="language-python"># 一个极简的查询入口，便于在终端/前端演示
+if __name__ == &quot;__main__&quot;:
+    while True:
+        q = input(&quot;\n请输入问题（q 退出）: &quot;).strip()
+        if q.lower() in {&quot;q&quot;, &quot;quit&quot;, &quot;退出&quot;}:
+            break
+        out = answer(q)
+        print(&quot;\n&quot; + out[&quot;answer&quot;])
+        print(&quot;\n--- 引用来源 ---&quot;)
+        for s in out[&quot;sources&quot;]:
+            print(&quot; *&quot;, s)</code></pre>
+<h3 id="h-三验收与复盘">三、验收与复盘<a class="anchor" href="#h-三验收与复盘" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>切块质量验收</strong>：抽查 5 个节点，确认每个节点语义完整、来源元数据正确。</li>
+<li><strong>检索 smoke test</strong>：拿 3 个已知答案的问题测检索，肉眼判断 top-5 里是否包含答案片段。</li>
+<li><strong>引用对齐验收</strong>：随机看 3 个回答，确认每个 <code>[来源N]</code> 都真实对应一条检索片段，且内容支持结论。</li>
+<li><strong>可对比性验收</strong>：切块大小、top-k、是否 MMR 都已做成参数，便于下一课跑对比实验。</li>
+<li><strong>复盘提示</strong>：记录你<strong>发现并修复的第一个问题</strong>（例如&quot;默认切块把表格切散了&quot;&quot;MMR 后命中率反而不如纯相似度&quot;），这些&quot;踩坑记录&quot;是面试最真实的素材。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>LlamaIndex 文档加载与 NodeParser：<a href="https://docs.llamaindex.ai/en/stable/module_guides/loading/documents_and_nodes/" target="_blank" rel="noopener noreferrer">https://docs.llamaindex.ai/en/stable/module_guides/loading/documents_and_nodes/</a></li>
+<li>LlamaIndex 检索器文档：<a href="https://docs.llamaindex.ai/en/stable/module_guides/querying/retriever/retrievers/" target="_blank" rel="noopener noreferrer">https://docs.llamaindex.ai/en/stable/module_guides/querying/retriever/retrievers/</a></li>
+<li>BGE Embedding 论文与模型：<a href="https://huggingface.co/BAAI/bge-small-zh-v1.5" target="_blank" rel="noopener noreferrer">https://huggingface.co/BAAI/bge-small-zh-v1.5</a></li>
+<li>Chroma 官方文档：<a href="https://docs.trychroma.com/" target="_blank" rel="noopener noreferrer">https://docs.trychroma.com/</a></li>
+</ul>
+<p><a href="#/l/proj-ch2-l3">下一课：结果与复盘</a></p>

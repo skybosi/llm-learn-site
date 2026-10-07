@@ -1,0 +1,288 @@
+<h2 id="h-allreduce-三种做法ring--tree--recursive-doubli">AllReduce 三种做法：ring / tree / recursive-doubling 的步数与通信量<a class="anchor" href="#h-allreduce-三种做法ring--tree--recursive-doubli" aria-label="本节链接">#</a></h2>
+<p>8 张卡各持一份 100 MiB 的梯度，要逐元素求和并把结果交回每张卡。最直白的写法是&quot;所有卡发给 0 号卡，0 号卡求和再广播回去&quot;——总发送量 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">2</span><span class="mopen">(</span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span><span class="mord mathnormal">s</span></span></span></span> 看起来不算离谱，但 0 号卡一进一出两块带宽会直接变成整个作业的天花板。同一件事，工业库（NCCL）实际用的是一族结构完全不同的算法。这一课把其中三种主流做法折算成同一套账：<strong>步数、每步消息大小、每 rank 发送量、全体发送量</strong>，再用第 1 章的 α-β 模型换成时间。</p>
+<p><figure><img class="md-img" src="content/courses/distributed-training-systems/assets/chapter-2-figure-01.svg" alt="AllReduce 三种算法的账本" loading="lazy" decoding="async"><figcaption>AllReduce 三种算法的账本</figcaption></figure>
+</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-先把符号和四个口径定死">1. 先把符号和四个口径定死<a class="anchor" href="#h-1-先把符号和四个口径定死" aria-label="本节链接">#</a></h4>
+<p><strong>AllReduce</strong>（全归约）指：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span></span></span></span> 个 rank 各持一份同形状张量，每个 rank 输入 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span></span></span></span> 字节，输出是各 rank 逐元素归约（通常求和）后的结果，所有 rank 结果相同。四个口径必须分开记，混用是这一章最常见的错误：</p>
+<table>
+<thead>
+<tr>
+<th>口径</th>
+<th>含义</th>
+<th>谁在惩罚它</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>步数</td>
+<td>所有 rank 同时收发一次算一步</td>
+<td>固定延迟 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span></td>
+</tr>
+<tr>
+<td>每步消息大小</td>
+<td>一个 rank 一步发出多少字节</td>
+<td>单次传输时间 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">s</span><span class="mord">/</span><span class="mord mathnormal" style="margin-right:0.0528em;">β</span></span></span></span>，以及小消息的效率</td>
+</tr>
+<tr>
+<td>每 rank 发送量</td>
+<td>一个 rank 在整个 AllReduce 里发出的总字节</td>
+<td>该卡自己的出向带宽</td>
+</tr>
+<tr>
+<td>全体发送量</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7778em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span><span class="mord">×</span></span></span></span> 每 rank 发送量</td>
+<td>网络汇总带宽（bisection / 交换机）</td>
+</tr>
+</tbody></table>
+<h4 id="h-2-ring环reduce-scatter--allgather">2. ring（环）：reduce-scatter + allgather<a class="anchor" href="#h-2-ring环reduce-scatter--allgather" aria-label="本节链接">#</a></h4>
+<p><strong>ReduceScatter</strong>（归约散射）：把缓冲区切成 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span></span></span></span> 块，归约后第 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span></span></span></span> 块完整结果落到 rank <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span></span></span></span>。<strong>AllGather</strong>（全收集）：每 rank 拿一块，最后每 rank 都拿到全部块。NCCL 文档把这条等价关系写得很直白：先 ReduceScatter 再 AllGather，等于一次 AllReduce。</p>
+<p>ring 的做法：rank 排成一个逻辑环，每步向左邻居收一块、向右邻居发一块。</p>
+<ul>
+<li>reduce-scatter 阶段 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7778em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> 步：第 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 步 rank <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span></span></span></span> 收到块 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7778em;vertical-align:-0.0833em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.0556em;"></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin"><span class="mord"><span class="mord mathrm">mod</span></span></span><span class="mspace" style="margin-right:0.0556em;"></span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span></span></span></span> 的部分和并累加；</li>
+<li>allgather 阶段 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7778em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> 步：把已完整的块沿同一个环传一圈。</li>
+</ul>
+<p>账本（代码实测 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">8</span></span></span></span>）：<strong>14 步</strong>，每步每 rank 只发 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">s</span><span class="mord">/</span><span class="mord mathnormal">p</span></span></span></span>（实测 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.125</span><span class="mord mathnormal">s</span></span></span></span>），每 rank 发送 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">2</span><span class="mopen">(</span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span><span class="mord mathnormal">s</span><span class="mord">/</span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1.75</span><span class="mord mathnormal">s</span></span></span></span>，全体 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">2</span><span class="mopen">(</span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span><span class="mord mathnormal">s</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">14</span><span class="mord mathnormal">s</span></span></span></span>。每一步所有链路都在忙、没有 rank 空转，且每 rank 发送量 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">2</span><span class="mopen">(</span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span><span class="mord mathnormal">s</span><span class="mord">/</span><span class="mord mathnormal">p</span></span></span></span> 已经贴着 AllReduce 的信息量下界走——Patarasuk 与 Yuan 2009 年证明的&quot;环式 AllReduce 带宽最优&quot;就是这个意思。代价在延迟项：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">2</span><span class="mopen">(</span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span> 随 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span></span></span></span> <strong>线性</strong>增长（NVIDIA 自己的说法是 &quot;the downside of rings is that latency scales linearly with the number of GPUs&quot;）。</p>
+<h4 id="h-3-tree树延迟换总字节">3. tree（树）：延迟换总字节<a class="anchor" href="#h-3-tree树延迟换总字节" aria-label="本节链接">#</a></h4>
+<p>二项树（binomial tree）做法：第 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 步，rank 号第 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 位为 1 的把当前部分和交给&quot;把这一位清零&quot;的伙伴；<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">⌈</span><span class="mop">l<span style="margin-right:0.0139em;">g</span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">p</span><span class="mclose">⌉</span></span></span></span> 步后 rank 0 拿到完整和。再沿同一棵树反向广播 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">⌈</span><span class="mop">l<span style="margin-right:0.0139em;">g</span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">p</span><span class="mclose">⌉</span></span></span></span> 步，人人有结果。</p>
+<ul>
+<li>步数 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">2</span><span class="mopen">⌈</span><span class="mop">l<span style="margin-right:0.0139em;">g</span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">p</span><span class="mclose">⌉</span></span></span></span>（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">8</span></span></span></span> 时 6 步），延迟项从 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">2</span><span class="mopen">(</span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span> 降到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">2</span><span class="mopen">⌈</span><span class="mop">l<span style="margin-right:0.0139em;">g</span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">p</span><span class="mclose">⌉</span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span>；</li>
+<li>但每步消息是<strong>整个缓冲区</strong> <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span></span></span></span>（没有切块），每 rank 恰好发 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">⌈</span><span class="mop">l<span style="margin-right:0.0139em;">g</span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">p</span><span class="mclose">⌉</span></span></span></span> 次；</li>
+<li>账本（实测）：每 rank <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">3.0</span><span class="mord mathnormal">s</span></span></span></span>、全体 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">24</span><span class="mord mathnormal">s</span></span></span></span>，比 ring 的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">14</span><span class="mord mathnormal">s</span></span></span></span> 多 71%。</li>
+</ul>
+<p>所以朴素二项树是&quot;延迟换带宽&quot;的标准例子。NCCL 用的不是这棵树：它构建<strong>双二叉树（double binary tree）</strong>，两棵互补的树各承担一半数据，按 NVIDIA 官方博客的说法，&quot;每 rank 最多把一半数据发两次、收两次，和 ring 的收发量同级&quot;，同时保留对数级延迟；当树换不来带宽时 NCCL 会自动切回 ring。常见误解是把树想成&quot;根是唯一瓶颈&quot;——二项树里每个 rank 都发 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">⌈</span><span class="mop">l<span style="margin-right:0.0139em;">g</span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">p</span><span class="mclose">⌉</span></span></span></span> 次，真正的代价是&quot;每步都发整个缓冲区&quot;和总字节数。</p>
+<h4 id="h-4-recursive-doubling--butterfly折半--倍增">4. recursive-doubling / butterfly（折半 + 倍增）<a class="anchor" href="#h-4-recursive-doubling--butterfly折半--倍增" aria-label="本节链接">#</a></h4>
+<p>第三种做法把 reduce-scatter 改成<strong>每步折半</strong>（掩码 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">p</span><span class="mord">/2</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">p</span><span class="mord">/4</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="minner">…</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">1</span></span></span></span>）、把 allgather 改成<strong>每步倍增</strong>（掩码 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">2</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="minner">…</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">p</span><span class="mord">/2</span></span></span></span>），伙伴是 <code>rank ^ mask</code>：</p>
+<ul>
+<li>reduce-scatter：第 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 步 rank 只保留&quot;块号与自己在掩码位上相同&quot;的那一半，把另一半发给伙伴并累加收到的对应块；</li>
+<li>allgather：反过来，每步把自己已有的块集发一份给伙伴、收下自己没有的。</li>
+</ul>
+<p>账本（实测 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">8</span></span></span></span>）：<strong>6 步</strong>，消息大小是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">[</span><span class="mord mathnormal">s</span><span class="mord">/2</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">s</span><span class="mord">/4</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">s</span><span class="mord">/8</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">s</span><span class="mord">/8</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">s</span><span class="mord">/4</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">s</span><span class="mord">/2</span><span class="mclose">]</span></span></span></span>——首尾大、中间小；每 rank 发送仍是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1.75</span><span class="mord mathnormal">s</span></span></span></span>、全体 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">14</span><span class="mord mathnormal">s</span></span></span></span>，与 ring 的带宽账<strong>完全同级</strong>，步数却只有 ring 的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">6/14</span></span></span></span>。代价是通信对象：最后几步每 rank 要发 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">s</span><span class="mord">/2</span></span></span></span> 并与距离 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">p</span><span class="mord">/2</span></span></span></span> 的伙伴互换，网络要求从&quot;邻居链路可用&quot;升级成&quot;同时可用的远距离通路&quot;；跨机时这些步要走 NIC，直接吃网络的 bisection 带宽（第 3 课量化）。</p>
+<p>MPICH 里对非 2 的幂要额外处理（把非 2 的幂归并成 2 的幂再补步，步数上界 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">2</span><span class="mopen">⌊</span><span class="mop">l<span style="margin-right:0.0139em;">g</span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">p</span><span class="mclose">⌋</span></span></span></span>），这也是 Thakur 等人 2005 年那篇集合通信优化论文里的做法。</p>
+<h4 id="h-5-三张账本摆在桌上">5. 三张账本摆在桌上<a class="anchor" href="#h-5-三张账本摆在桌上" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>算法</th>
+<th>步数</th>
+<th>每步消息</th>
+<th>每 rank 发送</th>
+<th>全体发送（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">8</span></span></span></span> 实测）</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>ring</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">2</span><span class="mopen">(</span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">s</span><span class="mord">/</span><span class="mord mathnormal">p</span></span></span></span>，均匀</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">2</span><span class="mopen">(</span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span><span class="mord mathnormal">s</span><span class="mord">/</span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2</span><span class="mord mathnormal">s</span></span></span></span></td>
+<td>14 s，14 步</td>
+</tr>
+<tr>
+<td>tree（朴素二项树）</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">2</span><span class="mopen">⌈</span><span class="mop">l<span style="margin-right:0.0139em;">g</span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">p</span><span class="mclose">⌉</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span></span></span></span>，均匀但都很大</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">⌈</span><span class="mop">l<span style="margin-right:0.0139em;">g</span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">p</span><span class="mclose">⌉</span><span class="mord mathnormal">s</span></span></span></span></td>
+<td>24 s，6 步</td>
+</tr>
+<tr>
+<td>butterfly（折半+倍增）</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">2</span><span class="mopen">⌈</span><span class="mop">l<span style="margin-right:0.0139em;">g</span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">p</span><span class="mclose">⌉</span></span></span></span></td>
+<td>几何增减</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">2</span><span class="mopen">(</span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span><span class="mord mathnormal">s</span><span class="mord">/</span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2</span><span class="mord mathnormal">s</span></span></span></span></td>
+<td>14 s，6 步</td>
+</tr>
+</tbody></table>
+<p>常见坑：① 把&quot;每 rank 发送量&quot;与&quot;全体发送量&quot;混着比（差 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span></span></span></span> 倍）；② 认为 ring 延迟最优（小消息下 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">2</span><span class="mopen">(</span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span> 是纯亏）；③ 认为树省带宽（朴素树的总字节是 ring 的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">p</span><span class="mord">/2</span></span></span></span> 倍量级）；④ 以为非 2 的幂直接照搬（要补步或做二进块分解）；⑤ 把示例 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mord">/</span><span class="mord mathnormal" style="margin-right:0.0528em;">β</span></span></span></span> 当自己机器的参数（用 <code>nccl-tests</code> 实测，见下）。</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>三个算法都用 numpy 在本地跑一遍：结果与逐元素参考求和比对（偏差为 0），同时把每步消息、每 rank 发送量、全体发送量记成账。</p>
+<pre data-lang="python"><code class="language-python"># ===== 示例 1：三种 AllReduce 的步数与通信量（纯 Python/numpy，无需 GPU） =====
+import math
+import numpy as np
+
+
+def make_inputs(P, n, seed=7):
+    rng = np.random.default_rng(seed)
+    return [rng.integers(0, 256, size=n).astype(np.float64) for _ in range(P)]
+
+
+def ring_allreduce(inputs):
+    &quot;&quot;&quot;ring：reduce-scatter (P-1) 步 + allgather (P-1) 步，每步每 rank 发 s/P 字节。&quot;&quot;&quot;
+    P, n = len(inputs), inputs[0].size
+    m = n // P
+    assert n % P == 0, &quot;ring 需要 s 能被 P 整除&quot;
+    b = [v.reshape(P, m).copy() for v in inputs]
+    msgs, sent = [], [0] * P
+    for k in range(P - 1):                                   # reduce-scatter
+        nxt = [c.copy() for c in b]
+        for r in range(P):
+            c = (r - k - 1) % P
+            nxt[r][c] = b[r][c] + b[(r - 1) % P][c]
+            sent[r] += m * 8
+        b = nxt
+        msgs.append(m * 8)
+    for k in range(P - 1):                                   # allgather
+        nxt = [c.copy() for c in b]
+        for r in range(P):
+            c = (r - k) % P
+            nxt[r][c] = b[(r - 1) % P][c]
+            sent[r] += m * 8
+        b = nxt
+        msgs.append(m * 8)
+    return [c.reshape(n) for c in b], {&quot;steps&quot;: len(msgs), &quot;msgs&quot;: msgs, &quot;sent&quot;: sent}
+
+
+def tree_allreduce(inputs):
+    &quot;&quot;&quot;tree：二项树归约到 rank0（lg P 步）+ 沿同一棵树广播（lg P 步），每步消息 = 整个缓冲区。&quot;&quot;&quot;
+    P, n = len(inputs), inputs[0].size
+    lg = int(math.log2(P))
+    assert 2 ** lg == P, &quot;二项树演示要求 P 是 2 的幂&quot;
+    b = [v.copy() for v in inputs]
+    msgs, sent = [], [0] * P
+    for k in range(lg):                                      # 归约：第 k 位为 1 的送给第 k 位为 0 的
+        nxt = [c.copy() for c in b]
+        for r in range(P):
+            if (r &gt;&gt; k) &amp; 1:
+                p = r ^ (1 &lt;&lt; k)
+                nxt[p] = nxt[p] + b[r]
+                sent[r] += n * 8
+        b = nxt
+        msgs.append(n * 8)
+    for k in reversed(range(lg)):                            # 广播：父节点结果交给子节点
+        nxt = [c.copy() for c in b]
+        for r in range(P):
+            if (r &gt;&gt; k) &amp; 1:
+                p = r ^ (1 &lt;&lt; k)
+                nxt[r] = b[p].copy()
+                sent[p] += n * 8
+        b = nxt
+        msgs.append(n * 8)
+    return b, {&quot;steps&quot;: len(msgs), &quot;msgs&quot;: msgs, &quot;sent&quot;: sent}
+
+
+def butterfly_allreduce(inputs):
+    &quot;&quot;&quot;butterfly：递归折半 reduce-scatter + 递归倍增 allgather，共 2 lg P 步，消息大小按 2 的幂增减。&quot;&quot;&quot;
+    P, n = len(inputs), inputs[0].size
+    m = n // P
+    lg = int(math.log2(P))
+    assert 2 ** lg == P, &quot;butterfly 演示要求 P 是 2 的幂&quot;
+    chunks = [[v.reshape(P, m)[c].copy() for c in range(P)] for v in inputs]
+    held = [set(range(P)) for _ in range(P)]
+    msgs, sent = [], [0] * P
+
+    mask = P // 2
+    while mask &gt;= 1:                                         # reduce-scatter（折半）
+        old = [[c.copy() for c in row] for row in chunks]
+        gives, msg = [], 0
+        for r in range(P):
+            g = [c for c in held[r] if (c &amp; mask) != (r &amp; mask)]
+            gives.append(g)
+            msg = max(msg, len(g) * m * 8)
+        for r in range(P):
+            p = r ^ mask
+            for c in gives[r]:
+                chunks[p][c] = chunks[p][c] + old[r][c]
+                sent[r] += m * 8
+        held = [{c for c in held[r] if (c &amp; mask) == (r &amp; mask)} for r in range(P)]
+        msgs.append(msg)
+        mask //= 2
+
+    mask = 1
+    while mask &lt; P:                                          # allgather（倍增）
+        old = [[c.copy() for c in row] for row in chunks]
+        sends, msg = [], 0
+        for r in range(P):
+            g = [c for c in held[r] if (c &amp; mask) == (r &amp; mask)]
+            sends.append(g)
+            msg = max(msg, len(g) * m * 8)
+        for r in range(P):
+            p = r ^ mask
+            for c in sends[r]:
+                chunks[p][c] = old[r][c]
+                sent[r] += m * 8
+        held = [held[r] | set(sends[r ^ mask]) for r in range(P)]
+        msgs.append(msg)
+        mask *= 2
+
+    outs = [np.concatenate([chunks[r][c] for c in range(P)]) for r in range(P)]
+    return outs, {&quot;steps&quot;: len(msgs), &quot;msgs&quot;: msgs, &quot;sent&quot;: sent}
+
+
+P, n = 8, 8192
+inputs = make_inputs(P, n)
+expect = np.sum(inputs, axis=0)
+s_bytes = n * 8
+print(f&quot;P = {P} 个 rank，每个 rank 一份 {n} 个 float64（s = {s_bytes} B）&quot;)
+
+for name, fn in ((&quot;ring      &quot;, ring_allreduce), (&quot;tree      &quot;, tree_allreduce),
+                 (&quot;butterfly &quot;, butterfly_allreduce)):
+    outs, info = fn(inputs)
+    err = max(float(np.abs(o - expect).max()) for o in outs)
+    frac = [round(b / s_bytes, 4) for b in info[&quot;msgs&quot;]]
+    s_ = info[&quot;sent&quot;]
+    print(f&quot;{name}:步数 {info[&#39;steps&#39;]:2d} | 每步消息/s = {frac}&quot;)
+    print(f&quot;           每 rank 发送 {min(s_)/s_bytes:.3f}~{max(s_)/s_bytes:.3f} s&quot;
+          f&quot; | 全体合计 {sum(s_)/s_bytes:.3f} s | 与精确求和最大偏差 {err:.1e}&quot;)
+
+
+# ===== 示例 2：用 α-β 模型把上面的账换成时间（α、β 是示例参数，请换成实测值） =====
+def t_model(info, s, P, alpha_us, beta_gbs):
+    return sum(alpha_us + f * s / (beta_gbs * 1e9) * 1e6 for f in
+               [b / (n * 8) for b in info[&quot;msgs&quot;]])
+
+
+res = {name: fn(inputs)[1] for name, fn in ((&quot;ring&quot;, ring_allreduce),
+                                            (&quot;tree&quot;, tree_allreduce),
+                                            (&quot;butterfly&quot;, butterfly_allreduce))}
+alpha, beta = 5.0, 300.0
+print(f&quot;\nα = {alpha} μs，β = {beta} GB/s（NVLink 级示例参数），P = {P}，单位 μs：&quot;)
+print(f&quot;{&#39;消息 s&#39;:&gt;10} {&#39;ring&#39;:&gt;10} {&#39;tree&#39;:&gt;10} {&#39;butterfly&#39;:&gt;10}   最快&quot;)
+for kb in (4, 64, 1024, 16384, 262144):
+    s = kb * 1024
+    t = {k: t_model(v, s, P, alpha, beta) for k, v in res.items()}
+    best = min(t, key=t.get)
+    row = &quot;&quot;.join(f&quot;{t[k]:&gt;10.1f}&quot; for k in (&quot;ring&quot;, &quot;tree&quot;, &quot;butterfly&quot;))
+    print(f&quot;{kb:&gt;7} KiB{row}   {best}&quot;)</code></pre>
+<p>在 Python 3.10.16 + numpy 1.26.2 下实际运行结果：</p>
+<pre data-lang="text"><code class="language-text">P = 8 个 rank，每个 rank 一份 8192 个 float64（s = 65536 B）
+ring      :步数 14 | 每步消息/s = [0.125, 0.125, 0.125, 0.125, 0.125, 0.125, 0.125, 0.125, 0.125, 0.125, 0.125, 0.125, 0.125, 0.125]
+           每 rank 发送 1.750~1.750 s | 全体合计 14.000 s | 与精确求和最大偏差 0.0e+00
+tree      :步数  6 | 每步消息/s = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+           每 rank 发送 3.000~3.000 s | 全体合计 24.000 s | 与精确求和最大偏差 0.0e+00
+butterfly :步数  6 | 每步消息/s = [0.5, 0.25, 0.125, 0.125, 0.25, 0.5]
+           每 rank 发送 1.750~1.750 s | 全体合计 14.000 s | 与精确求和最大偏差 0.0e+00
+
+α = 5.0 μs，β = 300.0 GB/s（NVLink 级示例参数），P = 8，单位 μs：
+      消息 s       ring       tree  butterfly   最快
+      4 KiB      70.0      30.1      30.0   butterfly
+     64 KiB      70.4      31.3      30.4   butterfly
+   1024 KiB      76.1      51.0      36.1   butterfly
+  16384 KiB     167.9     365.5     127.9   butterfly
+ 262144 KiB    1635.9    5398.7    1595.9   butterfly</code></pre>
+<p>注意这张表只在&quot;均匀 β、且不做跨机区分&quot;的假设下成立：butterfly 的胜利来自步数少、总字节又不比 ring 多。一旦把&quot;跨机带宽是共享资源&quot;写进模型，大消息下的赢家就会换人——那是第 3 课的内容。</p>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选：需要 1~2 张 GPU（自备或云上按需开 1~2 卡的小实例；上面的 Python 部分不需要 GPU） ----
+# 1) 看拓扑：哪些卡之间有 NVLink、哪些绕 PCIe
+nvidia-smi topo -m
+# 2) 装官方集合通信基准（单机 1~2 卡不需要 MPI）
+git clone https://github.com/NVIDIA/nccl-tests &amp;&amp; cd nccl-tests &amp;&amp; make
+# 3) 量一次 AllReduce：-b 起始、-e 结束、-f 步长、-g GPU 数
+./build/all_reduce_perf -b 8 -e 128M -f 2 -g 2
+# 4) 强制指定算法做对比（NCCL_ALGO 接受 Ring / Tree 等，见 NCCL User Guide 的环境变量页）
+NCCL_ALGO=Ring ./build/all_reduce_perf -b 8 -e 128M -f 2 -g 2
+NCCL_ALGO=Tree ./build/all_reduce_perf -b 8 -e 128M -f 2 -g 2
+# 判读：小消息（8B~8K）那一行的 busbw 由 α 主导；大消息（32M~128M）才是 β 的真实值。
+# 把两组 (size, time) 代进第 1 章的 fit_alpha_beta，就得到你自己机器的 α 与 β。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：把 <code>butterfly_allreduce</code> 的 allgather 阶段改成&quot;先折半 reduce-scatter、再朴素环式 allgather&quot;，统计步数与每 rank 发送量；用 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">8</span></span></span></span> 跑一遍，解释为什么总字节数会比 butterfly 多。</li>
+<li><strong>解释</strong>：为什么朴素二项树每 rank 都恰好发 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">⌈</span><span class="mop">l<span style="margin-right:0.0139em;">g</span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">p</span><span class="mclose">⌉</span></span></span></span> 次（无论它在树里是叶子还是根）？用 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">8</span></span></span></span> 的 rank 0 与 rank 7 各画一遍。</li>
+<li><strong>对比/验证</strong>：把示例 1 的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span></span></span></span> 从 8 改成 16、64，分别打印三种算法的步数与每 rank 发送量，验证 ring 的步数是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">2</span><span class="mopen">(</span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span></span></span></span>、两个对数算法是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord">2</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop">l<span style="margin-right:0.0139em;">g</span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">p</span></span></span></span>。</li>
+<li><strong>思考</strong>：如果一次 AllReduce 只有 4 KiB，你更在意 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span> 还是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0528em;">β</span></span></span></span>？把示例 2 的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span> 从 5 μs 提到 20 μs，重算 4 KiB 那一行，说明哪一项在决定结果。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>NVIDIA, <em>NCCL User Guide</em> — Collective Operations（AllReduce / ReduceScatter / AllGather / AlltoAll 的精确定义，以及 &quot;ReduceScatter followed by AllGather is equivalent to AllReduce&quot;）与 Environment Variables（<code>NCCL_ALGO</code> 的可选算法列表、协议列表）：<a href="https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/collectives.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/collectives.html</a></li>
+<li>P. Patarasuk, X. Yuan, <em>Bandwidth optimal all-reduce algorithms for clusters of workstations</em>, J. Parallel Distrib. Comput. 69(2), 2009（ring AllReduce 的 reduce-scatter + allgather 结构与 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">2</span><span class="mopen">(</span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span></span></span></span> 步、带宽最优性分析）：<a href="https://doi.org/10.1016/j.jpdc.2008.09.002" target="_blank" rel="noopener noreferrer">https://doi.org/10.1016/j.jpdc.2008.09.002</a></li>
+<li>R. Thakur, R. Rabenseifner, W. Gropp, <em>Optimization of Collective Communication Operations in MPICH</em>, Int. J. High Performance Computing Applications 19(1), 2005（递归倍增/折半、二项树、非 2 的幂处理，以及各算法的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span>-<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0528em;">β</span></span></span></span> 代价式）：<a href="https://www.mcs.anl.gov/~thakur/papers/ijhpca-coll.pdf" target="_blank" rel="noopener noreferrer">https://www.mcs.anl.gov/~thakur/papers/ijhpca-coll.pdf</a></li>
+<li>NVIDIA Developer Blog, S. Jeaugey, <em>Massively Scale Your Deep Learning Training with NCCL 2.4</em>（双二叉树：对数级延迟 + 与 ring 同级的收发量；ring 的延迟随 GPU 数线性增长；&quot;树换不来带宽时切回 ring&quot;）：<a href="https://developer.nvidia.com/blog/massively-scale-deep-learning-training-nccl-2-4/" target="_blank" rel="noopener noreferrer">https://developer.nvidia.com/blog/massively-scale-deep-learning-training-nccl-2-4/</a></li>
+<li>NVIDIA, <em>nccl-tests</em>（<code>all_reduce_perf</code> 等基准程序，自测带宽与延迟的工具）：<a href="https://github.com/NVIDIA/nccl-tests" target="_blank" rel="noopener noreferrer">https://github.com/NVIDIA/nccl-tests</a></li>
+</ul>
+<p><a href="#/l/dts-ch2-l2">下一课：ReduceScatter / AllGather / All2All 及其在 TP、EP 里的角色</a></p>

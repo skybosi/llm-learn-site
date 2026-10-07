@@ -1,0 +1,590 @@
+<h2 id="h-需求到架构从-slo-反推检索与生成的设计">需求到架构：从 SLO 反推检索与生成的设计<a class="anchor" href="#h-需求到架构从-slo-反推检索与生成的设计" aria-label="本节链接">#</a></h2>
+<h3 id="h-这一节要解决什么">这一节要解决什么<a class="anchor" href="#h-这一节要解决什么" aria-label="本节链接">#</a></h3>
+<p>前六章是&quot;从技术出发&quot;：给定一个检索问题，怎么做得更好。这一章反过来，<strong>从需求出发</strong>：</p>
+<blockquote>
+<p>客户说&quot;要一个能查内部文档的问答系统，回答要快、要准、不能泄密&quot;，这句话怎么变成一台机器上的配置？</p>
+</blockquote>
+<p>这句话里几乎没有一个可以直接用的量。而架构恰恰是由量决定的：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 取多少、要不要重排、上不上缓存、需要几张卡、每查询成本多少 —— 这些不是&quot;最佳实践&quot;能回答的，它们由<strong>规模、延迟目标、成本上限、质量目标</strong>共同解出。</p>
+<p>本节要回答四个问题：</p>
+<ol>
+<li>需求里必须被量化的是哪几项？<strong>不能量化的需求该被当成什么？</strong></li>
+<li>容量模型怎么算？从语料规模一路推到索引内存、并发、副本数。</li>
+<li>怎么<strong>从 SLO 反推设计决策</strong>（最大 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span>、是否重排、模型档位、是否缓存）？</li>
+<li>架构决策记录（ADR）为什么必须写&quot;何时重审&quot;？以及哪些常见错误会让这套计算失效？</li>
+</ol>
+<blockquote>
+<p><strong>结论先放在这里</strong>：架构不是选出来的，是<strong>解出来的</strong>。SLO 与成本上限给定后，最大 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span>、是否重排、模型档位都是数；而容量主要由<strong>峰值 QPS × 单请求停留时间</strong>（Little&#39;s law）与<strong>单请求 KV 显存</strong>决定，<strong>不是</strong>由语料规模决定（⚠️ 示例：语料从 1 万篇涨到 1000 万篇，副本数完全不变，因为瓶颈是 KV 而不是索引）。<strong>无法量化的需求等于没有需求</strong> —— 它只会在验收时变成争论。</p>
+</blockquote>
+<h3 id="h-一先把需求变成数字">一、先把需求变成数字<a class="anchor" href="#h-一先把需求变成数字" aria-label="本节链接">#</a></h3>
+<h4 id="h-11-需求问卷">1.1 需求问卷<a class="anchor" href="#h-11-需求问卷" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>类别</th>
+<th>必须量化</th>
+<th>不能量化时会怎样</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>语料</td>
+<td>文档数 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span></span></span></span>、平均 token/篇、更新率 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0379em;">δ</span></span></span></span>/天</td>
+<td>索引内存与重建策略无法定</td>
+</tr>
+<tr>
+<td>流量</td>
+<td>平均 QPS、峰均比、日活/会话数</td>
+<td>副本数只能猜，容量在峰值崩</td>
+</tr>
+<tr>
+<td>延迟</td>
+<td>P95/P99 目标（分别给）、TTFT 与总延迟分别给</td>
+<td>无法反推 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span>，也无法判断是否需要缓存</td>
+</tr>
+<tr>
+<td>成本</td>
+<td>每查询上限、每月预算</td>
+<td>Pareto 工作点无法选</td>
+</tr>
+<tr>
+<td>质量</td>
+<td>recall@k 目标、引用一致率、拒答率上限</td>
+<td>&quot;好不好&quot;无法验收</td>
+</tr>
+<tr>
+<td>权限</td>
+<td>租户数、ACL 粒度、数据驻留要求</td>
+<td>索引架构（分区 vs 共享）无法选</td>
+</tr>
+<tr>
+<td>合规</td>
+<td>保留期、可删除、审计范围</td>
+<td>日志与 trace 设计无法定</td>
+</tr>
+<tr>
+<td>运维</td>
+<td>可接受的停机窗口、SLA</td>
+<td>重建与回滚策略无法定</td>
+</tr>
+</tbody></table>
+<p><strong>原则：无法量化就不算需求。</strong> 遇到&quot;要快、要准、要安全&quot;这类表述，正确的动作不是猜一个默认值，而是<strong>把它变成一个反问</strong>：</p>
+<blockquote>
+<p>&quot;P95 是 1 秒还是 3 秒？每查询成本能接受 0.05 元还是 0.5 元？&quot;</p>
+</blockquote>
+<p>因为这两个数字直接决定完全不同的架构（前者可能必须缓存 + 小模型，后者可能连重排都不必开）。</p>
+<h4 id="h-12-三条硬约束的优先级">1.2 三条硬约束的优先级<a class="anchor" href="#h-12-三条硬约束的优先级" aria-label="本节链接">#</a></h4>
+<p>需求之间会冲突。处理顺序不是&quot;都满足&quot;，而是：</p>
+<ol>
+<li><strong>合规与权限</strong>（不可协商：数据驻留、ACL）</li>
+<li><strong>正确性下限</strong>（质量目标、拒答策略）</li>
+<li><strong>延迟 SLO</strong>（用户体验）</li>
+<li><strong>成本</strong>（在 1~3 满足后优化）</li>
+</ol>
+<p><strong>为什么是这个顺序</strong>：合规违反是事故，质量不达标是产品问题，延迟超限是体验问题，成本超支是财务问题。<strong>冲突时按这个顺序砍功能，而不是按&quot;哪个便宜&quot;砍。</strong></p>
+<h3 id="h-二容量模型从语料规模推到副本数">二、容量模型：从语料规模推到副本数<a class="anchor" href="#h-二容量模型从语料规模推到副本数" aria-label="本节链接">#</a></h3>
+<h4 id="h-21-索引内存">2.1 索引内存<a class="anchor" href="#h-21-索引内存" aria-label="本节链接">#</a></h4>
+<p>沿用第 2 章第 3 节的结论：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord text"><span class="mord">Mem</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">index</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.1708em;vertical-align:-1.4763em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.6944em;"><span style="top:-1.5237em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">向量</span></span></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.6944em;"><span class="svg-align" style="top:-2.202em;"><span class="pstrut" style="height:3em;"></span><span class="stretchy" style="height:0.548em;min-width:1.6em;"><span class="brace-left" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMinYMin slice"><path d="M0 6l6-6h17c12.688 0 19.313.3 20 1 4 4 7.313 8.3 10 13
+ 35.313 51.3 80.813 93.8 136.5 127.5 55.688 33.7 117.188 55.8 184.5 66.5.688
+ 0 2 .3 4 1 18.688 2.7 76 4.3 172 5h399450v120H429l-6-1c-124.688-8-235-61.7
+-331-161C60.687 138.7 32.312 99.3 7 54L0 41V6z"/></svg></span><span class="brace-center" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMidYMin slice"><path d="M199572 214
+c100.7 8.3 195.3 44 280 108 55.3 42 101.7 93 139 153l9 14c2.7-4 5.7-8.7 9-14
+ 53.3-86.7 123.7-153 211-199 66.7-36 137.3-56.3 212-62h199568v120H200432c-178.3
+ 11.7-311.7 78.3-403 201-6 8-9.7 12-11 12-.7.7-6.7 1-18 1s-17.3-.3-18-1c-1.3 0
+-5-4-11-12-44.7-59.3-101.3-106.3-170-141s-145.3-54.3-229-60H0V214z"/></svg></span><span class="brace-right" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMaxYMin slice"><path d="M399994 0l6 6v35l-6 11c-56 104-135.3 181.3-238 232-57.3
+ 28.7-117 45-179 50H-300V214h399897c43.3-7 81-15 113-26 100.7-33 179.7-91 237
+-174 2.7-5 6-9 10-13 .7-1 7.3-1 20-1h17z"/></svg></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.109em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">chunk</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord mathnormal">d</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord mathnormal">b</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.798em;"><span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.4763em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:2.3813em;vertical-align:-1.698em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.6833em;"><span style="top:-1.477em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">HNSW </span><span class="mord cjk_fallback mtight">图（双向边，</span><span class="mord mtight">4 </span><span class="mord cjk_fallback mtight">字节</span><span class="mord mtight">/</span><span class="mord cjk_fallback mtight">边）</span></span></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.6833em;"><span class="svg-align" style="top:-2.202em;"><span class="pstrut" style="height:3em;"></span><span class="stretchy" style="height:0.548em;min-width:1.6em;"><span class="brace-left" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMinYMin slice"><path d="M0 6l6-6h17c12.688 0 19.313.3 20 1 4 4 7.313 8.3 10 13
+ 35.313 51.3 80.813 93.8 136.5 127.5 55.688 33.7 117.188 55.8 184.5 66.5.688
+ 0 2 .3 4 1 18.688 2.7 76 4.3 172 5h399450v120H429l-6-1c-124.688-8-235-61.7
+-331-161C60.687 138.7 32.312 99.3 7 54L0 41V6z"/></svg></span><span class="brace-center" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMidYMin slice"><path d="M199572 214
+c100.7 8.3 195.3 44 280 108 55.3 42 101.7 93 139 153l9 14c2.7-4 5.7-8.7 9-14
+ 53.3-86.7 123.7-153 211-199 66.7-36 137.3-56.3 212-62h199568v120H200432c-178.3
+ 11.7-311.7 78.3-403 201-6 8-9.7 12-11 12-.7.7-6.7 1-18 1s-17.3-.3-18-1c-1.3 0
+-5-4-11-12-44.7-59.3-101.3-106.3-170-141s-145.3-54.3-229-60H0V214z"/></svg></span><span class="brace-right" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMaxYMin slice"><path d="M399994 0l6 6v35l-6 11c-56 104-135.3 181.3-238 232-57.3
+ 28.7-117 45-179 50H-300V214h399897c43.3-7 81-15 113-26 100.7-33 179.7-91 237
+-174 2.7-5 6-9 10-13 .7-1 7.3-1 20-1h17z"/></svg></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.109em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">chunk</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">M</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord">2</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord">4</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.798em;"><span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.698em;"><span></span></span></span></span></span></span></span></span></span></p>
+<p><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.109em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">chunk</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.109em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">doc</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord">tok/doc</span></span><span class="mord">/</span><span class="mord text"><span class="mord">tok/chunk</span></span></span></span></span>，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">b</span></span></span></span> 是每维字节数（量化后可为 1）。</p>
+<p>⚠️ 示例：</p>
+<table>
+<thead>
+<tr>
+<th>语料</th>
+<th>chunk 数</th>
+<th>向量内存</th>
+<th>图内存</th>
+<th>合计</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1 万篇 × 1200 token</td>
+<td>31,578</td>
+<td>0.02 GB</td>
+<td>0.00 GB</td>
+<td><strong>0.03 GB</strong></td>
+</tr>
+<tr>
+<td>1000 万篇 × 1200 token</td>
+<td>31,578,947</td>
+<td>24.25 GB</td>
+<td>4.04 GB</td>
+<td><strong>28.29 GB</strong></td>
+</tr>
+</tbody></table>
+<p><strong>注意</strong>：图内存只有向量的约 1/6（<code>M=16</code>、768 维、int8）；<strong>所以&quot;省内存&quot;的主战场永远是向量本身</strong>（第 2 章的结论在此复现）。</p>
+<h4 id="h-22-并发与副本littles-law--kv-显存">2.2 并发与副本：Little&#39;s law + KV 显存<a class="anchor" href="#h-22-并发与副本littles-law--kv-显存" aria-label="本节链接">#</a></h4>
+<p>并发请求数的期望值由 Little&#39;s law 给出：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.9805em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal">λ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">peak</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.9805em;vertical-align:-0.2861em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">W</span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">λ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">peak</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.0636em;vertical-align:-0.3802em;"></span><span class="mord"><span class="mord text"><span class="mord">QPS</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.0573em;"><span style="top:-2.4559em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">avg</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.3802em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord cjk_fallback">峰均比</span></span></span></span></span></span></p>
+<p><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">W</span></span></span></span> 是单请求停留时间（秒）。<strong>注意这里是峰值 QPS，不是平均</strong> —— 用平均值配容量是第 5 章第 4 节已经证伪的做法（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">ρ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">→</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> 时 P99 爆炸）。</p>
+<p>单个副本能承载多少并发，由 <strong>KV 显存</strong>决定（第 5 章第 1 节的公式）：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.9694em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord text"><span class="mord">KV</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">req</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0813em;">H</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0813em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.0315em;">k</span><span class="mord mathnormal mtight" style="margin-right:0.0359em;">v</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">d</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">h</span><span class="mord mathnormal mtight">e</span><span class="mord mathnormal mtight">a</span><span class="mord mathnormal mtight">d</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.5945em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">in</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">b</span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">slots</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.4221em;vertical-align:-0.9721em;"></span><span class="minner"><span class="mopen delimcenter" style="top:0em;"><span class="delimsizing size3">⌊</span></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3603em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord text"><span class="mord">KV</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">req</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord text"><span class="mord">GPU mem</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord text"><span class="mord cjk_fallback">可用比例</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.9721em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mclose delimcenter" style="top:0em;"><span class="delimsizing size3">⌋</span></span></span></span></span></span></span></p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.9694em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord text"><span class="mord">KV</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">req</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0813em;">H</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0813em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.0315em;">k</span><span class="mord mathnormal mtight" style="margin-right:0.0359em;">v</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">d</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">h</span><span class="mord mathnormal mtight">e</span><span class="mord mathnormal mtight">a</span><span class="mord mathnormal mtight">d</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.5945em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">in</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">b</span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">slots</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.4221em;vertical-align:-0.9721em;"></span><span class="minner"><span class="mopen delimcenter" style="top:0em;"><span class="delimsizing size3">⌊</span></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3603em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord text"><span class="mord">KV</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">req</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord text"><span class="mord">GPU mem</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord text"><span class="mord cjk_fallback">可用比例</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.9721em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mclose delimcenter" style="top:0em;"><span class="delimsizing size3">⌋</span></span></span></span></span></span></span></p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord text"><span class="mord">replicas</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.4em;vertical-align:-0.95em;"></span><span class="minner"><span class="mopen delimcenter" style="top:0em;"><span class="delimsizing size3">⌈</span></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3603em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord text"><span class="mord">slots</span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">C</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mclose delimcenter" style="top:0em;"><span class="delimsizing size3">⌉</span></span></span></span></span></span></span></p>
+<p>⚠️ 示例（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">80</span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0813em;">H</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0813em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.0315em;">k</span><span class="mord mathnormal mtight" style="margin-right:0.0359em;">v</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">8</span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">d</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">h</span><span class="mord mathnormal mtight">e</span><span class="mord mathnormal mtight">a</span><span class="mord mathnormal mtight">d</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">128</span></span></span></span>、fp16）：</p>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>峰值 QPS</th>
+<th>并发 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">C</span></span></span></span></th>
+<th>KV/请求</th>
+<th>单实例 slots</th>
+<th>副本数</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>内部知识库</td>
+<td>6.0</td>
+<td>17.97</td>
+<td>11.842 GB</td>
+<td>4</td>
+<td><strong>5</strong></td>
+</tr>
+<tr>
+<td>多租户 SaaS</td>
+<td>250.0</td>
+<td>748.91</td>
+<td>11.842 GB</td>
+<td>4</td>
+<td><strong>188</strong></td>
+</tr>
+</tbody></table>
+<p><strong>两个反直觉但重要的点</strong>：</p>
+<ol>
+<li><strong>KV/请求 11.842 GB 是&quot;单请求&quot;的量</strong> —— 因为 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">in</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 里含 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 个 chunk（约 36k token）。<strong>长上下文把&quot;并发能力&quot;直接吃掉了</strong>：一张 80GB 卡只能放 4 路。</li>
+<li><strong>语料规模完全不影响副本数</strong>（两个场景的 KV 与 slots 相同）。语料只影响<strong>索引内存</strong>与 ANN 的常数项。<strong>所以&quot;我们的语料很大，所以要很多机器&quot;是一个错误的因果推断</strong> —— 真正吃机器的是&quot;并发 × 上下文长度&quot;。</li>
+</ol>
+<h4 id="h-23-容量规划的三条判据">2.3 容量规划的三条判据<a class="anchor" href="#h-23-容量规划的三条判据" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>先算 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">C</span></span></span></span>，再算 slots，最后算 replicas</strong>。顺序反了会得到&quot;按语料规模估机器&quot;的错误结论。</li>
+<li><strong>为 P99 留余量</strong>：按第 5 章第 4 节，把 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">ρ</span></span></span></span> 压到等待概率 &lt;1%（Erlang-C 的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="mopen">(</span><span class="mord mathnormal">c</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">a</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&lt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.01</span></span></span></span>）。</li>
+<li><strong>索引内存是&quot;每副本一份&quot;还是&quot;分片&quot;</strong>：共享索引意味着每个副本都要装下全量（⚠️ 示例：28.29 GB/副本 × 188 副本 = 5.3 TB 显存用于索引），这在高副本数场景下会成为真正的成本项。</li>
+</ul>
+<p><figure><img class="md-img" src="content/courses/rag-systems/assets/chapter-7-figure-01.svg" alt="容量：索引看语料、副本看并发" loading="lazy" decoding="async"><figcaption>容量：索引看语料、副本看并发</figcaption></figure>
+</p>
+<h3 id="h-三从-slo-反推设计决策">三、从 SLO 反推设计决策<a class="anchor" href="#h-三从-slo-反推设计决策" aria-label="本节链接">#</a></h3>
+<h4 id="h-31-反推链条">3.1 反推链条<a class="anchor" href="#h-31-反推链条" aria-label="本节链接">#</a></h4>
+<p>把第 5 章第 4 节的延迟分解<strong>倒过来用</strong>：</p>
+<pre data-lang="text"><code class="language-text">P99 预算
+  ├─ 减去 decode 地板（= out_tok × TPOT）        -&gt; 剩余预算
+  ├─ 减去固定段（net/queue/embed/ann_base/acl）   -&gt; 剩余预算
+  ├─ 剩余 / 每 chunk 的 prefill 成本 + ann_per_k  -&gt; 最大 k
+  ├─ 若还要重排：再从剩余里扣 pool × rerank_ms    -&gt; 重排池上限
+  └─ 若 k 太小（&lt; 质量目标所需）：
+        选项 A 缩输出（降 decode 地板）
+        选项 B 用小模型解码
+        选项 C 上缓存（前缀缓存把 prefill 打折）
+        选项 D 放宽 SLO 或降质量目标</code></pre>
+<p>⚠️ 示例（内部知识库，P99 预算 3000ms）：</p>
+<pre><code>SLO 内最大 k=93（瓶颈 prefill，P95≈2995.6ms）；开重排(池≤50)时最大 k=90
+延迟分段 {&#39;ann&#39;: 38.5, &#39;rerank&#39;: 0.0, &#39;prefill&#39;: 1597.1, &#39;decode&#39;: 1320.0}</code></pre>
+<p><strong>读数</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">93</span></span></span></span> 看起来很大，但代价是每查询 36k token 输入（成本 0.084 元）。而一旦输出长度 +20%，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 立刻从 93 掉到 77 —— <strong>decode 地板一抬，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 的预算就被挤掉</strong>。</p>
+<h4 id="h-32-预算目标--决策的反推表">3.2 预算/目标 → 决策的反推表<a class="anchor" href="#h-32-预算目标--决策的反推表" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>给定</th>
+<th>反推结论</th>
+<th>触发条件</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>P99 预算紧（&lt;<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span>s）</td>
+<td>必须上缓存 + 小模型；<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 压到 10 以内</td>
+<td>decode 地板已占预算大头</td>
+</tr>
+<tr>
+<td>P99 宽松（&gt;<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">3</span></span></span></span>s）</td>
+<td>可以开重排、加大 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span></td>
+<td>—</td>
+</tr>
+<tr>
+<td>成本上限低</td>
+<td>降 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span>、多级模型路由、前缀缓存</td>
+<td>每查询 token 成本 &gt; 上限</td>
+</tr>
+<tr>
+<td>质量目标高（recall@10 &gt; 0.9）</td>
+<td>混合检索 + 重排（第 3 章）；<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 不能太小</td>
+<td>单路召回达不到</td>
+</tr>
+<tr>
+<td>语料 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span></span></span></span> 大但 QPS 低</td>
+<td>索引内存优先（量化、磁盘索引）</td>
+<td>索引内存 &gt; 单机内存</td>
+</tr>
+<tr>
+<td>QPS 高</td>
+<td>副本数由并发决定；缓存收益最大</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">C</span></span></span></span> &gt; 单实例 slots</td>
+</tr>
+<tr>
+<td>多租户 + 强合规</td>
+<td>分区索引 + 前置 ACL（第 6 章）</td>
+<td>租户数少而大 / 数据驻留</td>
+</tr>
+<tr>
+<td>质量目标缺失</td>
+<td><strong>先补评测，再谈架构</strong>（第 7 章第 2 节）</td>
+<td>无法定义&quot;好&quot;</td>
+</tr>
+</tbody></table>
+<h4 id="h-33-敏感性排序哪个输入先让-slo-崩">3.3 敏感性排序：哪个输入先让 SLO 崩<a class="anchor" href="#h-33-敏感性排序哪个输入先让-slo-崩" aria-label="本节链接">#</a></h4>
+<p>⚠️ 示例（每个输入 +20%，基线为内部知识库）：</p>
+<table>
+<thead>
+<tr>
+<th>扰动</th>
+<th>副本</th>
+<th>Δ副本</th>
+<th>最大 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span></th>
+<th>Δ<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span></th>
+<th>Δ成本（元）</th>
+<th>主导段</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>（基线）</td>
+<td>5</td>
+<td>—</td>
+<td>93</td>
+<td>—</td>
+<td>—</td>
+<td>prefill</td>
+</tr>
+<tr>
+<td>QPS +20%</td>
+<td>6</td>
+<td>+1</td>
+<td>93</td>
+<td>+0</td>
+<td>+0.00000</td>
+<td>prefill</td>
+</tr>
+<tr>
+<td>峰均比 +20%</td>
+<td>6</td>
+<td>+1</td>
+<td>93</td>
+<td>+0</td>
+<td>+0.00000</td>
+<td>prefill</td>
+</tr>
+<tr>
+<td>输出长度 +20%</td>
+<td>5</td>
+<td>+0</td>
+<td>77</td>
+<td><strong>−16</strong></td>
+<td>−0.01185</td>
+<td>decode</td>
+</tr>
+<tr>
+<td>语料 +20%</td>
+<td>5</td>
+<td>+0</td>
+<td>93</td>
+<td>+0</td>
+<td>+0.00000</td>
+<td>prefill</td>
+</tr>
+<tr>
+<td>SLO 收紧 20%</td>
+<td>3</td>
+<td><strong>−2</strong></td>
+<td>58</td>
+<td><strong>−35</strong></td>
+<td>−0.03127</td>
+<td>decode</td>
+</tr>
+</tbody></table>
+<p><strong>三个可操作的结论</strong>：</p>
+<ol>
+<li><strong>副本数对峰值 QPS 最敏感，对语料规模不敏感</strong> —— 因为吃显存的是 KV，不是索引。<strong>扩容时先看并发，不要先看语料。</strong></li>
+<li><strong>最大 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 对输出长度与 SLO 最敏感</strong> —— decode 是固定地板，输出一长，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 的预算立刻被挤掉。</li>
+<li><strong>SLO 收紧会让 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 下降 → token 变少 → 每查询成本反而下降</strong>。质量与成本<strong>同向下降</strong>，所以&quot;降本&quot;不能作为收紧 SLO 的理由 —— 必须把质量目标一起看。这是&quot;成本优化&quot;最容易骗人的地方。</li>
+</ol>
+<h3 id="h-四架构决策记录adr">四、架构决策记录（ADR）<a class="anchor" href="#h-四架构决策记录adr" aria-label="本节链接">#</a></h3>
+<h4 id="h-41-模板">4.1 模板<a class="anchor" href="#h-41-模板" aria-label="本节链接">#</a></h4>
+<pre data-lang="markdown"><code class="language-markdown"># ADR-003：是否启用 cross-encoder 重排
+
+## 背景
+语料 1000 万篇，recall@10 已达 0.86，但 nDCG@10 只有 0.61（排序问题）。
+P99 预算 3s，当前 P95 = 1.8s。
+
+## 决策
+启用 cross-encoder 重排，重排池 = 50（不改索引、不改嵌入模型）。
+
+## 考虑过的替代方案
+1. 换更大的嵌入模型（成本：全量重嵌入 ≈ 3 天 + 双倍存储）
+2. 加大 k 到 100（成本：token ×2，质量收益饱和）
+3. 不处理（接受 nDCG 0.61）
+
+## 理由
+实测重排池 50 带来 nDCG +0.09，延迟 +45ms（占总预算 1.5%）；
+而换嵌入模型的边际质量/成本比只有它的 1/6（见 ch5-l4 的 MC 表）。
+
+## 后果
+- 正向：排序质量提升；重排模型需独立版本管理。
+- 负向：每查询 +45ms；需新增重排缓存的键维度。
+
+## 何时重审
+- 当重排池 50 的收益/成本比低于换嵌入模型时；
+- 当 P99 预算被压低到 2s 以下时；
+- 当重排模型升级、收益发生变化时。</code></pre>
+<h4 id="h-42-为什么必须写何时重审与被否决的方案">4.2 为什么必须写&quot;何时重审&quot;与&quot;被否决的方案&quot;<a class="anchor" href="#h-42-为什么必须写何时重审与被否决的方案" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>&quot;何时重审&quot;</strong>把一个决策变成<strong>有生命周期的假设</strong>。没有它，决策会以&quot;当初就是这么定的&quot;形式永久固化，而当初的前提可能早就变了（流量涨 10 倍、模型换代、成本单价下降）。</li>
+<li><strong>&quot;被否决的方案&quot;</strong>保存了<strong>当时的比较依据</strong>。否则半年后有人会重新提出同一个方案，团队要重新做一遍实验。</li>
+</ul>
+<p><strong>判据</strong>：一份 ADR 如果删掉&quot;何时重审&quot;仍然读得通，那它就没写完。</p>
+<h4 id="h-43-adr-与评测门禁挂钩">4.3 ADR 与评测门禁挂钩<a class="anchor" href="#h-43-adr-与评测门禁挂钩" aria-label="本节链接">#</a></h4>
+<p>每个 ADR 的&quot;后果&quot;应当对应一组<strong>可测指标</strong>，并进入第 7 章第 2 节的门禁：</p>
+<table>
+<thead>
+<tr>
+<th>ADR 决策</th>
+<th>对应指标</th>
+<th>门禁条件</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>启用重排</td>
+<td>nDCG@10、重排段延迟</td>
+<td>nDCG 升、P99 不超</td>
+</tr>
+<tr>
+<td>启用语义缓存</td>
+<td>假命中率、成本</td>
+<td>假命中率 &lt; 阈值、成本下降</td>
+</tr>
+<tr>
+<td>ACL 前置过滤</td>
+<td>canary 命中断言</td>
+<td>命中数 == 0</td>
+</tr>
+<tr>
+<td>增大 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span></td>
+<td>recall@k、每查询成本</td>
+<td>recall 升、成本在预算内</td>
+</tr>
+</tbody></table>
+<h3 id="h-五边界与常见错误">五、边界与常见错误<a class="anchor" href="#h-五边界与常见错误" aria-label="本节链接">#</a></h3>
+<table>
+<thead>
+<tr>
+<th>错误</th>
+<th>表现</th>
+<th>修正</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>把平均值当 SLO</td>
+<td>平均延迟达标，P99 爆炸</td>
+<td>用分位数，按 Erlang-C 留余量（ch5-l4）</td>
+</tr>
+<tr>
+<td>按语料规模估机器</td>
+<td>买了一堆机器，并发仍然不够</td>
+<td>先算 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.9805em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal">λ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">peak</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mord mathnormal" style="margin-right:0.1389em;">W</span></span></span></span> 与 KV slots</td>
+</tr>
+<tr>
+<td>忽略索引重建窗口</td>
+<td>重建时线上抖动或降级</td>
+<td>预留重建算力 + 蓝绿切换（ch6-l1）</td>
+</tr>
+<tr>
+<td>忽略冷启动</td>
+<td>新副本首请求慢（缓存空、模型未加载）</td>
+<td>预热 + 探针</td>
+</tr>
+<tr>
+<td>只算算力不算人力</td>
+<td>预算漏掉运维/评测/标注</td>
+<td>把人力计入 TCO（ch7-l4）</td>
+</tr>
+<tr>
+<td>没有质量目标就上重排</td>
+<td>过度设计，成本翻倍</td>
+<td>先建评测与指标树（ch7-l2）</td>
+</tr>
+<tr>
+<td>按平均值配峰值容量</td>
+<td>峰值时段崩</td>
+<td>峰均比 + 余量</td>
+</tr>
+<tr>
+<td>忽略降级路径</td>
+<td>依赖不可用时全站挂</td>
+<td>缓存兜底 / 小模型兜底 / 明确拒答</td>
+</tr>
+</tbody></table>
+<p><strong>最后一条的判据</strong>：对每个外部依赖（LLM、向量服务、重排服务），写出&quot;它挂了会怎样&quot;。<strong>如果答案是&quot;全站不可用&quot;，那就还缺一条降级路径。</strong></p>
+<h4 id="h-51-决策复盘的三个问题">5.1 决策复盘的三个问题<a class="anchor" href="#h-51-决策复盘的三个问题" aria-label="本节链接">#</a></h4>
+<p>架构定稿后，用三个问题做一次自检（每个都要能给出具体数字，而不是&quot;应该没问题&quot;）：</p>
+<ol>
+<li><strong>最坏输入是什么？</strong> 把 QPS、输出长度、语料规模、并发租户数各取 P99 甚至极值，重跑一遍 <code>plan()</code>，看哪个约束先破。⚠️ 示例：输出长度 +20% 就让最大 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 从 93 掉到 77 —— 那么&quot;用户偶尔贴一段长文要求总结&quot;的场景必须单独估算。</li>
+<li><strong>哪一项假设最不可靠？</strong> 例如&quot;单实例能放 4 路&quot;依赖 KV 公式与显存占用比例；如果实际只能用 2 路，副本数直接翻倍。<strong>把最不可靠的假设标出来，并为它准备一个可测的验证动作</strong>（压测、试运行、灰度）。</li>
+<li><strong>半年后哪些输入会变？</strong> 流量会涨、语料会大、模型会换代、单价会降。<strong>每一个变化都对应一个 ADR 的&quot;何时重审&quot;条件</strong> —— 这正是 §4.2 要求的可判定条件。</li>
+</ol>
+<p><strong>判据</strong>：如果三个问题里有任何一个答不出来，说明这次的&quot;架构&quot;还只是一张配置表，不是一组有依据的决策。</p>
+<h3 id="h-代码">代码<a class="anchor" href="#h-代码" aria-label="本节链接">#</a></h3>
+<pre data-lang="python"><code class="language-python"># -*- coding: utf-8 -*-
+&quot;&quot;&quot;(a) 容量与 SLO 反推计算器；(b) 敏感性排序。
+   ⚠️ 硬件参数与单价是示例值（以官方为准），不构成任何真实容量承诺。&quot;&quot;&quot;
+import math
+
+def plan(N_docs=10_000, tok_per_doc=1_200, chunk_tok=380, d=768, b_per_elem=1,
+         QPS_avg=2.0, peak_factor=3.0, out_tok=220, p99_budget_ms=3000.0,
+         M_graph=16, gpu_mem_gb=80.0, gpu_hour=6.0, c_in=2.0/1e6, c_out=8.0/1e6,
+         tp=8, flops_peak=9.9e14, eff=0.40, ann_base=6.0, ann_per_k=0.35,
+         rerank_ms=0.9, decode_ms_tok=6.0, net_queue=40.0):
+    chunks = N_docs * tok_per_doc / chunk_tok
+    vec_gb = chunks * d * b_per_elem / 1e9
+    graph_gb = chunks * M_graph * 2 * 4 / 1e9
+    index_gb = vec_gb + graph_gb
+    QPS_peak = QPS_avg * peak_factor
+
+    def total_ms(k, rerank_pool, n_out):
+        ann = ann_base + ann_per_k * k
+        rr = rerank_ms * rerank_pool if rerank_pool else 0.0
+        n_in = 800 + chunk_tok * k
+        prefill = (2 * 70e9 * n_in) / (flops_peak * eff * tp) * 1000
+        decode = decode_ms_tok * n_out
+        return (net_queue + ann + rr + prefill + decode,
+                dict(ann=ann, rerank=rr, prefill=prefill, decode=decode))
+
+    kmax, bottleneck = 0, &quot;-&quot;
+    for k in range(1, 201):                       # 从 SLO 反推最大 k
+        t, seg = total_ms(k, 0, out_tok)
+        if t &lt;= p99_budget_ms:
+            kmax, bottleneck = k, max(seg, key=seg.get)
+    kmax_rr = max((k for k in range(1, 201)
+                   if total_ms(k, min(50, k), out_tok)[0] &lt;= p99_budget_ms), default=0)
+    t_p95, seg = total_ms(max(1, kmax), 0, out_tok)
+
+    conc = QPS_peak * (t_p95 / 1000.0)            # Little&#39;s law
+    kv_per_req_gb = 2 * 80 * 8 * 128 * 2 * (800 + chunk_tok * max(1, kmax)) / 1e9
+    slots = max(1, int((gpu_mem_gb * 0.6) / max(kv_per_req_gb, 1e-6)))
+    replicas = max(1, math.ceil(conc / slots))
+    n_in = 800 + chunk_tok * max(1, kmax)
+    token_cost = c_in * n_in + c_out * out_tok
+    gpu_cost = (t_p95 / 1000.0) * (gpu_hour * tp / 3600.0)
+    cost = token_cost + gpu_cost / slots
+    return dict(N_docs=N_docs, chunks=int(chunks), index_gb=round(index_gb, 2),
+                vec_gb=round(vec_gb, 2), graph_gb=round(graph_gb, 2),
+                QPS_peak=round(QPS_peak, 1), k_max=kmax, bottleneck=bottleneck,
+                k_max_with_rerank=kmax_rr, p95_ms=round(t_p95, 1),
+                conc=round(conc, 2), kv_per_req_gb=round(kv_per_req_gb, 3),
+                slots_per_inst=slots, replicas=replicas,
+                cost_per_query=round(cost, 5),
+                cost_per_day=round(cost * QPS_avg * 86400, 2),
+                seg={kk: round(vv, 1) for kk, vv in seg.items()})
+
+for name, kw in [(&quot;内部知识库&quot;, dict(N_docs=10_000, QPS_avg=2.0, peak_factor=3.0)),
+                 (&quot;多租户 SaaS&quot;, dict(N_docs=10_000_000, QPS_avg=50.0, peak_factor=5.0))]:
+    r = plan(**kw)
+    print(f&quot;== 场景：{name} ==&quot;)
+    print(f&quot;  语料 {r[&#39;N_docs&#39;]:,} 篇 -&gt; {r[&#39;chunks&#39;]:,} chunk；索引内存 {r[&#39;index_gb&#39;]:.2f} GB&quot;
+          f&quot;（向量 {r[&#39;vec_gb&#39;]:.2f} + 图 {r[&#39;graph_gb&#39;]:.2f}）&quot;)
+    print(f&quot;  峰值 QPS {r[&#39;QPS_peak&#39;]} -&gt; 并发 {r[&#39;conc&#39;]}（Little&#39;s law）&quot;)
+    print(f&quot;  KV/请求 {r[&#39;kv_per_req_gb&#39;]} GB -&gt; 单实例 {r[&#39;slots_per_inst&#39;]} 路 -&gt; &quot;
+          f&quot;副本 {r[&#39;replicas&#39;]}&quot;)
+    print(f&quot;  SLO 内最大 k={r[&#39;k_max&#39;]}（瓶颈 {r[&#39;bottleneck&#39;]}，P95≈{r[&#39;p95_ms&#39;]}ms）；&quot;
+          f&quot;开重排(池≤50)时最大 k={r[&#39;k_max_with_rerank&#39;]}&quot;)
+    print(f&quot;  每查询成本 {r[&#39;cost_per_query&#39;]} 元 -&gt; 每天 {r[&#39;cost_per_day&#39;]} 元&quot;)
+    print(f&quot;  延迟分段 {r[&#39;seg&#39;]}\n&quot;)
+
+BASE = dict(N_docs=10_000, tok_per_doc=1_200, chunk_tok=380, d=768, b_per_elem=1,
+            QPS_avg=2.0, peak_factor=3.0, out_tok=220, p99_budget_ms=3000.0)
+base = plan(**BASE)
+print(&quot;== 敏感性（每个输入 +20%）==&quot;)
+print(f&quot;{&#39;扰动&#39;:&lt;20} {&#39;副本&#39;:&gt;5} {&#39;Δ副本&#39;:&gt;7} {&#39;最大k&#39;:&gt;6} {&#39;Δk&#39;:&gt;5} {&#39;Δ成本(元)&#39;:&gt;11} {&#39;主导段&#39;:&gt;8}&quot;)
+print(f&quot;{&#39;(基线)&#39;:&lt;20} {base[&#39;replicas&#39;]:&gt;5} {&#39;-&#39;:&gt;7} {base[&#39;k_max&#39;]:&gt;6} {&#39;-&#39;:&gt;5} &quot;
+      f&quot;{&#39;-&#39;:&gt;11} {base[&#39;bottleneck&#39;]:&gt;8}&quot;)
+for pname, key, factor in [(&quot;QPS +20%&quot;, &quot;QPS_avg&quot;, 1.2), (&quot;峰均比 +20%&quot;, &quot;peak_factor&quot;, 1.2),
+                           (&quot;输出长度 +20%&quot;, &quot;out_tok&quot;, 1.2), (&quot;语料 +20%&quot;, &quot;N_docs&quot;, 1.2),
+                           (&quot;SLO 收紧 20%&quot;, &quot;p99_budget_ms&quot;, 0.8)]:
+    args = dict(BASE); args[key] = args[key] * factor
+    r = plan(**args)
+    print(f&quot;{pname:&lt;20} {r[&#39;replicas&#39;]:&gt;5} {r[&#39;replicas&#39;]-base[&#39;replicas&#39;]:&gt;+7} &quot;
+          f&quot;{r[&#39;k_max&#39;]:&gt;6} {r[&#39;k_max&#39;]-base[&#39;k_max&#39;]:&gt;+5} &quot;
+          f&quot;{r[&#39;cost_per_query&#39;]-base[&#39;cost_per_query&#39;]:&gt;+11.5f} {r[&#39;bottleneck&#39;]:&gt;8}&quot;)</code></pre>
+<pre data-lang="text"><code class="language-text">== 场景：内部知识库 ==
+  语料 10,000 篇 -&gt; 31,578 chunk；索引内存 0.03 GB（向量 0.02 + 图 0.00）
+  峰值 QPS 6.0 -&gt; 并发 17.97（Little&#39;s law）
+  KV/请求 11.842 GB -&gt; 单实例 4 路 -&gt; 副本 5
+  SLO 内最大 k=93（瓶颈 prefill，P95≈2995.6ms）；开重排(池≤50)时最大 k=90
+  每查询成本 0.08403 元 -&gt; 每天 14519.6 元
+  延迟分段 {&#39;ann&#39;: 38.5, &#39;rerank&#39;: 0.0, &#39;prefill&#39;: 1597.1, &#39;decode&#39;: 1320.0}
+
+== 场景：多租户 SaaS ==
+  语料 10,000,000 篇 -&gt; 31,578,947 chunk；索引内存 28.29 GB（向量 24.25 + 图 4.04）
+  峰值 QPS 250.0 -&gt; 并发 748.91（Little&#39;s law）
+  KV/请求 11.842 GB -&gt; 单实例 4 路 -&gt; 副本 188
+  SLO 内最大 k=93（瓶颈 prefill，P95≈2995.6ms）；开重排(池≤50)时最大 k=90
+  每查询成本 0.08403 元 -&gt; 每天 362990.1 元
+  延迟分段 {&#39;ann&#39;: 38.5, &#39;rerank&#39;: 0.0, &#39;prefill&#39;: 1597.1, &#39;decode&#39;: 1320.0}
+
+== 敏感性（每个输入 +20%）==
+扰动                      副本     Δ副本    最大k    Δk      Δ成本(元)      主导段
+(基线)                     5       -     93     -           -  prefill
+QPS +20%                 6      +1     93    +0    +0.00000  prefill
+峰均比 +20%                 6      +1     93    +0    +0.00000  prefill
+输出长度 +20%                5      +0     77   -16    -0.01185   decode
+语料 +20%                  5      +0     93    +0    +0.00000  prefill
+SLO 收紧 20%               3      -2     58   -35    -0.03127   decode</code></pre>
+<p><strong>关键设计决策</strong>：把 <code>plan()</code> 写成一个<strong>纯函数</strong>（输入全是标量，输出全是标量字典），而不是一个类或一段脚本。这样带来两个直接好处：(1) 敏感性分析只需换一个参数重跑（这就是表里每一行的来源）；(2) 每个 ADR 里的数字都可以被复算 —— <strong>&quot;决策可复算&quot;是 ADR 能长期有效的前提</strong>。如果容量估算散落在一堆脚本里，&quot;何时重审&quot;就永远无法执行。</p>
+<h3 id="h-练习">练习<a class="anchor" href="#h-练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><p><strong>给你的系统填需求问卷</strong>。用 §1.1 的表格，逐项填入你手上系统的真实数字（或假设一个）。对填不出来的项，写出你要向谁、问什么问题才能得到它。然后指出：哪一项的不确定性最大，它对架构的影响是什么？</p>
+</li>
+<li><p><strong>容量模型的两处简化</strong>。本节的 <code>plan()</code> 里有两处简化：(a) 假设索引每副本一份全量；(b) 未把 ANN 代价随语料规模的增长计入延迟。分别给出修正模型，并说明在什么规模下这两个简化会导致明显错误的结论。</p>
+</li>
+<li><p><strong>反推三条不同的架构</strong>。给定三个需求组合：(a) P99 &lt; 1s、成本敏感、质量中等；(b) P99 &lt; 3s、质量优先、成本不敏感；(c) P99 &lt; 500ms、只做单跳事实问答。分别给出 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span>、是否重排、是否缓存、模型档位、副本策略的建议，并说明依据（要求引用本节的公式与表格）。</p>
+</li>
+<li><p><strong><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">ρ</span></span></span></span> 与副本数的联立</strong>。把第 5 章第 4 节的 Erlang-C 引入容量模型：副本数不仅要满足&quot;并发 × KV slots&quot;，还要满足&quot;等待概率 &lt; 1%&quot;。写出联立方程并求解一个具体场景（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">λ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">40</span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">μ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">25</span></span></span></span>、服务时间含在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">μ</span></span></span></span> 内）。回答：两个约束哪一个更紧？</p>
+</li>
+<li><p><strong>索引副本的存储账</strong>。若索引 28.29 GB、副本 188、每副本一份全量，计算索引总显存占用；再改为&quot;索引分片 + 查询广播&quot;（每副本装 1/8，查询打 8 个分片），重算总量并指出新引入的延迟与故障面。给出你的选择判据。</p>
+</li>
+<li><p><strong>写一份真实 ADR</strong>。选一个你系统里做过的决策（例如&quot;要不要加缓存&quot;），按 §4.1 的模板写完整 ADR，必须包含：至少两个被否决的替代方案、用本节的公式算出的数字、以及&quot;何时重审&quot;的<strong>可判定条件</strong>（不是&quot;以后再说&quot;）。</p>
+</li>
+<li><p><strong>降级路径设计</strong>。为 RAG 系统的每个外部依赖（LLM、向量检索、重排、缓存）写出&quot;挂了会怎样&quot;与降级动作。要求给出降级后的 SLO 与质量损失估计。回答：哪一条降级路径可以接受，哪一条应该直接拒绝服务？</p>
+</li>
+<li><p><strong>敏感性分析的扩展</strong>。把 §3.3 的敏感性分析扩展到&quot;两个参数同时 +20%&quot;（例如 QPS 与输出长度同时涨）。找出使 SLO 违约的<strong>最小参数组合</strong>（提示：在二维网格上扫描，画出违约边界）。说明这条边界对容量规划的实际用途。</p>
+</li>
+</ol>
+<h3 id="h-小结">小结<a class="anchor" href="#h-小结" aria-label="本节链接">#</a></h3>
+<ul>
+<li><strong>需求必须量化，否则等于没有需求</strong>。必须量化的项：语料规模与更新率、QPS 与峰均比、P95/P99（TTFT 与总延迟分开）、成本上限、质量目标、权限粒度、合规保留期。</li>
+<li><strong>硬约束的优先级</strong>：合规/权限 &gt; 正确性下限 &gt; 延迟 SLO &gt; 成本。冲突时按此顺序砍功能。</li>
+<li><strong>容量由并发与 KV 决定，不由语料规模决定</strong>。<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.9805em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal">λ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">peak</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mord mathnormal" style="margin-right:0.1389em;">W</span></span></span></span>（Little&#39;s law）；slots = GPU 显存 / KV-per-request；replicas = <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">⌈</span><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="mord">/</span><span class="mord text"><span class="mord">slots</span></span><span class="mclose">⌉</span></span></span></span>。</li>
+<li>⚠️ 示例：内部知识库（1 万篇、QPS 2、峰均比 3）→ 并发 17.97、KV/请求 11.842 GB、单实例 4 路、<strong>副本 5</strong>；多租户 SaaS（1000 万篇、QPS 50、峰均比 5）→ 并发 748.91、<strong>副本 188</strong>。<strong>语料涨 1000 倍，副本数不变</strong> —— 吃机器的是&quot;并发 × 上下文长度&quot;。</li>
+<li><strong>SLO 反推链条</strong>：P99 预算 − decode 地板 − 固定段 → 最大 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> → 再扣重排池。⚠️ 示例：P99=3000ms 时 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0315em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mop mtight"><span class="mtight">m</span><span class="mtight">a</span><span class="mtight">x</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">93</span></span></span></span>（瓶颈 prefill）；开重排池 50 时 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0315em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mop mtight"><span class="mtight">m</span><span class="mtight">a</span><span class="mtight">x</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">90</span></span></span></span>。</li>
+<li><strong>敏感性排序</strong>：副本数对 QPS/峰均比最敏感（+20% → +1 副本）；最大 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 对输出长度与 SLO 最敏感（+20% 输出 → <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 从 93 掉到 77；SLO 收紧 20% → 掉到 58）。<strong>语料 +20% 对副本与 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 都无影响</strong>。</li>
+<li>⚠️ <strong>SLO 收紧会让 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 下降、token 变少、成本反而下降</strong>（−0.03127 元/查询）。质量与成本同向下降 —— &quot;降本&quot;不能作为收紧 SLO 的理由。</li>
+<li><strong>ADR 必须写&quot;何时重审&quot;与&quot;被否决的方案&quot;</strong>，并把后果映射到可测指标（进入第 7 章第 2 节的门禁）。</li>
+<li><strong>常见错误</strong>：平均值当 SLO、按语料估机器、忽略重建窗口与冷启动、漏算人力、没有质量目标就上重排、没有降级路径。</li>
+<li><strong>一句话</strong>：<strong>架构是解出来的：先量化需求，再用 Little&#39;s law 与 KV 显存定容量，用 P99 预算反推 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 与是否重排，用敏感性排序决定先优化哪一项。</strong></li>
+</ul>
+<blockquote>
+<p>下一节：架构定下来了，但&quot;改一处到底有没有变好&quot;必须由评测回答。下一节把指标树、失败分类与统计判据搭起来。</p>
+</blockquote>

@@ -1,0 +1,87 @@
+<h2 id="h-激活与框架开销与-oom">激活与框架开销与 OOM<a class="anchor" href="#h-激活与框架开销与-oom" aria-label="本节链接">#</a></h2>
+<p>把权重和 KV cache 都算进去，理论上显存应该够用了，可程序还是报 <code>OutOfMemoryError</code>——剩下的&quot;隐形开销&quot;往往藏在<strong>激活张量</strong>和<strong>框架自身</strong>里。学完本课，你应当能列出一张完整的&quot;峰值显存账单&quot;，判断一次推理会不会 OOM，并知道哪些手段能把它压下去。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-激活转瞬即逝的中间张量">1. 激活：转瞬即逝的中间张量<a class="anchor" href="#h-1-激活转瞬即逝的中间张量" aria-label="本节链接">#</a></h4>
+<p>前向传播时，每一层都会产生中间结果——注意力分数、softmax 输出、前馈网络的隐层状态，这些统称<strong>激活（activation）</strong>。与权重不同，激活<strong>用完即弃</strong>，推理时不必像训练那样把它们全部存下来做反向传播，所以单次推理的激活占用通常远小于权重。但当批量大、序列长时，某些激活（尤其是词表很大的<strong>输出 logits</strong>，大小约 <code>batch × seq × vocab × bytes</code>）依然会形成可观的瞬时峰值。</p>
+<h4 id="h-2-框架开销看不到但确实存在">2. 框架开销：看不到但确实存在<a class="anchor" href="#h-2-框架开销看不到但确实存在" aria-label="本节链接">#</a></h4>
+<p>即便你一个张量都不算，推理框架一启动就会吃掉一批显存：</p>
+<ul>
+<li><strong>CUDA 上下文（context）</strong>：驱动为 GPU 分配的工作区，通常数百 MB 到 1～2 GiB。</li>
+<li><strong>内存分配器</strong>：PyTorch 的 caching allocator 为了性能会<strong>缓存已释放的块</strong>，导致&quot;已 free 但未归还&quot;的显存存在。</li>
+<li><strong>碎片</strong>：反复申请/释放不同大小的张量会留下无法利用的缝隙。</li>
+</ul>
+<p>这些加起来，轻则几百 MB，重则几 GiB，是很多&quot;明明算下来够用却 OOM&quot;的幕后原因。</p>
+<h4 id="h-3-峰值显存账单与-oom">3. 峰值显存账单与 OOM<a class="anchor" href="#h-3-峰值显存账单与-oom" aria-label="本节链接">#</a></h4>
+<p>一次推理的<strong>峰值显存</strong>大致是四部分之和：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord cjk_fallback">峰值</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord text"><span class="mord cjk_fallback">权重</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7778em;vertical-align:-0.0833em;"></span><span class="mord text"><span class="mord">KV cache</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord text"><span class="mord cjk_fallback">激活峰值</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord cjk_fallback">框架开销</span></span></span></span></span></span></p>
+<p>当请求的峰值超过卡上<strong>可用显存</strong>（总容量减去系统已占用）时，就发生 <strong>OOM（Out of Memory，显存耗尽）</strong>。OOM 不是&quot;参数太大&quot;这么简单，而是这张账单里<strong>任何一项</strong>超支都可能触发。</p>
+<p><figure><img class="md-img" src="content/courses/inference-hardware/assets/chapter-5-figure-03.svg" alt="峰值显存构成图：一根竖直柱状图分成四段，从下到上依次是&quot;权重（固定）&quot;&quot;KV cache（随上下文线性）&quot;&quot;激活峰值（瞬时）&quot;&quot;框架开销（常数）&quot;，每段用不同颜色；柱顶画一条红色虚线标&quot;显卡容量&quot;，若柱顶超过虚线则用红色感叹号标出&quot;OOM&quot;，直观说明四部分叠加后如何越过容量上限" loading="lazy" decoding="async"><figcaption>峰值显存构成图：一根竖直柱状图分成四段，从下到上依次是&quot;权重（固定）&quot;&quot;KV cache（随上下文线性）&quot;&quot;激活峰值（瞬时）&quot;&quot;框架开销（常数）&quot;，每段用不同颜色；柱顶画一条红色虚线标&quot;显卡容量&quot;，若柱顶超过虚线则用红色感叹号标出&quot;OOM&quot;，直观说明四部分叠加后如何越过容量上限</figcaption></figure>
+</p>
+<h4 id="h-4-缓解-oom-的手段">4. 缓解 OOM 的手段<a class="anchor" href="#h-4-缓解-oom-的手段" aria-label="本节链接">#</a></h4>
+<p>对应账单的每一项，都有对应的省钱办法：</p>
+<ul>
+<li><strong>压权重</strong>：INT8/INT4 量化；</li>
+<li><strong>压 KV cache</strong>：GQA/MQA、缩短上下文、<strong>分页注意力（PagedAttention，vLLM）</strong> 消除缓存碎片；</li>
+<li><strong>压激活</strong>：减小 batch、限制最大序列长度；</li>
+<li><strong>摊开销</strong>：多卡<strong>张量并行</strong>把权重和激活切到多张卡上（下一章讲互连）。</li>
+</ul>
+<p><figure><img class="md-img" src="content/courses/inference-hardware/assets/chapter-5-figure-04.svg" alt="OOM 缓解策略对照图：四列卡片分别对应&quot;量化权重&quot;&quot;分页注意力/缩短上下文&quot;&quot;减小 batch&quot;&quot;张量并行&quot;，每张卡片上写一句&quot;省的是账单里的哪一项&quot;，下方用箭头把各手段指回上面那张账单柱状图对应的分段" loading="lazy" decoding="async"><figcaption>OOM 缓解策略对照图：四列卡片分别对应&quot;量化权重&quot;&quot;分页注意力/缩短上下文&quot;&quot;减小 batch&quot;&quot;张量并行&quot;，每张卡片上写一句&quot;省的是账单里的哪一项&quot;，下方用箭头把各手段指回上面那张账单柱状图对应的分段</figcaption></figure>
+</p>
+<h3 id="h-二可运行示例">二、可运行示例<a class="anchor" href="#h-二可运行示例" aria-label="本节链接">#</a></h3>
+<p>下面写一个&quot;峰值显存估算器&quot;：输入模型规模、上下文、批量，估算四部分显存并判断是否 OOM。</p>
+<pre data-lang="python"><code class="language-python"># -*- coding: utf-8 -*-
+# 峰值显存 ≈ 权重 + KV cache + 激活峰值 + 框架开销
+
+def weight_gb(params, bytes_per_param=2):
+    return params * bytes_per_param / (1024 ** 3)
+
+def kv_cache_gb(L, H_kv, D, seq, batch=1, bytes_per_elem=2):
+    return 2 * L * H_kv * D * seq * batch * bytes_per_elem / (1024 ** 3)
+
+def logits_gb(seq, batch, vocab, bytes_per_elem=4):
+    &quot;&quot;&quot;输出层 logits 张量：batch × seq × vocab，常以 FP32 存在。&quot;&quot;&quot;
+    return seq * batch * vocab * bytes_per_elem / (1024 ** 3)
+
+def peak_gb(params, L, H_kv, D, seq, batch, vocab, overhead_gb=1.5):
+    &quot;&quot;&quot;把四部分加总，返回各分项与峰值。&quot;&quot;&quot;
+    w = weight_gb(params)
+    kv = kv_cache_gb(L, H_kv, D, seq, batch)
+    act = logits_gb(seq, batch, vocab)          # 这里只算 logits 这一项做近似
+    return {&quot;权重&quot;: w, &quot;KV cache&quot;: kv, &quot;激活(logits)&quot;: act, &quot;框架开销&quot;: overhead_gb,
+            &quot;峰值&quot;: w + kv + act + overhead_gb}
+
+# 以 LLaMA-3 8B (GQA) 为例：8B 参数、32 层、8 KV 头、头维度 128、词表约 128k
+bill = peak_gb(params=8e9, L=32, H_kv=8, D=128,
+               seq=8192, batch=4, vocab=128_256)
+
+print(&quot;峰值显存账单（LLaMA-3 8B，seq=8192，batch=4）：&quot;)
+for k, v in bill.items():
+    print(f&quot;  {k:&lt;12} {v:&gt;7.2f} GiB&quot;)
+
+# 判断：能否塞进给定显存的卡？
+for vram in (24, 48, 80):
+    ok = bill[&quot;峰值&quot;] &lt;= vram
+    print(f&quot;  {&#39;能&#39; if ok else &#39;不能&#39;}装进 {vram} GiB 卡（峰值 {bill[&#39;峰值&#39;]:.2f} GiB）&quot;)
+
+# 定位元凶：把 batch 或 seq 调大，看哪一项先失控
+print(&quot;\n固定 batch=1，观察 KV cache 随上下文如何反超权重：&quot;)
+for seq in (2048, 8192, 32768, 131072):
+    b = peak_gb(8e9, 32, 8, 128, seq, batch=1, vocab=128_256)
+    print(f&quot;  seq={seq:&gt;6} -&gt; 权重 {b[&#39;权重&#39;]:&gt;6.2f} GiB，KV {b[&#39;KV cache&#39;]:&gt;7.2f} GiB，峰值 {b[&#39;峰值&#39;]:&gt;7.2f} GiB&quot;)</code></pre>
+<p>运行后你会发现：batch=1 时权重占大头；但 seq 一旦拉到 32K、128K，KV cache 迅速反超，峰值随之突破常见单卡容量——这就是&quot;KV cache 是 OOM 元凶&quot;在账单上的直观呈现。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>手算峰值</strong>：设权重 14 GiB、KV cache 2 GiB、激活 0.5 GiB、框架开销 1.5 GiB，峰值是多少？能否装进 16 GiB 的卡？</li>
+<li><strong>找元凶</strong>：在上面的代码里把 <code>vocab</code> 改成 32000 和 320000，观察&quot;激活(logits)&quot;一项的变化，说明超大词表为什么也会成为显存负担。</li>
+<li><strong>改 overhead</strong>：把 <code>overhead_gb</code> 从 1.5 改成 0.5 和 3.0，观察判断结果是否翻转，解释为什么&quot;框架开销&quot;估算不准会导致实际 OOM。</li>
+<li><strong>压账单</strong>：保持模型不变，通过调低 <code>seq</code> 或 <code>batch</code> 让 8B 模型在 24 GiB 卡上不 OOM，找出临界组合。</li>
+<li><strong>思考</strong>：为什么推理时激活占用通常远小于训练？如果训练要存每层激活做反向传播，激活这项会变成账单里多大的部分？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Efficient Memory Management for Large Language Model Serving with PagedAttention（vLLM，激活与 KV 碎片治理）：<a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2309.06180</a></li>
+<li>LLaMA: Open and Efficient Foundation Language Models（模型与词表规模）：<a href="https://arxiv.org/abs/2302.13971" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2302.13971</a></li>
+<li>PyTorch Memory Management（caching allocator 行为）：<a href="https://pytorch.org/docs/stable/notes/cuda.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/docs/stable/notes/cuda.html</a></li>
+<li>NVIDIA H100 Tensor Core GPU（显卡容量与显存规格）：<a href="https://www.nvidia.com/en-us/data-center/h100/" target="_blank" rel="noopener noreferrer">https://www.nvidia.com/en-us/data-center/h100/</a></li>
+</ul>
+<p><a href="#/l/hw-ch6-l1">下一课：PCIe 带宽</a></p>

@@ -1,0 +1,151 @@
+<h2 id="h-生成模型分类">生成模型分类<a class="anchor" href="#h-生成模型分类" aria-label="本节链接">#</a></h2>
+<p>你已经在 LLM 课程里见过&quot;预测下一个 token&quot;的生成式目标，也见过判别式的分类头。这一课把&quot;生成模型&quot;这个概念讲清楚：它到底和判别模型差在哪、按什么维度分类、主流三大家族（<strong>VAE / GAN / 归一化流</strong>）各自怎么构造、又各有什么软肋。理解这张地图，是后面学扩散模型的前置——扩散模型本质上就是&quot;流的近亲 + 变分下界的另一种用法&quot;。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-判别式-vs-生成式学的是两种不同的东西">1. 判别式 vs 生成式：学的是两种不同的东西<a class="anchor" href="#h-1-判别式-vs-生成式学的是两种不同的东西" aria-label="本节链接">#</a></h4>
+<p>给定数据 <code>x</code> 与标签 <code>y</code>，判别模型学的是<strong>条件分布 <code>P(y|x)</code></strong>——给你一张图，回答&quot;它是猫还是狗&quot;。它只需要找到一条把两类分开的决策边界，边界的&quot;另一边&quot;长什么样，它毫不关心。</p>
+<p>生成模型学的是<strong>联合分布 <code>P(x)</code>（无监督）或 <code>P(x,y)</code>（有监督）</strong>——它要理解&quot;数据本身是怎么来的&quot;，于是既能给任意样本打分（密度估计），也能<strong>造出新样本</strong>（采样）。造样本这件事，判别模型做不到：它连 <code>x</code> 的边缘分布都没建模。</p>
+<p>用一句话记：<strong>判别式划界线，生成式造数据</strong>。</p>
+<p><figure><img class="md-img" src="content/courses/multimodal-diffusion/assets/chapter-1-figure-01.svg" alt="判别式与生成式对比：左图是判别模型——数据点分两类，画一条决策边界把两者隔开，模型只关心边界；右图是生成模型——数据点围绕一个隐变量空间分布，模型学习整个分布的形状，既能算密度又能从任意点采样出新样本" loading="lazy" decoding="async"><figcaption>判别式与生成式对比：左图是判别模型——数据点分两类，画一条决策边界把两者隔开，模型只关心边界；右图是生成模型——数据点围绕一个隐变量空间分布，模型学习整个分布的形状，既能算密度又能从任意点采样出新样本</figcaption></figure>
+</p>
+<h4 id="h-2-按似然是否显式分类">2. 按&quot;似然是否显式&quot;分类<a class="anchor" href="#h-2-按似然是否显式分类" aria-label="本节链接">#</a></h4>
+<p>生成模型的第一种分类法，看它<strong>是否显式定义了数据似然 <code>P(x)</code></strong>：</p>
+<ul>
+<li><strong>显式密度模型</strong>：直接写出 <code>P(x)</code> 或它的变分下界，可以逐点计算概率。又分两小类：<ul>
+<li><strong>可精确计算的</strong>：如<strong>自回归模型</strong>（<code>P(x) = ∏ P(x_t | x_&lt;t)</code>，用链式法则把联合分布拆成一串条件分布，LLM 就是它的代表）、<strong>归一化流（Flow）</strong>（用可逆变换 + 变量替换公式精确算密度）。</li>
+<li><strong>只能近似计算的</strong>：<strong>变分自编码器（VAE）</strong>——真似然 <code>P(x) = ∫ P(x|z)P(z) dz</code> 积分难算，于是最大化它的<strong>证据下界（ELBO）</strong>。</li>
+</ul>
+</li>
+<li><strong>隐式密度模型</strong>：<strong>生成对抗网络（GAN）</strong>——不写出任何密度，直接让生成器与判别器对抗，隐式地逼近数据分布。GAN 能采样、不能算概率。</li>
+</ul>
+<p>第二种分类法看<strong>采样方式</strong>：VAE/GAN 用神经网络一步映射（从潜变量到数据），Flow 靠可逆变换，自回归靠逐 token 采样，而后面要讲的扩散模型靠&quot;多步去噪&quot;。</p>
+<h4 id="h-3-vae把生成变成编码解码--约束">3. VAE：把生成变成&quot;编码—解码 + 约束&quot;<a class="anchor" href="#h-3-vae把生成变成编码解码--约束" aria-label="本节链接">#</a></h4>
+<p>VAE 的核心直觉是<strong>给隐变量 <code>z</code> 一个先验，再学一个从 <code>z</code> 到数据 <code>x</code> 的生成器</strong>。但直接最大化 <code>log P(x)</code> 遇到一个硬骨头：边际似然 <code>P(x) = ∫ P(x|z)P(z) dz</code> 要对隐变量积分，不可解。</p>
+<p>于是引入<strong>编码器 <code>q(z|x)</code></strong>（近似后验），推导出<strong>证据下界 ELBO</strong>（下一课详细推导）：</p>
+<pre><code>log P(x)  ≥  E_{q(z|x)}[ log P(x|z) ]  -  KL( q(z|x) ‖ P(z) )
+                └── 重构项（要还原 x）──┘    └── 正则项（z 靠近先验）──┘</code></pre>
+<p>直观理解：<strong>重构项</strong>逼生成器&quot;能造回原图&quot;，<strong>KL 项</strong>逼编码器的输出服从标准正态，这样测试时直接抽 <code>z ~ N(0,I)</code> 就能生成。代价是 KL 项会&quot;抹平&quot;分布，导致 VAE 样本偏模糊——这是它最被诟病的缺点。</p>
+<h4 id="h-4-gan用警察抓小偷隐式逼近分布">4. GAN：用&quot;警察抓小偷&quot;隐式逼近分布<a class="anchor" href="#h-4-gan用警察抓小偷隐式逼近分布" aria-label="本节链接">#</a></h4>
+<p>GAN 完全不碰似然，而是玩一个<strong>极小极大博弈</strong>：</p>
+<pre><code>min_G max_D  E_{x~真实}[ log D(x) ] + E_{z~噪声}[ log(1 - D(G(z))) ]</code></pre>
+<p>判别器 <code>D</code> 努力分辨真假，生成器 <code>G</code> 努力骗过 <code>D</code>。训练到均衡时，<code>G</code> 生成的分布理论上与真实分布重合。GAN 的优势是<strong>样本锐利、质量高</strong>；代价是训练极不稳定（模式坍塌、判别器过强、梯度消失），而且<strong>没有显式似然</strong>，无法直接评估 <code>P(x)</code>。</p>
+<h4 id="h-5-归一化流用可逆变换精确算密度">5. 归一化流：用可逆变换&quot;精确&quot;算密度<a class="anchor" href="#h-5-归一化流用可逆变换精确算密度" aria-label="本节链接">#</a></h4>
+<p>Flow 的思路最&quot;硬核&quot;：<strong>用一个可逆神经网络 <code>f</code> 把简单分布（如标准正态）逐步变换成复杂数据分布</strong>。由变量替换公式（下一课推导），数据密度可以<strong>精确</strong>写出来：</p>
+<pre><code>log P(x) = log P_Z(f^{-1}(x)) + log | det J_{f^{-1}}(x) |</code></pre>
+<p>只要 <code>f</code> 可逆、雅可比行列式好算，就能<strong>既精确算密度、又能双向采样</strong>。代价是&quot;可逆 + 行列式可算&quot;这两个约束把网络结构卡得很死（典型做法如仿射耦合层、加性耦合层），表达力受限。</p>
+<p><figure><img class="md-img" src="content/courses/multimodal-diffusion/assets/chapter-1-figure-02.svg" alt="三大生成模型流派对比：三张并排卡片。左&quot;VAE&quot;——先验正态分布 → 编码器/解码器，标注&quot;ELBO 近似似然，样本偏模糊&quot;；中&quot;GAN&quot;——噪声 → 生成器 vs 判别器对抗，标注&quot;隐式分布，样本锐利但训练不稳&quot;；右&quot;Flow&quot;——正态分布经过一串可逆变换，标注&quot;精确似然，可逆约束限制表达力&quot;" loading="lazy" decoding="async"><figcaption>三大生成模型流派对比：三张并排卡片。左&quot;VAE&quot;——先验正态分布 → 编码器/解码器，标注&quot;ELBO 近似似然，样本偏模糊&quot;；中&quot;GAN&quot;——噪声 → 生成器 vs 判别器对抗，标注&quot;隐式分布，样本锐利但训练不稳&quot;；右&quot;Flow&quot;——正态分布经过一串可逆变换，标注&quot;精确似然，可逆约束限制表达力&quot;</figcaption></figure>
+</p>
+<h4 id="h-6-三者各有软肋扩散模型来补位">6. 三者各有软肋，扩散模型来补位<a class="anchor" href="#h-6-三者各有软肋扩散模型来补位" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>方法</th>
+<th align="center">显式似然</th>
+<th align="center">采样质量</th>
+<th align="center">训练稳定性</th>
+<th>主要短板</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>VAE</td>
+<td align="center">变分下界</td>
+<td align="center">模糊</td>
+<td align="center">稳</td>
+<td>KL 项压平分布</td>
+</tr>
+<tr>
+<td>GAN</td>
+<td align="center">无</td>
+<td align="center">锐利</td>
+<td align="center">不稳</td>
+<td>模式坍塌、难收敛</td>
+</tr>
+<tr>
+<td>Flow</td>
+<td align="center">精确</td>
+<td align="center">一般</td>
+<td align="center">稳</td>
+<td>可逆约束太强</td>
+</tr>
+<tr>
+<td>扩散模型</td>
+<td align="center">变分下界</td>
+<td align="center">高</td>
+<td align="center">稳</td>
+<td>采样慢（多步）</td>
+</tr>
+</tbody></table>
+<p>扩散模型恰好补上这个空位：<strong>训练稳定（像 VAE 那样有清晰目标）、样本质量高（超过 GAN）、似然有下界可优化</strong>，唯一代价是采样要多步迭代。下一课先用&quot;似然视角 + 采样视角&quot;把生成模型的两个通用语言统一起来，为扩散模型的数学打底。</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>用一个 2D 玩具任务亲手感受三种方法的&quot;味道&quot;。先跑一个<strong>迷你 GAN</strong>，让生成器学会画一个圆环：</p>
+<pre data-lang="python"><code class="language-python">import torch
+import torch.nn as nn
+import matplotlib.pyplot as plt
+
+torch.manual_seed(0)
+
+# —— 真实数据：二维圆环上的点，带一点噪声 ——
+def real_samples(n):
+    theta = torch.rand(n) * 2 * torch.pi
+    r = 1.0 + 0.05 * torch.randn(n)
+    return torch.stack([r * torch.cos(theta), r * torch.sin(theta)], dim=1)
+
+# —— 判别器：输出一个 logit，越大越&quot;像真的&quot; ——
+D = nn.Sequential(nn.Linear(2, 64), nn.ReLU(), nn.Linear(64, 1))
+# —— 生成器：把 2 维噪声映射成 2 维点 ——
+G = nn.Sequential(nn.Linear(2, 64), nn.ReLU(), nn.Linear(64, 2))
+
+opt_D = torch.optim.Adam(D.parameters(), lr=1e-3)
+opt_G = torch.optim.Adam(G.parameters(), lr=1e-3)
+bce = nn.BCEWithLogitsLoss()   # 内部自带 sigmoid，适合二分类 logit
+
+for step in range(2000):
+    # 1) 训判别器：真样本尽量判 1，假样本尽量判 0
+    x = real_samples(128)
+    fake = G(torch.randn(128, 2)).detach()   # detach：此步不更新生成器
+    loss_D = bce(D(x), torch.ones(128, 1)) + bce(D(fake), torch.zeros(128, 1))
+    opt_D.zero_grad(); loss_D.backward(); opt_D.step()
+
+    # 2) 训生成器：目标是&quot;骗过判别器&quot;，把假样本判成 1
+    fake = G(torch.randn(128, 2))
+    loss_G = bce(D(fake), torch.ones(128, 1))
+    opt_G.zero_grad(); loss_G.backward(); opt_G.step()
+
+    if step % 500 == 0:
+        print(f&quot;step {step}: loss_D={loss_D.item():.3f}, loss_G={loss_G.item():.3f}&quot;)
+
+# 训练完，采样 500 个点画出来，观察是否&quot;长&quot;成了圆环
+with torch.no_grad():
+    samples = G(torch.randn(500, 2))
+plt.scatter(samples[:, 0], samples[:, 1], s=4, label=&quot;生成样本&quot;)
+plt.gca().set_aspect(&quot;equal&quot;)
+plt.legend(); plt.show()</code></pre>
+<p>再看三种方法的<strong>损失函数</strong>各长什么样（这是它们的本质区别）：</p>
+<pre data-lang="python"><code class="language-python"># —— VAE：最大化 ELBO，等价于最小化 (重构误差 + KL 正则) ——
+recon = ((x - x_hat) ** 2).sum()                          # 重构项：还原原图
+kl = -0.5 * (1 + log_var - mu ** 2 - log_var.exp()).sum() # KL(q(z|x)‖N(0,I))
+loss_vae = recon + kl
+
+# —— Flow：最大化精确对数似然（变量替换公式），等价于最小化负对数似然 ——
+log_p = base_log_prob(z) + log_det_jacobian   # 基分布概率 + log|det J|
+loss_flow = -log_p.mean()
+
+# —— GAN：没有显式似然，只有&quot;真假对抗&quot;的极小极大目标 ——
+loss_gan = -(torch.log(D(G(z)))).mean()       # 生成器视角（非饱和形式）</code></pre>
+<p>运行后你会发现：GAN 只关心&quot;像不像真的&quot;，从不算概率；VAE 的损失里显式出现&quot;概率下界&quot;；Flow 的损失里显式出现&quot;精确概率&quot;。<strong>这就是&quot;隐式 vs 显式 vs 变分近似&quot;三种哲学在代码里的落点。</strong></p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>运行迷你 GAN，把 <code>real_samples</code> 改成&quot;两个高斯团&quot;（月牙/双峰数据），观察生成器能否学到多峰分布；反复跑几次，记录是否出现<strong>模式坍塌</strong>（生成器只画出一个团）。</li>
+<li>在 VAE 损失里把 KL 项系数从 1 调到 0.1、再调到 10，分别说明重构项与正则项谁占上风、对&quot;样本模糊度/多样性&quot;有什么影响。</li>
+<li>用一段话解释：为什么 GAN&quot;没有显式似然&quot;既是优点（表达力强）又是缺点（无法做密度估计、难评估训练进度）？</li>
+<li>手推变量替换公式 <code>P_X(x) = P_Z(f^{-1}(x)) |det J_{f^{-1}}(x)|</code> 的一维版本，并说明&quot;可逆&quot;为什么是 Flow 的硬约束。</li>
+<li>思考题：扩散模型被归为&quot;显式密度（变分下界）&quot;模型，但它采样又是多步迭代——它和 Flow、VAE 各有什么亲缘关系？带着这个问题进入第 2、3 课。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Kingma &amp; Welling, <em>Auto-Encoding Variational Bayes</em>（VAE 原论文）：<a href="https://arxiv.org/abs/1312.6114" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1312.6114</a></li>
+<li>Goodfellow et al., <em>Generative Adversarial Nets</em>（GAN 原论文）：<a href="https://arxiv.org/abs/1406.2661" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1406.2661</a></li>
+<li>Rezende &amp; Mohamed, <em>Variational Inference with Normalizing Flows</em>（归一化流奠基作）：<a href="https://arxiv.org/abs/1505.05770" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1505.05770</a></li>
+<li>Papamakarios et al., <em>Normalizing Flows for Probabilistic Modeling and Inference</em>（Flow 综述）：<a href="https://arxiv.org/abs/1912.02762" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1912.02762</a></li>
+<li>Ho et al., <em>Denoising Diffusion Probabilistic Models</em>（DDPM，下章主角）：<a href="https://arxiv.org/abs/2006.11239" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2006.11239</a></li>
+</ul>
+<p><a href="#/l/mm-ch1-l2">下一课：似然视角与采样</a></p>

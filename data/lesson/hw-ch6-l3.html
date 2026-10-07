@@ -1,0 +1,85 @@
+<h2 id="h-多卡为何不是线性加速">多卡为何不是线性加速<a class="anchor" href="#h-多卡为何不是线性加速" aria-label="本节链接">#</a></h2>
+<p>&quot;两张卡就该快两倍&quot;是很多人对多卡的第一直觉，现实却几乎从不如此。学完本课，你应当能用量化的方式解释：<strong>为什么多卡加速远低于线性</strong>，以及通信、串行、负载不均衡各自吃掉多少收益。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-理想与现实的差距">1. 理想与现实的差距<a class="anchor" href="#h-1-理想与现实的差距" aria-label="本节链接">#</a></h4>
+<p>理想情况下，把任务分给 N 张卡，时间缩短到 1/N，这叫<strong>线性加速（linear speedup）</strong>。但程序里总有<strong>没法并行、必须串行</strong>的部分，还有<strong>卡与卡之间要互相等待、交换数据</strong>的开销，所以实际加速比总是打折扣。</p>
+<h4 id="h-2-amdahl-定律串行部分决定上限">2. Amdahl 定律：串行部分决定上限<a class="anchor" href="#h-2-amdahl-定律串行部分决定上限" aria-label="本节链接">#</a></h4>
+<p><strong>Amdahl 定律</strong>刻画了最核心的约束：设任务中可并行部分占比为 p（0≤p≤1），用 N 张卡，则加速比为</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.2574em;vertical-align:-0.936em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3214em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord mathnormal">p</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord mathnormal">p</span><span class="mord">/</span><span class="mord mathnormal" style="margin-right:0.109em;">N</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.936em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></p>
+<p>哪怕可并行部分高达 99%（p=0.99），当 N→∞ 时加速比上限也只有 1/(1-p) = 100 倍；现实中 p 往往远没这么高，串行部分（数据加载、启动、无法切分的计算）就成了天花板。</p>
+<p><figure><img class="md-img" src="content/courses/inference-hardware/assets/chapter-6-figure-03.svg" alt="多卡加速比曲线图：横轴为卡数 N（1 到 64），纵轴为加速比；画三条曲线——理想线性加速（直线）、p=0.99、p=0.95 的 Amdahl 曲线（随 N 上升后逐渐走平），用红色虚线标出&quot;通信开销进一步把实际曲线拉得更低&quot;；图上标注各曲线的&quot;上限&quot;，直观展示&quot;卡越多，边际收益越低&quot;" loading="lazy" decoding="async"><figcaption>多卡加速比曲线图：横轴为卡数 N（1 到 64），纵轴为加速比；画三条曲线——理想线性加速（直线）、p=0.99、p=0.95 的 Amdahl 曲线（随 N 上升后逐渐走平），用红色虚线标出&quot;通信开销进一步把实际曲线拉得更低&quot;；图上标注各曲线的&quot;上限&quot;，直观展示&quot;卡越多，边际收益越低&quot;</figcaption></figure>
+</p>
+<h4 id="h-3-通信开销每算一步都要开会">3. 通信开销：每算一步都要&quot;开会&quot;<a class="anchor" href="#h-3-通信开销每算一步都要开会" aria-label="本节链接">#</a></h4>
+<p>多卡并行不是各算各的，而是<strong>边算边同步</strong>：</p>
+<ul>
+<li><strong>张量并行</strong>：一层矩阵乘切到多卡，每层结束都要 <strong>all-reduce</strong> 交换部分和，通信量随层数累加；</li>
+<li><strong>流水线并行</strong>：卡之间传递中间结果，还会有<strong>气泡（bubble）</strong>——先填满流水线的阶段里，多数卡在空等；</li>
+<li><strong>数据并行（训练）</strong>：每步都要同步梯度。</li>
+</ul>
+<p>上一课算过：一次 2 GB 通信走 PCIe 要几十毫秒，走 NVLink 也要几毫秒；这些时间卡与卡之间是<strong>相互等待</strong>的，算得再快的卡也得停下来等最慢的那一跳。</p>
+<h4 id="h-4-负载不均衡与尾延迟">4. 负载不均衡与尾延迟<a class="anchor" href="#h-4-负载不均衡与尾延迟" aria-label="本节链接">#</a></h4>
+<p>即使通信免费，还有两个&quot;隐性打折&quot;：</p>
+<ul>
+<li><strong>负载不均衡</strong>：把工作切成 N 份，很难切得完全均匀，最慢的那张卡决定整体完成时间；</li>
+<li><strong>尾延迟</strong>：多卡同时处理请求时，个别卡偶发抖动，整个批次的响应被拖慢。</li>
+</ul>
+<p>于是真实曲线是：<strong>卡数越多，加速比越偏离线性，边际收益递减</strong>，甚至加到某个点后<strong>反而不如更少的卡</strong>。</p>
+<p><figure><img class="md-img" src="content/courses/inference-hardware/assets/chapter-6-figure-04.svg" alt="多卡通信开销示意：三张 GPU 并排，每张卡上方是蓝色&quot;计算&quot;方块、下方是橙色条纹&quot;通信等待&quot;，用竖直虚线对齐三张卡的计算结束点，示意&quot;最快的卡也要等最慢的卡&quot;完成同步，整体耗时被拖长" loading="lazy" decoding="async"><figcaption>多卡通信开销示意：三张 GPU 并排，每张卡上方是蓝色&quot;计算&quot;方块、下方是橙色条纹&quot;通信等待&quot;，用竖直虚线对齐三张卡的计算结束点，示意&quot;最快的卡也要等最慢的卡&quot;完成同步，整体耗时被拖长</figcaption></figure>
+</p>
+<h4 id="h-5-推理场景的特殊性">5. 推理场景的特殊性<a class="anchor" href="#h-5-推理场景的特殊性" aria-label="本节链接">#</a></h4>
+<p>推理的多卡（通常张量并行）还有个额外代价：权重虽被切分，但<strong>通信发生在每一层、每个 token</strong> 上，属于<strong>延迟敏感</strong>的短交互。相比之下，批量越大、单次计算越重，通信占比越低，加速越接近线性——这也是&quot;小 batch 下多卡推理往往不划算&quot;的原因。</p>
+<h3 id="h-二可运行示例">二、可运行示例<a class="anchor" href="#h-二可运行示例" aria-label="本节链接">#</a></h3>
+<p>用 Amdahl 定律 + 一个简单的通信开销模型，画出&quot;加速比随卡数增长后走平&quot;的真实曲线。</p>
+<pre data-lang="python"><code class="language-python"># -*- coding: utf-8 -*-
+# 多卡加速比 = Amdahl 串行上限 × 通信开销折扣
+
+def amdahl(p, N):
+    &quot;&quot;&quot;Amdahl 定律：p 为可并行占比，N 为卡数。&quot;&quot;&quot;
+    return 1.0 / ((1 - p) + p / N)
+
+def with_comm(p, N, comm_fraction):
+    &quot;&quot;&quot;在 Amdahl 基础上再乘通信折扣：
+       每张卡实际算的时间还要加上通信时间 comm_fraction（占并行段的比例）。
+       近似：有效卡数 = N / (1 + comm_fraction * N)。&quot;&quot;&quot;
+    effective_N = N / (1 + comm_fraction * N)
+    return amdahl(p, effective_N)
+
+Ns = [1, 2, 4, 8, 16, 32, 64]
+print(&quot;加速比对比（p = 可并行占比 0.98）：&quot;)
+print(f&quot;{&#39;卡数&#39;:&gt;4} {&#39;理想线性&#39;:&gt;8} {&#39;Amdahl&#39;:&gt;8} {&#39;+通信10%&#39;:&gt;9} {&#39;+通信25%&#39;:&gt;9}&quot;)
+for N in Ns:
+    linear = N
+    a = amdahl(0.98, N)
+    c10 = with_comm(0.98, N, 0.10)
+    c25 = with_comm(0.98, N, 0.25)
+    print(f&quot;{N:&gt;4} {linear:&gt;8.1f} {a:&gt;8.2f} {c10:&gt;9.2f} {c25:&gt;9.2f}&quot;)
+
+# 边际收益：每多加一倍卡，加速比多涨多少？
+print(&quot;\n从 8 卡翻到 16 卡、32 卡的边际收益（含通信 15%）：&quot;)
+prev = with_comm(0.98, 8, 0.15)
+for N in (16, 32):
+    cur = with_comm(0.98, N, 0.15)
+    print(f&quot;  {N:&gt;2} 卡：加速比 {cur:.2f}，比 {N//2} 卡多涨 {(cur - prev):.2f}&quot;)
+    prev = cur
+
+# 推理场景：小 batch 通信占比高，大 batch 通信占比低
+print(&quot;\n不同通信占比下，16 卡的加速比：&quot;)
+for frac in (0.05, 0.15, 0.40, 0.80):
+    print(f&quot;  通信占并行段 {frac:&gt;4.0%} -&gt; 加速比 {with_comm(0.98, 16, frac):.2f}（线性=16）&quot;)</code></pre>
+<p>运行后你会发现：即便可并行度高达 98%，64 卡的 Amdahl 上限也远低于 64；再加上通信折扣，16 卡实际可能只到几倍加速。通信占比越高（小 batch 推理越典型），折扣越狠——这正解释了&quot;多卡不是线性加速&quot;。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>手算上限</strong>：若可并行占比 p=0.95，当卡数趋近无穷时，加速比上限是多少？（提示：1/(1-p)）</li>
+<li><strong>改 p</strong>：把代码里的 p 改成 0.90 和 0.999，观察 Amdahl 曲线&quot;走平&quot;的高度如何变化，说明串行部分为什么是致命伤。</li>
+<li><strong>通信占比</strong>：把 <code>comm_fraction</code> 设为 0 与 0.5，分别代表&quot;零通信&quot;与&quot;通信吃满&quot;，对比 16 卡加速比，体会通信对可扩展性的毁灭性影响。</li>
+<li><strong>找拐点</strong>：固定 p 和通信占比，找到&quot;再往上加卡加速比反而几乎不涨&quot;的卡数，试着解释为什么实际部署不会无限堆卡。</li>
+<li><strong>思考</strong>：为什么推理场景下&quot;小 batch&quot;的多卡加速比通常比&quot;大 batch&quot;更差？如果服务商按卡时收费，你会建议在什么吞吐量下才值得上多卡？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Amdahl&#39;s Law（G. Amdahl, 1967，&quot;Validity of the Single Processor Approach&quot;）：<a href="https://en.wikipedia.org/wiki/Amdahl%27s_law" target="_blank" rel="noopener noreferrer">https://en.wikipedia.org/wiki/Amdahl%27s_law</a></li>
+<li>Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism（张量/流水线并行的通信与气泡）：<a href="https://arxiv.org/abs/1909.08053" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1909.08053</a></li>
+<li>Efficient Large-Scale Language Model Training on GPU Clusters（Megatron-LM 论文，多卡扩展性分析）：<a href="https://arxiv.org/abs/2104.04473" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2104.04473</a></li>
+<li>NVIDIA NVLink &amp; NVSwitch（多卡通信带宽背景）：<a href="https://www.nvidia.com/en-us/data-center/nvlink/" target="_blank" rel="noopener noreferrer">https://www.nvidia.com/en-us/data-center/nvlink/</a></li>
+</ul>
+<p><a href="#/l/hw-ch7-l1">下一课：不同 GPU 规格对比</a></p>

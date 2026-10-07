@@ -1,0 +1,181 @@
+<h2 id="h-合并访存与对齐一次访存能拿到多少有效字节">合并访存与对齐：一次访存能拿到多少有效字节<a class="anchor" href="#h-合并访存与对齐一次访存能拿到多少有效字节" aria-label="本节链接">#</a></h2>
+<p>上一课说显存延迟数百周期、每个 SM 平均只分到十几字节/周期。那么这十几字节真的能拿到吗？不一定：硬件搬运数据的<strong>最小单位不是 4 字节，而是 32 字节的扇区</strong>（sector）。32 个线程各要 4 字节时，地址凑得整齐就只搬 128 字节且全部有用；凑不齐就可能搬 1024 字节只用上 128。本课把它变成能手算的「有效字节率」，并用模拟器把常见访问模式的浪费量全部量出来。</p>
+<p><figure><img class="md-img" src="content/courses/gpu-cuda-kernels/assets/chapter-3-figure-02.svg" alt="合并访存：32 个线程的地址如何决定传输量" loading="lazy" decoding="async"><figcaption>合并访存：32 个线程的地址如何决定传输量</figcaption></figure>
+</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-一次访存到底搬多少扇区与-cache-line">1. 一次访存到底搬多少：扇区与 cache line<a class="anchor" href="#h-1-一次访存到底搬多少扇区与-cache-line" aria-label="本节链接">#</a></h4>
+<p>两个粒度必须分清：</p>
+<ul>
+<li><strong>扇区</strong>（sector）：L2 与 L1/SM 之间搬运的最小单位，32 字节，也是<strong>计费单位</strong>；</li>
+<li><strong>cache line</strong>：L1 的一行是 128 字节，即 4 个扇区；DRAM 一侧按更长的 burst 取数，所以按行看有时更接近真实代价。</li>
+</ul>
+<p>一个 warp 的 32 个地址先各自落到某个扇区上，<strong>落在同一扇区的多个线程只需搬一次</strong>。于是：</p>
+<pre><code>有效字节率 = 有用字节 / 实际传输字节 = 128 B / (扇区数 × 32 B)</code></pre>
+<p>连续访问的理想值是 4 个扇区（32 × 4 B = 128 B = 1 行），有效率 100%。这是最好的情况，也是所有布局优化的目标。</p>
+<h4 id="h-2-常见形态步长每翻一倍有效率减半">2. 常见形态：步长每翻一倍，有效率减半<a class="anchor" href="#h-2-常见形态步长每翻一倍有效率减半" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>访问模式</th>
+<th>覆盖扇区</th>
+<th>传输字节</th>
+<th>有效字节率</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>连续且对齐（stride 1 个 float）</td>
+<td>4</td>
+<td>128 B</td>
+<td>100%</td>
+</tr>
+<tr>
+<td>连续但起点偏移 4 B</td>
+<td>5</td>
+<td>160 B</td>
+<td>80%</td>
+</tr>
+<tr>
+<td>stride 2 个 float（8 B）</td>
+<td>8</td>
+<td>256 B</td>
+<td>50%</td>
+</tr>
+<tr>
+<td>stride 8 个 float（32 B）</td>
+<td>32</td>
+<td>1024 B</td>
+<td>12.5%</td>
+</tr>
+<tr>
+<td>stride 32 个 float（128 B）</td>
+<td>32</td>
+<td>1024 B（按行算 4096 B）</td>
+<td>12.5%（按行 3.1%）</td>
+</tr>
+<tr>
+<td>AoS：<code>struct{float x,y,z;}</code> 只取 <code>x</code></td>
+<td>12</td>
+<td>384 B</td>
+<td>33.3%</td>
+</tr>
+<tr>
+<td>SoA：字段独立成数组</td>
+<td>4</td>
+<td>128 B</td>
+<td>100%</td>
+</tr>
+</tbody></table>
+<p>规律很清楚：连续访问的扇区数 ≈ 覆盖跨度 ÷ 32；<strong>步长每翻一倍，扇区数翻一倍，有效率减半</strong>，直到每个线程各占一个扇区（warp 最多 32 个扇区）为止。到 stride 128 B 再往上，扇区数不再涨，但每个扇区落在不同的 cache line 上，按行计费时浪费还在放大——这就是「跨步访问」在 GEMM 转置读、卷积滑窗、稀疏访存里格外致命的原因。</p>
+<h4 id="h-3-对齐为什么偏移只多花一个扇区">3. 对齐：为什么偏移只多花一个扇区<a class="anchor" href="#h-3-对齐为什么偏移只多花一个扇区" aria-label="本节链接">#</a></h4>
+<p>设 32 个 float 的连续访问起点偏移 <code>o</code> 字节，则它跨的扇区数是 <code>4 + (o mod 32 != 0 ? 1 : 0)</code>：只要不落在 32 字节边界上，就多搬一个扇区，有效率 80%。也就是说每次要多搬 1/4 的字节，<strong>连续访问的对齐损失上限就是 25%</strong>。</p>
+<p>工程上要保证「每个线程访问的元素大小与地址对齐」（自然对齐，natural alignment）。<code>cudaMalloc</code> 返回的设备指针有对齐保证，实际踩坑多在<strong>自己造的偏移</strong>上：数组切片、结构体字段偏移、<code>char*</code> 指针运算、手工 <code>reinterpret_cast</code>。</p>
+<h4 id="h-4-aos-vs-soa布局本身就是访存模式">4. AoS vs SoA：布局本身就是访存模式<a class="anchor" href="#h-4-aos-vs-soa布局本身就是访存模式" aria-label="本节链接">#</a></h4>
+<p><code>struct {float x, y, z;} p[N]</code> 是 AoS（array of structs）。只取 <code>p[i].x</code> 时，相邻线程的地址隔了 12 字节，32 个线程铺开 384 字节、只用到 128 字节——有效率 33.3%。把它拆成三个独立数组（SoA，structure of arrays），同一个循环立刻回到 100%。</p>
+<p>布局规则是「按同一 warp 同一时刻要用的字段来排」。另外，只读数据加 <code>__restrict__</code> 与 <code>const</code> 能帮编译器选只读路径；但<strong>不要指望 texture 路径</strong>：官方文档已明确说明，在当前所有受支持的 GPU 上，纹理/表面访存对非纹理 load 不再提供额外性能收益。合并访存只能靠地址模式本身解决。</p>
+<p><figure><img class="md-img" src="content/courses/gpu-cuda-kernels/assets/chapter-3-figure-03.svg" alt="AoS 与 SoA 对比：只取 x 时有效率 33.3% 对 100%" loading="lazy" decoding="async"><figcaption>AoS 与 SoA 对比：只取 x 时有效率 33.3% 对 100%</figcaption></figure>
+</p>
+<h4 id="h-5-边界线程与部分活跃的-warp">5. 边界线程与部分活跃的 warp<a class="anchor" href="#h-5-边界线程与部分活跃的-warp" aria-label="本节链接">#</a></h4>
+<p>模拟结果：32 个线程里只有 17 个活跃时，传输 3 个扇区（96 B）却只用 68 B，有效率 70.8%；活跃 24 个恰好落在扇区边界上，有效率仍是 100%。扇区按 8 个 float 对齐，<strong>活跃线程数落在扇区边界上才不浪费</strong>。</p>
+<p>实践做法：block 尺寸取 32 的倍数；越界的线程直接 <code>return</code>，而不是让它去处理「剩余元素」；循环尾部让整个 warp 一起退出，避免出现「半个 warp 干活、半个 warp 空转还照样搬扇区」。</p>
+<h4 id="h-6-常见坑">6. 常见坑<a class="anchor" href="#h-6-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>以为「每个线程读 4 字节 = 一次 4 字节传输」</strong>：计费按扇区。</li>
+<li><strong>只看 cache line 不看扇区</strong>：行是取数单位，扇区才是计费单位。</li>
+<li><strong>觉得步长「不大」就放松</strong>：stride 8 B 已经掉到 50%。</li>
+<li><strong>忽略对齐</strong>：切片与字段偏移是最常见的来源。</li>
+<li><strong>只算一次访存</strong>：循环里每次迭代都在浪费，代价要乘以迭代次数。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面这段纯 Python（只用标准库，装了 numpy 更好）把「32 个地址 → 扇区集合 → 有效字节率」算出来，覆盖连续、偏移、跨步、AoS/SoA、部分活跃五种情形。</p>
+<pre data-lang="python"><code class="language-python"># ---- 访存事务模拟器：一个 warp 的 32 个地址要搬多少字节 ----
+SECTOR = 32          # 全局访存的最小传输单位：32 字节扇区
+LINE   = 128         # L1 cache line：4 个扇区
+
+def transactions(addrs_bytes):
+    &quot;&quot;&quot;返回本次 warp 访存覆盖的（扇区数, cache line 数）&quot;&quot;&quot;
+    sectors = {(a // SECTOR) * SECTOR for a in addrs_bytes}
+    lines   = {(a // LINE) * LINE for a in addrs_bytes}
+    return len(sectors), len(lines)
+
+def report(name, addrs_bytes, useful_bytes):
+    s, l = transactions(addrs_bytes)
+    print(f&#39;{name:&lt;26} 扇区 {s:&gt;3} 行 {l:&gt;3} 传输 {s*SECTOR:&gt;5}B &#39;
+          f&#39;有用 {useful_bytes:&gt;4}B 有效率 {useful_bytes/(s*SECTOR)*100:&gt;5.1f}%&#39;)
+
+WARP, F = 32, 4      # 32 个线程，每线程取一个 4 字节 float
+useful = WARP * F
+
+report(&#39;连续（warp 天然对齐）&#39;, [i * F for i in range(WARP)], useful)
+report(&#39;连续但起点偏移 4B&#39;,   [4 + i * F for i in range(WARP)], useful)
+report(&#39;步长 2 字（stride 8B）&#39;,  [i * 2 * F for i in range(WARP)], useful)
+report(&#39;步长 8 字（stride 32B）&#39;, [i * 8 * F for i in range(WARP)], useful)
+report(&#39;步长 32 字（stride 128B）&#39;, [i * 32 * F for i in range(WARP)], useful)
+report(&#39;AoS：取 vec3(12B) 的 x&#39;, [i * 12 for i in range(WARP)], useful)
+report(&#39;SoA：取 x[] 连续（4B）&#39;, [i * 4 for i in range(WARP)], useful)
+
+def min_sectors(addrs_bytes):
+    return len({(a // SECTOR) * SECTOR for a in addrs_bytes})
+
+print()
+print(&#39;对齐实验：32 个连续 float，起始地址从 0 到 28 字节&#39;)
+for off in range(0, 32, 4):
+    a = [off + i * F for i in range(WARP)]
+    print(f&#39;  起始偏移 {off:&gt;2}B → 扇区 {min_sectors(a)}  &#39;
+          f&#39;有效率 {useful/(min_sectors(a)*SECTOR)*100:&gt;5.1f}%&#39;)
+
+print()
+print(&#39;部分活跃的 warp（前 t 个线程有效，地址连续）&#39;)
+for t in (32, 24, 19, 17, 16, 8, 1):
+    a = [i * F for i in range(t)]
+    print(f&#39;  活跃 {t:&gt;2}/32 → 扇区 {min_sectors(a):&gt;2}  有用 {t*F:&gt;3}B  &#39;
+          f&#39;有效率 {t*F/(min_sectors(a)*SECTOR)*100:&gt;5.1f}%&#39;)</code></pre>
+<p>运行结果（本机实测，Python 3 + numpy）：</p>
+<pre><code>连续（warp 天然对齐）              扇区   4 行   1 传输   128B 有用  128B 有效率 100.0%
+连续但起点偏移 4B                 扇区   5 行   2 传输   160B 有用  128B 有效率  80.0%
+步长 2 字（stride 8B）          扇区   8 行   2 传输   256B 有用  128B 有效率  50.0%
+步长 8 字（stride 32B）         扇区  32 行   8 传输  1024B 有用  128B 有效率  12.5%
+步长 32 字（stride 128B）       扇区  32 行  32 传输  1024B 有用  128B 有效率  12.5%
+AoS：取 vec3(12B) 的 x        扇区  12 行   3 传输   384B 有用  128B 有效率  33.3%
+SoA：取 x[] 连续（4B）           扇区   4 行   1 传输   128B 有用  128B 有效率 100.0%
+
+对齐实验：32 个连续 float，起始地址从 0 到 28 字节
+  起始偏移  0B → 扇区 4  有效率 100.0%
+  起始偏移  4B → 扇区 5  有效率  80.0%
+  起始偏移  8B → 扇区 5  有效率  80.0%
+  起始偏移 12B → 扇区 5  有效率  80.0%
+  起始偏移 16B → 扇区 5  有效率  80.0%
+  起始偏移 20B → 扇区 5  有效率  80.0%
+  起始偏移 24B → 扇区 5  有效率  80.0%
+  起始偏移 28B → 扇区 5  有效率  80.0%
+
+部分活跃的 warp（前 t 个线程有效，地址连续）
+  活跃 32/32 → 扇区  4  有用 128B  有效率 100.0%
+  活跃 24/32 → 扇区  3  有用  96B  有效率 100.0%
+  活跃 19/32 → 扇区  3  有用  76B  有效率  79.2%
+  活跃 17/32 → 扇区  3  有用  68B  有效率  70.8%
+  活跃 16/32 → 扇区  2  有用  64B  有效率 100.0%
+  活跃  8/32 → 扇区  1  有用  32B  有效率 100.0%
+  活跃  1/32 → 扇区  1  有用   4B  有效率  12.5%</code></pre>
+<p>注意最后一段的「台阶」：活跃线程数在 8 的整数倍上有效率都是 100%，一旦落到 17、19 就掉到 70%~80%——因为每个扇区装 8 个 float。这说明<strong>尾部的边界处理不是「少算几个元素」的小事，而是带宽浪费</strong>。</p>
+<p><strong>可选，需自备或云上按需</strong>（无 GPU 可跳过）：</p>
+<pre data-lang="bash"><code class="language-bash"># 在自备 GPU 或按需云实例上，用 ncu 量真实的扇区数：
+ncu --metrics l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum,\
+l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum ./strided_demo
+# sectors / requests = 平均每次请求搬几个扇区：连续访问理想值约 4（128B / 32B）
+# 把同一个 kernel 的索引从 a[i*8] 改成 a[i]，这个比值会明显下降
+# 指标名以 `ncu --query-metrics | grep sectors` 查到的当前版本为准</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：给模拟器加一个 <code>float4</code> 模式（每线程取 16 字节连续），验证 32 个线程共 512 字节 = 16 个扇区、有效率仍 100%；再说明它省下的到底是什么（提示：不是扇区，是请求数与指令数）。</li>
+<li><strong>解释</strong>：为什么 stride 8 B 的有效率是 50%，而 stride 32 B 掉到 12.5%？用「一个扇区装 8 个 float」这句话把两档串起来解释。</li>
+<li><strong>对比/验证</strong>：用 numpy 造 AoS（<code>(N,3)</code> 取一列）与 SoA（三个独立数组）两种布局，各做一次同规模求和并计时。GPU 上差距可达数倍，为什么在 CPU 上往往只有几十个百分点？</li>
+<li><strong>思考</strong>：如果只能改一处，你会先消除跨步还是先修对齐？给出定量依据（提示：比较两者的浪费比例上限）。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>CUDA Programming Guide（v13.4）§2.3.4.1 Coalesced Global Memory Access（合并访存的官方定义与示例）：<a href="https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/writing-cuda-kernels.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/writing-cuda-kernels.html</a></li>
+<li>CUDA C++ Best Practices Guide（v13.4）§10.2 Device Memory Spaces：§10.2.1.2 Sequential but Misaligned、§10.2.1.3 Effects of Misaligned Accesses、§10.2.1.4 Strided Accesses：<a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/contents.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/contents.html</a></li>
+<li>CUDA C++ Best Practices Guide（v13.4）§10.2.1.1 A Simple Access Pattern（连续性对带宽的影响）：<a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#coalesced-access-to-global-memory" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#coalesced-access-to-global-memory</a></li>
+<li>NVIDIA Nsight Compute 文档（<code>l1tex__*</code> 访存指标与 Memory Workload Analysis）：<a href="https://docs.nvidia.com/nsight-compute/" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/nsight-compute/</a></li>
+</ul>
+<p><a href="#/l/cuda-ch3-l3">下一课：bank conflict：成因、检测与消除</a></p>

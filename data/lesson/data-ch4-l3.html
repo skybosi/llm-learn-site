@@ -1,0 +1,816 @@
+<h2 id="h-合成数据蒸馏自举与改写三条路线的机制与风险">合成数据：蒸馏、自举与改写三条路线的机制与风险<a class="anchor" href="#h-合成数据蒸馏自举与改写三条路线的机制与风险" aria-label="本节链接">#</a></h2>
+<h3 id="h-这一节要解决什么">这一节要解决什么<a class="anchor" href="#h-这一节要解决什么" aria-label="本节链接">#</a></h3>
+<p>前两节把标注的&quot;质&quot;（第 1 节的判据与一致性）与&quot;量&quot;（第 2 节的采集策略）都推到了同一个硬约束面前：<strong>人力预算</strong>。本节处理当这个约束不够用时的第三条路 —— 让模型自己造训练数据。</p>
+<p>合成数据有两个别的数据源没有的性质，它们一好一坏，而且来自同一个机制：</p>
+<ol>
+<li><strong>它可以是无限的。</strong> 成本只与推理算力有关，与人力无关。这让人自然想到&quot;用合成数据把数据量堆到 scaling law 的甜点区&quot;。</li>
+<li><strong>它会自己污染自己。</strong> 只要&quot;生成的数据&quot;进入&quot;下一轮生成所依赖的模型&quot;，这个过程就是一个<strong>反馈回路</strong>。它的失效不是&quot;多了一点噪声&quot;，而是分布的<strong>逐代漂移</strong>（distributional drift / model collapse）—— 而且这个过程在单代上完全看不出来，只有在跨代比较时才显形。</li>
+</ol>
+<p>所以这一节的组织方式是<strong>先讲机制，再给条件</strong>：</p>
+<ol>
+<li><strong>三条路线的机制</strong>：蒸馏（distillation）、自举（bootstrapping / self-training）、改写（paraphrase）。它们的收益来源各不相同（软标签的信息量、伪标签的量、表面不变性），因此失效模式也各不相同（系统错误复制、模式坍缩、语义漂移）。</li>
+<li><strong>坍缩的两种失败模式</strong>：本节代码 A 段把&quot;递归自举&quot;做成一个可以逐代观察的实验，结果是<strong>平滑（拉普拉斯）并没有阻止漂移，只是把失败方式从&quot;支撑收缩、熵下降&quot;换成了&quot;质量漏向没被采样过的区域、熵上升&quot;</strong>。这两条曲线的方向相反，而 TV 都在单调上涨。</li>
+<li><strong>锚定的阈值</strong>：加回多少真实数据才不漂？代码给出的是&quot;存在阈值，且阈值依赖模型的表达能力&quot;（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0</span></span></span></span> 时约 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">5%</span></span></span></span> 就够，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.5</span></span></span></span> 时要到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">20%</span></span></span></span>）。</li>
+<li><strong>校验器（verifier）是合成数据唯一的放大器</strong>：它有可判定的答案时，接受集的错误率可以被压到远低于教师（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.2016</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">→</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.0026</span></span></span></span>）；它的严格度是一个<strong>能算出来的超参</strong>，而且是否&quot;越严越好&quot;取决于它的误杀率如何随严格度变化。</li>
+<li><strong>评价污染</strong>：合成管线让污染从&quot;数据收集事故&quot;变成&quot;流程的默认结果&quot;。代码 C 段量化：虚高 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">9.50</span></span></span></span> 点，去污染后残余 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1.25</span></span></span></span> 点，代价是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">248</span></span></span></span> 条误删。</li>
+</ol>
+<p>结论先放在这里（<strong>是条件，不是立场</strong>）：</p>
+<blockquote>
+<p><strong>合成数据本身既不好也不坏，它是把&quot;教师的偏差&quot;与&quot;模型的容量&quot;相乘的一个算子。</strong> 当①有可判定的校验器、②有真实数据锚定、③教师对学生有知识势差、④多样性有外部来源时，它是放大器；缺少任何一条，它就是一个<strong>确认偏误的加速器</strong> —— 每一代都把上一代的偏差学得更精确，而单代指标看起来在变好。</p>
+</blockquote>
+<h3 id="h-一三条路线的机制">一、三条路线的机制<a class="anchor" href="#h-一三条路线的机制" aria-label="本节链接">#</a></h3>
+<h4 id="h-11-蒸馏软标签携带什么">1.1 蒸馏：软标签携带什么<a class="anchor" href="#h-11-蒸馏软标签携带什么" aria-label="本节链接">#</a></h4>
+<p><strong>蒸馏</strong>（distillation）指用一个强模型（teacher）产出标签（或分布）来训练另一个模型（student）。它有两种形态，收益来源不同：</p>
+<table>
+<thead>
+<tr>
+<th>形态</th>
+<th>教师提供什么</th>
+<th>收益来源</th>
+<th>主要风险</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>硬标签蒸馏</strong></td>
+<td>教师最终输出（类标、答案、推理链）</td>
+<td>标注成本的替代</td>
+<td>教师错误 100% 被复制</td>
+</tr>
+<tr>
+<td><strong>软标签蒸馏</strong></td>
+<td>教师的完整分布 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">q</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0359em;">q</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="minner">…</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0359em;">q</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0715em;">K</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span></span></span></span></td>
+<td>分布携带<strong>类间相似结构</strong>（student 每步收到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">K</span></span></span></span> 个约束而不是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> 个），梯度方差更小</td>
+<td>需要教师暴露 logits；分布可能过度尖锐</td>
+</tr>
+</tbody></table>
+<p>软标签为什么在<strong>有限数据</strong>下更高效，可以用一个简单的不等式看：对于一个样本，硬标签只说明&quot;第 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 类正确&quot;，而软标签同时说明了&quot;第 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7519em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.7519em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">′</span></span></span></span></span></span></span></span></span></span></span></span> 类与第 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 类有多像&quot;。后者是<strong>跨类别的结构信息</strong>，它相当于为每个样本提供了额外约束。在数据充足时这部分信息被真实数据覆盖，所以收益消失 —— 这正是&quot;蒸馏在数据少时效果好、数据多时无用&quot;的机制，而不是经验之谈。</p>
+<p>蒸馏有三个不能靠调参消除的风险：</p>
+<ol>
+<li><strong>教师的系统错误被无衰减地复制。</strong> 真实标注里的错误是<strong>独立</strong>的（不同标注者不会犯同一个错），因此可以在平均中被削弱；而教师的错误是<strong>共享</strong>的（同一个模型、同一套权重、同一类盲区），它不会被平均掉，只会被学得更精确。代码 B 段的偏差表把这条量化了：教师在某个子群体上错误率 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.60</span></span></span></span>、其余 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.05</span></span></span></span>，那么要<strong>把 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.55</span></span></span></span> 的群体差压到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.05</span></span></span></span> 以内，该子群体需要约 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">91%</span></span></span></span> 以上是真实标注</strong>。</li>
+<li><strong>容量不匹配。</strong> student 容量小于 teacher 时只能学到近似；容量大于 teacher 时也无法超越 teacher 的信息（<strong>教师的误差是 student 误差的下界</strong>，除非引入外部信号 —— 这正是 verifier 的作用）。</li>
+<li><strong>蒸馏不产生新的多样性。</strong> 教师能给多少种&quot;正确但不同&quot;的答案，取决于它的采样参数与 prompt 族；合成数据的多样性上限等于生成过程的多样性上限，而不是&quot;无限&quot;。</li>
+</ol>
+<h4 id="h-12-自举反馈回路与模式坍缩">1.2 自举：反馈回路与模式坍缩<a class="anchor" href="#h-12-自举反馈回路与模式坍缩" aria-label="本节链接">#</a></h4>
+<p><strong>自举</strong>（bootstrapping / self-training / STaR / ReST 等）指用模型自己的输出（经过某种过滤）作为训练数据，然后再训练自己。这个循环是本节最需要小心的地方，因为它的失效是<strong>跨代</strong>的。</p>
+<p>把过程写成递推：第 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6151em;"></span><span class="mord mathnormal">t</span></span></span></span> 代模型 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 生成 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span> 个样本，用某个过滤器 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">F</span></span></span></span> 筛出 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7519em;"></span><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.7519em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">′</span></span></span></span></span></span></span></span></span></span></span></span> 个，再用它们（可能与真实数据混合）拟合出 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6389em;vertical-align:-0.2083em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">t</span><span class="mbin mtight">+</span><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2083em;"><span></span></span></span></span></span></span></span></span></span>。用离散分布（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">K</span></span></span></span> 个格）做最简模型、用计数 + 拉普拉斯平滑做拟合，就是代码 A 段的实验：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">t</span><span class="mbin mtight">+</span><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2083em;"><span></span></span></span></span></span></span><span class="mopen">[</span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mclose">]</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.5054em;vertical-align:-0.7693em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.7361em;"><span style="top:-2.3588em;"><span class="pstrut" style="height:3.0448em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6779em;"><span style="top:-2.989em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">′</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mord mathnormal" style="margin-right:0.0715em;">K</span></span></span><span style="top:-3.2748em;"><span class="pstrut" style="height:3.0448em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.7361em;"><span class="pstrut" style="height:3.0448em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.0448em;"><span style="top:-2.3987em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0315em;">k</span></span></span><span style="top:-3.2198em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mopen mtight">(</span><span class="mord mathnormal mtight">t</span><span class="mclose mtight">)</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.3013em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.7693em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.0448em;"><span style="top:-2.3987em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0315em;">k</span></span></span><span style="top:-3.2198em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mopen mtight">(</span><span class="mord mathnormal mtight">t</span><span class="mclose mtight">)</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.3013em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">#</span><span class="mopen">{</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">i</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≤</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8019em;"></span><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8019em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">′</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">:</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.3217em;vertical-align:-0.2769em;"></span><span class="mord"><span class="mord mathnormal">x</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.0448em;"><span style="top:-2.4231em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span><span style="top:-3.2198em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mopen mtight">(</span><span class="mord mathnormal mtight">t</span><span class="mclose mtight">)</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2769em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.3217em;vertical-align:-0.2769em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mclose">}</span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">x</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.0448em;"><span style="top:-2.4231em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span><span style="top:-3.2198em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mopen mtight">(</span><span class="mord mathnormal mtight">t</span><span class="mclose mtight">)</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2769em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∼</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span></span></p>
+<p><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0</span></span></span></span> 时这个映射是<strong>不可逆</strong>的：某个 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.3461em;vertical-align:-0.3013em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.0448em;"><span style="top:-2.3987em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0315em;">k</span></span></span><span style="top:-3.2198em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mopen mtight">(</span><span class="mord mathnormal mtight">t</span><span class="mclose mtight">)</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.3013em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0</span></span></span></span> 的格永远得到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">t</span><span class="mbin mtight">+</span><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2083em;"><span></span></span></span></span></span></span><span class="mopen">[</span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mclose">]</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0</span></span></span></span>，之后再也抽不到（支撑单向收缩）；<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5782em;vertical-align:-0.0391em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&gt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0</span></span></span></span> 时它可逆，但代价是所有零计数的格都被塞进一个 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0019em;vertical-align:-0.25em;"></span><span class="mord">1/</span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.7519em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">′</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mord mathnormal" style="margin-right:0.0715em;">K</span><span class="mclose">)</span></span></span></span> 量级的地板，于是&quot;从没被采样过&quot;与&quot;采样过但很少&quot;被混为一谈 —— 这正是有平滑时熵反而上升的来源。<strong>两种失败模式的分岔点就在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span> 是否为零上。</strong></p>
+<p>结果有两个必须分清的现象：</p>
+<p><strong>现象一：无平滑（纯 MLE）时，分布变尖、支撑收缩。</strong></p>
+<table>
+<thead>
+<tr>
+<th>代</th>
+<th>TV</th>
+<th>KL</th>
+<th>被低估的真实质量</th>
+<th>支撑格数</th>
+<th>熵</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>0</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.0742</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.0979</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.0042</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">93</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4.1224</span></span></span></span></td>
+</tr>
+<tr>
+<td>5</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.1865</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.4511</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.0299</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">84</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4.0352</span></span></span></span></td>
+</tr>
+<tr>
+<td>10</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.2798</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2.1256</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.0916</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">68</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">3.8470</span></span></span></span></td>
+</tr>
+<tr>
+<td>30</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.4152</span></span></span></span></td>
+<td>—</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.2711</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord"><span class="mord mathbf">50</span></span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord"><span class="mord mathbf">3.5240</span></span></span></span></span></td>
+</tr>
+</tbody></table>
+<p>机制很直接：<strong>低概率区域在有限样本下抽不到，纯 MLE 会把它的概率估成 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0</span></span></span></span>；一旦为 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0</span></span></span></span>，它以后永远抽不到。</strong> 于是质量单向地从尾部流向头部，30 代之后支撑格数从 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">93</span></span></span></span> 掉到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">50</span></span></span></span>（腰斩），被严重低估的真实质量从 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">0.4%</span></span></span></span> 涨到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">27.1%</span></span></span></span>。</p>
+<p><strong>现象二：有平滑时，不是不漂，而是换个方向漂 —— 质量漏向&quot;从没被采样过的区域&quot;。</strong></p>
+<table>
+<thead>
+<tr>
+<th>代</th>
+<th>TV</th>
+<th>KL</th>
+<th>被低估的真实质量</th>
+<th>支撑格数</th>
+<th>熵</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>0</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.0831</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.0426</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.0000</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">200</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4.2760</span></span></span></span></td>
+</tr>
+<tr>
+<td>5</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.2559</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.2881</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.0034</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">200</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4.5743</span></span></span></span></td>
+</tr>
+<tr>
+<td>10</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.3370</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.4356</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.0192</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">200</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4.7207</span></span></span></span></td>
+</tr>
+<tr>
+<td>30</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.5903</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1.2290</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.1948</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">200</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord"><span class="mord mathbf">4.8881</span></span></span></span></span></td>
+</tr>
+</tbody></table>
+<p><strong>注意熵的方向：无平滑时熵下降（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4.1224</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">→</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">3.5240</span></span></span></span>），有平滑时熵上升（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4.2760</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">→</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4.8881</span></span></span></span>）。</strong> 这不是矛盾，而是两种不同的失败：前者是&quot;坍缩成几个尖峰&quot;，后者是&quot;给从没被采样过的区域硬塞了一个均匀地板，学会了&#39;整个区间是均匀的&#39;这个假结构&quot;。工程上这两者都表现为&quot;下游指标不升或下降&quot;，但修法完全不同 —— <strong>所以分布级监控必须同时看熵的方向与覆盖率，只报一个标量是不够的。</strong></p>
+<blockquote>
+<p>一条常被误解的结论：<strong>平滑（或&quot;加一点随机性&quot;）不是坍缩的解药。</strong> 它只是把不可逆的支撑丢失换成了有偏的质量泄漏。真正的解药是<strong>外部锚定</strong> —— 每一代都注入一部分真实数据。</p>
+</blockquote>
+<p><strong>锚定阈值。</strong> 代码 A 段的第三张表扫了锚定比例 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">π</span></span></span></span>：</p>
+<table>
+<thead>
+<tr>
+<th><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span></th>
+<th><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">π</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0</span></span></span></span></th>
+<th><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.02</span></span></span></span></th>
+<th><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.05</span></span></span></span></th>
+<th><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.10</span></span></span></span></th>
+<th><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.20</span></span></span></span></th>
+<th><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.50</span></span></span></span></th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>0</strong>（纯 MLE）</td>
+<td>仍漂移</td>
+<td>仍漂移</td>
+<td>稳态（TV <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.212</span></span></span></span>）</td>
+<td>稳态（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.179</span></span></span></span>）</td>
+<td>稳态（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.130</span></span></span></span>）</td>
+<td>稳态（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.091</span></span></span></span>）</td>
+</tr>
+<tr>
+<td><strong>0.5</strong>（有平滑）</td>
+<td>仍漂移</td>
+<td>仍漂移</td>
+<td>仍漂移</td>
+<td>仍漂移</td>
+<td>稳态（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.201</span></span></span></span>）</td>
+<td>稳态（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.111</span></span></span></span>）</td>
+</tr>
+</tbody></table>
+<p>两个结论：① <strong>锚定比例存在阈值</strong>，低于它分布仍然逐代漂移；② <strong>阈值依赖模型的表达能力/平滑强度</strong>（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0</span></span></span></span> 时约 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">5%</span></span></span></span>，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.5</span></span></span></span> 时要到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">20%</span></span></span></span>）。而且即使进入稳态，<strong>稳态偏差也不是零</strong>（本例约 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.09</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∼</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.20</span></span></span></span> 的 TV）—— 合成数据与真实数据之间始终隔着一个由锚定比例与模型决定的距离。</p>
+<h4 id="h-13-改写表面不变性与语义漂移">1.3 改写：表面不变性与语义漂移<a class="anchor" href="#h-13-改写表面不变性与语义漂移" aria-label="本节链接">#</a></h4>
+<p><strong>改写</strong>（paraphrase / back-translation / instruction backtranslation）保持语义、改变表面形式。它的收益来源与上两条完全不同：它不增加&quot;新知识&quot;，它增加的是<strong>同一知识的不同表面实现</strong>，因此它针对的是模型学到的<strong>表面捷径</strong>（模板、措辞、格式）。</p>
+<p>改写有效与有害的条件因此也很清楚：</p>
+<table>
+<thead>
+<tr>
+<th>条件</th>
+<th>改写有效</th>
+<th>改写有害</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>任务对表面形式敏感（模板化评测、格式匹配）</td>
+<td>✔ 打破模板依赖</td>
+<td>—</td>
+</tr>
+<tr>
+<td>答案本身可核验</td>
+<td>✔ 改写后仍能核验</td>
+<td>—</td>
+</tr>
+<tr>
+<td>答案不可核验（开放生成）</td>
+<td>—</td>
+<td>✘ 错误被改写成十个流畅的错答案</td>
+</tr>
+<tr>
+<td>语义边界精细（否定、量词、条件）</td>
+<td>—</td>
+<td>✘ 语义漂移随改写步数累积</td>
+</tr>
+<tr>
+<td>与评测集同模板</td>
+<td>—</td>
+<td>✘ 模板同质化 = 第 1 章第 3 节的&quot;指令-评测同源&quot;</td>
+</tr>
+</tbody></table>
+<p>改写的三个必备检验：<strong>回译一致性</strong>（改回来是否等价）、<strong>可核验断言</strong>（把语义等价拆成若干条可判定的断言，逐条检查 —— 与第 1 节第 1.2 节的&quot;可判定判据&quot;是同一件事）、以及<strong>改写步数上限</strong>（多步改写的漂移是累积的，必须设上限并在每步检查）。</p>
+<h3 id="h-二坍缩的机制与可测的量">二、坍缩的机制与可测的量<a class="anchor" href="#h-二坍缩的机制与可测的量" aria-label="本节链接">#</a></h3>
+<h4 id="h-21-三种机制">2.1 三种机制<a class="anchor" href="#h-21-三种机制" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>机制</th>
+<th>来源</th>
+<th>表现</th>
+<th>能否靠加数据解决</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>统计近似误差</strong></td>
+<td>有限样本下低概率区域抽不到</td>
+<td>尾部质量流失、支撑收缩</td>
+<td>不能（样本再多也只是线性减缓，代数是乘积关系）</td>
+</tr>
+<tr>
+<td><strong>函数近似误差</strong></td>
+<td>模型表达不了尾部的结构（有平滑时会塞一个假地板）</td>
+<td>熵上升、分布变平</td>
+<td>不能（要改模型或改表示）</td>
+</tr>
+<tr>
+<td><strong>方差收缩 / 随机游走累积</strong></td>
+<td>每代在自己输出上重采样，log 空间误差累积</td>
+<td>TV 单调上涨，即使单代方差不变</td>
+<td>不能（要引入外部锚）</td>
+</tr>
+</tbody></table>
+<p>三条机制都指向同一个结论：<strong>递归自举的误差是&quot;代&quot;的乘积，不是&quot;样本量&quot;的函数。</strong> 增加每代样本量只能降低单代的方差，减慢漂移速度，改变不了漂移的方向。这与&quot;多喂几遍数据&quot;的收益饱和（第 1 章第 2 节）是同一个数学形态。</p>
+<h4 id="h-22-可测的量分布级门禁">2.2 可测的量（分布级门禁）<a class="anchor" href="#h-22-可测的量分布级门禁" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>怎么算</th>
+<th>能发现什么</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>TV / KL（对真实分布）</strong></td>
+<td>需要一份真实参考分布</td>
+<td>总体漂移；KL 对&quot;真实存在但模型没覆盖的区域&quot;特别敏感</td>
+</tr>
+<tr>
+<td><strong>被低估的真实质量</strong></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mop op-symbol small-op" style="position:relative;top:0em;">∑</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">true</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mopen">[</span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">model</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&lt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">0.1</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">true</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">]</span></span></span></span></td>
+<td>直接度量&quot;忘了哪些区域&quot;，比 TV 更可解释</td>
+</tr>
+<tr>
+<td><strong>支撑 / 覆盖率</strong></td>
+<td>概率超过阈值的位置数；文本任务里用 unique <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span>-gram 比例</td>
+<td>支撑收缩（无平滑坍缩）</td>
+</tr>
+<tr>
+<td><strong>熵</strong></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">−</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop op-symbol small-op" style="position:relative;top:0em;">∑</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop">lo<span style="margin-right:0.0139em;">g</span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">p</span></span></span></span></td>
+<td><strong>方向比大小重要</strong>：下降 = 变尖，上升 = 假均匀</td>
+</tr>
+<tr>
+<td><strong>自相似度</strong></td>
+<td>self-BLEU / 生成样本两两相似度分布的均值</td>
+<td>文本任务的多样性下降；对改写路线的模板同质化尤其敏感</td>
+</tr>
+</tbody></table>
+<p><strong>门禁的用法</strong>：把这些量按代记录，定义&quot;连续两代恶化且超过阈值&quot;为熔断条件。理由与第 3 章第 3 节的&quot;统计判据不能修复设计缺陷&quot;同源 —— 下游指标的噪声远大于这些分布级量的漂移，<strong>等到下游指标掉下来时已经漂了几代</strong>。</p>
+<h4 id="h-23-缓解手段与它们的代价">2.3 缓解手段与它们的代价<a class="anchor" href="#h-23-缓解手段与它们的代价" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>手段</th>
+<th>机制</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>真实数据锚定</strong></td>
+<td>每代注入 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">π</span></span></span></span> 比例真实数据，给出稳态</td>
+<td>阈值依赖模型（本例 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">5%</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∼</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">20%</span></span></span></span>）；稳态偏差非零</td>
+</tr>
+<tr>
+<td><strong>提高采样温度 / 加噪声</strong></td>
+<td>增加单代多样性，减缓支撑收缩</td>
+<td>引入错误（温度与正确率不是独立的）；不改变漂移方向</td>
+</tr>
+<tr>
+<td><strong>冻结真实核心集</strong></td>
+<td>保留一份永不参与生成的真实数据作为参考分布与验收</td>
+<td>需要维护；核心集本身也会过时（分布漂移）</td>
+</tr>
+<tr>
+<td><strong>换更&quot;宽&quot;的表示</strong></td>
+<td>减少函数近似误差（表达得了尾部）</td>
+<td>需要模型侧改动；不解决统计近似误差</td>
+</tr>
+<tr>
+<td><strong>只做一轮合成</strong></td>
+<td>不做递归（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span>），直接切断反馈回路</td>
+<td>放弃了&quot;自举扩量&quot;的收益 —— <strong>但这通常是最划算的选择</strong></td>
+</tr>
+</tbody></table>
+<p>最后一行值得强调：工程上最常见的正确决定是<strong>只做一轮</strong>（one-shot synthesis）。递归自举的收益是&quot;数据量可以继续增长&quot;，而它的代价是分布漂移 + 评价污染，且在多数项目里&quot;数据量不够&quot;并不是瓶颈。<strong>先证明一轮合成的收益是真的，再考虑第二轮。</strong></p>
+<h3 id="h-三评价污染合成管线让泄漏变成默认">三、评价污染：合成管线让泄漏变成默认<a class="anchor" href="#h-三评价污染合成管线让泄漏变成默认" aria-label="本节链接">#</a></h3>
+<h4 id="h-31-三条路径">3.1 三条路径<a class="anchor" href="#h-31-三条路径" aria-label="本节链接">#</a></h4>
+<p>承接第 1 章第 3 节（泄漏的因果分析：泄漏是因果图里一条&quot;训练时可见、部署时不可见&quot;的路径）与第 2 章第 2 节（近似去重），合成数据把污染从&quot;数据收集事故&quot;变成&quot;流程的默认结果&quot;，路径有三条：</p>
+<ol>
+<li><strong>教师记忆了评测集。</strong> 教师（尤其在它自己的训练里见过评测集时）会在那些题上表现得异常好。这些题被生成进合成流，student 学到的就不是&quot;能力&quot;而是&quot;答案&quot;。<strong>这条路径最隐蔽的地方是：你无法从合成数据本身看出它来自评测集</strong> —— 直到你去做跨集比对。</li>
+<li><strong>合成流与评测集同分布 / 同模板。</strong> 生成时用的 prompt 族、条件、格式如果与评测集同源，就会产生第 1 章第 3 节讲过的&quot;指令-评测同源&quot;泄漏：student 学到的是模板，而不是任务。</li>
+<li><strong>用同一个 judge 评自己生成的数据。</strong> 如果&quot;生成&quot;与&quot;评估&quot;用同一个模型（或同一家族），判据的盲区完全重合，评估结果会<strong>系统性偏高且无法自证</strong>。这与第 1 节第 2.3 节的&quot;一致地错&quot;是同一个机制。</li>
+</ol>
+<h4 id="h-32-检测与代价">3.2 检测与代价<a class="anchor" href="#h-32-检测与代价" aria-label="本节链接">#</a></h4>
+<p>代码 C 段把这条链路做成了一个可算的算例：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">500</span></span></span></span> 道评测题中 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">190</span></span></span></span> 道被污染（合成流里有对应的近重复条目），去污染的检出率 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.90</span></span></span></span>、误删率 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.02</span></span></span></span>（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">20000</span></span></span></span> 条训练数据）。</p>
+<table>
+<thead>
+<tr>
+<th>量</th>
+<th>值</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>真实水平（零污染）</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.7000</span></span></span></span></td>
+</tr>
+<tr>
+<td>去污染前的评测分</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.7950</span></span></span></span>（<strong>虚高 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">9.50</span></span></span></span> 点</strong>）</td>
+</tr>
+<tr>
+<td>去污染后的评测分</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.7125</span></span></span></span>（<strong>残余虚高 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1.25</span></span></span></span> 点</strong>）</td>
+</tr>
+<tr>
+<td>去污染命中的是污染条目</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">165</span></span></span></span> 条</td>
+</tr>
+<tr>
+<td>误删的干净训练数据</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">248</span></span></span></span> 条</td>
+</tr>
+</tbody></table>
+<p>三个读法：</p>
+<ul>
+<li><strong>虚高的量级由污染比例与&quot;见过答案的答对率&quot;决定</strong>，本例是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">9.5</span></span></span></span> 个点 —— 与许多&quot;合成数据提升了 X 个点&quot;的报告处在同一量级。<strong>在看到合成数据的提升时，第一个要排除的就是污染。</strong></li>
+<li><strong>残余虚高不为零</strong>，因为检出率 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord">0.90</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel"><span class="mrel"><span class="mord vbox"><span class="thinbox"><span class="rlap"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="inner"><span class="mord"><span class="mrel"></span></span></span><span class="fix"></span></span></span></span></span><span class="mspace nobreak"></span><span class="mrel">=</span></span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span>。这与第 2 章第 2 节的结论一致：去污染只能降低泄漏率，不能归零，所以<strong>报告里必须写残余泄漏率</strong>，而不是&quot;已去污染&quot;。</li>
+<li><strong>误删是静默成本</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">248</span></span></span></span> 条被删掉的干净数据不会在任何指标上出现，只会让模型在那些区域变差。这正是&quot;去污染的阈值是一个 PR 权衡&quot;的含义（第 2 章第 2 节）。</li>
+</ul>
+<h4 id="h-33-为什么合成--同源评测最危险">3.3 为什么&quot;合成 + 同源评测&quot;最危险<a class="anchor" href="#h-33-为什么合成--同源评测最危险" aria-label="本节链接">#</a></h4>
+<p>第 1 章第 3 节说过，泄漏破坏三样东西：泛化误差的<strong>估计</strong>（选错模型）、置信区间的<strong>独立性假设</strong>（低估方差）、决策的<strong>可逆性</strong>（上线后才发现）。合成数据让第一条变得尤其危险，因为：</p>
+<blockquote>
+<p><strong>污染与能力在分数上不可区分，而合成数据的收益又恰好是&quot;期望看到的&quot;。</strong> 一个团队看到合成数据带来 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">+</span><span class="mord">9</span></span></span></span> 点，它同时收到了&quot;方法有效&quot;与&quot;评测被污染&quot;两个假设，而这两个假设的验证方式完全不同（前者要看跨集泛化，后者要查数据交集）。<strong>没有跨集（或跨版本）验证的合成数据报告，不能作为决策依据。</strong></p>
+</blockquote>
+<p>工程上最小的防污染要求有三条：① 合成流与评测集做<strong>近重复扫描</strong>并报告残余泄漏率；② 保留一个<strong>从未参与过任何生成/训练</strong>的私有评测集（它的价值在于&quot;没被任何人见过&quot;）；③ 对教师做一次&quot;评测集暴露&quot;的假设声明 —— 你无法验证教师训练时见过什么，但你可以声明你按&quot;见过&quot;来做防护。</p>
+<p><figure><img class="md-img" src="content/courses/data-engineering/assets/chapter-4-figure-03.svg" alt="合成量越大，混批掉得越多" loading="lazy" decoding="async"><figcaption>合成量越大，混批掉得越多</figcaption></figure>
+</p>
+<h3 id="h-四何时有效何时有害条件表">四、何时有效、何时有害：条件表<a class="anchor" href="#h-四何时有效何时有害条件表" aria-label="本节链接">#</a></h3>
+<p>把上面的机制收成一张可测的条件表。<strong>每一行都能在动手之前估出来</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>条件（可测）</th>
+<th>合成有效</th>
+<th>合成有害</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>可判定的校验器</strong></td>
+<td>有（单元测试 / 类型检查 / 可执行 / 检索到证据 / 算术核对）</td>
+<td>无 —— 只能靠模型自评 → 确认偏误</td>
+</tr>
+<tr>
+<td><strong>真实数据锚定</strong></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7719em;vertical-align:-0.136em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">π</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≥</span></span></span></span> 阈值（本例 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">5%</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∼</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">20%</span></span></span></span>）</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">π</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0</span></span></span></span> 或低于阈值 → 逐代漂移</td>
+</tr>
+<tr>
+<td><strong>教师的知识势差</strong></td>
+<td>student 明显弱于 teacher（蒸馏有东西可学）</td>
+<td>teacher 与 student 同源同水平 → 只是复制自己的错误</td>
+</tr>
+<tr>
+<td><strong>教师的系统偏差</strong></td>
+<td>子群体偏差小，或该子群体有真实标注覆盖</td>
+<td>子群体偏差大且没有被真实数据覆盖（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.60</span></span></span></span> vs <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.05</span></span></span></span> 型的偏差）</td>
+</tr>
+<tr>
+<td><strong>多样性来源</strong></td>
+<td>来自 prompt 族 / 条件 / 外部结构（而非模型自身）</td>
+<td>只来自模型采样 → 多样性上限 = 模型自身</td>
+</tr>
+<tr>
+<td><strong>评测独立性</strong></td>
+<td>有未参与生成的私有集 + 残余泄漏率报告</td>
+<td>评测集与合成流同源（虚高 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">9.5</span></span></span></span> 点量级）</td>
+</tr>
+<tr>
+<td><strong>递归代数</strong></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span>（只做一轮）</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8193em;vertical-align:-0.136em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≥</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">3</span></span></span></span> 且没有分布级门禁</td>
+</tr>
+<tr>
+<td><strong>任务形态</strong></td>
+<td>有 verifier 的任务（代码、数学、结构化抽取、可执行）</td>
+<td>开放生成、主观判断、无法核验的结论</td>
+</tr>
+</tbody></table>
+<p><strong>动手前的五步决策清单</strong>（顺序不能换）：</p>
+<ol>
+<li><strong>先估 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0528em;">β</span></span></span></span> 与 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">η</span></span></span></span></strong>：教师在你关心的子群体上的偏差 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0528em;">β</span></span></span></span>，以及&quot;一条合成样本等价于多少条真实样本&quot;的折扣 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">η</span></span></span></span>。估不出这两者，后面所有配比讨论都是空谈。</li>
+<li><strong>先确认有没有 verifier</strong>。有 → 合成是放大器，把预算往校验压；没有 → 合成只能做<strong>一轮</strong>，且必须以真实数据锚定与验收为主。</li>
+<li><strong>先切环路</strong>：把&quot;生成&quot;与&quot;再训练&quot;解耦，明确这次合成是 one-shot 还是递归；如果是递归，必须写下代数上限与分布级熔断阈值。</li>
+<li><strong>先做去污染</strong>，再谈配比。污染会把配比实验的结论整体污染掉（第 3 章第 3 节的&quot;统计判据不能修复设计缺陷&quot;）。</li>
+<li><strong>再谈比例</strong>：进入下一节（配比、课程式排序、混合）。</li>
+</ol>
+<h3 id="h-五取舍与边界">五、取舍与边界<a class="anchor" href="#h-五取舍与边界" aria-label="本节链接">#</a></h3>
+<table>
+<thead>
+<tr>
+<th>取舍</th>
+<th>一端</th>
+<th>另一端</th>
+<th>怎么选</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>代数</strong></td>
+<td>一轮（安全、收益有限）</td>
+<td>多轮（量大、漂移累积）</td>
+<td>默认一轮；递归必须有锚定 + 分布门禁</td>
+</tr>
+<tr>
+<td><strong>平滑</strong></td>
+<td>无（支撑收缩、熵下降）</td>
+<td>有（假均匀、熵上升）</td>
+<td>都要锚定；平滑不解决问题</td>
+</tr>
+<tr>
+<td><strong>教师选择</strong></td>
+<td>最强（贵、可能记过评测集）</td>
+<td>同族同规模（便宜、无势差）</td>
+<td>有 verifier 时用最强；无 verifier 时先解决 verifier</td>
+</tr>
+<tr>
+<td><strong>教师偏差</strong></td>
+<td>靠真实标注覆盖（贵）</td>
+<td>靠 prompt/规则约束（便宜、不可靠）</td>
+<td>子群体必须有真实锚；覆盖率比总量重要</td>
+</tr>
+<tr>
+<td><strong>改写步数</strong></td>
+<td>1 步（漂移小）</td>
+<td>多步（多样性高）</td>
+<td>每步都要语义等价检验，设步数上限</td>
+</tr>
+<tr>
+<td><strong>验收口径</strong></td>
+<td>下游指标（相关但滞后）</td>
+<td>分布级指标（敏感但间接）</td>
+<td>两者都要：分布级做熔断，下游指标做结论</td>
+</tr>
+</tbody></table>
+<p><strong>三条边界</strong>：</p>
+<ol>
+<li><strong>合成数据无法修复&quot;教师不知道的东西&quot;。</strong> 它只能把教师已有的能力<strong>转移</strong>与<strong>复制</strong>。所以&quot;用合成数据补齐能力短板&quot;这个目标在逻辑上不成立 —— 短板来自教师本身没有的能力。这一点决定了合成数据在能力覆盖上的作用方向：它<strong>扩大已有能力的覆盖密度</strong>，不扩大能力的边界。</li>
+<li><strong>合成数据的收益与风险在同一个算子里。</strong> 教师越强，蒸馏的收益越大，同时&quot;教师记住了评测集&quot;的风险也越大；递归代数越多，数据量越大，漂移越多。<strong>不存在&quot;只取收益不承担风险&quot;的参数设置</strong>，只能按条件权衡。</li>
+<li><strong>&quot;合成数据看起来有效&quot;必须由跨集验证来支撑。</strong> 单集上的提升同时兼容&quot;方法有效&quot;与&quot;评测污染&quot;两个假设；区分它们必须靠一个<strong>没参与过生成</strong>的评测集，或者跨版本/跨时间的一致性检验（第 1 章第 3 节的六类泄漏审计）。</li>
+</ol>
+<h3 id="h-代码">代码<a class="anchor" href="#h-代码" aria-label="本节链接">#</a></h3>
+<p>一段代码，三段，全部使用<strong>合成数据</strong>（⚠️）：A 段把&quot;递归自举&quot;做成一个 200 格的离散分布实验，用每代 2000 条自生成样本做 MLE 重拟合，比较&quot;无平滑 / 有平滑 / 不同真实锚定比例&quot;三代以内的漂移，并给出分布级指标（TV、KL、被低估的真实质量、支撑格数、熵）；B 段把蒸馏的误差传播写成&quot;教师错误率 + 校验器 + 学习曲线缺口&quot;，扫描校验器严格度并给出最优值的<strong>条件</strong>，同时量化教师子群体偏差的放大；C 段把评测污染做成一个可算的算例，给出虚高、残余虚高与去污染的误删代价。纯标准库，固定种子，可复现。</p>
+<pre data-lang="python"><code class="language-python"># -*- coding: utf-8 -*-
+&quot;&quot;&quot;⚠️ 全部数据为合成数据。合成数据的三条路线：递归自举的模式坍缩、蒸馏的误差
+放大与 verifier 的收益、以及评测污染造成的虚高。纯标准库，固定种子，可复现。
+
+A 段：把模型简化成 200 格的离散分布（每代用 n 条自生成样本做 MLE 重拟合），
+      量化「递归无锚」如何让尾部与稀有模式逐代消失。
+B 段：把蒸馏简化成「教师错误率 + 校验器 + 学习曲线」，量化 verifier 严格度的最优值。
+C 段：把评测污染简化成「教师记住了多少评测题」，量化去污染前后的评测分差。
+&quot;&quot;&quot;
+import math, random
+from bisect import bisect_left
+
+# ==================================================== A. 递归自举的模式坍缩
+LO, HI, K = -10.0, 10.0, 200
+W = (HI - LO) / K
+EDGES = [LO + i * W for i in range(K + 1)]
+MIX = [(0.60, -2.0, 0.70), (0.25, 0.5, 0.50), (0.12, 2.5, 0.40), (0.03, 5.0, 0.35)]
+N_GEN = 2000          # 每代生成的样本数
+GENS = 15
+
+
+def gauss_mass(a, b, mu, sd):
+    f = lambda z: 0.5 * (1.0 + math.erf((z - mu) / (sd * math.sqrt(2.0))))
+    return f(b) - f(a)
+
+
+P_TRUE = [sum(w * gauss_mass(EDGES[i], EDGES[i + 1], mu, sd) for w, mu, sd in MIX)
+          for i in range(K)]
+P_TRUE = [max(p, 1e-12) for p in P_TRUE]
+S = sum(P_TRUE)
+P_TRUE = [p / S for p in P_TRUE]
+
+
+def sample(p, n, rng):
+    cum, acc = [], 0.0
+    for v in p:
+        acc += v
+        cum.append(acc)
+    return [bisect_left(cum, rng.random()) for _ in range(n)]
+
+
+def refit(idx, alpha):
+    &quot;&quot;&quot;MLE 重拟合：计数 + 拉普拉斯平滑 alpha。alpha=0 时「没被抽到的格永久归零」。&quot;&quot;&quot;
+    c = [0] * K
+    for i in idx:
+        c[i] += 1
+    tot = len(idx) + alpha * K
+    return [(c[i] + alpha) / tot for i in range(K)]
+
+
+def tv(p):    return 0.5 * sum(abs(p[i] - P_TRUE[i]) for i in range(K))
+def kl(p):    return sum(P_TRUE[i] * math.log(P_TRUE[i] / max(p[i], 1e-12)) for i in range(K))
+def band(p, a, b):
+    return sum(p[i] for i in range(K) if EDGES[i] &gt;= a and EDGES[i + 1] &lt;= b)
+
+
+def under(p):
+    &quot;&quot;&quot;被模型严重低估的真实区域质量：Σ p_true·1[p_model &lt; 0.1·p_true]。坍塌的核心量。&quot;&quot;&quot;
+    return sum(P_TRUE[i] for i in range(K) if p[i] &lt; 0.1 * P_TRUE[i])
+def supp(p):  return sum(1 for v in p if v &gt; 1e-5)
+def ent(p):   return -sum(v * math.log(v) for v in p if v &gt; 1e-12)
+
+
+print(&quot;=== A. 递归自举：每代用 %d 条自生成样本重拟合；真分布 4 个模式，最远的权重 0.03 ===&quot;
+      % N_GEN)
+
+
+def runA(alpha, pi, gens=GENS, seed=2024):
+    rng = random.Random(seed)
+    p = refit(sample(P_TRUE, N_GEN, rng), alpha)
+    out = []
+    for g in range(gens + 1):
+        out.append((g, tv(p), kl(p), under(p), supp(p), ent(p)))
+        n_syn = int(N_GEN * (1 - pi))
+        idx = sample(p, n_syn, rng) + (sample(P_TRUE, N_GEN - n_syn, rng) if pi &gt; 0 else [])
+        p = refit(idx, alpha)
+    return out
+
+
+print(&quot;  真分布：TV = 0 ｜ 被低估质量 = %.4f ｜ 支撑格数 = %d ｜ 熵 = %.4f&quot;
+      % (under(P_TRUE), supp(P_TRUE), ent(P_TRUE)))
+print(&quot;  --- 失败模式一（α=0，纯 MLE，无锚定）：分布变尖、支撑收缩 ---&quot;)
+print(&quot;  %-6s %-9s %-9s %-13s %-11s %s&quot; % (&quot;代&quot;, &quot;TV&quot;, &quot;KL&quot;, &quot;被低估质量&quot;, &quot;支撑格数&quot;, &quot;熵&quot;))
+for g, t, k, u, sp, e in runA(0.0, 0.0):
+    if g in (0, 1, 3, 5, 10, 20, 30):
+        print(&quot;  %-6d %-9.4f %-9.4f %-13.4f %-11d %.4f&quot; % (g, t, k, u, sp, e))
+print(&quot;  --- 失败模式二（α=0.5，有平滑，无锚定）：质量漏向没采样过的区域，熵反而上升 ---&quot;)
+print(&quot;  %-6s %-9s %-9s %-13s %-11s %s&quot; % (&quot;代&quot;, &quot;TV&quot;, &quot;KL&quot;, &quot;被低估质量&quot;, &quot;支撑格数&quot;, &quot;熵&quot;))
+for g, t, k, u, sp, e in runA(0.5, 0.0):
+    if g in (0, 1, 3, 5, 10, 20, 30):
+        print(&quot;  %-6d %-9.4f %-9.4f %-13.4f %-11d %.4f&quot; % (g, t, k, u, sp, e))
+
+print(&quot;  --- 锚定比例扫描：加多少真实数据才不漂 ---&quot;)
+print(&quot;  %-6s %-7s %-9s %-9s %-9s %-11s %-8s %s&quot;
+      % (&quot;α&quot;, &quot;π(真实)&quot;, &quot;TV@10&quot;, &quot;TV@20&quot;, &quot;TV@30&quot;, &quot;支撑@30&quot;, &quot;熵@30&quot;, &quot;判定&quot;))
+for alpha in (0.0, 0.5):
+    for pi in (0.0, 0.02, 0.05, 0.10, 0.20, 0.50):
+        o = dict((g, (t, k, u, sp, e)) for g, t, k, u, sp, e in runA(alpha, pi, 30))
+        drift = o[30][0] - o[10][0]
+        print(&quot;  %-6.1f %-7.2f %-9.4f %-9.4f %-9.4f %-11d %-8.4f %s&quot;
+              % (alpha, pi, o[10][0], o[20][0], o[30][0], o[30][3], o[30][4],
+                 &quot;仍漂移&quot; if drift &gt; 0.05 else &quot;进入稳态&quot;))
+print(&quot;  → 无锚定时 TV 单调上升（α=0：0.074→0.415，支撑 93→50 格）；锚定比例存在阈值，&quot;)
+print(&quot;    且阈值依赖模型：α=0 时约 5% 就够，α=0.5 时要 20% 才稳；稳态偏差始终不为零。&quot;)
+
+# ============================================ B. 蒸馏：误差放大与 verifier
+print(&quot;=== B. 蒸馏的误差传播：教师错误率 20%%，校验器严格度取多少 ===&quot;)
+print(&quot;  模型：接受集错误率 = ε(1-r) / [(1-ε)(1-f) + ε(1-r)]；&quot;)
+print(&quot;        学生错误率 = 接受集错误率 + 学习曲线缺口 0.25/sqrt(n_acc/1000)；&quot;)
+print(&quot;        f(r) = f0 + c·r² 是校验器的误杀率（越严越容易把对的也判错）。&quot;)
+EPS, N_SYN = 0.20, 20000
+base = EPS + 0.25 / math.sqrt(N_SYN / 1000.0)
+print(&quot;  基准（不校验）：学生错误率 = %.4f&quot; % base)
+for f0, c, vname in ((0.01, 0.02, &quot;强校验器（误杀率几乎不随严格度上升）&quot;),
+                     (0.02, 0.90, &quot;弱校验器（越严，误杀率涨得越快）&quot;)):
+    print(&quot;  --- %s ---&quot; % vname)
+    print(&quot;  %-10s %-9s %-14s %-11s %-11s %s&quot;
+          % (&quot;r&quot;, &quot;接受率&quot;, &quot;接受集错误率&quot;, &quot;有效样本量&quot;, &quot;学生错误率&quot;, &quot;对比基准&quot;))
+    best = (9.9, None)
+    for r in (0.0, 0.3, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99):
+        f = f0 + c * r * r
+        acc_rate = (1 - EPS) * (1 - f) + EPS * (1 - r)
+        err_acc = EPS * (1 - r) / acc_rate
+        n_acc = N_SYN * acc_rate
+        stu = err_acc + 0.25 / math.sqrt(max(n_acc, 1) / 1000.0)
+        if stu &lt; best[0]:
+            best = (stu, r)
+        print(&quot;  %-10.2f %-9.4f %-14.4f %-11.0f %-11.4f %+.1f%%&quot;
+              % (r, acc_rate, err_acc, n_acc, stu, (stu - base) / base * 100))
+    print(&quot;  → 最优 r* = %.2f（学生错误率 %.4f）%s&quot;
+          % (best[1], best[0],
+             &quot;；单调下降，即「越严越好」&quot; if best[1] &gt; 0.9 else &quot;；这是内点最优&quot;))
+print()
+print(&quot;  教师偏差的放大：学生错误率 ≈ ρ·(真实标注错误率 0.02) + (1-ρ)·(教师错误率)，ρ 为真实占比&quot;)
+print(&quot;  %-10s %-16s %-16s %s&quot; % (&quot;真实占比 ρ&quot;, &quot;子群体错误率&quot;, &quot;其余群体错误率&quot;, &quot;两者之差&quot;))
+for rho in (0.0, 0.10, 0.30, 0.50, 0.90, 0.99):
+    e_sub = rho * 0.02 + (1 - rho) * 0.60
+    e_rest = rho * 0.02 + (1 - rho) * 0.05
+    print(&quot;  %-10.2f %-16.4f %-16.4f %.4f&quot; % (rho, e_sub, e_rest, e_sub - e_rest))
+print(&quot;  → 要把 0.55 的群体差压到 0.05 以内，该子群体需要约 91% 以上是真实标注。&quot;)
+print(&quot;    合成数据无论多少条都只会把 0.60 这个偏差复现得更精确，不会把它拉回来。&quot;)
+
+# ============================================ C. 评价污染：虚高与去污染
+print()
+print(&quot;=== C. 评测污染：合成流里有 35% 与评测集近重复，去污染检出率 90%、误删率 2% ===&quot;)
+rng = random.Random(7)
+N_EVAL, N_TRAIN = 500, 20000
+CONTAM, DETECT, FP = 0.35, 0.90, 0.02
+SKILL, MEMO_RIGHT = 0.30, 0.95      # 学生的真实水平错误率 / 见过答案时的答对率
+contaminated = [rng.random() &lt; CONTAM for _ in range(N_EVAL)]
+caught = [contaminated[i] and rng.random() &lt; DETECT for i in range(N_EVAL)]
+
+
+def score(use):
+    &quot;&quot;&quot;学生对每道评测题的答对概率：训练里见过该题 → MEMO_RIGHT；否则 1-SKILL。&quot;&quot;&quot;
+    return sum(MEMO_RIGHT if use[i] else (1 - SKILL) for i in range(N_EVAL)) / N_EVAL
+
+
+raw, dec, honest = score(contaminated), score([contaminated[i] and not caught[i]
+                                               for i in range(N_EVAL)]), 1 - SKILL
+n_contam = sum(contaminated)
+n_caught = sum(caught)
+n_fp = int(round(FP * (N_TRAIN - n_contam * N_TRAIN // N_EVAL)))
+print(&quot;  被污染的评测题 ≈ %d / %d 道（对应约 %d 条污染训练数据 / %d 条）；&quot;
+      % (n_contam, N_EVAL, n_contam, N_TRAIN))
+print(&quot;  去污染命中 %d 条，另外误删约 %d 条干净训练数据&quot; % (n_caught, n_fp))
+print(&quot;  真实水平（零污染）= %.4f ｜ 去污染前 = %.4f（虚高 %.2f 点）｜ 去污染后 = %.4f（残余虚高 %.2f 点）&quot;
+      % (honest, raw, (raw - honest) * 100, dec, (dec - honest) * 100))
+print(&quot;  → 残余虚高来自漏检的 %d 条（检出率 90%% 不等于 100%%）；误删 %d 条是这次去污染的代价，&quot;
+      % (n_contam - n_caught, n_fp))
+print(&quot;    它不会被任何指标发现，只会让模型在那些区域变差。&quot;)</code></pre>
+<p>实际输出（Python 3.14.5 / 纯标准库，固定种子）：</p>
+<pre><code>=== A. 递归自举：每代用 2000 条自生成样本重拟合；真分布 4 个模式，最远的权重 0.03 ===
+  真分布：TV = 0 ｜ 被低估质量 = 0.0000 ｜ 支撑格数 = 110 ｜ 熵 = 4.1528
+  --- 失败模式一（α=0，纯 MLE，无锚定）：分布变尖、支撑收缩 ---
+  代      TV        KL        被低估质量         支撑格数        熵
+  0      0.0742    0.0979    0.0042        93          4.1224
+  1      0.1168    0.1720    0.0064        89          4.0937
+  3      0.1633    0.3875    0.0145        85          4.0627
+  5      0.1865    0.4511    0.0299        84          4.0352
+  10     0.2798    2.1256    0.0916        68          3.8470
+  --- 失败模式二（α=0.5，有平滑，无锚定）：质量漏向没采样过的区域，熵反而上升 ---
+  代      TV        KL        被低估质量         支撑格数        熵
+  0      0.0831    0.0426    0.0000        200         4.2760
+  1      0.1312    0.0881    0.0000        200         4.3462
+  3      0.2001    0.1899    0.0034        200         4.4870
+  5      0.2559    0.2881    0.0034        200         4.5743
+  10     0.3370    0.4356    0.0192        200         4.7207
+  --- 锚定比例扫描：加多少真实数据才不漂 ---
+  α      π(真实)   TV@10     TV@20     TV@30     支撑@30       熵@30     判定
+  0.0    0.00    0.2798    0.3900    0.4152    50          3.5240   仍漂移
+  0.0    0.02    0.2350    0.2966    0.3099    72          3.7965   仍漂移
+  0.0    0.05    0.2305    0.2353    0.2117    78          3.9365   进入稳态
+  0.0    0.10    0.1936    0.1668    0.1792    88          4.0124   进入稳态
+  0.0    0.20    0.1393    0.1293    0.1304    93          4.0936   进入稳态
+  0.0    0.50    0.1016    0.0895    0.0907    95          4.1404   进入稳态
+  0.5    0.00    0.3370    0.4865    0.5903    200         4.8881   仍漂移
+  0.5    0.02    0.2935    0.4201    0.4927    200         4.8489   仍漂移
+  0.5    0.05    0.2655    0.3306    0.3664    200         4.8159   仍漂移
+  0.5    0.10    0.2287    0.2495    0.2875    200         4.6752   仍漂移
+  0.5    0.20    0.1776    0.1749    0.2011    200         4.5611   进入稳态
+  0.5    0.50    0.1127    0.1061    0.1108    200         4.3969   进入稳态
+  → 无锚定时 TV 单调上升（α=0：0.074→0.415，支撑 93→50 格）；锚定比例存在阈值，
+    且阈值依赖模型：α=0 时约 5% 就够，α=0.5 时要 20% 才稳；稳态偏差始终不为零。
+=== B. 蒸馏的误差传播：教师错误率 20%%，校验器严格度取多少 ===
+  模型：接受集错误率 = ε(1-r) / [(1-ε)(1-f) + ε(1-r)]；
+        学生错误率 = 接受集错误率 + 学习曲线缺口 0.25/sqrt(n_acc/1000)；
+        f(r) = f0 + c·r² 是校验器的误杀率（越严越容易把对的也判错）。
+  基准（不校验）：学生错误率 = 0.2559
+  --- 强校验器（误杀率几乎不随严格度上升） ---
+  r          接受率       接受集错误率         有效样本量       学生错误率       对比基准
+  0.00       0.9920    0.2016         19840       0.2577      +0.7%
+  0.30       0.9306    0.1504         18611       0.2084      -18.6%
+  0.50       0.8880    0.1126         17760       0.1719      -32.8%
+  0.60       0.8662    0.0924         17325       0.1524      -40.4%
+  0.70       0.8442    0.0711         16883       0.1319      -48.4%
+  0.80       0.8218    0.0487         16435       0.1103      -56.9%
+  0.90       0.7990    0.0250         15981       0.0876      -65.8%
+  0.95       0.7876    0.0127         15751       0.0757      -70.4%
+  0.99       0.7783    0.0026         15566       0.0659      -74.2%
+  → 最优 r* = 0.99（学生错误率 0.0659）；单调下降，即「越严越好」
+  --- 弱校验器（越严，误杀率涨得越快） ---
+  r          接受率       接受集错误率         有效样本量       学生错误率       对比基准
+  0.00       0.9840    0.2033         19680       0.2596      +1.4%
+  0.30       0.8592    0.1629         17184       0.2233      -12.8%
+  0.50       0.7040    0.1420         14080       0.2087      -18.5%
+  0.60       0.6048    0.1323         12096       0.2042      -20.2%
+  0.70       0.4912    0.1221         9824        0.2019      -21.1%
+  0.80       0.3632    0.1101         7264        0.2029      -20.7%
+  0.90       0.2208    0.0906         4416        0.2095      -18.1%
+  0.95       0.1442    0.0693         2884        0.2166      -15.4%
+  0.99       0.0803    0.0249         1607        0.2221      -13.2%
+  → 最优 r* = 0.70（学生错误率 0.2019）；这是内点最优
+
+  教师偏差的放大：学生错误率 ≈ ρ·(真实标注错误率 0.02) + (1-ρ)·(教师错误率)，ρ 为真实占比
+  真实占比 ρ     子群体错误率           其余群体错误率          两者之差
+  0.00       0.6000           0.0500           0.5500
+  0.10       0.5420           0.0470           0.4950
+  0.30       0.4260           0.0410           0.3850
+  0.50       0.3100           0.0350           0.2750
+  0.90       0.0780           0.0230           0.0550
+  0.99       0.0258           0.0203           0.0055
+  → 要把 0.55 的群体差压到 0.05 以内，该子群体需要约 91% 以上是真实标注。
+    合成数据无论多少条都只会把 0.60 这个偏差复现得更精确，不会把它拉回来。
+
+=== C. 评测污染：合成流里有 35% 与评测集近重复，去污染检出率 90%、误删率 2% ===
+  被污染的评测题 ≈ 190 / 500 道（对应约 190 条污染训练数据 / 20000 条）；
+  去污染命中 165 条，另外误删约 248 条干净训练数据
+  真实水平（零污染）= 0.7000 ｜ 去污染前 = 0.7950（虚高 9.50 点）｜ 去污染后 = 0.7125（残余虚高 1.25 点）
+  → 残余虚高来自漏检的 25 条（检出率 90% 不等于 100%）；误删 248 条是这次去污染的代价，
+    它不会被任何指标发现，只会让模型在那些区域变差。</code></pre>
+<p><strong>九处实现决策的理由：</strong></p>
+<ul>
+<li><strong>A 段用&quot;离散直方图 + 计数拟合&quot;而不是神经网络</strong>：坍缩的三种机制里，统计近似误差与方差累积与模型规模无关，用 200 个格就能完整复现。神经网络会让实验慢几个数量级，却不会让机制更清楚。<strong>模型的简单性是这里的方法论要求，不是妥协。</strong></li>
+<li><strong>A 段同时跑 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0</span></span></span></span> 与 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.5</span></span></span></span></strong>：这是本节最有信息量的一处对照。只跑一种会得出错误结论（&quot;加平滑就好了&quot;或&quot;一定会坍缩&quot;），两种一起看才能得出&quot;平滑只换了失败方式&quot;。</li>
+<li><strong>A 段把&quot;被低估的真实质量&quot;单独列为一个指标</strong>：TV 与 KL 是总体量，说不清&quot;模型到底忘了哪一块&quot;。<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mop op-symbol small-op" style="position:relative;top:0em;">∑</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">true</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord">1</span><span class="mopen">[</span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">model</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&lt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">0.1</span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">true</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">]</span></span></span></span> 直接指向&quot;应该覆盖但没覆盖&quot;的质量，它与&quot;支撑格数&quot;配合可以区分&quot;变尖&quot;与&quot;漏掉一小块&quot;。</li>
+<li><strong>A 段的锚定是&quot;每代混入 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">π</span></span></span></span> 比例的真实样本&quot;而不是&quot;第一代用真实数据初始化&quot;</strong>：这是锚定的正确含义 —— 只要反馈回路还开着，真实数据就必须<strong>持续</strong>进入，初始化一次不构成锚。</li>
+<li><strong>A 段用&quot;TV@30 与 TV@10 的差是否超过 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.05</span></span></span></span>&quot;判定稳态</strong>：不用&quot;TV@30 与 TV@20 的差&quot;，因为收敛是渐近的，最后两代的差会在临界点附近任意小；与第 10 代比较能区分&quot;缓慢但持续漂移&quot;与&quot;真正稳定&quot;。</li>
+<li><strong>B 段把校验器建模成 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="mclose">)</span></span></span></span> 两个可测量</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span></span></span></span> = 召回（漏放的真错），<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span></span></span></span> = 误杀（拒掉的真对）。这两个量在一批人工核验过的样本上可以直接测出来 —— <strong>校验器是一个可以被评测的组件，而不是一个&quot;信不信&quot;的选择</strong>。</li>
+<li><strong>B 段故意给出两种校验器并让它们的最优解不同</strong>：强校验器（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span></span></span></span> 几乎不随严格度上升）下最优是&quot;越严越好&quot;（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6887em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6887em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.99</span></span></span></span>）；弱校验器（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">0.02</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">0.90</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span>）下最优是<strong>内点</strong>（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6887em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6887em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.70</span></span></span></span>）。<strong>&quot;越严越好&quot;不是一个立场，是一个关于 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="mclose">)</span></span></span></span> 的条件</strong> —— 这正是本节要传达的写法。</li>
+<li><strong>B 段的偏差表用&quot;真实占比 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">ρ</span></span></span></span> 的线性混合&quot;而不是模拟一次训练</strong>：真实的作用机制是&quot;学生学到的错误率介于两个来源之间&quot;，一阶近似足以给出量级（要压平 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.55</span></span></span></span> 的群体差需要 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6776em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">ρ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.91</span></span></span></span>）。代码里明确标注了这是近似，避免把量级当成精确定律。</li>
+<li><strong>C 段把&quot;污染&quot;实现成&quot;评测题在训练流里有近重复条目&quot;</strong>，而不是&quot;教师直接背诵&quot;：前者是可检测、可去污染的形态（对应第 2 章第 2 节的工具），后者无法从数据本身发现。<strong>用可检测的形式做算例，结论才能落到流程上。</strong></li>
+<li>⚠️ 本段代码是<strong>教学实现</strong>：离散分布、总体规模 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2000</span></span></span></span> 条/代、代数 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7719em;vertical-align:-0.136em;"></span><span class="mrel">≤</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">30</span></span></span></span>。真实系统的分布是文本、每代样本量在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">5</span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∼</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">9</span></span></span></span></span></span></span></span></span></span></span> 量级、代数通常 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7719em;vertical-align:-0.136em;"></span><span class="mrel">≤</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">3</span></span></span></span>。<strong>不要把这些数外推</strong>；可外推的是三条：① 漂移随代数累积、与样本量只呈线性缓解；② 锚定存在阈值且阈值依赖模型；③ 校验器的最优严格度由 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="mclose">)</span></span></span></span> 的权衡决定，而不是由&quot;严一点更安全&quot;决定。</li>
+</ul>
+<h3 id="h-练习">练习<a class="anchor" href="#h-练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><p><strong>找到你这份分布上的锚定阈值</strong>：把 A 段的真分布换成你自己的（例如三个模式、权重 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">0.7/0.2/0.1</span></span></span></span>，或用一个真实的文本 token 频率表）。
+（a）扫 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5782em;vertical-align:-0.0391em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">π</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">{</span><span class="mord">0</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">0.01</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">0.02</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">0.05</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">0.1</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">0.2</span><span class="mclose">}</span></span></span></span>，报告 TV@30 与&quot;是否稳态&quot;，找出阈值；
+（b）把每代样本量从 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2000</span></span></span></span> 降到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">500</span></span></span></span> 再升到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">8000</span></span></span></span>，报告阈值如何变化；
+（c）用 (a)(b) 说明：<strong>&quot;锚定 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">10%</span></span></span></span> 就够&quot;这类结论能不能跨任务复用？</strong>（提示：阈值同时依赖模型表达力、样本量与分布的尾部权重）</p>
+</li>
+<li><p><strong>区分两种坍缩</strong>：设计一个实验，使 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0</span></span></span></span> 与 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.5</span></span></span></span> 的 TV 曲线<strong>交叉</strong>（前期一种更好、后期另一种更好）。
+（a）给出能造成交叉的参数设置并画出（列出）两条曲线；
+（b）说明交叉点的位置由什么决定；
+（c）如果只看第 3 代的 TV，会得出什么错误结论？这对&quot;合成数据实验至少要看几代&quot;意味着什么？</p>
+</li>
+<li><p><strong>校验器的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="mclose">)</span></span></span></span> 从哪来</strong>：为你熟悉的一个任务（例如&quot;生成的 SQL 是否可执行并返回预期行数&quot;）设计一个校验器。
+（a）写出它的召回 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span></span></span></span> 与误杀 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span></span></span></span> 的<strong>测量方案</strong>（需要多少人工核验样本、怎么保证这些样本不是生成分布的一个偏样本）；
+（b）把 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="mclose">)</span></span></span></span> 画成一条曲线（用真实的测量点，而不是猜），判断它属于 B 段的&quot;强&quot;还是&quot;弱&quot;；
+（c）据此给出严格度 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6887em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6887em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span></span></span></span></span></span></span></span> 的建议值，并说明如果 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6887em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6887em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span></span></span></span></span></span></span></span> 处接受率只有 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">20%</span></span></span></span>，你的下一步动作是什么。</p>
+</li>
+<li><p><strong>One-shot vs 递归的收益账</strong>：设每代生成 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span> 条的成本是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7167em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0359em;">g</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span></span>、校验成本 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0359em;">v</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>、通过率 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span></span></span></span>；合成样本的有效折扣 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">η</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.5</span></span></span></span>（第 4 节会给出估法），学生误差模型 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">E</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.0647em;vertical-align:-0.3147em;"></span><span class="mord mathnormal">A</span><span class="mord">/</span><span class="mord sqrt"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.7253em;"><span class="svg-align" style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord" style="padding-left:0.833em;"><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">eff</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span><span style="top:-2.6853em;"><span class="pstrut" style="height:3em;"></span><span class="hide-tail" style="min-width:0.853em;height:1.08em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="1.08em" viewBox="0 0 400000 1080" preserveAspectRatio="xMinYMin slice"><path d="M95,702
+c-2.7,0,-7.17,-2.7,-13.5,-8c-5.8,-5.3,-9.5,-10,-9.5,-14
+c0,-2,0.3,-3.3,1,-4c1.3,-2.7,23.83,-20.7,67.5,-54
+c44.2,-33.3,65.8,-50.3,66.5,-51c1.3,-1.3,3,-2,5,-2c4.7,0,8.7,3.3,12,10
+s173,378,173,378c0.7,0,35.3,-71,104,-213c68.7,-142,137.5,-285,206.5,-429
+c69,-144,104.5,-217.7,106.5,-221
+l0 -0
+c5.3,-9.3,12,-14,20,-14
+H400000v40H845.2724
+s-225.272,467,-225.272,467s-235,486,-235,486c-2.7,4.7,-9,7,-19,7
+c-6,0,-10,-1,-12,-3s-194,-422,-194,-422s-65,47,-65,47z
+M834 80h400000v40h-400000z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.3147em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.0085em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0528em;">β</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0359em;">π</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span>，其中 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">π</span></span></span></span> 随代数上升。
+（a）在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">1</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">2</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">3</span></span></span></span> 下算出最优的总误差与最优预算分配；
+（b）找出&quot;第二轮开始收益为负&quot;的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0528em;">β</span></span></span></span> 阈值；
+（c）说明为什么这个阈值与教师偏差的关系比与数据量的关系更紧。</p>
+</li>
+<li><p><strong>污染审计</strong>：取 C 段，把检出率从 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.90</span></span></span></span> 改成 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.60</span></span></span></span> 与 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.99</span></span></span></span>。
+（a）报告虚高、残余虚高与误删率；
+（b）把误删率从 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.02</span></span></span></span> 改到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.10</span></span></span></span>，重跑，说明&quot;误删的代价&quot;为什么无法从评测分上看到；
+（c）设计一个<strong>不只依赖近重复检测</strong>的污染发现手段（提示：跨集泛化差、时间切分、canary 样本注入），并说明它需要什么基础设施。</p>
+</li>
+<li><p><strong>协议落地</strong>：为一个&quot;用合成数据补足长尾意图&quot;的项目写一份合成数据验收协议。
+（a）写明分布级熔断指标（至少两个）与阈值、代数上限、锚定比例下限；
+（b）写明 teacher 的评测集暴露假设、去污染方案与残余泄漏率的上报口径；
+（c）写明&quot;合成有效&quot;的判定需要跨集证据的形式（哪个集、多少题、与合成流有无交集）；
+（d）给出一个具体的、会让你<strong>停止合成</strong>的观测结果。</p>
+</li>
+</ol>
+<h3 id="h-小结">小结<a class="anchor" href="#h-小结" aria-label="本节链接">#</a></h3>
+<ul>
+<li><strong>三条路线的收益来源不同</strong>：蒸馏靠软标签携带的类间结构（有限数据下更高效），自举靠伪标签的量，改写靠表面不变性。因此失效模式也不同：系统错误复制 / 模式坍缩 / 语义漂移。</li>
+<li><strong>蒸馏的风险不能靠调参消除</strong>：教师错误是<strong>共享</strong>的，不会被平均掉。代码实测：子群体偏差 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.60</span></span></span></span> vs <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.05</span></span></span></span> 时，<strong>要把群体差压到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.05</span></span></span></span> 以内，该子群体需要约 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">91%</span></span></span></span> 以上是真实标注</strong>。教师的误差是 student 误差的下界。</li>
+<li><strong>递归自举的坍缩有两种形态，熵的方向可以区分它们</strong>：无平滑时支撑从 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">93</span></span></span></span> 格掉到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">50</span></span></span></span> 格、熵从 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4.1224</span></span></span></span> 降到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">3.5240</span></span></span></span>（变尖）；有平滑时支撑保持 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">200</span></span></span></span> 格、熵从 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4.2760</span></span></span></span> <strong>升到</strong> <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4.8881</span></span></span></span>（质量漏向没采样过的区域，学会一个假均匀地板）。两者的 TV 都在单调上涨（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.074</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">→</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.415</span></span></span></span> / <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.083</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">→</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.590</span></span></span></span>）。</li>
+<li><strong>平滑不是解药，锚定才是</strong>。锚定比例存在阈值，且<strong>阈值依赖模型</strong>（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0</span></span></span></span> 约 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">5%</span></span></span></span>，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.5</span></span></span></span> 要到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">20%</span></span></span></span>）。即使进入稳态，稳态偏差也非零（TV 约 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.09</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∼</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.20</span></span></span></span>）。工程上最划算的默认选择往往是 <strong>one-shot（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span>）</strong>：直接切断反馈回路。</li>
+<li><strong>校验器是合成数据唯一的放大器</strong>：接受集错误率可从 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.2016</span></span></span></span> 压到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.0026</span></span></span></span>（教师 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.20</span></span></span></span>）。但严格度不是&quot;越严越好&quot;，而是一个可算的超参 —— 强校验器下最优是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6887em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6887em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.99</span></span></span></span>（单调），弱校验器（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">0.02</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">0.90</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span>）下最优是内点 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6887em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6887em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.70</span></span></span></span>。<strong>判据是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="mclose">)</span></span></span></span> 的形状，不是立场的强弱。</strong></li>
+<li><strong>评价污染与能力在分数上不可区分</strong>：代码 C 段的虚高是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">9.50</span></span></span></span> 个点，去污染后残余 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1.25</span></span></span></span> 点，代价是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">248</span></span></span></span> 条误删。<strong>没有跨集验证的合成数据报告不能作为决策依据。</strong></li>
+<li><strong>条件表比立场表有用</strong>：有 verifier、有真实锚、有知识势差、有多样性外部来源、有未参与生成的私有评测集 → 合成是放大器；缺任何一条，它就是确认偏误的加速器。</li>
+<li><strong>合成数据无法修复&quot;教师不知道的东西&quot;</strong>：它扩大已有能力的覆盖密度，不扩大能力的边界。这一点决定了&quot;用合成补齐短板&quot;在逻辑上不成立。</li>
+</ul>
+<blockquote>
+<p>下一节：<strong>合成与真实数据的混合：配比、课程式排序与去污染</strong> —— 到这里三次讨论都停在&quot;要不要用合成&quot;上。下一节处理&quot;用了之后怎么放&quot;：合成:真实的配比 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">π</span></span></span></span> 有一个由&quot;教师偏差 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0528em;">β</span></span></span></span>&quot;与&quot;合成折扣 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">η</span></span></span></span>&quot;共同决定的最优值，排序（混批 vs 合成先、真实后退火）在真实标签干净与脏时结论相反，而去污染必须同时防&quot;训练→评测&quot;与&quot;评测→训练&quot;两个方向。最后一节会把生成、校验、去污染、配比、冻结装成一条可运行的流程，并给出一个完整的数值算例与预算分配。</p>
+</blockquote>

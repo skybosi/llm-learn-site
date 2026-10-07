@@ -1,0 +1,119 @@
+<h2 id="h-多路召回">多路召回<a class="anchor" href="#h-多路召回" aria-label="本节链接">#</a></h2>
+<blockquote>
+<p>排序模型再强，也只能在&quot;已经捞出来的几百个候选&quot;里挑。如果候选池里根本没有用户会喜欢的物品，排序再准也白搭。本课回到漏斗的最上游——召回，讲清楚工业界为什么几乎不用&quot;单一路召回&quot;，而是用<strong>多路召回</strong>拼出一张尽量无死角的候选网。</p>
+</blockquote>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-召回阶段的任务与约束">1. 召回阶段的任务与约束<a class="anchor" href="#h-1-召回阶段的任务与约束" aria-label="本节链接">#</a></h4>
+<p>召回（recall / matching）的任务是：在毫秒级时延内，从<strong>百万甚至上亿</strong>的物品池里，快速挑出几百到几千个&quot;可能感兴趣&quot;的候选，交给后面的粗排、精排。它面对两个硬约束：</p>
+<ul>
+<li><strong>规模大</strong>：不能像精排那样给每个物品都跑一遍重模型，必须用&quot;轻量 + 索引&quot;的方式快速裁剪。</li>
+<li><strong>时延低</strong>：用户打开 App 到看到推荐，全程只有几百毫秒，召回只能占其中一小部分。</li>
+</ul>
+<p>因此召回的核心取舍是：<strong>用精度换速度与覆盖面</strong>。召回阶段允许&quot;捞进来一些不那么准的&quot;，但绝不能&quot;漏掉真正会点击的&quot;。评判召回好坏，看的不是排序精度，而是<strong>召回率</strong>（真正感兴趣的物品里，有多少被捞进来了）和<strong>覆盖率</strong>。</p>
+<h4 id="h-2-为什么必须多路">2. 为什么必须&quot;多路&quot;<a class="anchor" href="#h-2-为什么必须多路" aria-label="本节链接">#</a></h4>
+<p>如果只用一路召回（比如只做 ItemCF），会有一个致命弱点：<strong>每种召回策略都有自己的盲区</strong>。举几个典型的&quot;盲区&quot;：</p>
+<ul>
+<li><strong>ItemCF 协同过滤</strong>：只推荐&quot;和用户历史行为共现过的相似物品&quot;，对<strong>新用户（没有历史行为）</strong>和<strong>新物品（没有被共现过）</strong>无能为力。</li>
+<li><strong>热门召回</strong>：能兜底冷启动，但千人一面，没有个性化，长期推荐会造成&quot;信息茧房&quot;。</li>
+<li><strong>向量召回</strong>：擅长语义泛化，但可能召回&quot;语义相似却已看过&quot;的重复内容，且训练门槛高。</li>
+</ul>
+<p>没有任何单一策略能同时解决&quot;个性化、冷启动、多样性、时效性&quot;四个需求。<strong>多路召回</strong>的思路就是：<strong>并行地跑很多路召回，每路负责覆盖一类需求，最后把各路结果合并、去重、截断</strong>。这就像用一张&quot;渔网&quot;去捕鱼——单根线有洞，多张网叠在一起才能把鱼兜住。</p>
+<p><figure><img class="md-img" src="content/courses/recommendation-systems/assets/chapter-5-figure-01.svg" alt="多路召回并行捞候选再合并" loading="lazy" decoding="async"><figcaption>多路召回并行捞候选再合并</figcaption></figure>
+</p>
+<h4 id="h-3-常见的几路召回">3. 常见的几路召回<a class="anchor" href="#h-3-常见的几路召回" aria-label="本节链接">#</a></h4>
+<p>工业界通常会根据业务需求，组合下面几路：</p>
+<ul>
+<li><strong>协同过滤召回</strong>：ItemCF / UserCF，利用&quot;物以类聚、人以群分&quot;，是个性化的基本盘（第 2 章学过）。</li>
+<li><strong>向量召回（双塔 + ANN）</strong>：把用户和物品编码成向量，用近似最近邻检索，能召回&quot;没见过共现但语义相近&quot;的物品，是近年最主流的一路（下一课细讲）。</li>
+<li><strong>热门 / 兜底召回</strong>：全局热门、类目热门、地域热门，负责新用户和新物品的冷启动。</li>
+<li><strong>兴趣标签召回</strong>：给用户和物品都打标签（或类目），按标签匹配度召回，可解释性强。</li>
+<li><strong>图召回</strong>：在&quot;用户-物品&quot;二分图上做随机游走（如 PersonalRank），捕捉多跳关系，能挖出&quot;你朋友也喜欢&quot;这类更远的关联。</li>
+<li><strong>时效 / 新鲜度召回</strong>：召回新发布的物品，或按时间衰减给近期内容加权，保证推荐流有新鲜血液。</li>
+</ul>
+<p>各路召回的量级通常不一样，比如热门召回给 100 个、向量召回给 400 个、ItemCF 给 300 个，合并后大约上千，再截断交给粗排。</p>
+<h4 id="h-4-合并策略加权去重与冷启动保底">4. 合并策略：加权、去重与冷启动保底<a class="anchor" href="#h-4-合并策略加权去重与冷启动保底" aria-label="本节链接">#</a></h4>
+<p>多路召回的合并不是简单拼接，有几个关键动作：</p>
+<ol>
+<li><strong>打分归一化</strong>：各路召回的分数量纲不同（ItemCF 是相似度、热门是计数、向量是内积），不能直接相加比较。常见做法是把每路分数做 min-max 归一化，再按一路权重加权融合。</li>
+<li><strong>去重</strong>：同一个物品可能被多路召回，合并时按物品 ID 去重，分数可以取各路之和（多路都推荐它，说明它更可信）或取最大。</li>
+<li><strong>配额与保底</strong>：给每路一个数量配额，同时保证&quot;冷启动路&quot;（热门/标签）至少占一定比例，避免新物品永远没曝光。</li>
+</ol>
+<p>还有一个容易被忽略的点：<strong>新物品冷启动</strong>。协同过滤和向量召回都偏向&quot;已有历史&quot;的物品，新物品天然吃亏。所以要专门留一路&quot;新物品召回&quot;（按发布时间和类目推送），并在合并时给它保底曝光量，让它积累第一批反馈数据。</p>
+<h3 id="h-二可运行示例">二、可运行示例<a class="anchor" href="#h-二可运行示例" aria-label="本节链接">#</a></h3>
+<h4 id="h-示例-1手写-itemcf-召回">示例 1：手写 ItemCF 召回<a class="anchor" href="#h-示例-1手写-itemcf-召回" aria-label="本节链接">#</a></h4>
+<p>先构造用户-物品交互矩阵，算物品间余弦相似度，再为一个用户召回&quot;他喜欢过的物品的相似物品&quot;。</p>
+<pre data-lang="python"><code class="language-python">import numpy as np
+
+# 交互矩阵：5 个用户 × 6 个物品，1 表示喜欢/点击
+R = np.array([
+    [1, 1, 0, 0, 0, 0],   # u0
+    [1, 0, 1, 0, 0, 0],   # u1
+    [0, 1, 0, 1, 0, 0],   # u2
+    [0, 0, 1, 1, 1, 0],   # u3
+    [0, 0, 0, 1, 0, 1],   # u4
+])
+
+def cosine_sim(A):
+    &quot;&quot;&quot;计算列向量两两之间的余弦相似度。&quot;&quot;&quot;
+    norm = np.linalg.norm(A, axis=0, keepdims=True) + 1e-9
+    A_norm = A / norm
+    return A_norm.T @ A_norm   # (n_items, n_items)
+
+item_sim = cosine_sim(R)  # 物品-物品相似度
+
+def itemcf_recall(user_vec, item_sim, top_k=3):
+    &quot;&quot;&quot;ItemCF 召回：用户历史物品的相似物品打分之和，排除已交互过的。&quot;&quot;&quot;
+    n = len(user_vec)
+    scores = np.zeros(n)
+    liked = np.where(user_vec &gt; 0)[0]
+    for i in liked:
+        scores += item_sim[i]                    # 累加相似度
+    scores[liked] = -np.inf                      # 排除已经看过/点过的
+    return np.argsort(-scores)[:top_k]
+
+user0 = R[0]
+rec = itemcf_recall(user0, item_sim, top_k=3)
+print(&quot;u0 的 ItemCF 召回:&quot;, rec.tolist())
+print(&quot;物品相似度矩阵(取整):\n&quot;, np.round(item_sim, 2))</code></pre>
+<h4 id="h-示例-2多路召回合并itemcf--热门--标签">示例 2：多路召回合并（ItemCF + 热门 + 标签）<a class="anchor" href="#h-示例-2多路召回合并itemcf--热门--标签" aria-label="本节链接">#</a></h4>
+<p>实现三路召回，各自打分并归一化，加权合并后去重、截断，展示&quot;多路互补 + 冷启动保底&quot;。</p>
+<pre data-lang="python"><code class="language-python">import numpy as np
+
+n_items = 6
+# 三路召回的原始分数（不同量纲）
+itemcf_scores = np.array([0.8, 0.0, 0.6, 0.0, 0.0, 0.0])   # ItemCF 相似度
+hot_scores    = np.array([3, 5, 2, 8, 4, 9])               # 热门计数
+tag_scores    = np.array([0.0, 0.0, 0.0, 0.7, 0.0, 0.5])   # 标签匹配度(新物品也在这路)
+
+def minmax(s):
+    lo, hi = s.min(), s.max()
+    return (s - lo) / (hi - lo + 1e-9) if hi &gt; lo else np.zeros_like(s)
+
+# 加权融合：热门路权重低（兜底）、ItemCF/标签路权重高（个性化）
+merged = (0.5 * minmax(itemcf_scores)
+          + 0.2 * minmax(hot_scores)
+          + 0.3 * minmax(tag_scores))
+
+# 去重 + 截断 topK（这里用分数排序模拟；实际工程按物品 ID 去重）
+top_k = 3
+top_idx = np.argsort(-merged)[:top_k]
+print(&quot;各路归一化分数:&quot;)
+print(&quot;  ItemCF:&quot;, np.round(minmax(itemcf_scores), 2))
+print(&quot;  热门  :&quot;, np.round(minmax(hot_scores), 2))
+print(&quot;  标签  :&quot;, np.round(minmax(tag_scores), 2))
+print(&quot;融合分数:&quot;, np.round(merged, 2))
+print(&quot;最终 topK 物品:&quot;, top_idx.tolist())</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>在示例 1 中，给用户 <code>u0</code> 换成一个&quot;没有任何交互&quot;的新用户，观察 ItemCF 召回会输出什么；解释为什么这路召回避开了冷启动，必须靠热门/标签路兜底。</li>
+<li>修改示例 2 的权重（比如把热门路权重调到 0.8），观察最终 topK 变化，并说明&quot;冷启动保底&quot;和&quot;个性化质量&quot;之间的权衡。</li>
+<li>列举三种&quot;多路召回里需要去重&quot;的场景，并说明去重时&quot;分数求和&quot;与&quot;取最大&quot;分别适合什么情形。</li>
+<li>思考题：为什么向量召回能召回&quot;没见过共现、但语义相近&quot;的物品，而 ItemCF 做不到？这弥补了 ItemCF 的哪一类盲区？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>王喆《深度学习推荐系统》配套论文清单 Reco-papers：<a href="https://github.com/wzhe06/Reco-papers" target="_blank" rel="noopener noreferrer">https://github.com/wzhe06/Reco-papers</a></li>
+<li>YouTube 推荐系统论文《Deep Neural Networks for YouTube Recommendations》（召回阶段的经典工程实践）：<a href="https://static.googleusercontent.com/media/research.google.com/zh-CN//pubs/archive/45530.pdf" target="_blank" rel="noopener noreferrer">https://static.googleusercontent.com/media/research.google.com/zh-CN//pubs/archive/45530.pdf</a></li>
+<li>《推荐系统实践》项亮著（协同过滤与召回相关公开资料）：<a href="https://github.com/wzhe06/Reco-papers" target="_blank" rel="noopener noreferrer">https://github.com/wzhe06/Reco-papers</a></li>
+</ul>
+<p><a href="#/l/rec-ch5-l2">下一课：向量召回（双塔/ANN）</a></p>

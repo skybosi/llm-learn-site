@@ -1,0 +1,108 @@
+<h2 id="h-负载均衡与监控">负载均衡与监控<a class="anchor" href="#h-负载均衡与监控" aria-label="本节链接">#</a></h2>
+<p>上一课我们有了一个能对外服务的 API。但单个推理实例扛不住线上流量——你需要<strong>多副本 + 负载均衡</strong>把请求分到各实例上，还需要<strong>监控</strong>看清每个实例的健康与性能。这一课把&quot;服务化&quot;从&quot;能跑&quot;推进到&quot;能扛、能看&quot;：负载均衡怎么选策略、推理服务的监控指标怎么看、怎么用 Prometheus + Grafana 搭一套可观测体系。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-为什么需要多副本与负载均衡">1. 为什么需要多副本与负载均衡<a class="anchor" href="#h-1-为什么需要多副本与负载均衡" aria-label="本节链接">#</a></h4>
+<p>单个推理实例的吞吐有上限（受 GPU 显存、批大小、算力约束），高并发时请求会排长队、延迟飙升甚至被打爆。解决方式是<strong>水平扩展</strong>：起多个相同的推理实例（可能分布在不同机器上），前面放一个<strong>负载均衡器（Load Balancer，LB）</strong>，把请求分发到后端实例。LB 的职责包括：<strong>转发流量、健康检查、故障摘除</strong>。</p>
+<p>对推理服务，LB 有一个特殊挑战：请求是<strong>长时间占用资源</strong>的（一个回答可能生成几十秒），且<strong>显存是硬约束</strong>（同时能容纳的活跃序列有上限）。因此&quot;谁有空接谁&quot;比&quot;轮流接&quot;更重要。</p>
+<h4 id="h-2-负载均衡的常见策略">2. 负载均衡的常见策略<a class="anchor" href="#h-2-负载均衡的常见策略" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>轮询（Round Robin）</strong>：依次把请求发给每个后端，简单但<strong>不看后端实际负载</strong>——某个实例正在跑长任务时，轮询仍可能把新请求塞给它；</li>
+<li><strong>最少连接（Least Connections）</strong>：发给当前活跃连接最少的实例。对推理更合理，因为&quot;活跃连接&quot;近似于&quot;正在生成的请求数&quot;；</li>
+<li><strong>加权轮询</strong>：给不同配置的实例不同权重（大卡实例权重大）；</li>
+<li><strong>会话保持（Session Affinity）</strong>：同一用户的多轮对话尽量路由到同一实例，便于命中该实例上的前缀缓存；</li>
+<li><strong>基于队列/容量的调度</strong>：由引擎暴露自身&quot;还能接多少请求&quot;的指标，LB 据此决策，这是最贴合 LLM 的做法，但实现最复杂。</li>
+</ul>
+<p>实践中常用 Nginx、Envoy、K8s Ingress 或云 LB 做转发，再结合引擎侧暴露的负载指标做精细化调度。会话保持与&quot;前缀缓存命中&quot;直接相关：同一对话路由到同一实例，公共前缀才复用得上。</p>
+<h4 id="h-3-监控什么推理服务的核心指标">3. 监控什么：推理服务的核心指标<a class="anchor" href="#h-3-监控什么推理服务的核心指标" aria-label="本节链接">#</a></h4>
+<p>监控分两层：<strong>系统层</strong>（通用）与<strong>推理层</strong>（LLM 专属）。</p>
+<p>系统层：GPU 利用率、显存使用量、CPU、网卡吞吐、请求错误率、实例存活（健康检查）。</p>
+<p>推理层才是重点，要盯住这几个：</p>
+<ul>
+<li><strong>TTFT（首 token 延迟）</strong>：请求到达 → 第一个 token 出来的时间，直接决定用户&quot;等多久开始看到字&quot;；</li>
+<li><strong>TPOT / ITL（每 token 间隔）</strong>：后续每个 token 之间的平均耗时，决定&quot;字往外蹦的快慢&quot;；</li>
+<li><strong>吞吐（tokens/s、requests/s）</strong>：整体产出速度；</li>
+<li><strong>排队长度 / 排队时间</strong>：请求在调度队列里等了多久，是延迟劣化的主要来源；</li>
+<li><strong>KV Cache 使用率</strong>：块池用了多少，逼近 100% 说明要开始抢占或拒绝请求了；</li>
+<li><strong>批大小</strong>：一次前向实际并行的序列数，反映连续批处理的效率；</li>
+<li><strong>前缀缓存命中率</strong>：上一课讲的前缀复用效果。</li>
+</ul>
+<p>这些指标的分位数（P50/P99）比平均值更有意义——P99 延迟直接对应&quot;最差的一批用户体验&quot;。</p>
+<h4 id="h-4-用-prometheus--grafana-搭可观测">4. 用 Prometheus + Grafana 搭可观测<a class="anchor" href="#h-4-用-prometheus--grafana-搭可观测" aria-label="本节链接">#</a></h4>
+<p>主流推理引擎（vLLM、SGLang）都暴露 <strong>Prometheus 格式</strong>的指标端点（vLLM 在 <code>/metrics</code>，且需 <code>--enable-metrics</code> 或依赖 <code>prometheus_client</code>）。搭建链路：</p>
+<ol>
+<li>推理实例暴露 <code>/metrics</code>；</li>
+<li>Prometheus 定期抓取（scrape）各实例的指标并存储；</li>
+<li>Grafana 从 Prometheus 查询，画仪表盘、设告警。</li>
+</ol>
+<p>告警要设在&quot;体验临界点&quot;上，例如 <code>P99 TTFT &gt; 3s</code>、<code>KV Cache 使用率 &gt; 90%</code>、<code>实例存活探测失败</code>，而不是等用户来报。</p>
+<p><figure><img class="md-img" src="content/courses/llm-inference-optimization/assets/chapter-7-figure-02.svg" alt="负载均衡与监控架构：LB 分发请求到多副本，各实例暴露 /metrics 由 Prometheus 抓取、Grafana 展示" loading="lazy" decoding="async"><figcaption>负载均衡与监控架构：LB 分发请求到多副本，各实例暴露 /metrics 由 Prometheus 抓取、Grafana 展示</figcaption></figure>
+</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<h4 id="h-示例-1用最少连接策略做一个简化负载均衡模拟">示例 1：用最少连接策略做一个简化负载均衡模拟<a class="anchor" href="#h-示例-1用最少连接策略做一个简化负载均衡模拟" aria-label="本节链接">#</a></h4>
+<p>下面不依赖真实网络，用&quot;活跃请求数&quot;模拟各实例的负载，演示&quot;最少连接&quot;与&quot;轮询&quot;的差异：</p>
+<pre data-lang="python"><code class="language-python">import random
+
+class Instance:
+    def __init__(self, name):
+        self.name = name
+        self.active = 0            # 当前正在处理的请求数
+
+    def load(self):
+        return self.active
+
+def least_connections(instances):
+    &quot;&quot;&quot;选择活跃请求最少的实例（推理服务的推荐策略）。&quot;&quot;&quot;
+    return min(instances, key=lambda i: i.load())
+
+def round_robin(instances, counter):
+    &quot;&quot;&quot;轮询：不看负载，依次分配。&quot;&quot;&quot;
+    return instances[counter % len(instances)]
+
+# 两个实例，模拟实例 A 正在跑一个长请求（活跃=5），实例 B 空闲（活跃=0）
+a, b = Instance(&quot;A&quot;), Instance(&quot;B&quot;)
+a.active = 5
+pool = [a, b]
+
+# 来 6 个新请求，对比两种策略把它们分到哪
+print(&quot;最少连接分配：&quot;)
+for _ in range(6):
+    chosen = least_connections(pool)
+    print(f&quot;  -&gt; {chosen.name}（当前活跃 {chosen.load()}）&quot;)
+    chosen.active += 1
+
+# 重置，再看轮询
+a.active, b.active = 5, 0
+print(&quot;轮询分配：&quot;)
+for i in range(6):
+    chosen = round_robin(pool, i)
+    print(f&quot;  -&gt; {chosen.name}（当前活跃 {chosen.load()}）&quot;)
+    chosen.active += 1</code></pre>
+<p>轮询会把一半新请求塞给已经满载的 A，而最少连接会先把 B 填起来——对&quot;长时占用、显存受限&quot;的推理服务，后者明显更合理。</p>
+<h4 id="h-示例-2抓取-vllm-的-prometheus-指标">示例 2：抓取 vLLM 的 Prometheus 指标<a class="anchor" href="#h-示例-2抓取-vllm-的-prometheus-指标" aria-label="本节链接">#</a></h4>
+<pre data-lang="bash"><code class="language-bash"># 启动时开启指标（vLLM 在 /metrics 暴露 Prometheus 格式）
+vllm serve meta-llama/Llama-3.1-8B-Instruct --enable-metrics</code></pre>
+<pre data-lang="bash"><code class="language-bash"># 抓取指标并过滤出与延迟/吞吐相关的几行
+curl -s http://localhost:8000/metrics | grep -E &quot;vllm:(time_to_first_token|e2e_request_latency|num_requests_running|gpu_cache_usage)&quot;</code></pre>
+<p>常见指标含义（以 vLLM 为例）：</p>
+<ul>
+<li><code>vllm:time_to_first_token_seconds</code>：TTFT 的直方图（分位数可从这里算）；</li>
+<li><code>vllm:e2e_request_latency_seconds</code>：端到端请求延迟；</li>
+<li><code>vllm:num_requests_running</code>：当前活跃请求数；</li>
+<li><code>vllm:gpu_cache_usage_perc</code>：KV Cache 使用率。</li>
+</ul>
+<p>把这些指标接进 Prometheus 的抓取配置（<code>scrape_configs</code> 指向 <code>localhost:8000</code>），就能在 Grafana 里画出延迟分位数与显存曲线。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>把示例 1 扩展成三个实例，分别用最少连接、轮询、加权轮询各跑 100 个随机时长请求，统计每个实例的总负载，比较三种策略的均衡程度。</li>
+<li>解释为什么&quot;最少连接&quot;对推理服务优于轮询，以及为什么它仍可能不如&quot;基于引擎剩余容量的调度&quot;（提示：不同请求的显存占用不同）。</li>
+<li>起一个 vLLM 服务并 <code>curl /metrics</code>，找出 TTFT、TPOT、KV Cache 使用率对应的指标名，并说明如何从直方图算 P99。</li>
+<li>用 Prometheus + Grafana（或本地自绘）搭一个最小可观测：持续压测服务，画出 P50/P99 TTFT 随并发上升的曲线，找到延迟开始陡增的拐点。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>vLLM 文档 · 生产化与指标（Prometheus）：<a href="https://docs.vllm.ai/en/latest/serving/metrics.html" target="_blank" rel="noopener noreferrer">https://docs.vllm.ai/en/latest/serving/metrics.html</a></li>
+<li>Prometheus 文档 · 抓取配置：<a href="https://prometheus.io/docs/prometheus/latest/configuration/configuration/" target="_blank" rel="noopener noreferrer">https://prometheus.io/docs/prometheus/latest/configuration/configuration/</a></li>
+<li>Grafana 文档：<a href="https://grafana.com/docs/" target="_blank" rel="noopener noreferrer">https://grafana.com/docs/</a></li>
+<li>Nginx 负载均衡文档：<a href="https://nginx.org/en/docs/http/load_balancing.html" target="_blank" rel="noopener noreferrer">https://nginx.org/en/docs/http/load_balancing.html</a></li>
+</ul>
+<p><a href="#/l/inf-ch7-l3">下一课：SLA 与成本优化</a></p>

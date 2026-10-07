@@ -1,0 +1,148 @@
+<h2 id="h-gpt-架构">GPT 架构<a class="anchor" href="#h-gpt-架构" aria-label="本节链接">#</a></h2>
+<p>上一课讲了 GPT 怎么&quot;生成&quot;，这一课讲 GPT 的&quot;身体&quot;长什么样。GPT 用的是<strong>仅解码器（decoder-only）</strong>的 Transformer：把上一门课里解码器的&quot;掩码自注意力&quot;作为核心，去掉交叉注意力，再按&quot;前归一化（pre-LN）&quot;堆叠很多层。我们会拆解每个零件，对比 GPT-1/2/3 三代的具体参数，并亲手搭一个最小的 GPT 块，把&quot;架构&quot;从论文里落到代码里。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-整体结构一个读上文猜下文的堆栈">1. 整体结构：一个&quot;读上文、猜下文&quot;的堆栈<a class="anchor" href="#h-1-整体结构一个读上文猜下文的堆栈" aria-label="本节链接">#</a></h4>
+<p>GPT 的输入是一串 token，输出是对每个位置&quot;下一个 token&quot;的预测。从输入到输出，数据依次流过：</p>
+<pre><code>token 嵌入 + 位置嵌入
+   → 堆叠 N 个 Transformer 块（每个块 = 掩码自注意力 + 前馈网络，均带残差与 LayerNorm）
+   → 最终 LayerNorm
+   → 线性层（映射到词表大小）→ softmax</code></pre>
+<p>它与你在注意力课程里见过的标准 Transformer 解码器有两个关键区别：</p>
+<ol>
+<li><strong>没有编码器，也没有交叉注意力</strong>：自注意力只发生在&quot;自己和自己&quot;之间，且带因果掩码；</li>
+<li><strong>LayerNorm 放在子层之前（pre-LN）</strong>：这是 GPT-2 之后的默认做法，训练更稳定，允许把网络堆得很深。</li>
+</ol>
+<p>因为结构里只有&quot;解码器&quot;这一半，所以称 <strong>decoder-only</strong>。</p>
+<h4 id="h-2-输入表示token-嵌入--位置嵌入">2. 输入表示：token 嵌入 + 位置嵌入<a class="anchor" href="#h-2-输入表示token-嵌入--位置嵌入" aria-label="本节链接">#</a></h4>
+<p>每个 token 先查表得到 <code>token embedding</code>，再与一个<strong>可学习的绝对位置嵌入</strong>相加。GPT 没有像 BERT 那样单独设&quot;分段嵌入&quot;（它不需要区分两个句子），输入就两样：词 + 位置。</p>
+<pre><code>输入向量 = token_embedding[token_id] + position_embedding[位置下标]</code></pre>
+<p>嵌入维度记为 <code>d_model</code>（GPT-2 是 768，GPT-3 是 12288）。词表由 BPE（Byte Pair Encoding）子词算法切分得到，GPT-2 词表约 5 万个 token。</p>
+<h4 id="h-3-一个-transformer-块掩码自注意力--前馈">3. 一个 Transformer 块：掩码自注意力 + 前馈<a class="anchor" href="#h-3-一个-transformer-块掩码自注意力--前馈" aria-label="本节链接">#</a></h4>
+<p>每个块做两件事（都带残差连接 + LayerNorm）：</p>
+<ol>
+<li><strong>掩码多头自注意力</strong>：让每个位置只能&quot;看到&quot;自己及之前的 token（上一课的因果掩码），捕捉上下文；</li>
+<li><strong>前馈网络（FFN）</strong>：两层线性 + 一个非线性激活，中间维度通常放大 4 倍（<code>4 × d_model</code>）。GPT 系列用的是 <strong>GELU</strong> 激活。</li>
+</ol>
+<p>用伪代码表示一个块的前向：</p>
+<pre><code>x = x + MultiHeadSelfAttention(LayerNorm(x), causal_mask)   # 注意力子层
+x = x + FFN(LayerNorm(x))                                   # 前馈子层</code></pre>
+<p>注意 LayerNorm 在进入子层<strong>之前</strong>作用（pre-LN）。相比之下，原始 Transformer 和 BERT 用的是 <strong>post-LN</strong>（子层之后归一化）。pre-LN 让梯度在残差路径上更&quot;顺&quot;，是 GPT-2 能把层数一路加上去、GPT-3 堆到 96 层的关键工程技巧。</p>
+<h4 id="h-4-输出头与权重共享">4. 输出头与权重共享<a class="anchor" href="#h-4-输出头与权重共享" aria-label="本节链接">#</a></h4>
+<p>最后一个块出来后，过一层最终 LayerNorm，再乘一个线性层把 <code>d_model</code> 维映射到词表大小，softmax 后得到&quot;下一个 token&quot;的概率分布。GPT 有个省参数的细节叫 <strong>权重共享（weight tying）</strong>：输入嵌入矩阵和输出线性层的权重<strong>共用同一份</strong>。因为输入嵌入和输出头都是&quot;词表大小 × d_model&quot;，共享后能省下大量参数。</p>
+<p><figure><img class="md-img" src="content/courses/llm-foundations/assets/chapter-2-figure-03.svg" alt="GPT（仅解码器）整体架构示意" loading="lazy" decoding="async"><figcaption>GPT（仅解码器）整体架构示意</figcaption></figure>
+</p>
+<h4 id="h-5-三代-gpt-的参数对比">5. 三代 GPT 的参数对比<a class="anchor" href="#h-5-三代-gpt-的参数对比" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>模型</th>
+<th>参数量</th>
+<th>层数</th>
+<th>注意力头数</th>
+<th>d_model</th>
+<th>词表</th>
+<th>上下文长度</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>GPT-1</td>
+<td>1.17 亿</td>
+<td>12</td>
+<td>12</td>
+<td>768</td>
+<td>约 4 万</td>
+<td>512</td>
+</tr>
+<tr>
+<td>GPT-2</td>
+<td>15 亿</td>
+<td>48</td>
+<td>—</td>
+<td>1600</td>
+<td>约 5 万</td>
+<td>1024</td>
+</tr>
+<tr>
+<td>GPT-3</td>
+<td>1750 亿</td>
+<td>96</td>
+<td>96</td>
+<td>12288</td>
+<td>约 5 万</td>
+<td>2048</td>
+</tr>
+</tbody></table>
+<p>从 GPT-1 到 GPT-3，<strong>结构几乎没变</strong>，变的主要是规模：层数、宽度、数据量。这再次印证了第 1 章的缩放定律——架构复用了，能力靠规模堆出来。</p>
+<p><figure><img class="md-img" src="content/courses/llm-foundations/assets/chapter-2-figure-04.svg" alt="pre-LN 与 post-LN 残差路径对比示意" loading="lazy" decoding="async"><figcaption>pre-LN 与 post-LN 残差路径对比示意</figcaption></figure>
+</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>先用 Hugging Face 读 GPT-2 的配置，把上表变成可验证的数字。</p>
+<pre data-lang="python"><code class="language-python">from transformers import GPT2Config, GPT2LMHeadModel
+
+cfg = GPT2Config.from_pretrained(&quot;gpt2&quot;)
+print(&quot;层数 n_layer     =&quot;, cfg.n_layer)
+print(&quot;注意力头 n_head   =&quot;, cfg.n_head)
+print(&quot;嵌入维 n_embd     =&quot;, cfg.n_embd)
+print(&quot;词表 vocab_size   =&quot;, cfg.vocab_size)
+print(&quot;上下文 n_positions=&quot;, cfg.n_positions)
+
+model = GPT2LMHeadModel(cfg)
+params = sum(p.numel() for p in model.parameters())
+print(&quot;总参数量 =&quot;, f&quot;{params/1e6:.1f}M&quot;)   # gpt2 约 124M
+print(&quot;权重共享? &quot;, model.lm_head.weight is model.transformer.wte.weight)</code></pre>
+<p>最后一行会输出 <code>True</code>，印证&quot;输入嵌入与输出头共享权重&quot;。</p>
+<p>再亲手搭一个最小的 GPT 块，体会 pre-LN + 残差 + 因果掩码的完整流程：</p>
+<pre data-lang="python"><code class="language-python">import torch
+import torch.nn as nn
+
+class GPTBlock(nn.Module):
+    &quot;&quot;&quot;一个最小 GPT 块：pre-LN + 掩码多头自注意力 + FFN。&quot;&quot;&quot;
+    def __init__(self, d_model, n_head, ffn_mult=4):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(d_model)                 # 进入注意力前先归一化
+        self.attn = nn.MultiheadAttention(d_model, n_head, batch_first=True)
+        self.ln2 = nn.LayerNorm(d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, ffn_mult * d_model),      # 先放大 4 倍
+            nn.GELU(),                                   # GPT 用 GELU
+            nn.Linear(ffn_mult * d_model, d_model),
+        )
+
+    def forward(self, x, causal_mask):
+        h = self.attn(self.ln1(x), self.ln1(x), self.ln1(x),
+                      attn_mask=causal_mask, need_weights=False)[0]
+        x = x + h                                        # 残差连接
+        x = x + self.ffn(self.ln2(x))                    # 前馈 + 残差
+        return x
+
+# 构造因果掩码：位置 i 只能 attend 到 j &lt;= i
+def causal_mask(T):
+    return torch.triu(torch.ones(T, T), diagonal=1).bool()
+
+d_model, n_head, T = 64, 4, 8
+block = GPTBlock(d_model, n_head)
+x = torch.randn(1, T, d_model)             # batch=1, 长度 8
+out = block(x, causal_mask(T))
+print(&quot;\nGPT 块输出形状:&quot;, out.shape)       # 应与输入一致 [1, 8, 64]
+
+# 验证因果性：把输入最后一个位置替换成大数，只影响输出最后位置，不影响前面
+x2 = x.clone()
+x2[:, -1, :] += 100.0
+diff = (block(x2, causal_mask(T)) - out).abs()
+print(&quot;受最后位置影响的输出位置:&quot;, (diff &gt; 0.1).any(dim=-1).nonzero().squeeze().tolist())</code></pre>
+<p>最后一个实验很有趣：因为因果掩码，改动输入序列的<strong>最后一个</strong> token，只会改变输出序列的<strong>最后一个</strong>位置（以及它之后的，但这里它已是末尾），前面位置纹丝不动——这正是&quot;未来信息被屏蔽&quot;的直接证据。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>修改 <code>GPTBlock</code>，把 <code>nn.GELU</code> 换成 <code>nn.ReLU</code>，观察前向能否照常运行；结合 GPT 论文说明为什么原作者选 GELU 而非 ReLU。</li>
+<li>用 <code>GPT2Config</code> 分别实例化 <code>gpt2</code>、<code>gpt2-medium</code>、<code>gpt2-large</code>、<code>gpt2-xl</code>，打印各自的 <code>n_layer / n_embd / n_head</code>，对照上表验证规模如何逐级放大。</li>
+<li>在 <code>GPTBlock</code> 基础上，补一个词嵌入层与输出头，拼成一个能前向的微型 GPT（<code>输入 token id → 嵌入 → 若干块 → LayerNorm → 线性输出</code>），输入随机 token id，确认输出形状为 <code>[batch, T, vocab]</code>。</li>
+<li>思考题：pre-LN 为什么比 post-LN 更容易训练更深的网络？从&quot;残差路径上梯度如何流动&quot;的角度给出你的解释。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Radford et al., <em>Improving Language Understanding by Generative Pre-Training</em>（GPT-1 论文）：<a href="https://cdn.openai.com/research-covers/language-unsupervised/language_understanding_paper.pdf" target="_blank" rel="noopener noreferrer">https://cdn.openai.com/research-covers/language-unsupervised/language_understanding_paper.pdf</a></li>
+<li>Radford et al., <em>Language Models are Unsupervised Multitask Learners</em>（GPT-2 论文）：<a href="https://d4mucfpksywv.cloudfront.net/better-language-models/language_models_are_unsupervised_multitask_learners.pdf" target="_blank" rel="noopener noreferrer">https://d4mucfpksywv.cloudfront.net/better-language-models/language_models_are_unsupervised_multitask_learners.pdf</a></li>
+<li>Brown et al., <em>Language Models are Few-Shot Learners</em>（GPT-3 论文）：<a href="https://arxiv.org/abs/2005.14165" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2005.14165</a></li>
+<li>Hugging Face Transformers 文档 · GPT2：<a href="https://huggingface.co/docs/transformers/model_doc/gpt2" target="_blank" rel="noopener noreferrer">https://huggingface.co/docs/transformers/model_doc/gpt2</a></li>
+</ul>
+<p><a href="#/l/llm-ch2-l3">下一课：GPT 演进</a></p>

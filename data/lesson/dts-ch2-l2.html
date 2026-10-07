@@ -1,0 +1,287 @@
+<h2 id="h-reducescatter--allgather--all2all-及其在-tpep">ReduceScatter / AllGather / All2All 及其在 TP、EP 里的角色<a class="anchor" href="#h-reducescatter--allgather--all2all-及其在-tpep" aria-label="本节链接">#</a></h2>
+<p>上一课把 AllReduce 拆成 ring / tree / butterfly，但训练循环里最常被真正调用的原语并不是 AllReduce：张量并行（TP）的一次&quot;归约&quot;经常被拆成 AllGather 与 ReduceScatter 两步来做，MoE 的一层几乎全靠两次 All2All 搬运 token。这一课把这四个原语的语义、组合关系和账本对齐，再看它们在 TP 与 EP 里各自干什么活——<strong>只要能把&quot;谁发给谁、发多少、输出怎么排布&quot;说清楚，后面所有并行策略的通信账都能自己算</strong>。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-四个原语语义先对齐-nccl-口径">1. 四个原语：语义先对齐 NCCL 口径<a class="anchor" href="#h-1-四个原语语义先对齐-nccl-口径" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>原语</th>
+<th>输入</th>
+<th>输出</th>
+<th>一句话</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>AllReduce</td>
+<td>每 rank 一份 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span></span></span></span></td>
+<td>每 rank 一份，内容相同</td>
+<td>归约结果人人有份</td>
+</tr>
+<tr>
+<td>ReduceScatter</td>
+<td>每 rank 一份 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span></span></span></span></td>
+<td>每 rank 一块 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">s</span><span class="mord">/</span><span class="mord mathnormal">p</span></span></span></span></td>
+<td>归约后按 rank <strong>分块</strong></td>
+</tr>
+<tr>
+<td>AllGather</td>
+<td>每 rank 一块 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">s</span><span class="mord">/</span><span class="mord mathnormal">p</span></span></span></span></td>
+<td>每 rank <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span></span></span></span></td>
+<td>把各家的块<strong>拼起来</strong>给所有人</td>
+</tr>
+<tr>
+<td>All2All</td>
+<td>每 rank <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span></span></span></span> 段、共 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span></span></span></span></td>
+<td>每 rank <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span></span></span></span> 段、共 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span></span></span></span></td>
+<td>第 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.854em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0572em;">j</span></span></span></span> 段发给 rank <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.854em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0572em;">j</span></span></span></span>，第 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6595em;"></span><span class="mord mathnormal">i</span></span></span></span> 段来自 rank <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6595em;"></span><span class="mord mathnormal">i</span></span></span></span></td>
+</tr>
+</tbody></table>
+<p>两处细节必须记住。第一，NCCL 文档写明了等价关系：&quot;先 ReduceScatter 再 AllGather 等于一次 AllReduce&quot;，&quot;先 Reduce 再 Broadcast 也等于 AllReduce&quot;——AllReduce 是个<strong>复合操作</strong>，不是原子操作。第二，AllGather 的输出<strong>按 rank 索引排序</strong>，All2All 的输入输出段序<strong>由 rank 与 device 的映射决定</strong>；NCCL 专门提示 rank 到设备的映射会改变布局，写错布局得到的不是&quot;精度差一点&quot;，而是数据错位。</p>
+<h4 id="h-2-组合关系与账本三个数与上一课完全对得上">2. 组合关系与账本：三个数与上一课完全对得上<a class="anchor" href="#h-2-组合关系与账本三个数与上一课完全对得上" aria-label="本节链接">#</a></h4>
+<p>ring 实现下（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4</span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">96</span></span></span></span> B 的实测）：</p>
+<ul>
+<li><strong>ReduceScatter</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7778em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">3</span></span></span></span> 步，每步每 rank 发 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">s</span><span class="mord">/</span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">24</span></span></span></span> B，每 rank 共 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.75</span><span class="mord mathnormal">s</span></span></span></span>；</li>
+<li><strong>AllGather</strong>：同样 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">3</span></span></span></span> 步、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.75</span><span class="mord mathnormal">s</span></span></span></span>；</li>
+<li>两者相加：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">2</span><span class="mopen">(</span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">6</span></span></span></span> 步、每 rank <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1.5</span><span class="mord mathnormal">s</span></span></span></span>——正是上一课 ring AllReduce 的账（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">2</span><span class="mopen">(</span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span><span class="mord">/</span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span></span></span></span>）。</li>
+</ul>
+<p><strong>All2All</strong> 的账不同：均匀情况下每个 rank 要把 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7778em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> 段送出去、只留 1 段（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">s</span><span class="mord">/</span><span class="mord mathnormal">p</span></span></span></span>），所以每 rank 发送 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span><span class="mord mathnormal">s</span><span class="mord">/</span><span class="mord mathnormal">p</span></span></span></span>，全局发送量恰好等于全局数据量——<strong>每个字节只被搬一次</strong>，没有任何冗余。它本质是一次&quot;分组转置&quot;：<code>out[r]</code> 的第 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.854em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0572em;">j</span></span></span></span> 段 = <code>in[j]</code> 的第 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span></span></span></span> 段，转置两次就是恒等（代码里已验证 <code>True</code>）。真实 MoE 用的是变长版本（各家段长不同，业界常称 all-to-allv），但语义不变。</p>
+<table>
+<thead>
+<tr>
+<th>原语</th>
+<th>ring 步数</th>
+<th>每 rank 发送</th>
+<th>是否做计算</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>AllReduce</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">2</span><span class="mopen">(</span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">2</span><span class="mopen">(</span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span><span class="mord mathnormal">s</span><span class="mord">/</span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2</span><span class="mord mathnormal">s</span></span></span></span></td>
+<td>是（归约）</td>
+</tr>
+<tr>
+<td>ReduceScatter</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7778em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span><span class="mord mathnormal">s</span><span class="mord">/</span><span class="mord mathnormal">p</span></span></span></span></td>
+<td>是（归约）</td>
+</tr>
+<tr>
+<td>AllGather</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7778em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span><span class="mord mathnormal">s</span><span class="mord">/</span><span class="mord mathnormal">p</span></span></span></span></td>
+<td>否（纯搬运）</td>
+</tr>
+<tr>
+<td>All2All</td>
+<td>一轮交换</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span><span class="mord mathnormal">s</span><span class="mord">/</span><span class="mord mathnormal">p</span></span></span></span>（均匀）</td>
+<td>否（纯重排）</td>
+</tr>
+</tbody></table>
+<p>关键差异在语义：All2All 是<strong>重排</strong>而不是归约，没有计算可以掩盖它，成本全在搬运，因此它最吃网络带宽、最怕负载不均衡。</p>
+<p><figure><img class="md-img" src="content/courses/distributed-training-systems/assets/chapter-2-figure-03.svg" alt="一个 AllReduce 如何拆成两半，All2All 为何是重排" loading="lazy" decoding="async"><figcaption>一个 AllReduce 如何拆成两半，All2All 为何是重排</figcaption></figure>
+</p>
+<h4 id="h-3-在-tp-里allreduce-是零件allgatherreducescatte">3. 在 TP 里：AllReduce 是零件，AllGather/ReduceScatter 是它的两半<a class="anchor" href="#h-3-在-tp-里allreduce-是零件allgatherreducescatte" aria-label="本节链接">#</a></h4>
+<p>Megatron-LM 的张量并行把 FFN 的第一个 GEMM 按<strong>列<strong>切分（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">A</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">[</span><span class="mord"><span class="mord mathnormal">A</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace"> </span><span class="mord"><span class="mord mathnormal">A</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">]</span></span></span></span>）、第二个按</strong>行</strong>切分（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0502em;">B</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">[</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0502em;">B</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.0502em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">;</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0502em;">B</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.0502em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">]</span></span></span></span>），于是</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.2222em;">Y</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathrm">act</span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0785em;">X</span><span class="mord"><span class="mord mathnormal">A</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0502em;">B</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.0502em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathrm">act</span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0785em;">X</span><span class="mord"><span class="mord mathnormal">A</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0502em;">B</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.0502em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span></span></p>
+<p>每个 rank 只算一半，再用一次 AllReduce 把两项加起来。论文摘要的原话是这套做法&quot;只需在 native PyTorch 里插入少量通信算子&quot;——前向一次 AllReduce，反向对输入的梯度再来一次。</p>
+<p>Megatron 的<strong>序列并行（sequence parallelism）</strong>（Korthikanti 等，2022）把这一步往前推：把 LayerNorm/Dropout 的激活沿序列维切分后，列 GEMM 需要的是完整激活，所以前向用 <strong>AllGather</strong> 换回整段激活；反向梯度天然是逐 rank 的序列分片，用 <strong>ReduceScatter</strong> 直接落地。结果是把&quot;两倍 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span></span></span></span> 的 AllReduce&quot;换成&quot;<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span></span></span></span> 的 AllGather + <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span></span></span></span> 的 ReduceScatter&quot;：实测里 fp32 的激活是 512 B，TP 的 AllReduce 与 SP 的 AllGather 在这一维上同阶，而 RS 与 AG 各只占一半——这正是第 1 课&quot;组合决定账本&quot;的直接应用。</p>
+<p>坑：TP 的通信发生在<strong>每一层</strong>的前向与反向，层数越多、通信次数越多，所以 TP 一般只用在一个节点内（走 NVLink），这也解释为什么 TP 度数与节点内卡数强相关（第 5 章展开）。</p>
+<h4 id="h-4-在-ep-里dispatch--combine-就是两次-all2all">4. 在 EP 里：dispatch / combine 就是两次 All2All<a class="anchor" href="#h-4-在-ep-里dispatch--combine-就是两次-all2all" aria-label="本节链接">#</a></h4>
+<p>MoE 层里，token 被 router 分给不同专家，而专家分布在不同 rank 上：<strong>dispatch</strong> 把 token 送到它所属专家所在的 rank，<strong>combine</strong> 把专家输出按原路送回原 rank 并累加。GShard 论文把这件事讲得很直接：MoE 的 expert dispatching 需要切换切分维度，而<strong>跨分区的通信就是 AllToAll</strong>（论文里 &quot;MoE dispatch and combine&quot; 对应 AllToAll 通信）。</p>
+<p>账本：均匀路由下，一次 All2All 的全局发送量 = 1 倍全局 token 字节（每个 token 只送一次），所以 dispatch + combine ≈ 2 倍 token 字节。与 DP 的梯度 AllReduce（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4831em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2</span><span class="mord mathnormal">s</span></span></span></span> 且要归约）相比，EP 的通信是<strong>变长、可重排</strong>的：路由不均衡时，热门专家所在 rank 要收更多 token，整层的时间由最慢的那个 rank 决定（工程上用 capacity factor、token drop/pad 来兜底，第 5 章专家并行详述）。</p>
+<p>坑：① 把 All2All 当 AllReduce 用（一个重排、一个归约，结果必然错位）；② 两端段序约定不一致（第 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.854em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0572em;">j</span></span></span></span> 段发给谁、第 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6595em;"></span><span class="mord mathnormal">i</span></span></span></span> 段来自谁必须严格对齐）；③ 忘了变长消息要按各段长度分别打包；④ 在 EP 里忽略路由热点的长尾等待。</p>
+<h4 id="h-5-谁在训练里用谁">5. 谁在训练里用谁<a class="anchor" href="#h-5-谁在训练里用谁" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>原语</th>
+<th>典型出处</th>
+<th>你在代码里会看到的调用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>AllReduce</td>
+<td>DP 梯度、TP 前/反向</td>
+<td>DDP 的梯度分桶、<code>all_reduce_perf</code></td>
+</tr>
+<tr>
+<td>ReduceScatter</td>
+<td>TP+SP 反向、ZeRO/FSDP 梯度分片</td>
+<td><code>torch.distributed.reduce_scatter_tensor</code></td>
+</tr>
+<tr>
+<td>AllGather</td>
+<td>TP+SP 前向、FSDP 参数收集</td>
+<td><code>torch.distributed.all_gather_into_tensor</code></td>
+</tr>
+<tr>
+<td>All2All</td>
+<td>EP/MoE、部分序列并行实现</td>
+<td><code>torch.distributed.all_to_all_single</code>、DeepSpeed/GShard 的 dispatch/combine</td>
+</tr>
+</tbody></table>
+<p>PyTorch FSDP 的分片对象是参数、梯度与优化器状态：前向要 AllGather 参数、反向用 ReduceScatter 归约梯度分片（详见 FSDP 文档；第 6 章会算它的通信代价）。</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面四段都用 numpy 在本地验证：RS + AG 复现 AllReduce、All2All 两遍回到原样、TP 的&quot;列切分 + 行切分 + 求和&quot;等于完整结果、EP 的 dispatch/combine 让每个 token 算对。</p>
+<pre data-lang="python"><code class="language-python"># ===== 示例 1：ReduceScatter + AllGather = AllReduce（纯 numpy，无 GPU） =====
+import numpy as np
+
+P, n = 4, 12                      # 4 个 rank，每个 rank 一份 12 个 float64
+m = n // P                        # 每块 3 个数
+rng = np.random.default_rng(3)
+parts = [rng.integers(0, 100, size=n).astype(np.float64) for _ in range(P)]
+ref = np.sum(parts, axis=0)
+
+
+def reduce_scatter_ring(parts):
+    &quot;&quot;&quot;ring reduce-scatter：P-1 步后 rank r 手里是第 (r+1)%P 块的完整归约结果。&quot;&quot;&quot;
+    P, n = len(parts), parts[0].size
+    b = [v.reshape(P, m).copy() for v in parts]
+    sent = [0] * P
+    for k in range(P - 1):
+        nxt = [c.copy() for c in b]
+        for r in range(P):
+            c = (r - k - 1) % P
+            nxt[r][c] = b[r][c] + b[(r - 1) % P][c]
+            sent[r] += m * 8
+        b = nxt
+    return [b[r][(r + 1) % P].copy() for r in range(P)], sent
+
+
+def all_gather_ring(shards):
+    &quot;&quot;&quot;ring allgather：shards[r] 是 rank r 手里已完整的第 (r+1)%P 块。&quot;&quot;&quot;
+    P = len(shards)
+    blocks = [[None] * P for _ in range(P)]
+    for r in range(P):
+        blocks[r][(r + 1) % P] = shards[r].copy()
+    sent = [0] * P
+    for k in range(P - 1):
+        old = [list(b) for b in blocks]
+        for r in range(P):
+            snd = (r + 1 - k) % P
+            blocks[(r + 1) % P][snd] = old[r][snd].copy()
+            sent[r] += m * 8
+    return [np.concatenate(blocks[r]) for r in range(P)], sent
+
+
+shards, s1 = reduce_scatter_ring(parts)
+full, s2 = all_gather_ring(shards)
+err = max(float(np.abs(f - ref).max()) for f in full)
+print(f&quot;P = {P}，s = {n*8} B（每块 {m*8} B）&quot;)
+print(f&quot;  reduce_scatter：{P-1} 步，每 rank 发送 {s1[0]} B = {(P-1)/P:.3f} s&quot;)
+print(f&quot;  all_gather    ：{P-1} 步，每 rank 发送 {s2[0]} B = {(P-1)/P:.3f} s&quot;)
+print(f&quot;  两者相加共 {2*(P-1)} 步、每 rank {2*(P-1)/P:.3f} s，&quot;
+      f&quot;与直接求和的最大偏差 {err:.1e}&quot;)
+
+# ===== 示例 2：All2All 就是一次&quot;分组转置&quot;，做两遍回到原样 =====
+blocks = [np.stack([np.full(m, r * 10 + j) for j in range(P)]) for r in range(P)]
+
+
+def all_to_all(blk):
+    &quot;&quot;&quot;blk[r] 形状 (P, m)：第 j 段发给 rank j；返回 out[r]，第 i 段来自 rank i。&quot;&quot;&quot;
+    P = len(blk)
+    return [np.concatenate([blk[i][r] for i in range(P)]) for r in range(P)]
+
+
+once = all_to_all(blocks)
+twice = all_to_all([b.reshape(P, m) for b in once])
+same = all(np.array_equal(twice[r], blocks[r].reshape(-1)) for r in range(P))
+sent = (P - 1) * m * 8
+print(f&quot;\n  all2all：{P} 段各 {m*8} B → 每 rank 送出 {(P-1)*m*8} B = {(P-1)/P:.3f} s&quot;
+      f&quot;（只有 s/P 留在本地）&quot;)
+print(f&quot;  连做两遍 all2all 是否回到原样：{same}&quot;
+      f&quot;（out[r] 的第 j 段 = in[j] 的第 r 段，转置两次即恒等）&quot;)
+
+# ===== 示例 3：张量并行（TP）：局部结果 all-reduce 起来 = 完整结果 =====
+S, H, F = 8, 16, 32
+X = rng.standard_normal((S, H))
+A = rng.standard_normal((H, F))
+B = rng.standard_normal((F, H))
+act = lambda Z: np.maximum(Z, 0)                     # 用 ReLU 代替 GeLU，结论与激活函数无关
+Y_full = act(X @ A) @ B
+
+tp = 2
+As = np.split(A, tp, axis=1)                          # 列切分
+Bs = np.split(B, tp, axis=0)                          # 行切分
+Y_parts = [act(X @ As[i]) @ Bs[i] for i in range(tp)]
+Y_tp = sum(Y_parts)                                   # all-reduce 做的事：逐元素求和
+print(f&quot;\n  完整 Y 与 TP={tp}（列切分 + 行切分 + all-reduce）的最大偏差 &quot;
+      f&quot;{np.abs(Y_tp - Y_full).max():.3e}&quot;)
+
+# 序列并行（SP）：激活先按序列切分，列 GEMM 前 all-gather 回来，通信量与激活同阶
+Xs = np.split(X, tp, axis=0)
+X_gathered = np.concatenate(Xs, axis=0)               # all-gather 的结果
+Y_sp = sum(act(X_gathered @ As[i]) @ Bs[i] for i in range(tp))
+print(f&quot;  SP：激活先按序列切成 {tp} 份，all-gather 后计算，最大偏差 &quot;
+      f&quot;{np.abs(Y_sp - Y_full).max():.3e}&quot;)
+print(f&quot;  通信量账本（fp32）：TP 前向 all-reduce = {X.shape[0]*H*4} B；&quot;
+      f&quot;SP 前向 all-gather = {X.shape[0]*H*4} B，反向 reduce-scatter 同阶&quot;)
+
+# ===== 示例 4：专家并行（EP）：dispatch / combine 就是两次 all2all =====
+P2, T, D = 4, 3, 5
+tokens = [rng.standard_normal((T, D)) for _ in range(P2)]
+route = [[(r + t) % P2 for t in range(T)] for r in range(P2)]     # 每个 token 归属哪个专家 rank
+W = [rng.standard_normal((D, D)) for _ in range(P2)]
+idx = [[[t for t in range(T) if route[r][t] == j] for j in range(P2)] for r in range(P2)]
+
+# dispatch：rank r 把去专家 j 的 token（按原顺序）发给 j
+blocks = [[tokens[r][idx[r][j]] for j in range(P2)] for r in range(P2)]
+recv = [[blocks[i][j] for i in range(P2)] for j in range(P2)]     # recv[j][i]：专家 j 收到来自 rank i 的
+# 专家计算：rank j 用自己的 W[j] 处理收到的 token
+out = [[recv[j][i] @ W[j] for i in range(P2)] for j in range(P2)]
+# combine：专家 j 把结果发回来源 rank i
+rebuilt = []
+for i in range(P2):
+    acc = np.zeros((T, D))
+    for j in range(P2):
+        acc[idx[i][j]] = out[j][i]                                # 按 token 原下标放回
+    rebuilt.append(acc)
+expect = [np.stack([tokens[r][t] @ W[route[r][t]] for t in range(T)]) for r in range(P2)]
+err = max(float(np.abs(rebuilt[r] - expect[r]).max()) for r in range(P2))
+one_wave = sum(b.nbytes for br in blocks for b in br)
+print(f&quot;\n  EP：{P2} 个专家 rank、每 rank {T} 个 token（d={D}）&quot;)
+print(f&quot;  dispatch + combine 两次 all2all 后，token 逐一算对：最大偏差 {err:.1e}&quot;)
+print(f&quot;  一次 all2all 全体发送 {one_wave} B = {one_wave/(P2*T*D*8):.3f} × 全局 token 量&quot;)</code></pre>
+<p>在 Python 3.10.16 + numpy 1.26.2 下实际运行结果：</p>
+<pre data-lang="text"><code class="language-text">P = 4，s = 96 B（每块 24 B）
+  reduce_scatter：3 步，每 rank 发送 72 B = 0.750 s
+  all_gather    ：3 步，每 rank 发送 72 B = 0.750 s
+  两者相加共 6 步、每 rank 1.500 s，与直接求和的最大偏差 0.0e+00
+
+  all2all：4 段各 24 B → 每 rank 送出 72 B = 0.750 s（只有 s/P 留在本地）
+  连做两遍 all2all 是否回到原样：True（out[r] 的第 j 段 = in[j] 的第 r 段，转置两次即恒等）
+
+  完整 Y 与 TP=2（列切分 + 行切分 + all-reduce）的最大偏差 1.066e-14
+  SP：激活先按序列切成 2 份，all-gather 后计算，最大偏差 1.066e-14
+  通信量账本（fp32）：TP 前向 all-reduce = 512 B；SP 前向 all-gather = 512 B，反向 reduce-scatter 同阶
+
+  EP：4 个专家 rank、每 rank 3 个 token（d=5）
+  dispatch + combine 两次 all2all 后，token 逐一算对：最大偏差 0.0e+00
+  一次 all2all 全体发送 480 B = 1.000 × 全局 token 量</code></pre>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选：需要 1~2 张 GPU（自备或云上按需开 1~2 卡；上面四段都不需要 GPU） ----
+# 1) 单个原语分别量一遍（-c 校验结果，-g 2 用两张卡）
+./build/reduce_scatter_perf -b 8 -e 128M -f 2 -g 2
+./build/all_gather_perf    -b 8 -e 128M -f 2 -g 2
+./build/alltoall_perf      -b 8 -e 128M -f 2 -g 2
+# 2) 对比&quot;AllReduce 一次&quot;与&quot;ReduceScatter + AllGather 两步&quot;的 busbw：
+./build/all_reduce_perf    -b 8 -e 128M -f 2 -g 2 | tail -5
+# 判读：Step 数与 busbw 的乘积就是实打实的通信时间；小消息下 RS+AG 的两次
+#       起步延迟往往比一次 AllReduce 更贵——这正是&quot;合起来调用更省&quot;的原因。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：给 <code>all_to_all</code> 加上&quot;变长段&quot;的版本（每个 rank 发往各家的 token 数不同），用一个 4 rank × 3 token 的路由表验证：原样做两遍仍能还原。</li>
+<li><strong>解释</strong>：为什么 NCCL 文档说&quot;ReduceScatter + AllGather = AllReduce&quot;？用第 1 课的 ring 账本说明两者步数与每 rank 发送量完全一致。</li>
+<li><strong>对比/验证</strong>：把示例 3 的 <code>tp</code> 从 2 改成 4（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">F</span></span></span></span> 用 4 的倍数），验证仍然等于完整结果，并给出 AllReduce 与 AllGather 的字节账本比值。</li>
+<li><strong>思考</strong>：如果 MoE 的路由极度不均衡（一个专家收到 10 倍 token），EP 的 All2All 时间由谁决定？给出两种工程处理方向，并说明各自的代价。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>NVIDIA, <em>NCCL User Guide</em> — Collective Operations（AllReduce / ReduceScatter / AllGather / AlltoAll 的语义、段序与输出布局，含 &quot;ReduceScatter followed by AllGather is equivalent to AllReduce&quot;）：<a href="https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/collectives.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/collectives.html</a></li>
+<li>M. Shoeybi 等, <em>Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism</em>, arXiv:1909.08053（TP 的列切分 + 行切分结构与&quot;只需插入少量通信算子&quot;的实现）：<a href="https://arxiv.org/abs/1909.08053" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1909.08053</a></li>
+<li>V. Korthikanti 等, <em>Reducing Activation Recomputation in Large Transformer Models</em>, arXiv:2205.05198（序列并行：与 TP 结合后用 AllGather / ReduceScatter 组织激活通信）：<a href="https://arxiv.org/abs/2205.05198" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2205.05198</a></li>
+<li>D. Lepikhin 等, <em>GShard: Scaling Giant Models with Conditional Computation and Automatic Sharding</em>, arXiv:2006.16668（MoE 的 expert dispatch 与 combine 对应跨分区 AllToAll 通信）：<a href="https://arxiv.org/abs/2006.16668" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2006.16668</a></li>
+<li>PyTorch 文档, <em>FullyShardedDataParallel</em>（FSDP 分片参数/梯度/优化器状态，前向 AllGather、反向 ReduceScatter 分片梯度）：<a href="https://pytorch.org/docs/stable/fsdp.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/docs/stable/fsdp.html</a></li>
+</ul>
+<p><a href="#/l/dts-ch2-l3">下一课：算法选择：消息大小、拓扑与数值确定性</a></p>

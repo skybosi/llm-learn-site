@@ -1,0 +1,163 @@
+<h2 id="h-融合的代价核算寄存器压力occupancy-与实测回归">融合的代价核算：寄存器压力、occupancy 与实测回归<a class="anchor" href="#h-融合的代价核算寄存器压力occupancy-与实测回归" aria-label="本节链接">#</a></h2>
+<p>既然融合能省流量，为什么不把整张图融成一个内核？因为融合不免费——它把&quot;中间值&quot;从显存搬到片上，而<strong>片上容量有限</strong>：寄存器用超了就溢出到局部内存（又是显存），occupancy 掉下来，收益当场反转。本课把这条链算成一张可复核的账，并说明&quot;融合多少&quot;在真实编译器里是启发式而非规则，最终只能靠实测回归定夺。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-融合把流量换成寄存器">1. 融合把流量换成寄存器<a class="anchor" href="#h-1-融合把流量换成寄存器" aria-label="本节链接">#</a></h4>
+<p>融合内核的寄存器需求由三个量决定：<strong>活值数</strong>（live values，每个&quot;在飞&quot;元素同时要保留的值；纯逐元素链约 2——输入值加中间值；合并多个归约会升到 3~4）、<strong>每线程并行元素数</strong> <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span></span></span></span>（lanes，为隐藏访存延迟而给单线程的多份独立工作）、<strong>固定开销</strong>（地址、循环变量、索引）。模型就一行：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6776em;vertical-align:-0.1944em;"></span><span class="mord text"><span class="mord">regs</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7778em;vertical-align:-0.0833em;"></span><span class="mord text"><span class="mord">base</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal">L</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.0044em;vertical-align:-0.31em;"></span><span class="mord text"><span class="mord">live_per_lane</span></span></span></span></span></span></p>
+<p>注意<strong>链长本身不直接吃寄存器</strong>：链内是顺序依赖，编译器可复用一个值；推高寄存器的是&quot;同时有多少份工作在飞&quot;——想加深访存流水（提高 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span></span></span></span>）就得交寄存器。</p>
+<h4 id="h-2-寄存器--occupancy一条会掉头的曲线">2. 寄存器 → occupancy：一条会掉头的曲线<a class="anchor" href="#h-2-寄存器--occupancy一条会掉头的曲线" aria-label="本节链接">#</a></h4>
+<p>寄存器按 warp 分配，粒度 256 个（每线程 8 个的倍数）；硬上限 255，超过就溢出。每 SM 可驻留的 warp 数因此是</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord text"><span class="mord">warps</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.4em;vertical-align:-0.95em;"></span><span class="mop">min</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="minner"><span class="mopen delimcenter" style="top:0em;"><span class="delimsizing size3">(</span></span><span class="minner"><span class="mopen delimcenter" style="top:0em;"><span class="delimsizing size3">⌊</span></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.427em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mopen">⌈</span><span class="mord text"><span class="mord">regs</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord">32/256</span><span class="mclose">⌉</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord">256</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord text"><span class="mord">regfile/SM</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.936em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mclose delimcenter" style="top:0em;"><span class="delimsizing size3">⌋</span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mpunct">,</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">max_warps</span></span><span class="mclose delimcenter" style="top:0em;"><span class="delimsizing size3">)</span></span></span></span></span></span></span></p>
+<p>代码用示例参数（寄存器文件 64K/SM、每 SM 最多 48 warp、每 block 128 线程）算表：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span></span></span></span> 从 1 涨到 32，寄存器 18 → 80，occupancy 从 100% 掉到 52%，每 block 片上工作集从 1.0 KiB 涨到 32.0 KiB。<strong>参数只是示例，请换成你自己架构的官方数值</strong>；结论形状不变：occupancy 与每线程并行元素互为跷跷板。</p>
+<h4 id="h-3-溢出多融一块就多一趟显存">3. 溢出：多融一块，就多一趟显存<a class="anchor" href="#h-3-溢出多融一块就多一趟显存" aria-label="本节链接">#</a></h4>
+<p>活值数上去更危险。代码第二张表取活值数 16（如合并多个归约、强行展开长链）：每线程 16 个元素就要 272 个寄存器，超过 255 的硬上限——编译器改走<strong>局部内存</strong>（local memory），而它在显存里。省下的带宽被溢出流量吃掉，相对代价按示例折算飙到 61.7x。<strong>方向一定，幅度取决于溢出的实际访问次数</strong>，须以实测校准。</p>
+<h4 id="h-4-融合预算是启发式不是正确性条件">4. 融合预算是启发式，不是正确性条件<a class="anchor" href="#h-4-融合预算是启发式不是正确性条件" aria-label="本节链接">#</a></h4>
+<p>真实编译器里确实有&quot;融合上限&quot;这类旋钮。本机 torch 2.3.1 的调度器源码 <code>can_fuse</code> 里就能读到这类闸门：节点是 extern/nop 时拒绝、两侧无共享数据时拒绝（除非开了 <code>aggressive_fusion</code>）、以及 <code>len(node1.get_nodes()) + len(node2.get_nodes()) &gt; config.max_fusion_size</code> 时拒绝——源码注释还写明这是 <em>heuristic not needed for correctness</em>（正确性不需要它），本机该配置项默认值为 64。</p>
+<p>一个实测把它的性质说清：本机把 <code>max_fusion_size</code> 改成 4 后重新编译那条 8 算子逐元素链，生成的<strong>仍然是一个</strong>融合内核（<code>cpp_fused_add_div_mul_relu_sigmoid_sub_0</code>）。<strong>所以它不是&quot;单核最多融几个节点&quot;的硬上限</strong>，只是调度器合并两个已融合节点时的启发式闸门之一。实践含义：别靠调阈值控制融合规模，要用代价核算 + 实测。</p>
+<h4 id="h-5-把三笔账合成一个决策">5. 把三笔账合成一个决策<a class="anchor" href="#h-5-把三笔账合成一个决策" aria-label="本节链接">#</a></h4>
+<p>一次融合决策要同时看三样：<strong>流量</strong>（越低越好）、<strong>occupancy</strong>（越低越难藏延迟）、<strong>溢出</strong>（出现即加流量）。代码把它们放进同一张表：一个内核融 8 个算子相对代价 1.00；切成两个 2.00（纯流量代价）；&quot;活值数 16、并发 16&quot;的超融合是 61.71——<strong>比切分还差</strong>。与第 1 课的真内核实测对照可见两端：切分是可预期的 ≈2.1x，超融合可能是数十倍的灾难。工程顺序：按类别划出候选（第 2 课）→ 核算器淘汰明显亏的 → 目标硬件上做实测回归。</p>
+<p><figure><img class="md-img" src="content/courses/ml-compilers/assets/chapter-5-figure-03.svg" alt="融合代价的传导链：流量换寄存器 → 占用率掉头 → 溢出到局部内存，收益反转只能靠实测定夺" loading="lazy" decoding="async"><figcaption>融合代价的传导链：流量换寄存器 → 占用率掉头 → 溢出到局部内存，收益反转只能靠实测定夺</figcaption></figure>
+</p>
+<h4 id="h-6-有卡怎么量无卡怎么替代">6. 有卡怎么量，无卡怎么替代<a class="anchor" href="#h-6-有卡怎么量无卡怎么替代" aria-label="本节链接">#</a></h4>
+<p>有 GPU 时三个根量都能直接读：<code>ncu --metrics launch__registers_per_thread,sm__warps_active,dram__bytes</code> 分别给出每线程寄存器、活跃 warp 比例与显存流量；把&quot;融合/切分&quot;两版各跑一次就能把回归钉在数据上。没有 GPU 时核算器给的是<strong>方向与量级</strong>：occ 掉头、溢出触发、切分代价翻倍都是算式结论，可直接当判据；阈值留到有卡时校准。</p>
+<h4 id="h-7-常见坑">7. 常见坑<a class="anchor" href="#h-7-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>把 occupancy 当越高越好</strong>：有些内核宁可低 occupancy、用更多寄存器换 ILP；occupancy 只是手段。</li>
+<li><strong>只看寄存器不看共享内存</strong>：共享内存同样是 occupancy 约束项，融合常顺带抬高它。</li>
+<li><strong>用一次计时下结论</strong>：回归幅度常小于噪声，至少跑多次取最小值，并固定输入形状。</li>
+<li><strong>忘了溢出不报错</strong>：溢出合法（走局部内存），不会编译失败，只会悄悄变慢——最容易被漏掉。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>纯 Python（无第三方依赖）的代价核算器：第 1 段把&quot;每线程并行元素数 → 寄存器 → occupancy → 片上工作集 → 是否溢出&quot;算成两张表；第 2 段把流量与 occupancy 放进同一张账，给出融合与切分的相对代价。</p>
+<pre data-lang="python"><code class="language-python"># ---- 第 3 课示例：融合代价核算器（纯 Python，无第三方依赖）----
+# 参数全部是&quot;示例值&quot;：请按目标架构的官方 Occupancy 文档替换后再做决策
+REG_FILE = 65536        # 每 SM 的 32-bit 寄存器数
+MAX_REGS = 255          # 每线程寄存器上限（超过就溢出到局部内存）
+MAX_WARPS = 48          # 每 SM 最大 warp 数
+THREADS = 128           # 每 block 线程数
+BW_PER_SM = 1.5e12 / 132   # 示例：总带宽 1.5 TB/s 均摊到 132 个 SM
+BYTES_PER_ELEM = 8      # 逐元素链：读 4 B + 写 4 B（fp32）
+
+def regs_per_warp(regs):
+    &quot;&quot;&quot;寄存器按 warp 分配，粒度 256 个寄存器（= 每线程 8 个的倍数）。&quot;&quot;&quot;
+    return max(256, -(-regs * 32 // 256) * 256)
+
+def occupancy(regs):
+    &quot;&quot;&quot;受寄存器文件限制的 warp 数，再受每 SM warp 上限约束；regs &gt; 255 时溢出。&quot;&quot;&quot;
+    warps = min(REG_FILE // regs_per_warp(regs), MAX_WARPS)
+    return warps, regs &lt;= MAX_REGS          # 第二个返回值 = 没溢出
+
+print(&#39;=== 1. 每线程并行元素数（ILP/tile）决定寄存器，寄存器决定 occupancy ===&#39;)
+print(&#39;    live_per_lane = 每个&quot;在飞&quot;元素同时活着的值数：点链 2（输入 + 中间值），&#39;
+      &#39;多个归约合并 3~4&#39;)
+for live in (2, 16):
+    print(f&#39;\n  每元素活值数 = {live}：&#39;)
+    print(f&#39;    {&quot;每线程元素&quot;:&gt;10}{&quot;寄存器/线程&quot;:&gt;13}{&quot;warp/SM&quot;:&gt;9}{&quot;occupancy&quot;:&gt;11}&#39;
+          f&#39;{&quot;每 block 片上工作集&quot;:&gt;20}   溢出&#39;)
+    for lanes in (1, 2, 4, 8, 16, 32):
+        regs = 16 + lanes * live
+        warps, no_spill = occupancy(regs)
+        ws = THREADS * lanes * live * 4
+        print(f&#39;    {lanes:&gt;10}{regs:&gt;13}{warps:&gt;9}{warps / MAX_WARPS * 100:&gt;10.0f}%&#39;
+              f&#39;{ws / 1024:&gt;17.1f} KiB   {&quot;是 → 走局部内存&quot; if not no_spill else &quot;否&quot;}&#39;)
+print(&#39;\n  同一段融合体，想提高&quot;每线程并行元素&quot;来加深访存流水，就要拿 occupancy 去换；&#39;)
+print(&#39;  活值数变大（例如把多个归约合并进同一个内核）时，先在 255 上撞墙、开始溢出。&#39;)
+
+print(&#39;\n=== 2. 融合还是切分：把&quot;流量&quot;和&quot;occupancy&quot;放在同一张账上 ===&#39;)
+def rel_time(kernels, regs, spill_lanes=0):
+    &quot;&quot;&quot;相对时间 ∝ 每元素字节数 / occupancy；溢出按每元素多一次 4 字节访问折算（示例系数）。&quot;&quot;&quot;
+    warps, no_spill = occupancy(regs)
+    occ = warps / MAX_WARPS
+    bytes_per_elem = kernels * BYTES_PER_ELEM + (0 if no_spill else spill_lanes * 4)
+    return bytes_per_elem / occ, occ, bytes_per_elem
+
+rows = [(&#39;一个内核融 8 个算子&#39;, 1, 16 + 8 * 2),
+        (&#39;切成两个内核各 4 个算子&#39;, 2, 16 + 8 * 2),
+        (&#39;一个内核（活值数 16，并发 16）&#39;, 1, 16 + 16 * 16),
+        (&#39;一个内核（活值数 16，并发 32）&#39;, 1, 16 + 32 * 16)]
+base = rel_time(1, 16 + 8 * 2)[0]
+print(f&#39;  {&quot;方案&quot;:&lt;28}{&quot;寄存器/线程&quot;:&gt;12}{&quot;occupancy&quot;:&gt;11}{&quot;每元素字节&quot;:&gt;12}{&quot;相对时间&quot;:&gt;10}&#39;)
+for tag, k, regs in rows:
+    t, occ, b = rel_time(k, regs, spill_lanes=16)
+    print(f&#39;  {tag:&lt;28}{regs:&gt;12}{occ * 100:&gt;10.0f}%{b:&gt;12}{t / base:&gt;10.2f}&#39;)
+print(&#39;  读法：切分的代价是流量翻倍（第 2 行 = 2.00）；融合过头的代价是 occupancy 掉下来、&#39;)
+print(&#39;  甚至溢出到局部内存（第 4 行），相对代价反而比切分更差。&#39;)
+
+print(&#39;\n=== 3. 切分代价的账面值（与第 1 课的真内核实测对照）===&#39;)
+t1, _, b1 = rel_time(1, 16 + 8 * 2)
+t2, _, b2 = rel_time(2, 16 + 8 * 2)
+print(f&#39;  一个内核融 8 个算子：每元素 {b1} 字节 → 相对时间 {t1 / base:.2f}&#39;)
+print(f&#39;  切成两个内核各 4 个：每元素 {b2} 字节 → 相对时间 {t2 / base:.2f}（账面就是 2 倍）&#39;)
+print(&#39;  第 1 课同机同尺度的 numba 实测（多次最小值，计时浮动 ±10%）：1 内核 ≈13 ms →&#39;)
+print(&#39;  2 内核 ≈28 ms（≈2.1x，与账面 2x 吻合）；8 内核 ≈57 ms（≈4.1x，不足 8x：每次内核启动&#39;)
+print(&#39;  与并行调度有固定开销）。&#39;)
+print(&#39;  本机没有 GPU，寄存器压力只能用上面的参数化核算推演：真回归必须在目标卡上用 ncu 量&#39;)
+print(&#39;  launch__registers_per_thread / sm__warps_active / dram__bytes 三个指标（见可选块）。&#39;)</code></pre>
+<p>本机实跑输出（Python 3.14，无第三方依赖；参数为示例值）：</p>
+<pre data-lang="text"><code class="language-text">=== 1. 每线程并行元素数（ILP/tile）决定寄存器，寄存器决定 occupancy ===
+    live_per_lane = 每个&quot;在飞&quot;元素同时活着的值数：点链 2（输入 + 中间值），多个归约合并 3~4
+
+  每元素活值数 = 2：
+         每线程元素       寄存器/线程  warp/SM  occupancy       每 block 片上工作集   溢出
+             1           18       48       100%              1.0 KiB   否
+             2           20       48       100%              2.0 KiB   否
+             4           24       48       100%              4.0 KiB   否
+             8           32       48       100%              8.0 KiB   否
+            16           48       42        88%             16.0 KiB   否
+            32           80       25        52%             32.0 KiB   否
+
+  每元素活值数 = 16：
+         每线程元素       寄存器/线程  warp/SM  occupancy       每 block 片上工作集   溢出
+             1           32       48       100%              8.0 KiB   否
+             2           48       42        88%             16.0 KiB   否
+             4           80       25        52%             32.0 KiB   否
+             8          144       14        29%             64.0 KiB   否
+            16          272        7        15%            128.0 KiB   是 → 走局部内存
+            32          528        3         6%            256.0 KiB   是 → 走局部内存
+
+  同一段融合体，想提高&quot;每线程并行元素&quot;来加深访存流水，就要拿 occupancy 去换；
+  活值数变大（例如把多个归约合并进同一个内核）时，先在 255 上撞墙、开始溢出。
+
+=== 2. 融合还是切分：把&quot;流量&quot;和&quot;occupancy&quot;放在同一张账上 ===
+  方案                                寄存器/线程  occupancy       每元素字节      相对时间
+  一个内核融 8 个算子                           32       100%           8      1.00
+  切成两个内核各 4 个算子                         32       100%          16      2.00
+  一个内核（活值数 16，并发 16）                   272        15%          72     61.71
+  一个内核（活值数 16，并发 32）                   528         6%          72    144.00
+  读法：切分的代价是流量翻倍（第 2 行 = 2.00）；融合过头的代价是 occupancy 掉下来、
+  甚至溢出到局部内存（第 4 行），相对代价反而比切分更差。
+
+=== 3. 切分代价的账面值（与第 1 课的真内核实测对照）===
+  一个内核融 8 个算子：每元素 8 字节 → 相对时间 1.00
+  切成两个内核各 4 个：每元素 16 字节 → 相对时间 2.00（账面就是 2 倍）
+  第 1 课同机同尺度的 numba 实测（多次最小值，计时浮动 ±10%）：1 内核 ≈13 ms →
+  2 内核 ≈28 ms（≈2.1x，与账面 2x 吻合）；8 内核 ≈57 ms（≈4.1x，不足 8x：每次内核启动
+  与并行调度有固定开销）。
+  本机没有 GPU，寄存器压力只能用上面的参数化核算推演：真回归必须在目标卡上用 ncu 量
+  launch__registers_per_thread / sm__warps_active / dram__bytes 三个指标（见可选块）。</code></pre>
+<p>读表抓三处：<strong>occupancy 在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">16</span></span></span></span> 处开始掉</strong>（48 → 42 warp），<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">32</span></span></span></span> 只剩 52%；<strong>溢出在活值数 16、并发 16 时触发</strong>（272 &gt; 255），&quot;每元素字节&quot;从 8 涨到 72（示例折算）；<strong>超融合的 61.71 比切分的 2.00 差得多</strong>——这就是&quot;融合不是越多越好&quot;的算术版本。</p>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选，需自备 GPU 或云上按需：把上面的账换成真数据 ----
+# 1) 每线程寄存器与活跃 warp（这两个数直接对应本课的表 1）：
+#   ncu --metrics launch__registers_per_thread,sm__warps_active,launch__occupancy_limit_registers python3 run.py
+# 2) 显存流量（对应第 1 课的流量账；对比&quot;融合/切分&quot;两版）：
+#   ncu --metrics dram__bytes_read.sum,dram__bytes_write.sum python3 run.py
+# 3) 观察编译器把算子融成了几个内核（本机 CPU 版本已实测，见第 1 课）：
+#   OMP_NUM_THREADS=1 TORCH_LOGS=output_code python3 your_model.py 2&gt;&amp;1 | grep -E &quot;cpp_fused|triton_|extern_kernels&quot;
+# 4) 融合阈值旋钮（只当启发式用，不是硬上限；本机实测调小它并未切开 8 算子点链）：
+#   python3 -c &quot;import torch._inductor.config as c; print(c.max_fusion_size)&quot;   # 本机 torch 2.3.1 输出 64
+# 没有 GPU 也不影响本课：表 1/表 2 的算式结论（occupancy 掉头、溢出触发、切分翻倍）都可直接使用。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：把核算器的 <code>REG_FILE</code> 改成 32768（模拟寄存器文件更小的档位），重跑表 1 与表 2，找出 occupancy 开始下降与触发溢出的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span></span></span></span>，并解释两者为何不同。</li>
+<li><strong>解释</strong>：为什么&quot;链长&quot;不直接吃寄存器，而&quot;每线程并行元素数&quot;吃？若一条链有 8 个互相独立的头部（如 8 个输入相加），寄存器需求会怎么变？</li>
+<li><strong>对比/验证</strong>：把 <code>MAX_WARPS</code> 从 48 改成 64，表 1 的 occupancy 百分比整体变化，但&quot;溢出点&quot;不变——解释为什么溢出点只由 <code>MAX_REGS</code> 与活值数决定。</li>
+<li><strong>思考</strong>：本课把溢出折算成每元素多一次 4 字节访问。若真实溢出访问是 8 次，表 2 第 4 行会怎样变化？要拿到这个倍数需测哪两个量？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>NVIDIA, <em>CUDA C++ Programming Guide</em>（寄存器文件容量、每线程寄存器上限与 occupancy 的定义；本课表 1 的公式与参数以此为准）：<a href="https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html</a></li>
+<li>PyTorch 源码 <em>torch/_inductor/scheduler.py</em> 与 <em>config.py</em>（<code>can_fuse</code> 的 <code>exceeds max fusion</code> 闸门、<code>heuristic not needed for correctness</code> 注释、<code>max_fusion_size</code> 默认值；本课第 4 节本机实读）：<a href="https://github.com/pytorch/pytorch/blob/main/torch/_inductor/scheduler.py" target="_blank" rel="noopener noreferrer">https://github.com/pytorch/pytorch/blob/main/torch/_inductor/scheduler.py</a></li>
+<li>Tianqi Chen et al., <em>TVM: An Automated End-to-End Optimizing Compiler for Deep Learning</em>（OSDI&#39;18；融合增益与调度代价的权衡在真实编译器中的位置）：<a href="https://www.usenix.org/conference/osdi18/presentation/chen" target="_blank" rel="noopener noreferrer">https://www.usenix.org/conference/osdi18/presentation/chen</a></li>
+<li>NVIDIA Nsight Compute 文档（<code>launch__registers_per_thread</code>、<code>sm__warps_active</code>、<code>dram__bytes</code> 等指标的定义与采集方式）：<a href="https://docs.nvidia.com/nsight-compute/" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/nsight-compute/</a></li>
+</ul>
+<p><a href="#/l/mlc-ch5-l4">下一课：内存规划与融合的联合决策</a></p>

@@ -1,0 +1,81 @@
+<h2 id="h-通用-gnn-层">通用 GNN 层<a class="anchor" href="#h-通用-gnn-层" aria-label="本节链接">#</a></h2>
+<p>上一课我们用&quot;聚合 + 结合&quot;描述了一层 GNN 的直觉。这一课把它提炼成一个正式的、可复用的框架——<strong>消息传递（message passing）</strong>，并解释为什么 PyTorch Geometric 里几乎所有图卷积层都继承自同一个 <code>MessagePassing</code> 基类。把这个框架吃透，你就拿到了&quot;看懂任何 GNN 论文&quot;的万能钥匙：GraphSAGE、GCN、GAT、GIN 都只是这个框架下不同的&quot;消息函数、聚合函数、更新函数&quot;组合而已。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-消息传递的三步">1. 消息传递的三步<a class="anchor" href="#h-1-消息传递的三步" aria-label="本节链接">#</a></h4>
+<p>Gilmer 等人在论文《Neural Message Passing for Quantum Chemistry》里提出的<strong>消息传递神经网络（MPNN）</strong>，把一层 GNN 分解成三个清晰的步骤。设 h_v^(k) 是节点 v 在第 k 层的表示：</p>
+<ol>
+<li><p><strong>消息（message）</strong>：每条边上的邻居 u 向 v 发一条消息，由消息函数 M 计算，输入是 u 和 v 的表示以及边特征 e_uv：
+m_{u→v}^{(k)} = M( h_u^(k), h_v^(k), e_uv )</p>
+</li>
+<li><p><strong>聚合（aggregate）</strong>：节点 v 把自己收到的所有消息合并成一个向量，聚合函数通常是对称的（求和、平均、取最大）：
+m_v^{(k)} = AGGREGATE( { m_{u→v}^{(k)} : u ∈ N(v) } )</p>
+</li>
+<li><p><strong>更新（update）</strong>：节点 v 用聚合到的消息更新自己的表示：
+h_v^{(k+1)} = U( h_v^(k), m_v^{(k)} )</p>
+</li>
+</ol>
+<p>这三步环环相扣：<strong>消息决定&quot;邻居传什么&quot;，聚合决定&quot;怎么合并&quot;，更新决定&quot;如何用消息刷新自己&quot;</strong>。上一课的均值聚合，就是&quot;消息 = 恒等 + 邻居特征&quot;、&quot;聚合 = 平均&quot;、&quot;更新 = 线性变换 + 激活&quot;的特例。</p>
+<p><figure><img class="md-img" src="content/courses/graph-neural-networks/assets/chapter-2-figure-02.svg" alt="消息传递三步：消息、聚合、更新" loading="lazy" decoding="async"><figcaption>消息传递三步：消息、聚合、更新</figcaption></figure>
+</p>
+<h4 id="h-2-为什么聚合必须是对称的">2. 为什么聚合必须是对称的<a class="anchor" href="#h-2-为什么聚合必须是对称的" aria-label="本节链接">#</a></h4>
+<p>聚合函数有一个硬性要求：<strong>必须对输入集合的顺序不敏感（对称）</strong>。因为邻居集合 N(v) 里的节点没有天然顺序——你把邻居列表打乱，聚合结果必须不变。这直接保证了第一章说的<strong>置换等变性</strong>：节点编号怎么换，每个节点的输出都跟着节点走，不依赖编号。求和、平均、取最大都满足对称性，而&quot;把邻居排成一列接个 LSTM&quot;就不满足（顺序变了结果就变），除非额外设计。</p>
+<h4 id="h-3-向量化用邻接矩阵批量计算">3. 向量化：用邻接矩阵批量计算<a class="anchor" href="#h-3-向量化用邻接矩阵批量计算" aria-label="本节链接">#</a></h4>
+<p>逐节点套消息传递很直观，但太慢。实战中我们把它向量化成矩阵运算。以最简形式（消息 = W h_u，聚合 = 求和，更新 = 自身变换 + 激活）为例：</p>
+<p>  H^{(k+1)} = σ( A H^{(k)} W^{(k)ᵀ} )</p>
+<p>其中 A 是邻接矩阵，H^{(k)} 是所有节点表示堆成的 (n, d) 矩阵，W^{(k)} 是可学习的权重。<code>A @ H</code> 这一步就完成了&quot;对每个节点，把它所有邻居的表示求和&quot;——矩阵乘法天然地并行化了消息聚合。这就是为什么上一章要把图表示成邻接矩阵：<strong>它能一步完成全网的消息传递</strong>。</p>
+<p><figure><img class="md-img" src="content/courses/graph-neural-networks/assets/chapter-2-figure-03.svg" alt="把消息传递写成邻接矩阵乘法的批量形式" loading="lazy" decoding="async"><figcaption>把消息传递写成邻接矩阵乘法的批量形式</figcaption></figure>
+</p>
+<h4 id="h-4-统一的抽象pyg-的-messagepassing">4. 统一的抽象：PyG 的 MessagePassing<a class="anchor" href="#h-4-统一的抽象pyg-的-messagepassing" aria-label="本节链接">#</a></h4>
+<p>PyTorch Geometric 把这套框架做成了基类 <code>torch_geometric.nn.conv.MessagePassing</code>。你只需实现三个钩子函数：<code>message()</code>（消息函数 M）、<code>aggregate()</code>（聚合函数，默认求和）、<code>update()</code>（更新函数 U），PyG 会自动帮你根据 <code>edge_index</code> 收集邻居、分发消息。GCNConv、SAGEConv、GATConv、GINConv 全都是在这个基类上覆写出来的。理解 MPNN，你就理解了 PyG 的整个图层设计。</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面用 NumPy 逐节点实现一个完整的 MPNN 层，再给出等价的向量化写法，验证两者结果一致。</p>
+<pre data-lang="python"><code class="language-python">import numpy as np
+
+def relu(x):
+    return np.maximum(0.0, x)
+
+# 1) 图：5 个节点围成一个环
+edges = [(0, 1), (1, 2), (2, 3), (3, 4), (4, 0)]
+n = 5
+A = np.zeros((n, n))
+for u, v in edges:
+    A[u, v] = A[v, u] = 1.0
+
+# 2) 节点特征：每节点 3 维
+rng = np.random.default_rng(0)
+X = rng.normal(size=(n, 3))
+d_in, d_hidden = 3, 4
+Wm = rng.normal(size=(d_hidden, d_in))   # 消息变换
+Wu = rng.normal(size=(d_hidden, d_in))   # 自身变换
+
+# 3) 逐节点消息传递（MPNN 三步）
+H_new = np.zeros((n, d_hidden))
+for v in range(n):
+    neighbors = np.nonzero(A[v])[0]
+    # 消息：每个邻居 u 发给 v 的消息 = Wm @ h_u
+    messages = [Wm @ X[u] for u in neighbors]
+    # 聚合：求和（对称函数）
+    m_v = sum(messages) if messages else np.zeros(d_hidden)
+    # 更新：自身变换 + 聚合消息，再过 ReLU
+    H_new[v] = relu(Wu @ X[v] + m_v)
+print(&quot;逐节点消息传递结果 H^1：\n&quot;, np.round(H_new, 3))
+
+# 4) 等价的向量化写法：H^1 = relu(A X Wm^T + X Wu^T)
+H_vec = relu(A @ X @ Wm.T + X @ Wu.T)
+print(&quot;向量化结果 H^1：\n&quot;, np.round(H_vec, 3))
+print(&quot;两种写法是否一致：&quot;, np.allclose(H_new, H_vec))</code></pre>
+<p>运行后你会看到两种实现输出完全相同，但向量化写法只用一次矩阵乘法就完成了所有节点的消息聚合。真实框架（PyTorch/PyG）内部就是靠稀疏矩阵乘法 <code>spmm</code> 来并行做这件事的，能轻松扩展到千万级节点的图。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>把聚合函数从&quot;求和&quot;改成&quot;平均&quot;，逐节点实现里要怎么改？对应的向量化写法又该怎么改（提示：用度矩阵 D）？</li>
+<li>把消息函数改成同时依赖两端节点的拼接：<code>M = Wm @ concat(h_u, h_v)</code>。修改逐节点实现，思考这种&quot;依赖接收方&quot;的消息函数相比&quot;只依赖发送方&quot;多了什么表达能力。</li>
+<li>给边加上特征 e_uv（比如给每条边赋一个标量权重），把消息函数改成 <code>M = e_uv · (Wm @ h_u)</code>，即&quot;按边权缩放消息&quot;，实现之并解释它和加权图的关系。</li>
+<li>思考：如果聚合函数用&quot;按节点度数归一化的求和&quot;（即 GraphSAGE 的 mean 聚合），对度数差异很大的节点各有什么影响？为什么有时要用归一化、有时反而要用纯求和？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Gilmer et al. · Neural Message Passing for Quantum Chemistry：<a href="https://arxiv.org/abs/1704.01212" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1704.01212</a></li>
+<li>PyTorch Geometric 官方文档 · torch_geometric.nn.conv.MessagePassing：<a href="https://pytorch-geometric.readthedocs.io/en/latest/generated/torch_geometric.nn.conv.MessagePassing.html" target="_blank" rel="noopener noreferrer">https://pytorch-geometric.readthedocs.io/en/latest/generated/torch_geometric.nn.conv.MessagePassing.html</a></li>
+<li>Hamilton · Graph Representation Learning（第 5 章 Message Passing）：<a href="https://www.cs.mcgill.ca/~wlh/grl_book/" target="_blank" rel="noopener noreferrer">https://www.cs.mcgill.ca/~wlh/grl_book/</a></li>
+</ul>
+<p><a href="#/l/gnn-ch2-l3">下一课：聚合与更新函数</a></p>

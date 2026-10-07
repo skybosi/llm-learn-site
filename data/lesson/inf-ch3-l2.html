@@ -1,0 +1,110 @@
+<h2 id="h-tensorrt-llm-与-llamacpp">TensorRT-LLM 与 llama.cpp<a class="anchor" href="#h-tensorrt-llm-与-llamacpp" aria-label="本节链接">#</a></h2>
+<p>vLLM 是&quot;高吞吐 GPU 服务&quot;的通用解，但推理引擎的世界远不止这一种：NVIDIA 的 <strong>TensorRT-LLM</strong> 走的是&quot;针对自家 GPU 深度编译优化&quot;的极致性能路线；<strong>llama.cpp</strong> 走的是&quot;CPU / 消费级设备也能跑大模型&quot;的轻量通用路线。学完本课，你应当能说清三者的定位差异，并会写各自的启动/编译命令。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-tensorrt-llm为-nvidia-gpu-深度定制的编译器">1. TensorRT-LLM：为 NVIDIA GPU 深度定制的编译器<a class="anchor" href="#h-1-tensorrt-llm为-nvidia-gpu-深度定制的编译器" aria-label="本节链接">#</a></h4>
+<p>TensorRT-LLM 是 NVIDIA 官方的 LLM 推理框架，本质是一个<strong>编译型引擎</strong>。它的核心是：先把模型&quot;编译&quot;成针对目标 GPU 高度优化的 <strong>TensorRT engine（引擎）</strong>，再运行。编译过程做图优化、算子融合、kernel 自动调优（autotuning），因此单卡峰值性能往往极高。</p>
+<p>特点：</p>
+<ul>
+<li><strong>编译期优化</strong>：使用前要先 build engine（耗时几分钟到更久），换来运行时的高性能；</li>
+<li><strong>in-flight batching</strong>：即第 1 章的 continuous batching 的 NVIDIA 实现；</li>
+<li><strong>强量化支持</strong>：原生支持 FP8、INT8、INT4 AWQ 等，FP8 在 H100 上有明显加速；</li>
+<li><strong>多卡并行</strong>：张量并行 + 流水线并行，适合超大模型。</li>
+</ul>
+<p>代价是：<strong>绑定 NVIDIA 生态</strong>、上手门槛高、编译流程繁琐，且新模型需要额外写转换脚本。</p>
+<h4 id="h-2-llamacpp让大模型跑在-cpu-和消费级设备上">2. llama.cpp：让大模型跑在 CPU 和消费级设备上<a class="anchor" href="#h-2-llamacpp让大模型跑在-cpu-和消费级设备上" aria-label="本节链接">#</a></h4>
+<p>llama.cpp 是一个用 <strong>C/C++</strong> 写的极轻量推理实现，最初目标是在 Mac 上跑 LLaMA，后来演变成&quot;任何有内存的设备都能跑量化模型&quot;的通用工具。它依赖 <strong>GGUF 格式</strong>（第 4 章会详讲）的量化权重。</p>
+<p>特点：</p>
+<ul>
+<li><strong>几乎零依赖</strong>：编译成单个可执行文件，CPU 就能跑，也有 CUDA / Metal / Vulkan 后端加速；</li>
+<li><strong>极致量化</strong>：支持从 FP16 到 2-bit 的多种量化档位，4-bit 模型只需几 GB 内存就能跑 7B；</li>
+<li><strong>本地/边缘优先</strong>：适合个人电脑、手机、嵌入式设备，不适合高并发在线服务。</li>
+</ul>
+<p>代价是：<strong>吞吐不如 GPU 服务引擎</strong>（CPU 上跑大模型访存受限），功能聚焦于&quot;能跑起来&quot;而非&quot;榨干吞吐&quot;。</p>
+<h4 id="h-3-三者定位一句话">3. 三者定位一句话<a class="anchor" href="#h-3-三者定位一句话" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>引擎</th>
+<th>定位</th>
+<th>强项</th>
+<th>典型场景</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>vLLM</td>
+<td>通用高吞吐 GPU 服务</td>
+<td>易用、生态好、吞吐高</td>
+<td>在线 API、批量评测</td>
+</tr>
+<tr>
+<td>TensorRT-LLM</td>
+<td>NVIDIA 极致性能</td>
+<td>编译优化、FP8、超大模型多卡</td>
+<td>生产级 GPU 集群、低延迟</td>
+</tr>
+<tr>
+<td>llama.cpp</td>
+<td>轻量通用</td>
+<td>CPU/消费级、量化灵活</td>
+<td>本地跑模型、边缘设备</td>
+</tr>
+</tbody></table>
+<h3 id="h-二可运行示例">二、可运行示例<a class="anchor" href="#h-二可运行示例" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-tensorrt-llm编译并运行示意">1. TensorRT-LLM：编译并运行（示意）<a class="anchor" href="#h-1-tensorrt-llm编译并运行示意" aria-label="本节链接">#</a></h4>
+<pre data-lang="bash"><code class="language-bash"># 1) 安装（NVIDIA 提供 docker 镜像，最省事）
+docker pull nvcr.io/nvidia/tensorrt-llm/release:latest
+
+# 2) 把 Hugging Face 模型转换成 TRT-LLM 格式并编译 engine（以 Llama-2-7B 为例）
+python convert_checkpoint.py --model_dir ./Llama-2-7b-chat-hf \
+    --dtype float16 --output_dir ./trt_ckpt
+trtllm-build --checkpoint_dir ./trt_ckpt \
+    --gemm_plugin float16 --max_batch_size 64 --max_input_len 1024 \
+    --max_output_len 512 --output_dir ./engine
+
+# 3) 用 in-flight batching 启动服务
+python run.py --engine_dir ./engine --max_output_len 512 --port 8000</code></pre>
+<h4 id="h-2-llamacpp下载量化模型并推理">2. llama.cpp：下载量化模型并推理<a class="anchor" href="#h-2-llamacpp下载量化模型并推理" aria-label="本节链接">#</a></h4>
+<pre data-lang="bash"><code class="language-bash"># 1) 编译 llama.cpp（以 CPU 为例；有 CUDA 可加 -DGGML_CUDA=ON）
+git clone https://github.com/ggerganov/llama.cpp &amp;&amp; cd llama.cpp
+cmake -B build &amp;&amp; cmake --build build --config Release -j
+
+# 2) 下载一个 4-bit GGUF 模型（如 Llama-3-8B Q4_K_M）
+#    然后交互式推理，-ngl 999 表示尽量把层卸载到 GPU（若有）
+./build/bin/llama-cli -m ./llama-3-8b-q4_k_m.gguf \
+    -p &quot;用一句话解释 KV Cache&quot; -n 128 -ngl 999
+
+# 3) 或启动一个兼容 OpenAI 的本地服务
+./build/bin/llama-server -m ./llama-3-8b-q4_k_m.gguf --port 8080</code></pre>
+<h4 id="h-3-用一个-python-表格帮选型">3. 用一个 Python 表格帮选型<a class="anchor" href="#h-3-用一个-python-表格帮选型" aria-label="本节链接">#</a></h4>
+<pre data-lang="python"><code class="language-python"># -*- coding: utf-8 -*-
+# 简易选型：根据你的硬件与场景，推荐推理引擎
+
+def recommend(has_nvidia_gpu, is_production, need_cpu_only):
+    if need_cpu_only:
+        return &quot;llama.cpp（CPU/边缘，量化模型）&quot;
+    if has_nvidia_gpu and is_production:
+        return &quot;TensorRT-LLM（编译优化，极致性能）或 vLLM（易用高吞吐）&quot;
+    if has_nvidia_gpu:
+        return &quot;vLLM（开箱即用的高吞吐服务）&quot;
+    return &quot;llama.cpp（本地消费级设备）&quot;
+
+for gpu, prod, cpu in [(True, True, False), (True, False, False),
+                       (False, False, True), (False, False, False)]:
+    print(f&quot;GPU={gpu} 生产={prod} 仅CPU={cpu} -&gt; {recommend(gpu, prod, cpu)}&quot;)</code></pre>
+<p><figure><img class="md-img" src="content/courses/llm-inference-optimization/assets/chapter-3-figure-02.svg" alt="三大推理引擎定位对比图：用三栏卡片并列——左栏&quot;vLLM&quot;（图标为通用服务，标签&quot;易用、生态好、高吞吐&quot;）；中栏&quot;TensorRT-LLM&quot;（图标为 NVIDIA GPU，标签&quot;编译优化、FP8、超大模型多卡&quot;）；右栏&quot;llama.cpp&quot;（图标为笔记本电脑/手机，标签&quot;CPU/边缘、量化灵活&quot;）；每栏下方各写一句典型场景；底部画一条横轴，左端标&quot;本地/边缘/轻量&quot;，右端标&quot;在线/高并发/极致性能&quot;，把 llama.cpp 放在左端、vLLM 居中、TensorRT-LLM 放在右端" loading="lazy" decoding="async"><figcaption>三大推理引擎定位对比图：用三栏卡片并列——左栏&quot;vLLM&quot;（图标为通用服务，标签&quot;易用、生态好、高吞吐&quot;）；中栏&quot;TensorRT-LLM&quot;（图标为 NVIDIA GPU，标签&quot;编译优化、FP8、超大模型多卡&quot;）；右栏&quot;llama.cpp&quot;（图标为笔记本电脑/手机，标签&quot;CPU/边缘、量化灵活&quot;）；每栏下方各写一句典型场景；底部画一条横轴，左端标&quot;本地/边缘/轻量&quot;，右端标&quot;在线/高并发/极致性能&quot;，把 llama.cpp 放在左端、vLLM 居中、TensorRT-LLM 放在右端</figcaption></figure>
+</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>看差异</strong>：对比 TensorRT-LLM 的&quot;先编译 engine&quot;与 vLLM 的&quot;直接加载权重&quot;，思考：为什么 TensorRT-LLM 换模型更麻烦，但单卡峰值性能常更高？</li>
+<li><strong>CPU 跑模型</strong>：用 llama.cpp 在本地 CPU 上跑一个 4-bit 量化模型，记录生成速度（tokens/s），再对照第 1 章 decode&quot;访存密集&quot;的结论，解释为什么 CPU 上很慢。</li>
+<li><strong>加 GPU 卸载</strong>：llama.cpp 启动时把 <code>-ngl</code> 从 0 改到 999，观察速度变化，理解&quot;层卸载到 GPU&quot;的作用。</li>
+<li><strong>思考</strong>：一个边缘设备（无 GPU、内存 16GB）要跑 7B 模型，只能选哪个引擎？为什么 vLLM 和 TensorRT-LLM 都不可行？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>TensorRT-LLM 官方文档：<a href="https://nvidia.github.io/TensorRT-LLM/" target="_blank" rel="noopener noreferrer">https://nvidia.github.io/TensorRT-LLM/</a></li>
+<li>TensorRT-LLM GitHub 仓库：<a href="https://github.com/NVIDIA/TensorRT-LLM" target="_blank" rel="noopener noreferrer">https://github.com/NVIDIA/TensorRT-LLM</a></li>
+<li>llama.cpp GitHub 仓库：<a href="https://github.com/ggerganov/llama.cpp" target="_blank" rel="noopener noreferrer">https://github.com/ggerganov/llama.cpp</a></li>
+<li>GGUF 格式说明：<a href="https://github.com/ggerganov/ggml/blob/master/docs/gguf.md" target="_blank" rel="noopener noreferrer">https://github.com/ggerganov/ggml/blob/master/docs/gguf.md</a></li>
+</ul>
+<p><a href="#/l/inf-ch3-l3">下一课：SGLang 与选型对比</a></p>

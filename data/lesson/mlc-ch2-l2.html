@@ -1,0 +1,248 @@
+<h2 id="h-算子级-ir-与分解decomposition的取舍">算子级 IR 与分解（decomposition）的取舍<a class="anchor" href="#h-算子级-ir-与分解decomposition的取舍" aria-label="本节链接">#</a></h2>
+<p>第 1 课把模型捕获成了一张图，但图上写的是什么？前端最容易记下的节点是 <code>layer_norm</code>、<code>gelu</code>、<code>softmax</code> 这类<strong>高层算子（high-level op）</strong>——语义清楚、与框架一一对应；而后端要生成代码时，面对的是只认几十个<strong>原语（primitive）</strong>的机器：加减乘除、指数、归约、条件选择。于是编译器必须在某个时刻回答：这些算子什么时候拆、拆到什么粒度、拆完谁把它们再拼回去。本课用同一段 LayerNorm+GELU 管线，把&quot;整体保留&quot;与&quot;分解成原语&quot;两种 IR 都建出来，算清规模、数值、显存与融合四笔账。</p>
+<p><figure><img class="md-img" src="content/courses/ml-compilers/assets/chapter-2-figure-01.svg" alt="三条捕获路线：取材范围与代价" loading="lazy" decoding="async"><figcaption>三条捕获路线：取材范围与代价</figcaption></figure>
+</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-算子级-ir-记了什么">1. 算子级 IR 记了什么<a class="anchor" href="#h-1-算子级-ir-记了什么" aria-label="本节链接">#</a></h4>
+<p>一个算子节点至少带三样东西：<strong>算子身份</strong>（哪个 op）、<strong>输入输出契约</strong>（每个张量的 shape 与 dtype）、<strong>参数</strong>（<code>eps</code>、<code>dim</code>、<code>approximate=&#39;tanh&#39;</code> 等）。它在语义上是个黑盒：<code>softmax</code> 节点只说&quot;输出是输入在 dim 上的归一化指数&quot;，不说乘了几次、有没有减最大值、中间张量多大。分解的切入口就在这里——黑盒内部是<strong>可替换的实现</strong>：前端捕获得越&quot;高&quot;，IR 越短，能看见的自由度也越少。</p>
+<h4 id="h-2-分解的三种类型">2. 分解的三种类型<a class="anchor" href="#h-2-分解的三种类型" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>类型</th>
+<th>含义</th>
+<th>例子</th>
+<th>动了什么</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>结构拆分</td>
+<td>一个 op 展开成一段子图</td>
+<td><code>layer_norm</code> → mean/sub/mul/mean/add/sqrt/div/mul/add</td>
+<td>图结构</td>
+</tr>
+<tr>
+<td>恒等改写</td>
+<td>等价但更基础的形式</td>
+<td><code>gelu</code> → <code>tanh</code> 近似式；<code>a/b</code> → <code>a * (1/b)</code></td>
+<td>算子代数</td>
+</tr>
+<tr>
+<td>位置迁移</td>
+<td>op 留图里，下沉到后端按 pattern 处理</td>
+<td>后端匹配成 library call</td>
+<td>流水线阶段</td>
+</tr>
+</tbody></table>
+<p>前两类发生在图 IR 上；第三类是&quot;不分解&quot;的路。选哪条取决于后端有多少条 pattern 可匹配。</p>
+<p><figure><img class="md-img" src="content/courses/ml-compilers/assets/chapter-2-figure-03.svg" alt="分解的三种类型：结构拆分、恒等改写、位置迁移，选哪条取决于后端有多少条 pattern" loading="lazy" decoding="async"><figcaption>分解的三种类型：结构拆分、恒等改写、位置迁移，选哪条取决于后端有多少条 pattern</figcaption></figure>
+</p>
+<h4 id="h-3-为什么非要分解n-个算子-vs-m-个后端">3. 为什么非要分解：N 个算子 vs M 个后端<a class="anchor" href="#h-3-为什么非要分解n-个算子-vs-m-个后端" aria-label="本节链接">#</a></h4>
+<p>设前端有 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span></span></span></span> 个高层算子、后端有 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">M</span></span></span></span> 个目标，每个后端都为每个算子写一条生成路径，工作量是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">O</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">M</span><span class="mclose">)</span></span></span></span>。分解把这个积压拆成两个和：前端把 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span></span></span></span> 个算子<strong>降到</strong> <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">K</span></span></span></span> 个原语（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7224em;vertical-align:-0.0391em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">K</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≪</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span></span></span></span>，与后端数量无关），后端只为 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">K</span></span></span></span> 个原语做代码生成。MLIR 用 <code>linalg</code> 作共享下降层、TVM 用算子 + 调度描述的也是同一件事：<strong>把组合爆炸压成两段线性工作</strong>。</p>
+<h4 id="h-4-代价一分解会拆掉融合机会也会摧毁必须保留的结构">4. 代价一：分解会拆掉融合机会，也会摧毁必须保留的结构<a class="anchor" href="#h-4-代价一分解会拆掉融合机会也会摧毁必须保留的结构" aria-label="本节链接">#</a></h4>
+<p>融合的依据是&quot;生产者-消费者边界在哪&quot;。保留整体算子时 <code>layer_norm</code> 与 <code>gelu</code> 都是不可融的黑盒，分组结果是 2 组；分解成原语链后，18 个节点能整段进一个 kernel。</p>
+<p>反向的例子同样硬：注意力依赖&quot;QK^T→softmax→PV&quot;这个<strong>整体结构</strong>才能套在线 softmax 与 tiling；把 softmax 拆散落地，中间张量就把显存吃光——本课的账是 <code>(8,1024,32000)</code> 的 exp 结果要 1000 MiB，整段融合只常驻 <code>(B,T)</code> 的 running max/sum，64 KiB。<strong>分解粒度不是越细越好，上限由&quot;哪些结构必须留给后端识别&quot;决定。</strong></p>
+<h4 id="h-5-代价二分解会改变浮点结合序">5. 代价二：分解会改变浮点结合序<a class="anchor" href="#h-5-代价二分解会改变浮点结合序" aria-label="本节链接">#</a></h4>
+<p>分解出的求和顺序与原算子不一定一致，而浮点加法不满足结合律。1024 个 float32（|x|∼10）的 200 组随机实验中，逐项相加相对 f64 基准的中位偏差 3.9 ULP（最大 211.4），树形归约中位 0.8 ULP（最大 126.9）。量级远小于一般训练容差，但它说明两件事：<strong>&quot;分解前后逐位相等&quot;不能当验收标准</strong>；改写是否安全必须由编译器显式记账（第 4 章）。</p>
+<h4 id="h-6-常见坑">6. 常见坑<a class="anchor" href="#h-6-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>在捕获阶段就分解</strong>：中间端拿不到原始算子名、参数与模块层级，按算子做 pattern 匹配就没有锚点。</li>
+<li><strong>分解完忘做 shape 推导</strong>：&quot;sum 之后丢了 keepdim&quot;这类偏差是图级优化最常见的事故。</li>
+<li><strong>把分解当纯替换</strong>：<code>tanh</code> 近似 <code>gelu</code> 与精确 <code>erf</code> 版数值分布不同，精度验收要跟着改。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面用 numpy（python3.10 + numpy 1.26.2，纯 CPU）搭一个极简图 IR：<code>Builder</code> 建节点、<code>evaluate</code> 按原语求值、<code>dec_*</code> 是分解规则。同一段 LayerNorm+GELU 管线用两条路各建一张图，再比节点数、融合分组、数值一致性与浮点结合序。</p>
+<pre data-lang="python"><code class="language-python"># ===== 算子级 IR：同一语义，&quot;保留整体算子&quot; vs &quot;分解成原语&quot; =====
+# 需要 numpy（本机 python3.10 + numpy 1.26.2，纯 CPU 验证）
+import numpy as np
+
+EPS = 1e-5
+
+# ---------- 原语集合：后端只要认识这些就够，每个原语一个数学定义 ----------
+PRIMS = {
+    &#39;add&#39;:      lambda a, b: a + b,
+    &#39;sub&#39;:      lambda a, b: a - b,
+    &#39;mul&#39;:      lambda a, b: a * b,
+    &#39;div&#39;:      lambda a, b: a / b,
+    &#39;exp&#39;:      lambda a: np.exp(a),
+    &#39;sqrt&#39;:     lambda a: np.sqrt(a),
+    &#39;sum_dim&#39;:  lambda a, d, keep=False: np.sum(a, axis=d, keepdims=keep),
+    &#39;mean_dim&#39;: lambda a, d, keep=False: np.mean(a, axis=d, keepdims=keep),
+    &#39;max_dim&#39;:  lambda a, d, keep=False: np.max(a, axis=d, keepdims=keep),
+    &#39;tanh&#39;:     lambda a: np.tanh(a),
+    &#39;input&#39;:    lambda name: None,   # 占位：求值时由 evaluate 用外部 inputs 覆盖
+}
+
+class Builder:
+    &quot;&quot;&quot;极简图 IR 构建器：节点 = (op, args)，args 里 str 指向已有值名。&quot;&quot;&quot;
+    def __init__(self): self.nodes, self.env = [], {}
+    def emit(self, op, *args):
+        i = len(self.nodes); self.nodes.append((op, list(args)))
+        self.env[f&#39;v{i}&#39;] = None; return f&#39;v{i}&#39;
+    def ops(self): return [op for op, _ in self.nodes]
+    def evaluate(self, inputs):
+        env = dict(self.env); env.update({k: np.asarray(v, dtype=np.float32) for k, v in inputs.items()})
+        for i, (op, args) in enumerate(self.nodes):
+            if op == &#39;input&#39;:                       # 输入节点：把外部张量绑到这个值名上
+                env[f&#39;v{i}&#39;] = env[args[0]]; continue
+            vals = [env[a] if isinstance(a, str) else a for a in args]
+            env[f&#39;v{i}&#39;] = PRIMS[op](*vals)
+        return env[f&#39;v{len(self.nodes) - 1}&#39;]
+
+# ---------- 高层算子：一个节点顶一整段算法（前端&quot;保留整体&quot;的形态） ----------
+def layer_norm(a, w, b, eps=EPS):
+    mu = a.mean(axis=-1, keepdims=True)
+    var = ((a - mu) ** 2).mean(axis=-1, keepdims=True)
+    return (a - mu) / np.sqrt(var + eps) * w + b
+
+def gelu_tanh(a):
+    return 0.5 * a * (1.0 + np.tanh(0.7978845608 * (a + 0.044715 * a ** 3)))
+
+PRIMS.update({&#39;layer_norm&#39;: layer_norm, &#39;gelu_tanh&#39;: gelu_tanh})
+
+# ---------- 分解规则：每个高层算子展开成一段原语子图 ----------
+def dec_layer_norm(G, x, w, b, eps=EPS):
+    mu = G.emit(&#39;mean_dim&#39;, x, -1, True)
+    c = G.emit(&#39;sub&#39;, x, mu)
+    sq = G.emit(&#39;mul&#39;, c, c)
+    var = G.emit(&#39;mean_dim&#39;, sq, -1, True)
+    ev = G.emit(&#39;add&#39;, var, eps)
+    sd = G.emit(&#39;sqrt&#39;, ev)
+    n = G.emit(&#39;div&#39;, c, sd)
+    return G.emit(&#39;add&#39;, G.emit(&#39;mul&#39;, n, w), b)
+
+def dec_gelu_tanh(G, a):
+    half = G.emit(&#39;mul&#39;, a, 0.5)
+    sq = G.emit(&#39;mul&#39;, a, a)
+    cube = G.emit(&#39;mul&#39;, sq, a)
+    t1 = G.emit(&#39;mul&#39;, cube, 0.044715)
+    t2 = G.emit(&#39;add&#39;, a, t1)
+    t3 = G.emit(&#39;mul&#39;, t2, 0.7978845608)
+    t4 = G.emit(&#39;tanh&#39;, t3)
+    return G.emit(&#39;mul&#39;, half, G.emit(&#39;add&#39;, t4, 1.0))
+
+# ---------- 两张图：保留整体算子 vs 分解成原语，语义应当一致 ----------
+def build_whole():
+    G = Builder()
+    x = G.emit(&#39;input&#39;, &#39;x&#39;)          # 输入也记一个节点，便于统一计数
+    ln = G.emit(&#39;layer_norm&#39;, x, &#39;w&#39;, &#39;b&#39;)
+    return G, G.emit(&#39;gelu_tanh&#39;, ln)
+
+def build_decomposed():
+    G = Builder()
+    x = G.emit(&#39;input&#39;, &#39;x&#39;)
+    ln = dec_layer_norm(G, x, &#39;w&#39;, &#39;b&#39;)
+    return G, dec_gelu_tanh(G, ln)
+
+def fusion_groups(G, fused_ops):
+    &quot;&quot;&quot;按 op 名分组统计：整体算子每个单独成组，原语则让它连成一段。&quot;&quot;&quot;
+    groups, cur = [], 0
+    for op in G.ops():
+        if op == &#39;input&#39;: continue
+        if op in fused_ops:
+            cur += 1
+        else:
+            if cur: groups.append((&#39;原语链&#39;, cur)); cur = 0
+            groups.append((f&#39;{op}(不可融合)&#39;, 1))
+    if cur: groups.append((&#39;原语链&#39;, cur))
+    return groups
+
+def fmt(a):
+    return np.array2string(a, precision=6, suppress_small=True, floatmode=&#39;fixed&#39;)
+
+if __name__ == &#39;__main__&#39;:
+    rng = np.random.default_rng(0)
+    x = rng.standard_normal((4, 8)).astype(np.float32)
+    w = rng.standard_normal(8).astype(np.float32)
+    b = rng.standard_normal(8).astype(np.float32)
+    inputs = {&#39;x&#39;: x, &#39;w&#39;: w, &#39;b&#39;: b}
+
+    whole, _ = build_whole()
+    dec, _ = build_decomposed()
+    yw, yd = whole.evaluate(inputs), dec.evaluate(inputs)
+
+    print(&#39;=== 同一语义，两种 IR 的规模 ===&#39;)
+    print(f&#39;保留整体算子：{len(whole.nodes)} 个节点 → {whole.ops()}&#39;)
+    print(f&#39;分解成原语：  {len(dec.nodes)} 个节点 → {dec.ops()}&#39;)
+    print(f&#39;数值一致性：最大绝对差 = {np.abs(yw - yd).max():.3e}&#39;)
+    print(&#39;前两个元素  整体版 =&#39;, fmt(yw[0, :2]))
+    print(&#39;            分解版 =&#39;, fmt(yd[0, :2]))
+
+    print(&#39;\n=== 浮点结合序：分解会改变&quot;谁跟谁先相加&quot; ===&#39;)
+    def seq_sum(a):                      # 逐项相加（分解后的朴素写法）
+        s = np.float32(0.0)
+        for v in a: s = np.float32(s + v)
+        return s
+    def pair_sum(a):                     # 两两分组的树形归约（融合 kernel 的常见写法）
+        while len(a) &gt; 1:
+            a = [np.float32(a[i] + a[i + 1]) if i + 1 &lt; len(a) else a[i]
+                 for i in range(0, len(a), 2)]
+        return a[0]
+    worst, worst_ulp, seq_ulp, tree_ulp = 0.0, 0.0, [], []
+    for seed in range(200):
+        r = np.random.default_rng(seed)
+        v = (r.standard_normal(1024) * 10).astype(np.float32)
+        ref = float(np.sum(v.astype(np.float64)))            # f64 作基准
+        ulp = 2.0 ** -23 * abs(ref)
+        for got in (float(seq_sum(v)), float(pair_sum(list(v)))):
+            worst, worst_ulp = max(worst, abs(got - ref)), max(worst_ulp, abs(got - ref) / ulp)
+        seq_ulp.append(abs(float(seq_sum(v)) - ref) / ulp)
+        tree_ulp.append(abs(float(pair_sum(list(v))) - ref) / ulp)
+    print(f&#39;  1024 个 float32、|x|~10，200 组随机数：与 f64 基准的最大偏差 = {worst:.3e}&#39;)
+    print(f&#39;  折合最大 {worst_ulp:.1f} ULP（ULP = 2**-23 × |sum|）；&#39;
+          f&#39;中位：逐项 {np.median(seq_ulp):.1f} ULP，树形 {np.median(tree_ulp):.1f} ULP&#39;)
+
+    print(&#39;\n=== 中间张量的体积：分解把&quot;不落地&quot;变成了&quot;要落地&quot; ===&#39;)
+    B, T, V = 8, 1024, 32000
+    softmax_mid = B * T * V * 4                                   # 未归一化指数张量，float32
+    print(f&#39;  softmax 输入 (B,T,V)=({B},{T},{V})：分解出的 exp 结果需要 {softmax_mid / 2**20:.0f} MiB 显存&#39;)
+    print(f&#39;  整段融合（在线 softmax 一类写法）只需常驻 (B,T)=({B},{T}) 的 running max/sum，&#39;
+          f&#39;即 {B * T * 4 * 2 / 2**10:.1f} KiB——相差 {softmax_mid / (B * T * 4 * 2):.0f} 倍&#39;)
+
+    print(&#39;\n=== 融合分组：分解把&quot;算子边界&quot;变成了可融合的原语链 ===&#39;)
+    for name, G in ((&#39;保留整体&#39;, whole), (&#39;分解成原语&#39;, dec)):
+        groups = fusion_groups(G, fused_ops=set(PRIMS) - {&#39;layer_norm&#39;, &#39;gelu_tanh&#39;})
+        print(f&#39;  {name}：{len(groups)} 组 → {groups}&#39;)</code></pre>
+<p>实际运行结果（python3.10.16 + numpy 1.26.2）：</p>
+<pre data-lang="text"><code class="language-text">=== 同一语义，两种 IR 的规模 ===
+保留整体算子：3 个节点 → [&#39;input&#39;, &#39;layer_norm&#39;, &#39;gelu_tanh&#39;]
+分解成原语：  19 个节点 → [&#39;input&#39;, &#39;mean_dim&#39;, &#39;sub&#39;, &#39;mul&#39;, &#39;mean_dim&#39;, &#39;add&#39;, &#39;sqrt&#39;, &#39;div&#39;, &#39;mul&#39;, &#39;add&#39;, &#39;mul&#39;, &#39;mul&#39;, &#39;mul&#39;, &#39;mul&#39;, &#39;add&#39;, &#39;mul&#39;, &#39;tanh&#39;, &#39;add&#39;, &#39;mul&#39;]
+数值一致性：最大绝对差 = 0.000e+00
+前两个元素  整体版 = [-0.138962  0.888542]
+            分解版 = [-0.138962  0.888542]
+
+=== 浮点结合序：分解会改变&quot;谁跟谁先相加&quot; ===
+  1024 个 float32、|x|~10，200 组随机数：与 f64 基准的最大偏差 = 6.539e-04
+  折合最大 211.4 ULP（ULP = 2**-23 × |sum|）；中位：逐项 3.9 ULP，树形 0.8 ULP
+
+=== 中间张量的体积：分解把&quot;不落地&quot;变成了&quot;要落地&quot; ===
+  softmax 输入 (B,T,V)=(8,1024,32000)：分解出的 exp 结果需要 1000 MiB 显存
+  整段融合（在线 softmax 一类写法）只需常驻 (B,T)=(8,1024) 的 running max/sum，即 64.0 KiB——相差 16000 倍
+
+=== 融合分组：分解把&quot;算子边界&quot;变成了可融合的原语链 ===
+  保留整体：2 组 → [(&#39;layer_norm(不可融合)&#39;, 1), (&#39;gelu_tanh(不可融合)&#39;, 1)]
+  分解成原语：1 组 → [(&#39;原语链&#39;, 18)]</code></pre>
+<p>四笔账：<strong>规模</strong>——3 节点 vs 19 节点，分解换来代数化简与融合空间，代价是后端要多支持原语；<strong>正确性</strong>——两条路输出差为 0，因为本课让二者用了同一次求和顺序；<strong>数值</strong>——仅换一种结合序，中位偏差就从 3.9 ULP 降到 0.8 ULP（最大 211 ULP），所以&quot;逐位相等&quot;不能当验收标准；<strong>显存</strong>——把 softmax 拆散落地，<code>(8,1024,32000)</code> 的 exp 中间结果要 1000 MiB，整段融合只留 64 KiB running 状态。</p>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选，需自备能装 torch 的环境（本机未装 torch）----
+# 官方工具里看&quot;分解表&quot;的真实规模，两条命令即可：
+#   python3 -c &quot;import torch; from torch._decomp import get_decompositions; \
+#               print(len(get_decompositions([torch.ops.aten.layer_norm.default])))&quot;
+#   TORCH_LOGS=inductor python3 -c &quot;import torch; \
+#       f=torch.compile(lambda x: torch.nn.functional.gelu(x+1)); f(torch.randn(4,8))&quot;
+# 前者看&quot;一个算子被拆成几个原语&quot;，后者看 Inductor 实际生成了什么（含融合分组）。
+# 没有 torch 也能完成本课：上面的 numpy 版已把规模、数值与显存三笔账算完。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：给 <code>dec_gelu_tanh</code> 再写一版按精确 <code>erf</code> 分解（先声明 <code>erf</code> 原语再在 <code>PRIMS</code> 里定义），比较两版在 x 取 −6…6 上的最大差异，说明哪版更该进编译器。</li>
+<li><strong>解释</strong>：为什么保留整体算子会让融合分组退化成每组一个算子？若 100 个模型各定义了略有差异的 <code>layer_norm</code>，你希望 IR 里存什么？</li>
+<li><strong>对比/验证</strong>：把 <code>dec_layer_norm</code> 的 <code>mean_dim</code> 换成&quot;先 <code>sum_dim</code> 再 <code>mul 1/n</code>&quot;，重跑一致性对比；再用 1000 个 float32 比三种求和顺序的 ULP。</li>
+<li><strong>思考</strong>：若目标后端只认 <code>matmul</code> 与 <code>elementwise</code>，你会把 <code>softmax</code> 分解到哪一步、保留哪一步？用本课的显存账说明边界画在哪。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>PyTorch 官方文档, <em>torch.compiler_fine_grain_apis</em>（AOT/FX 图与 aten 算子层面的细粒度 API，分解与重写发生的位置）：<a href="https://docs.pytorch.org/docs/stable/torch.compiler_fine_grain_apis.html" target="_blank" rel="noopener noreferrer">https://docs.pytorch.org/docs/stable/torch.compiler_fine_grain_apis.html</a></li>
+<li>PyTorch 官方 Wiki, <em>Decompositions in PyTorch 2</em>（分解表、内部 decomposition 机制与算子覆盖的工程背景）：<a href="https://github.com/pytorch/pytorch/wiki/Decompositions-in-PyTorch-2" target="_blank" rel="noopener noreferrer">https://github.com/pytorch/pytorch/wiki/Decompositions-in-PyTorch-2</a></li>
+<li>MLIR 官方文档, <em>&#39;linalg&#39; Dialect</em>（结构化算子的索引映射、迭代器类型与六条设计性质，即&quot;共享下降层&quot;的现实形态）：<a href="https://mlir.llvm.org/docs/Dialects/Linalg/" target="_blank" rel="noopener noreferrer">https://mlir.llvm.org/docs/Dialects/Linalg/</a></li>
+<li>Chen 等, <em>TVM: An Automated End-to-End Optimizing Compiler for Deep Learning</em>（OSDI&#39;18；算子级 IR 与&quot;计算/调度分离&quot;的原始设计）：<a href="https://www.usenix.org/conference/osdi18/presentation/chen" target="_blank" rel="noopener noreferrer">https://www.usenix.org/conference/osdi18/presentation/chen</a></li>
+</ul>
+<p><a href="#/l/mlc-ch2-l3">下一课：动态形状——guard、重编译与编译缓存</a></p>

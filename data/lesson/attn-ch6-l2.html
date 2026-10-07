@@ -1,0 +1,143 @@
+<h2 id="h-一个小任务">一个小任务<a class="anchor" href="#h-一个小任务" aria-label="本节链接">#</a></h2>
+<p>上一课我们从零拼出了 Transformer，但还没让它真正&quot;学会&quot;任何东西。这一课跑通一个完整的训练闭环。任务选一个经典的合成小任务——<strong>序列反转</strong>：模型读入一串数字 token，必须原样、倒序地把它吐出来。反转任务看起来简单，却正好考验 Transformer 的两项核心能力——编码器要理解输入，解码器要<strong>按正确顺序、逐 token 生成</strong>，交叉注意力还必须学会&quot;对着源序列找对应位置&quot;。为了把重心放在训练流程上，这一课改用 PyTorch 官方封装 <code>nn.Transformer</code>（它和上一课手写的骨架功能等价），完整走一遍：造数据 → 建模型 → 训练 → 评估。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-为什么选序列反转当入门任务">1. 为什么选&quot;序列反转&quot;当入门任务<a class="anchor" href="#h-1-为什么选序列反转当入门任务" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>数据无限、零成本</strong>：随机整数序列要多少有多少，不用下载、不用清洗。</li>
+<li><strong>目标明确、可验证</strong>：输出必须严格等于输入的反转，对了就是对了，一眼就能判定。</li>
+<li><strong>恰好锻炼关键机制</strong>：解码器位置 <code>i</code> 要输出源序列的倒数第 <code>i</code> 个 token，这意味着交叉注意力里&quot;目标位置 ↔ 源位置&quot;会形成一条<strong>反对角线</strong>对齐。这个性质正是第 3 课可视化注意力的看点。</li>
+</ul>
+<p>当然，反转只是热身。理解了流程后，你可以把同样的骨架换成复制任务、排序任务、甚至一个小型机器翻译。</p>
+<h4 id="h-2-训练闭环的四块积木">2. 训练闭环的四块积木<a class="anchor" href="#h-2-训练闭环的四块积木" aria-label="本节链接">#</a></h4>
+<p>任何有监督训练都绕不开这四步，本课代码也严格对应：</p>
+<ol>
+<li><strong>数据</strong>：构造 <code>(源序列, 解码器输入, 目标输出)</code> 三元组。解码器输入 = 目标右移一位（teacher forcing，见第 5 章第 3 课）。</li>
+<li><strong>模型</strong>：<code>nn.Transformer</code> 骨架 + token 嵌入 + 位置编码 + 输出投影。</li>
+<li><strong>损失与优化器</strong>：<code>CrossEntropyLoss</code> 在<strong>所有位置</strong>上求平均，<code>Adam</code> 更新参数。</li>
+<li><strong>评估</strong>：用自回归贪婪解码生成整句，和期望输出逐 token 比对。</li>
+</ol>
+<h4 id="h-3-词表设计与右移一位">3. 词表设计与&quot;右移一位&quot;<a class="anchor" href="#h-3-词表设计与右移一位" aria-label="本节链接">#</a></h4>
+<p>反转任务的词表很简单：<code>0 = &lt;bos&gt;</code>（起始符）、<code>1 = &lt;eos&gt;</code>（结束符）、<code>2 ~ 11</code> 是十个&quot;数字&quot;token。设源序列为 <code>[a, b, c, d, e, f]</code>，那么：</p>
+<pre><code>源序列:      [a, b, c, d, e, f]
+解码器输入:  [&lt;bos&gt;, f, e, d, c, b, a]   ← 反转结果整体右移一位
+目标输出:    [f, e, d, c, b, a, &lt;eos&gt;]   ← 每个位置预测&quot;下一个&quot;真实 token</code></pre>
+<p><code>decoder_input[i]</code> 预测 <code>decoder_output[i]</code>。这样训练时一次前向就能同时监督 7 个位置，效率拉满。</p>
+<h4 id="h-4-评估时为什么要贪心解码">4. 评估时为什么要&quot;贪心解码&quot;<a class="anchor" href="#h-4-评估时为什么要贪心解码" aria-label="本节链接">#</a></h4>
+<p>训练用 teacher forcing，评估则必须自回归：从 <code>&lt;bos&gt;</code> 开始，每步取 logits 最大的 token，拼回输入再走下一步，直到遇到 <code>&lt;eos&gt;</code> 或达到长度上限。这就是第 5 章讲过的&quot;训练与推理差异&quot;在代码里的落地。</p>
+<p><figure><img class="md-img" src="content/courses/attention-transformer/assets/chapter-6-figure-02.svg" alt="序列反转任务的输入输出示例与训练 loss 曲线" loading="lazy" decoding="async"><figcaption>序列反转任务的输入输出示例与训练 loss 曲线</figcaption></figure>
+</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<pre data-lang="python"><code class="language-python">import math
+import torch
+import torch.nn as nn
+
+torch.manual_seed(0)
+
+VOCAB = 12                 # 0:&lt;bos&gt; 1:&lt;eos&gt; 2~11: 十个数字 token
+BOS, EOS = 0, 1
+
+# 位置编码（与上一课一致，batch_first 形式）
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=200):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        pos = torch.arange(max_len).unsqueeze(1).float()
+        div = torch.exp(torch.arange(0, d_model, 2).float()
+                        * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+        self.register_buffer(&quot;pe&quot;, pe.unsqueeze(0))
+    def forward(self, x):
+        return x + self.pe[:, :x.size(1)]
+
+# 序列反转任务的 Transformer
+class Reverser(nn.Module):
+    def __init__(self, vocab, d_model=32, n_heads=4, n_layers=2, dim_ff=64):
+        super().__init__()
+        self.d_model = d_model
+        self.embed = nn.Embedding(vocab, d_model)
+        self.pos = PositionalEncoding(d_model)
+        # 官方封装：encoder 和 decoder 各 n_layers 层
+        self.transformer = nn.Transformer(d_model, n_heads, n_layers, n_layers,
+                                          dim_ff, batch_first=True)
+        self.proj = nn.Linear(d_model, vocab)
+
+    def forward(self, src, tgt):
+        src_emb = self.pos(self.embed(src) * math.sqrt(self.d_model))
+        tgt_emb = self.pos(self.embed(tgt) * math.sqrt(self.d_model))
+        # 因果掩码：保证解码器不偷看未来
+        tgt_mask = nn.Transformer.generate_square_subsequent_mask(tgt.size(1), device=tgt.device)
+        out = self.transformer(src_emb, tgt_emb, tgt_mask=tgt_mask)
+        return self.proj(out)
+
+def make_batch(batch_size, seq_len):
+    src = torch.randint(2, VOCAB, (batch_size, seq_len))       # 源：随机数字
+    rev = src.flip(1)                                          # 反转
+    dec_in = torch.cat([torch.full((batch_size, 1), BOS), rev], dim=1)   # 右移一位
+    dec_out = torch.cat([rev, torch.full((batch_size, 1), EOS)], dim=1)  # 目标
+    return src, dec_in, dec_out
+
+# ---------- 训练 ----------
+model = Reverser(VOCAB)
+opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+loss_fn = nn.CrossEntropyLoss()
+
+losses = []
+for epoch in range(1, 301):
+    model.train()
+    src, dec_in, dec_out = make_batch(32, 6)          # 每轮随机造 32 条长度 6 的序列
+    logits = model(src, dec_in)                       # (32, 7, VOCAB)
+    loss = loss_fn(logits.reshape(-1, VOCAB), dec_out.reshape(-1))
+    opt.zero_grad(); loss.backward(); opt.step()
+    losses.append(loss.item())
+    if epoch % 50 == 0:
+        print(f&quot;epoch {epoch:&gt;3}  loss {loss.item():.4f}&quot;)</code></pre>
+<p>如果设备是 CPU，几百个 epoch 通常几十秒内能跑完；loss 会从接近 <code>ln(VOCAB)</code> 的随机水平一路降下来。接着做评估——自回归贪心解码，并和期望输出比对：</p>
+<pre data-lang="python"><code class="language-python">@torch.no_grad()
+def greedy_decode(model, src, max_len=8):
+    model.eval()
+    generated = torch.full((1, 1), BOS, dtype=torch.long)
+    for _ in range(max_len):
+        logits = model(src, generated)               # 教学版：每次重算整个前缀
+        nxt = logits[0, -1].argmax().item()          # 取最后一个位置的预测
+        generated = torch.cat([generated, torch.tensor([[nxt]])], dim=1)
+        if nxt == EOS:
+            break
+    return generated[0, 1:].tolist()                 # 去掉开头的 &lt;bos&gt;
+
+# 拿 5 条新鲜序列测试
+model.eval()
+correct = 0
+for _ in range(5):
+    src = torch.randint(2, VOCAB, (1, 6))
+    pred = greedy_decode(model, src)
+    target = src.flip(1).tolist()[0] + [EOS]
+    ok = (pred == target)
+    correct += ok
+    print(f&quot;源 {src.tolist()[0]} -&gt; 预测 {pred}  期望 {target}  {&#39;✓&#39; if ok else &#39;✗&#39;}&quot;)
+print(&quot;5 条中正确:&quot;, correct)
+
+# 画出 loss 曲线（可选）
+import matplotlib.pyplot as plt
+plt.plot(losses)
+plt.xlabel(&quot;epoch&quot;); plt.ylabel(&quot;loss&quot;)
+plt.title(&quot;序列反转任务的训练 loss&quot;)
+plt.show()</code></pre>
+<blockquote>
+<p>提示：这里的 <code>greedy_decode</code> 每次调用 <code>model</code> 都重算了整个前缀，是<strong>为清晰而牺牲效率</strong>的写法。工程上会配合 KV cache（第 5 章第 3 课）避免重复计算。</p>
+</blockquote>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>把源序列长度从 6 增加到 12，重新训练。观察 loss 收敛是否变慢、准确率是否下降，思考长序列反转为什么更难。</li>
+<li>把任务从&quot;反转&quot;改成&quot;复制&quot;（输出等于输入），训练后比较两者收敛速度。哪个更难？为什么？</li>
+<li>把 <code>greedy_decode</code> 里&quot;每次重算整个前缀&quot;改成&quot;缓存编码器输出，只重算解码器&quot;的版本，对比相同长度下两种写法的耗时差异。</li>
+<li>引入 <code>&lt;pad&gt;</code> 与变长序列：造一个 batch 内长度不等的反转数据，用 <code>src_key_padding_mask</code> / <code>tgt_key_padding_mask</code> 处理，观察掩码对训练是否必要。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>PyTorch 官方文档 · Transformer：<a href="https://pytorch.org/docs/stable/generated/torch.nn.Transformer.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/docs/stable/generated/torch.nn.Transformer.html</a></li>
+<li>PyTorch 官方文档 · CrossEntropyLoss：<a href="https://pytorch.org/docs/stable/generated/torch.nn.CrossEntropyLoss.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/docs/stable/generated/torch.nn.CrossEntropyLoss.html</a></li>
+<li>The Annotated Transformer（Harvard NLP）· 训练循环：<a href="https://nlp.seas.harvard.edu/annotated-transformer/" target="_blank" rel="noopener noreferrer">https://nlp.seas.harvard.edu/annotated-transformer/</a></li>
+<li>论文《Attention Is All You Need》6.x 节（训练细节）：<a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1706.03762</a></li>
+</ul>
+<p><a href="#/l/attn-ch6-l3">下一课：可视化注意力</a></p>

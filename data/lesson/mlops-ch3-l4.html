@@ -1,0 +1,997 @@
+<h2 id="h-从告警到定位故障树检查顺序与停止判据">从告警到定位：故障树、检查顺序与停止判据<a class="anchor" href="#h-从告警到定位故障树检查顺序与停止判据" aria-label="本节链接">#</a></h2>
+<h3 id="h-这一节要解决什么">这一节要解决什么<a class="anchor" href="#h-这一节要解决什么" aria-label="本节链接">#</a></h3>
+<p>前三节把监控做完了：判据有了（ch3-l1）、指标与不确定度有了（ch3-l2）、阈值是代价模型的最小值点（ch3-l3）。现在告警响了。</p>
+<pre><code>周四 03:12  P1 告警：拒答率 0.0120 → 0.0193（超出变化型阈值）
+周四 03:12  同一分钟：输入层「空值率」也越过阈值、成本层「每千 token 成本」上涨 8%
+周四 03:13  值班同学打开看板：三条告警，四个层，200 个指标
+周四 03:14  开始查……查哪一条？</code></pre>
+<p>这就是本节要解决的问题：<strong>告警之后的那段时间</strong>。它的特点是信息过载、时间压力、以及一个非常容易犯的错误 —— <strong>先做最贵的动作（重训、回滚），再去找原因</strong>。</p>
+<p>这个错误的具体形态有两种，都很常见：</p>
+<table>
+<thead>
+<tr>
+<th>错误动作</th>
+<th>代价</th>
+<th>为什么诱因是&quot;没判据&quot;</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>先回滚</strong></td>
+<td>如果根因在上游数据管道，回滚无效；而且回滚会<strong>销毁证据</strong>（旧版本的输入快照可能被覆盖）</td>
+<td>没有&quot;先分类再处置&quot;的判据</td>
+</tr>
+<tr>
+<td><strong>先重训</strong></td>
+<td>重训要几小时到几天；如果根因是一个字段单位变了，重训出来的模型会<strong>把错误学进去</strong></td>
+<td>没有&quot;概念漂移 vs 管道故障&quot;的判据</td>
+</tr>
+</tbody></table>
+<p>所以本节要回答：</p>
+<blockquote>
+<p>告警响了之后，<strong>按什么顺序查、查到什么程度可以停、什么情况下必须升级</strong>？这三件事都要有可算的判据。</p>
+</blockquote>
+<p>四个子问题：</p>
+<ol>
+<li><strong>为什么&quot;先看哪一层&quot;有确定的答案？</strong> —— 因为四层信号的<strong>检出延迟差着数量级</strong>（本节实测：输入层 schema 检查 1.5 分钟 vs 输出层次日离线指标 810 分钟，<strong>差 540 倍</strong>）。先看慢的那一层等于浪费 13 个小时（§一）。</li>
+<li><strong>检查顺序怎么算出来？</strong> —— 把排查写成<strong>故障树 + 贝叶斯更新</strong>：先验 × 似然 → 后验，检查的排序依据是<strong>单位成本信息增益</strong>（期望熵减少 / 耗时）（§二、§三）。</li>
+<li><strong>什么时候可以停止排查？</strong> —— 停止判据是&quot;最大后验 ≥ 0.80&quot;（或&quot;证据不再改变决策&quot;），不是&quot;把清单走完&quot;。实测：真因是&quot;上游 schema 变更&quot;时，走两步（4 分钟）就达到后验 0.9220，剩余检查不必做（§五）。</li>
+<li><strong>有哪些&quot;看不见&quot;的盲区？</strong> —— 边际全不变、只改相关性的漂移，逐特征监控全静默（实测：两条 KS 都不显著，而相关系数从 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">−</span><span class="mord">0.0244</span></span></span></span> 变成 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.8035</span></span></span></span>）（§四）。</li>
+</ol>
+<p>一句话给本节定调：</p>
+<blockquote>
+<p><strong>排查不是&quot;把可能的原因都看一遍&quot;，而是&quot;在每一步用最小的代价把后验推过处置门槛&quot;。</strong>
+没有这个框架，排查会退化成一个没有终止条件的仪式：查得越多越不确定，最后靠猜。</p>
+</blockquote>
+<h3 id="h-一第一条规则按检出延迟从小到大的顺序读">一、第一条规则：按检出延迟从小到大的顺序读<a class="anchor" href="#h-一第一条规则按检出延迟从小到大的顺序读" aria-label="本节链接">#</a></h3>
+<p>告警是<strong>信号</strong>，不是<strong>证据</strong>。同一个根因会在不同层、不同时间产生信号，而这些信号的到达时间差着数量级。设一次上游数据事故发生在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6151em;"></span><span class="mord mathnormal">t</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0</span></span></span></span>，各层信号的检出延迟可以拆成三段：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">detect</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.2958em;vertical-align:-1.6124em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.6833em;"><span style="top:-1.3876em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">传播</span></span></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.6833em;"><span class="svg-align" style="top:-2.0659em;"><span class="pstrut" style="height:3em;"></span><span class="stretchy" style="height:0.548em;min-width:1.6em;"><span class="brace-left" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMinYMin slice"><path d="M0 6l6-6h17c12.688 0 19.313.3 20 1 4 4 7.313 8.3 10 13
+ 35.313 51.3 80.813 93.8 136.5 127.5 55.688 33.7 117.188 55.8 184.5 66.5.688
+ 0 2 .3 4 1 18.688 2.7 76 4.3 172 5h399450v120H429l-6-1c-124.688-8-235-61.7
+-331-161C60.687 138.7 32.312 99.3 7 54L0 41V6z"/></svg></span><span class="brace-center" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMidYMin slice"><path d="M199572 214
+c100.7 8.3 195.3 44 280 108 55.3 42 101.7 93 139 153l9 14c2.7-4 5.7-8.7 9-14
+ 53.3-86.7 123.7-153 211-199 66.7-36 137.3-56.3 212-62h199568v120H200432c-178.3
+ 11.7-311.7 78.3-403 201-6 8-9.7 12-11 12-.7.7-6.7 1-18 1s-17.3-.3-18-1c-1.3 0
+-5-4-11-12-44.7-59.3-101.3-106.3-170-141s-145.3-54.3-229-60H0V214z"/></svg></span><span class="brace-right" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMaxYMin slice"><path d="M399994 0l6 6v35l-6 11c-56 104-135.3 181.3-238 232-57.3
+ 28.7-117 45-179 50H-300V214h399897c43.3-7 81-15 113-26 100.7-33 179.7-91 237
+-174 2.7-5 6-9 10-13 .7-1 7.3-1 20-1h17z"/></svg></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">prop</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.9341em;"><span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.6124em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:2.3263em;vertical-align:-1.5763em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.75em;"><span style="top:-1.4237em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">窗口内平均等待</span></span></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.75em;"><span class="svg-align" style="top:-2.102em;"><span class="pstrut" style="height:3em;"></span><span class="stretchy" style="height:0.548em;min-width:1.6em;"><span class="brace-left" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMinYMin slice"><path d="M0 6l6-6h17c12.688 0 19.313.3 20 1 4 4 7.313 8.3 10 13
+ 35.313 51.3 80.813 93.8 136.5 127.5 55.688 33.7 117.188 55.8 184.5 66.5.688
+ 0 2 .3 4 1 18.688 2.7 76 4.3 172 5h399450v120H429l-6-1c-124.688-8-235-61.7
+-331-161C60.687 138.7 32.312 99.3 7 54L0 41V6z"/></svg></span><span class="brace-center" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMidYMin slice"><path d="M199572 214
+c100.7 8.3 195.3 44 280 108 55.3 42 101.7 93 139 153l9 14c2.7-4 5.7-8.7 9-14
+ 53.3-86.7 123.7-153 211-199 66.7-36 137.3-56.3 212-62h199568v120H200432c-178.3
+ 11.7-311.7 78.3-403 201-6 8-9.7 12-11 12-.7.7-6.7 1-18 1s-17.3-.3-18-1c-1.3 0
+-5-4-11-12-44.7-59.3-101.3-106.3-170-141s-145.3-54.3-229-60H0V214z"/></svg></span><span class="brace-right" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMaxYMin slice"><path d="M399994 0l6 6v35l-6 11c-56 104-135.3 181.3-238 232-57.3
+ 28.7-117 45-179 50H-300V214h399897c43.3-7 81-15 113-26 100.7-33 179.7-91 237
+-174 2.7-5 6-9 10-13 .7-1 7.3-1 20-1h17z"/></svg></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">window</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord">/2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.898em;"><span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.5763em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:2.3813em;vertical-align:-1.698em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.6833em;"><span style="top:-1.477em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">人工</span><span class="mord mtight">/</span><span class="mord cjk_fallback mtight">自动判定</span></span></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.6833em;"><span class="svg-align" style="top:-2.202em;"><span class="pstrut" style="height:3em;"></span><span class="stretchy" style="height:0.548em;min-width:1.6em;"><span class="brace-left" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMinYMin slice"><path d="M0 6l6-6h17c12.688 0 19.313.3 20 1 4 4 7.313 8.3 10 13
+ 35.313 51.3 80.813 93.8 136.5 127.5 55.688 33.7 117.188 55.8 184.5 66.5.688
+ 0 2 .3 4 1 18.688 2.7 76 4.3 172 5h399450v120H429l-6-1c-124.688-8-235-61.7
+-331-161C60.687 138.7 32.312 99.3 7 54L0 41V6z"/></svg></span><span class="brace-center" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMidYMin slice"><path d="M199572 214
+c100.7 8.3 195.3 44 280 108 55.3 42 101.7 93 139 153l9 14c2.7-4 5.7-8.7 9-14
+ 53.3-86.7 123.7-153 211-199 66.7-36 137.3-56.3 212-62h199568v120H200432c-178.3
+ 11.7-311.7 78.3-403 201-6 8-9.7 12-11 12-.7.7-6.7 1-18 1s-17.3-.3-18-1c-1.3 0
+-5-4-11-12-44.7-59.3-101.3-106.3-170-141s-145.3-54.3-229-60H0V214z"/></svg></span><span class="brace-right" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMaxYMin slice"><path d="M399994 0l6 6v35l-6 11c-56 104-135.3 181.3-238 232-57.3
+ 28.7-117 45-179 50H-300V214h399897c43.3-7 81-15 113-26 100.7-33 179.7-91 237
+-174 2.7-5 6-9 10-13 .7-1 7.3-1 20-1h17z"/></svg></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">decision</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.798em;"><span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.698em;"><span></span></span></span></span></span></span></span></span></span></p>
+<p>本节算例（一次上游数据事故）：</p>
+<table>
+<thead>
+<tr>
+<th>层</th>
+<th>信号</th>
+<th>传播/分</th>
+<th>窗口/分</th>
+<th>决策/分</th>
+<th>总延迟/分</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>输入</td>
+<td>schema 版本 / 字段单位</td>
+<td>0</td>
+<td>1</td>
+<td>1</td>
+<td><strong>1.5</strong></td>
+</tr>
+<tr>
+<td>输入</td>
+<td>特征分布漂移（PSI）</td>
+<td>5</td>
+<td>15</td>
+<td>5</td>
+<td>17.5</td>
+</tr>
+<tr>
+<td>输出</td>
+<td>拒答率 / 格式失败率</td>
+<td>2</td>
+<td>1</td>
+<td>1</td>
+<td>3.5</td>
+</tr>
+<tr>
+<td>输出</td>
+<td>离线指标（次日标签）</td>
+<td>720</td>
+<td>60</td>
+<td>60</td>
+<td><strong>810.0</strong></td>
+</tr>
+<tr>
+<td>延迟</td>
+<td>p99 端到端延迟</td>
+<td>1</td>
+<td>5</td>
+<td>3</td>
+<td>6.5</td>
+</tr>
+<tr>
+<td>成本</td>
+<td>每千 token 成本</td>
+<td>1</td>
+<td>30</td>
+<td>10</td>
+<td>26.0</td>
+</tr>
+<tr>
+<td>业务</td>
+<td>人工客服工单量</td>
+<td>45</td>
+<td>120</td>
+<td>60</td>
+<td>165.0</td>
+</tr>
+</tbody></table>
+<p><strong>读数三条</strong>：</p>
+<ol>
+<li><strong>最快与最慢差 540 倍</strong>（1.5 分钟 vs 810 分钟）。如果值班同学先去看离线指标（&quot;我先确认一下质量到底掉了没&quot;），他就把 13.5 小时花在了一个<strong>不可能在 13 小时内给出答案</strong>的信号上；</li>
+<li><strong>&quot;最快的层未必是根因所在的层&quot;</strong>。schema 检查最先说话，但它只能告诉你&quot;上游有个字段变了&quot;，不能告诉你&quot;这个变化是否真的伤了模型&quot;；</li>
+<li><strong>传播延迟 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.9694em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">prop</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span></span> 是最容易被忽略的一段</strong>：业务层工单量的 45 分钟传播延迟、离线指标 720 分钟的标签延迟，都不是&quot;系统慢&quot;，而是<strong>因果链本身的长度</strong>。</li>
+</ol>
+<h4 id="h-11-由此得到的第一条值班规则">1.1 由此得到的第一条值班规则<a class="anchor" href="#h-11-由此得到的第一条值班规则" aria-label="本节链接">#</a></h4>
+<pre><code>告警响应顺序（按信号延迟，不按仪表盘的重要性）：
+  ① T_detect &lt; 5 分钟：schema/版本检查、输出侧格式失败率、延迟 p99
+  ② 5 ~ 30 分钟：特征分布漂移（PSI/KS）、成本指标
+  ③ 30 分钟 ~ 数小时：业务工单量、人工抽检
+  ④ 数小时 ~ 次日：离线指标、A/B 的最终结论
+先把 ① 全部读到，再动 ②；在 ① 的结果出来之前，不要去读 ④。</code></pre>
+<p>这条规则的依据不是经验，是<strong>上表的算术</strong>：读 ④ 的信息在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7224em;vertical-align:-0.0391em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&lt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">810</span></span></span></span> 分钟时<strong>根本不存在</strong>（标签还没到），而读 ① 的信息在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7224em;vertical-align:-0.0391em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&gt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">5</span></span></span></span> 分钟时<strong>已经存在很久了</strong>。</p>
+<h4 id="h-12-报警时间线的对齐一个必须先做的检查">1.2 报警时间线的对齐：一个必须先做的检查<a class="anchor" href="#h-12-报警时间线的对齐一个必须先做的检查" aria-label="本节链接">#</a></h4>
+<p>在开始任何&quot;原因分析&quot;之前，先做一件很朴素的事：<strong>把告警时间线与变更事件对齐</strong>。</p>
+<pre><code>变更事件（示例）
+  02:40  上游数据管道发版（字段 unit: s -&gt; ms）
+  02:55  缓存配置变更（TTL 30min -&gt; 5min）
+  03:05  模型服务扩缩容（pod 数 8 -&gt; 12）  &lt;- 注意：扩容本身也会改变流量分布
+告警
+  03:12  拒答率超阈值
+  03:12  空值率超阈值
+  03:12  成本上涨 8%</code></pre>
+<p>对齐后立刻有两个观察：</p>
+<ol>
+<li>三条告警<strong>同一分钟</strong>出现 → 指向一个共同的上游原因（而不是三个独立的模型问题）；</li>
+<li>03:12 距 02:40 是 32 分钟、距 02:55 是 17 分钟、距 03:05 是 7 分钟 → <strong>时间距离把 03:05 的扩缩容排在嫌疑第一位</strong>（但要注意：扩缩容经常是&quot;结果的陪跑者&quot;，比如因为重试变多而自动扩容 —— 这时它是<strong>症状</strong>不是原因）。</li>
+</ol>
+<p><strong>这一步的成本是几分钟，收益是排除掉一半的假设。</strong> 它的判据也很简单：对每个变更事件算出&quot;距首次告警的时间差&quot; <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord">Δ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>，按 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">∣</span><span class="mord"><span class="mord">Δ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord">∣</span></span></span></span> 排序；<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord">Δ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 明显小于该层检出延迟的变更事件基本可以排除（因为&quot;来不及&quot;产生该层的信号）。</p>
+<h3 id="h-二第二条规则用故障树把可能原因列成可检验的假设">二、第二条规则：用故障树把&quot;可能原因&quot;列成可检验的假设<a class="anchor" href="#h-二第二条规则用故障树把可能原因列成可检验的假设" aria-label="本节链接">#</a></h3>
+<p>时间线对齐之后，剩下的是&quot;到底哪个原因&quot;。这一步需要一张<strong>故障树</strong>：把可能原因列成互斥（或可加权的）假设，并为每个原因列出&quot;可检查的信号&quot;及其似然。</p>
+<h4 id="h-21-三个必须具备的字段">2.1 三个必须具备的字段<a class="anchor" href="#h-21-三个必须具备的字段" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>含义</th>
+<th>常见错误</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>先验</strong> <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mop">Pr</span><span class="mopen">(</span><span class="mord mathnormal">c</span><span class="mclose">)</span></span></span></span></td>
+<td>这个原因<strong>在没有新证据时</strong>有多可能</td>
+<td>用&quot;上次是哪一类&quot;当唯一依据（会锁死在历史里）</td>
+</tr>
+<tr>
+<td><strong>似然</strong> <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mop">Pr</span><span class="mopen">(</span><span class="mord text"><span class="mord cjk_fallback">检查结果</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∣</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">c</span><span class="mclose">)</span></span></span></span></td>
+<td>如果真因是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">c</span></span></span></span>，这个检查会给出什么结果</td>
+<td>只写&quot;这个检查与 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">c</span></span></span></span> 有关&quot;，不写<strong>通过率/失败率</strong></td>
+</tr>
+<tr>
+<td><strong>成本</strong></td>
+<td>做这个检查要多久、要动多少权限</td>
+<td>忽略&quot;需要申请权限&quot;这一类非技术成本</td>
+</tr>
+</tbody></table>
+<p>本节算例给出四个原因与四个检查（<code>CHECKS[name][cause]</code> 是&quot;<strong>在该原因成立时，这个检查通过的概率</strong>&quot;，于是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span></span></span></span> 是&quot;发现异常的概率&quot;）：</p>
+<table>
+<thead>
+<tr>
+<th>检查 \ 原因</th>
+<th>上游 schema 变更</th>
+<th>流量构成变化</th>
+<th>检索索引陈旧</th>
+<th>模型/配置变更</th>
+<th>耗时/分</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>校验上游 schema 版本</td>
+<td>0.05</td>
+<td>0.95</td>
+<td>0.95</td>
+<td>0.90</td>
+<td>3.0</td>
+</tr>
+<tr>
+<td>对比近 24h 的流量构成</td>
+<td>0.80</td>
+<td>0.10</td>
+<td>0.85</td>
+<td>0.85</td>
+<td>10.0</td>
+</tr>
+<tr>
+<td>比对索引的 doc 数与 hash</td>
+<td>0.90</td>
+<td>0.85</td>
+<td>0.05</td>
+<td>0.80</td>
+<td>4.0</td>
+</tr>
+<tr>
+<td>核对 manifest/binding 哈希</td>
+<td>0.85</td>
+<td>0.90</td>
+<td>0.85</td>
+<td>0.03</td>
+<td>1.0</td>
+</tr>
+</tbody></table>
+<p><strong>先验</strong>（示例）：上游 schema 变更 0.30、流量构成变化 0.25、检索索引陈旧 0.20、模型/配置变更 0.25。</p>
+<p><strong>表的读法</strong>：如果真因是&quot;上游 schema 变更&quot;，那么&quot;校验上游 schema 版本&quot;这个检查<strong>只有 5% 的概率通过</strong>（即 95% 会发现异常）—— 它是一个强信号；而同一个检查在&quot;流量构成变化&quot;下通过率 0.95，几乎不提供信息。</p>
+<h4 id="h-22-信息增益一个检查值多少">2.2 信息增益：一个检查值多少<a class="anchor" href="#h-22-信息增益一个检查值多少" aria-label="本节链接">#</a></h4>
+<p>给定先验 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span></span></span></span>，一个检查的&quot;价值&quot;可以用<strong>期望后验熵的下降</strong>（互信息）度量：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathrm">IG</span></span><span class="mopen">(</span><span class="mord text"><span class="mord">check</span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.3263em;vertical-align:-1.5763em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.75em;"><span style="top:-1.4237em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">先验熵</span></span></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.75em;"><span class="svg-align" style="top:-2.102em;"><span class="pstrut" style="height:3em;"></span><span class="stretchy" style="height:0.548em;min-width:1.6em;"><span class="brace-left" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMinYMin slice"><path d="M0 6l6-6h17c12.688 0 19.313.3 20 1 4 4 7.313 8.3 10 13
+ 35.313 51.3 80.813 93.8 136.5 127.5 55.688 33.7 117.188 55.8 184.5 66.5.688
+ 0 2 .3 4 1 18.688 2.7 76 4.3 172 5h399450v120H429l-6-1c-124.688-8-235-61.7
+-331-161C60.687 138.7 32.312 99.3 7 54L0 41V6z"/></svg></span><span class="brace-center" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMidYMin slice"><path d="M199572 214
+c100.7 8.3 195.3 44 280 108 55.3 42 101.7 93 139 153l9 14c2.7-4 5.7-8.7 9-14
+ 53.3-86.7 123.7-153 211-199 66.7-36 137.3-56.3 212-62h199568v120H200432c-178.3
+ 11.7-311.7 78.3-403 201-6 8-9.7 12-11 12-.7.7-6.7 1-18 1s-17.3-.3-18-1c-1.3 0
+-5-4-11-12-44.7-59.3-101.3-106.3-170-141s-145.3-54.3-229-60H0V214z"/></svg></span><span class="brace-right" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMaxYMin slice"><path d="M399994 0l6 6v35l-6 11c-56 104-135.3 181.3-238 232-57.3
+ 28.7-117 45-179 50H-300V214h399897c43.3-7 81-15 113-26 100.7-33 179.7-91 237
+-174 2.7-5 6-9 10-13 .7-1 7.3-1 20-1h17z"/></svg></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0813em;">H</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="mclose">)</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.898em;"><span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.5763em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:2.5263em;vertical-align:-1.6763em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.85em;"><span style="top:-1.3237em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">期望后验熵</span></span></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.85em;"><span class="svg-align" style="top:-2.002em;"><span class="pstrut" style="height:3em;"></span><span class="stretchy" style="height:0.548em;min-width:1.6em;"><span class="brace-left" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMinYMin slice"><path d="M0 6l6-6h17c12.688 0 19.313.3 20 1 4 4 7.313 8.3 10 13
+ 35.313 51.3 80.813 93.8 136.5 127.5 55.688 33.7 117.188 55.8 184.5 66.5.688
+ 0 2 .3 4 1 18.688 2.7 76 4.3 172 5h399450v120H429l-6-1c-124.688-8-235-61.7
+-331-161C60.687 138.7 32.312 99.3 7 54L0 41V6z"/></svg></span><span class="brace-center" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMidYMin slice"><path d="M199572 214
+c100.7 8.3 195.3 44 280 108 55.3 42 101.7 93 139 153l9 14c2.7-4 5.7-8.7 9-14
+ 53.3-86.7 123.7-153 211-199 66.7-36 137.3-56.3 212-62h199568v120H200432c-178.3
+ 11.7-311.7 78.3-403 201-6 8-9.7 12-11 12-.7.7-6.7 1-18 1s-17.3-.3-18-1c-1.3 0
+-5-4-11-12-44.7-59.3-101.3-106.3-170-141s-145.3-54.3-229-60H0V214z"/></svg></span><span class="brace-right" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMaxYMin slice"><path d="M399994 0l6 6v35l-6 11c-56 104-135.3 181.3-238 232-57.3
+ 28.7-117 45-179 50H-300V214h399897c43.3-7 81-15 113-26 100.7-33 179.7-91 237
+-174 2.7-5 6-9 10-13 .7-1 7.3-1 20-1h17z"/></svg></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathbb">E</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">结果</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen"><span class="delimsizing size1">[</span></span><span class="mord mathnormal" style="margin-right:0.0813em;">H</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∣</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mord text"><span class="mord cjk_fallback">结果</span></span><span class="mclose">)</span><span class="mclose"><span class="delimsizing size1">]</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.998em;"><span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.6763em;"><span></span></span></span></span></span></span></span></span></span></p>
+<p>其中熵 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0813em;">H</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.0497em;vertical-align:-0.2997em;"></span><span class="mord">−</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop"><span class="mop op-symbol small-op" style="position:relative;top:0em;">∑</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.0017em;"><span style="top:-2.4003em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">c</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2997em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="mopen">(</span><span class="mord mathnormal">c</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop">ln</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="mopen">(</span><span class="mord mathnormal">c</span><span class="mclose">)</span></span></span></span>（本节用自然对数，单位是纳特）。<strong>再把成本除进去</strong>，得到排序用的量：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord cjk_fallback">单位成本增益</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.363em;vertical-align:-0.936em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.427em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord text"><span class="mord">cost</span></span><span class="mopen">(</span><span class="mord text"><span class="mord">check</span></span><span class="mclose">)</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathrm">IG</span></span><span class="mopen">(</span><span class="mord text"><span class="mord">check</span></span><span class="mclose">)</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.936em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></p>
+<p>本节实测（先验熵 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0813em;">H</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1.3762</span></span></span></span>）：</p>
+<table>
+<thead>
+<tr>
+<th>检查</th>
+<th>耗时/分</th>
+<th>先验熵</th>
+<th>期望后验熵</th>
+<th>单位成本增益</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>核对 manifest/binding 哈希</td>
+<td>1.0</td>
+<td>1.3762</td>
+<td>0.7023</td>
+<td><strong>0.6739</strong></td>
+</tr>
+<tr>
+<td>校验上游 schema 版本</td>
+<td>3.0</td>
+<td>1.3762</td>
+<td>0.5761</td>
+<td>0.2667</td>
+</tr>
+<tr>
+<td>比对索引的 doc 数与 hash</td>
+<td>4.0</td>
+<td>1.3762</td>
+<td>0.6845</td>
+<td>0.1729</td>
+</tr>
+<tr>
+<td>对比近 24h 的流量构成</td>
+<td>10.0</td>
+<td>1.3762</td>
+<td>0.7918</td>
+<td>0.0584</td>
+</tr>
+</tbody></table>
+<p><strong>排序结果</strong>：核对 manifest 哈希 &gt; 校验 schema &gt; 比对索引 &gt; 对比流量构成。</p>
+<p><strong>两条读数</strong>：</p>
+<ol>
+<li><strong>最强信号既不是最便宜的、也不是最贵的，而是&quot;两者之比最优&quot;的</strong>：核对 manifest 哈希的期望后验熵 0.7023 不是最低（校验 schema 的 0.5761 更低），但它只要 1 分钟，所以单位成本增益第一；</li>
+<li><strong>&quot;对比流量构成&quot;排最后不是因为它没用，而是因为它贵</strong>：它的期望后验熵 0.7918 是四个里最差（信息最少），耗时又是 10 倍。</li>
+</ol>
+<h4 id="h-23-一个必须说清的边界似然从哪来">2.3 一个必须说清的边界：似然从哪来<a class="anchor" href="#h-23-一个必须说清的边界似然从哪来" aria-label="本节链接">#</a></h4>
+<p>上表的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mop">Pr</span><span class="mopen">(</span><span class="mord text"><span class="mord cjk_fallback">通过</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∣</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">c</span><span class="mclose">)</span></span></span></span> 是<strong>给定的</strong>，而实践中它们必须从历史事故里估。三个现实约束：</p>
+<table>
+<thead>
+<tr>
+<th>约束</th>
+<th>后果</th>
+<th>缓解</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>事故样本极少（一年几次）</td>
+<td>似然的不确定度极大（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">±</span><span class="mord">0.2</span></span></span></span> 很常见）</td>
+<td>用区间而不是点值；对区间做敏感性分析（§三.3）</td>
+</tr>
+<tr>
+<td>检查会引入<strong>假阴性</strong>（&quot;看起来正常&quot;但实际有问题）</td>
+<td>单次检查通过不能排除该原因</td>
+<td>给每个检查留一个&quot;最小可发现幅度&quot;，低于它的漂移不保证被发现</td>
+</tr>
+<tr>
+<td>检查之间不独立</td>
+<td>贝叶斯连乘会<strong>过度自信</strong>（把后验推得比实际更极端）</td>
+<td>把强相关的检查合并成一个；或者给每次更新加一个&quot;折扣&quot;</td>
+</tr>
+</tbody></table>
+<p><strong>这三条决定了本节框架的正确用法</strong>：它是<strong>排序工具</strong>，不是<strong>概率真相机</strong>。它的输出（&quot;先查哪一个、查到什么程度可以停&quot;）比它的中间量（后验的具体数值）更可靠。</p>
+<h3 id="h-三第三条规则排序策略要按真因分层评估">三、第三条规则：排序策略要按真因分层评估<a class="anchor" href="#h-三第三条规则排序策略要按真因分层评估" aria-label="本节链接">#</a></h3>
+<p>&quot;哪个顺序最好&quot;这个问题有一个反直觉的答案：<strong>没有全局最优顺序，只有针对真因分布的最优顺序</strong>。本节把三种策略放在两个真因下各测 4000 次：</p>
+<p>策略说明：</p>
+<ul>
+<li><strong>固定清单（按字母序）</strong>：<code>校验上游 schema 版本</code> → <code>对比近 24h 的流量构成</code> → <code>比对索引的 doc 数与 hash</code> → <code>核对 manifest/binding 哈希</code>（这是&quot;中文拼音/字典序&quot;的典型产物 —— 也是很多团队真实使用的顺序）；</li>
+<li><strong>随机顺序</strong>：把四个检查按固定随机种子打乱；</li>
+<li><strong>成本加权信息增益</strong>：按 §2.2 的排序。</li>
+</ul>
+<p><strong>停止判据统一为&quot;真因的后验 ≥ 0.80&quot;</strong>；&quot;命中率&quot;指&quot;清单走完之前就已经达标&quot;的比例。</p>
+<table>
+<thead>
+<tr>
+<th>策略</th>
+<th>真因</th>
+<th>平均步数</th>
+<th>命中率</th>
+<th>平均耗时/分</th>
+<th>未命中后验均值</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>固定清单（按字母序）</td>
+<td>上游 schema 变更</td>
+<td><strong>1.15</strong></td>
+<td>0.9485</td>
+<td><strong>3.77</strong></td>
+<td>0.1534</td>
+</tr>
+<tr>
+<td>随机顺序</td>
+<td>上游 schema 变更</td>
+<td>3.19</td>
+<td>0.8087</td>
+<td>14.77</td>
+<td>0.4917</td>
+</tr>
+<tr>
+<td>成本加权信息增益</td>
+<td>上游 schema 变更</td>
+<td>2.40</td>
+<td>0.8015</td>
+<td>6.78</td>
+<td>0.4937</td>
+</tr>
+<tr>
+<td>固定清单（按字母序）</td>
+<td>模型/配置变更</td>
+<td>4.00</td>
+<td>0.6042</td>
+<td>18.00</td>
+<td>0.4863</td>
+</tr>
+<tr>
+<td>随机顺序</td>
+<td>模型/配置变更</td>
+<td>3.26</td>
+<td>0.7408</td>
+<td>15.04</td>
+<td>0.4343</td>
+</tr>
+<tr>
+<td>成本加权信息增益</td>
+<td>模型/配置变更</td>
+<td><strong>2.25</strong></td>
+<td><strong>0.8728</strong></td>
+<td><strong>5.78</strong></td>
+<td><strong>0.2904</strong></td>
+</tr>
+</tbody></table>
+<p><strong>这张表的三个结论</strong>：</p>
+<ol>
+<li><strong>真因是&quot;上游 schema 变更&quot;时，字母序反而最好</strong>（1.15 步、3.77 分钟）—— 纯属巧合：按字母序恰好把 <code>校验上游 schema 版本</code> 排在第一位，而它对这个真因的发现概率是 0.95；</li>
+<li><strong>真因是&quot;模型/配置变更&quot;时，字母序最差</strong>（4.00 步、18.00 分钟、命中率只有 0.6042）—— 因为对这个真因最强的两个检查（<code>核对 manifest 哈希</code> 发现概率 0.97、<code>校验 schema 版本</code> 只有 0.10）都被排到了最后一个和第一个之后；</li>
+<li><strong>信息增益顺序在两个真因下都是&quot;接近最优&quot;的</strong>（2.40 步和 2.25 步），<strong>代价是它不是任何单一真因下的最优</strong>。</li>
+</ol>
+<p>所以正确的工程做法是：</p>
+<blockquote>
+<p><strong>不要问&quot;哪个顺序最好&quot;，而要问&quot;在我最可能的三个真因上，这个顺序各要几步&quot;。</strong>
+一个顺序如果在某个真因上要 4 步、耗时 18 分钟，那就该把它改掉 —— 即使它在另一个真因上只要 1.15 步。</p>
+</blockquote>
+<h4 id="h-31-顺序改进的迭代方法">3.1 顺序改进的迭代方法<a class="anchor" href="#h-31-顺序改进的迭代方法" aria-label="本节链接">#</a></h4>
+<p>实践中最省力的改进是<strong>把&quot;最便宜且对多个真因都有分辨力&quot;的检查提到前面</strong>。本节算例里 <code>核对 manifest/binding 哈希</code> 满足这个条件（1 分钟、对三个真因的发现概率都不低于 0.10、对&quot;模型/配置变更&quot;是 0.97）。这与 ch2-l1 的&quot;门槛单价&quot;结论同构：<strong>便宜的粗筛要放在前面</strong>，因为它保护的是后面所有昂贵检查的到达批次。</p>
+<h3 id="h-四盲区逐特征监控看不见的漂移">四、盲区：逐特征监控看不见的漂移<a class="anchor" href="#h-四盲区逐特征监控看不见的漂移" aria-label="本节链接">#</a></h3>
+<p>排查时最容易掉进的坑是&quot;<strong>每个特征都正常，所以输入没问题</strong>&quot;。本节给出一个反例（与 ch3-l1 §1.3 同构，但这次用相关系数）：</p>
+<p>构造：两个特征 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">x</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">y</span></span></span></span>，旧环境相互独立（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6776em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">ρ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0</span></span></span></span>），新环境 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">y</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">0.8</span><span class="mord mathnormal">x</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.04em;vertical-align:-0.1266em;"></span><span class="mord sqrt"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.9134em;"><span class="svg-align" style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord" style="padding-left:0.833em;"><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord">0.</span><span class="mord"><span class="mord">8</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.7401em;"><span style="top:-2.989em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span><span style="top:-2.8734em;"><span class="pstrut" style="height:3em;"></span><span class="hide-tail" style="min-width:0.853em;height:1.08em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="1.08em" viewBox="0 0 400000 1080" preserveAspectRatio="xMinYMin slice"><path d="M95,702
+c-2.7,0,-7.17,-2.7,-13.5,-8c-5.8,-5.3,-9.5,-10,-9.5,-14
+c0,-2,0.3,-3.3,1,-4c1.3,-2.7,23.83,-20.7,67.5,-54
+c44.2,-33.3,65.8,-50.3,66.5,-51c1.3,-1.3,3,-2,5,-2c4.7,0,8.7,3.3,12,10
+s173,378,173,378c0.7,0,35.3,-71,104,-213c68.7,-142,137.5,-285,206.5,-429
+c69,-144,104.5,-217.7,106.5,-221
+l0 -0
+c5.3,-9.3,12,-14,20,-14
+H400000v40H845.2724
+s-225.272,467,-225.272,467s-235,486,-235,486c-2.7,4.7,-9,7,-19,7
+c-6,0,-10,-1,-12,-3s-194,-422,-194,-422s-65,47,-65,47z
+M834 80h400000v40h-400000z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.1266em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">ε</span></span></span></span>。<strong>边际分布完全不变</strong>（都还是标准正态）。</p>
+<p>实测（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4000</span></span></span></span>，KS 临界值 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.1572em;vertical-align:-0.25em;"></span><span class="mord">1.36/</span><span class="mord sqrt"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.9072em;"><span class="svg-align" style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord" style="padding-left:0.833em;"><span class="mord">4000</span></span></span><span style="top:-2.8672em;"><span class="pstrut" style="height:3em;"></span><span class="hide-tail" style="min-width:0.853em;height:1.08em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="1.08em" viewBox="0 0 400000 1080" preserveAspectRatio="xMinYMin slice"><path d="M95,702
+c-2.7,0,-7.17,-2.7,-13.5,-8c-5.8,-5.3,-9.5,-10,-9.5,-14
+c0,-2,0.3,-3.3,1,-4c1.3,-2.7,23.83,-20.7,67.5,-54
+c44.2,-33.3,65.8,-50.3,66.5,-51c1.3,-1.3,3,-2,5,-2c4.7,0,8.7,3.3,12,10
+s173,378,173,378c0.7,0,35.3,-71,104,-213c68.7,-142,137.5,-285,206.5,-429
+c69,-144,104.5,-217.7,106.5,-221
+l0 -0
+c5.3,-9.3,12,-14,20,-14
+H400000v40H845.2724
+s-225.272,467,-225.272,467s-235,486,-235,486c-2.7,4.7,-9,7,-19,7
+c-6,0,-10,-1,-12,-3s-194,-422,-194,-422s-65,47,-65,47z
+M834 80h400000v40h-400000z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.1328em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.0215</span></span></span></span>）：</p>
+<table>
+<thead>
+<tr>
+<th>视角</th>
+<th>旧</th>
+<th>新</th>
+<th>判定</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">x</span></span></span></span> 的 KS</td>
+<td>—</td>
+<td>0.0210</td>
+<td><strong>不显著</strong></td>
+</tr>
+<tr>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">y</span></span></span></span> 的 KS</td>
+<td>—</td>
+<td>0.0253</td>
+<td>略超临界值，但仍属噪声量级</td>
+</tr>
+<tr>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">x</span></span></span></span> 的均值</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">−</span><span class="mord">0.0097</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.0070</span></span></span></span></td>
+<td>无变化</td>
+</tr>
+<tr>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">y</span></span></span></span> 的均值</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.0307</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">−</span><span class="mord">0.0066</span></span></span></span></td>
+<td>无变化</td>
+</tr>
+<tr>
+<td><strong>相关系数</strong></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">−</span><span class="mord">0.0244</span></span></span></span></td>
+<td><strong><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.8035</span></span></span></span></strong></td>
+<td>Fisher <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.044em;">z</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">87.9</span></span></span></span>，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7335em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&lt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">10</span></span></span></span></span></span></span></span></span></span></span></span></td>
+</tr>
+</tbody></table>
+<p><strong>读数</strong>：两条 KS 一在临界值上下<strong>摆动</strong>（0.0210 vs 0.0215、0.0253），按&quot;逐列告警&quot;的口径<strong>会被静音</strong>（前者不显著、后者只是刚过线）；而相关性已经从 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4831em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0</span></span></span></span> 涨到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.80</span></span></span></span>。</p>
+<p><strong>这条盲区对排查的直接影响</strong>：</p>
+<ol>
+<li>排查清单里必须有<strong>一条联合判据</strong>（MMD、两样本分类器、或者关键特征对的相关系数），否则&quot;逐列全绿&quot;会被误读成&quot;输入正常&quot;；</li>
+<li>联合判据的<strong>输出要能定位到&quot;哪一对/哪一组特征&quot;</strong>。MMD 只给一个数，所以工程上通常配一个&quot;逐对相关系数矩阵的变化热图&quot;或者用两样本分类器的特征重要性；</li>
+<li><strong>&quot;输入正常&quot;这个结论必须写明它的覆盖范围</strong>：逐列判据覆盖单变量边际、联合判据覆盖二阶依赖。更高阶的依赖（三阶及以上）通常没人监控 —— 这是一个应该被<strong>显式声明</strong>的已知盲区，而不是默认不存在。</li>
+</ol>
+<h3 id="h-五第四条规则停止判据与升级出口">五、第四条规则：停止判据与升级出口<a class="anchor" href="#h-五第四条规则停止判据与升级出口" aria-label="本节链接">#</a></h3>
+<p>排查有两个失败方式：<strong>停太早</strong>（后验还没到门槛就动手，动作可能是错的）和<strong>停太晚</strong>（信息已经足够却还在走清单，把 MTTR 花在了确认上）。两者都要有判据。</p>
+<h4 id="h-51-停止判据">5.1 停止判据<a class="anchor" href="#h-51-停止判据" aria-label="本节链接">#</a></h4>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7073em;vertical-align:-0.024em;"></span><span class="mord text"><span class="mord cjk_fallback">停止排查</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">⟺</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.45em;vertical-align:-0.7em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.4306em;"><span style="top:-2.4em;margin-left:0em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">c</span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span><span class="mop">max</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.7em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop">Pr</span><span class="mopen">(</span><span class="mord mathnormal">c</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∣</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord cjk_fallback">证据</span></span><span class="mclose">)</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≥</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">θ</span></span></span></span></span></p>
+<p>本节取 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">θ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.80</span></span></span></span>。实测一次：</p>
+<table>
+<thead>
+<tr>
+<th>检查</th>
+<th>结论</th>
+<th>真因后验</th>
+<th>最大后验</th>
+<th>熵</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>（未查）</td>
+<td>—</td>
+<td>0.3000</td>
+<td>0.3000</td>
+<td>1.3762</td>
+</tr>
+<tr>
+<td>核对 manifest/binding 哈希</td>
+<td>正常</td>
+<td>0.3878</td>
+<td>0.3878</td>
+<td>1.1351</td>
+</tr>
+<tr>
+<td>校验上游 schema 版本</td>
+<td><strong>异常</strong></td>
+<td><strong>0.9220</strong></td>
+<td>0.9220</td>
+<td>0.3375</td>
+</tr>
+</tbody></table>
+<p><strong>读数</strong>：走两步、用 4 分钟（1 + 3），最大后验从 0.3000 推到 0.9220，越过 0.80 → <strong>停止排查，开始处置</strong>。剩余两个检查（<code>比对索引</code> 4 分钟、<code>对比流量构成</code> 10 分钟）不必做。</p>
+<p>这个例子里&quot;省掉最贵那一步&quot;的收益是 10 分钟（占清单总耗时 18 分钟的一半以上）。在真实事故里，这个数字经常是&quot;几十分钟 vs 几小时&quot;。</p>
+<h4 id="h-52-三个必须写清的细节">5.2 三个必须写清的细节<a class="anchor" href="#h-52-三个必须写清的细节" aria-label="本节链接">#</a></h4>
+<p><strong>细节 1：阈值的选取。</strong> <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">θ</span></span></span></span> 不是拍的，它由&quot;错判的代价比&quot;决定：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">θ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.1963em;vertical-align:-0.836em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3603em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord text"><span class="mord cjk_fallback">正确处理的收益</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">错判</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">错判</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.836em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></p>
+<p>实务上：如果&quot;误判方向&quot;会导致一次错误的重训（几小时 + 一次无效发布），而&quot;继续查&quot;只要几分钟，那么 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">θ</span></span></span></span> 应该取高（0.9 以上）；如果&quot;误判方向&quot;只是多花十分钟查一个多余的信号（比如查一下成本指标），<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">θ</span></span></span></span> 可以取低（0.6 即可）。</p>
+<p><strong>细节 2：升级出口。</strong> 必须有&quot;走完清单仍不达标&quot;的处理：</p>
+<pre><code>若全部检查走完，最大后验仍 &lt; θ：
+  ① 输出&quot;未判定&quot; + 当前的假设排名与各自的概率（不要输出&quot;没有异常&quot;）
+  ② 加入新的检查（扩大故障树），或者放宽 θ 并明确记录&quot;这是在信息不足下做的决定&quot;
+  ③ 如果告警是 P0（用户已受损），先处置（回滚/限流/降级）再继续查 —— 处置与排查可以并行</code></pre>
+<p>这里的顺序很关键：<strong>&quot;未判定&quot;必须是一个合法输出</strong>。如果流程默认&quot;查不出原因就是没问题&quot;，那么所有&quot;证据不足&quot;的情况都会被静默归零。</p>
+<p><strong>细节 3：证据的记录格式。</strong> 每一次检查都要落成一条记录，字段至少包括：检查名、时间、结论（异常/正常）、<strong>原始读数与其不确定度</strong>、影响的切片、以及<strong>快照引用</strong>。理由有两个：</p>
+<ul>
+<li>事故复盘（ch3 之外的第 5 节内容）需要一条可重放的时间线；</li>
+<li>&quot;正常&quot;这个结论也需要证据 —— 否则三周后没人能解释当时为什么排除了某个原因。</li>
+</ul>
+<h4 id="h-53-一张可以贴墙的处置流程">5.3 一张可以贴墙的处置流程<a class="anchor" href="#h-53-一张可以贴墙的处置流程" aria-label="本节链接">#</a></h4>
+<pre><code>告警
+ ├─ 0. 对齐变更时间线（几分钟；排除&quot;来不及&quot;的事件）
+ ├─ 1. 按 T_detect 从小到大读信号（§一）
+ │     &lt;5min：schema/版本、格式失败率、p99
+ │     5-30min：分布漂移、成本
+ ├─ 2. 用故障树算单位成本信息增益，排检查顺序（§二）
+ ├─ 3. 逐个检查，贝叶斯更新后验
+ │     每步之后判断：max 后验 &gt;= θ ?
+ │       是 → 停止排查，进入处置
+ │       否 → 继续（但优先选&quot;对剩下真因分辨力最高&quot;的检查）
+ ├─ 4. 若清单走完仍不达标 → 输出&quot;未判定&quot; + 排名 + 扩大故障树
+ └─ 5. 处置（回滚 / 校准 / 重训 / 修上游）—— 注意：处置动作本身要记录，
+        因为它会成为下一轮排查的先验</code></pre>
+<p><strong>第 5 步的&quot;处置动作进先验&quot;值得单独说</strong>：如果这次事故的原因是&quot;上游字段单位变了&quot;，那么下一次同类告警时，&quot;上游 schema 变更&quot;的先验就应该被调高。这就是&quot;故障树要维护&quot;的具体含义 —— 它是<strong>活的</strong>，不是一次画完的图。</p>
+<h3 id="h-代码">代码<a class="anchor" href="#h-代码" aria-label="本节链接">#</a></h3>
+<p>下面的脚本只用标准库，把本节的量全部算出来。⚠️ 所有数据都是<strong>合成数据</strong>（<code>random</code>，固定种子），目的是让每个数字可复算，而不是给出现实数据上的结论。</p>
+<p>脚本 242 行，运行 <code>python3 /tmp/mlops_ch3_l4.py</code> 可复现下面的全部输出。</p>
+<pre data-lang="python"><code class="language-python">&quot;&quot;&quot;
+mlops-ch3-l4：从告警到定位的四个可运行实验。
+
+① 基础函数自检：正态 CDF / 分位数 / 熵
+② 故障树：先验 × 似然 → 后验，用「单位成本信息增益」排出检查顺序
+③ 排序策略对比：随机顺序 / 按先验 / 成本加权信息增益，到 80% 命中各要几步
+④ 越往下游越晚：分层监控的检出延迟账本
+⑤ 相关性漂移：两个特征的边际都不动，逐特征监控全静默
+
+运行：python3 /tmp/mlops_ch3_l4.py
+⚠️ 全部为合成数据（random，固定种子），目的是让每个数字可复算。
+&quot;&quot;&quot;
+from __future__ import annotations
+
+import math
+import random
+
+
+def mean(xs) -&gt; float:
+    return sum(xs) / len(xs)
+
+
+def stdev(xs) -&gt; float:
+    m = mean(xs)
+    return math.sqrt(sum((x - m) ** 2 for x in xs) / (len(xs) - 1))
+
+
+def entropy(p: dict) -&gt; float:
+    h = 0.0
+    for v in p.values():
+        if v &gt; 0:
+            h -= v * math.log(v)
+    return h
+
+
+def update(prior: dict, lr: dict) -&gt; dict:
+    &quot;&quot;&quot;贝叶斯更新：后验 ∝ 先验 × 似然比，归一化。&quot;&quot;&quot;
+    post = {c: prior[c] * lr[c] for c in prior}
+    z = sum(post.values())
+    return {c: v / z for c, v in post.items()}
+
+
+def kl(p: float, q: float) -&gt; float:
+    &quot;&quot;&quot;伯努利分布的 KL(p||q)：一个检查对「有故障 / 无故障」的分辨力（纳特）。&quot;&quot;&quot;
+    out = 0.0
+    for a, b in ((p, q), (1 - p, 1 - q)):
+        if a &gt; 0 and b &gt; 0:
+            out += a * math.log(a / b)
+    return out
+
+
+# ==================================================================== [0] 自检
+print(&quot;=&quot; * 78)
+print(&quot;[0] 基础函数自检&quot;)
+print(&quot;  H(均匀 4 类) = %.4f（解析 %.4f）&quot; % (entropy({c: 0.25 for c in &quot;abcd&quot;}), math.log(4)))
+print(&quot;  KL(0.9||0.5) = %.4f；KL(0.55||0.5) = %.4f&quot; % (kl(0.9, 0.5), kl(0.55, 0.5)))
+print(&quot;  -&gt; 自检留在代码里：熵或 KL 错一点，检查顺序就排反&quot;)
+
+# ==================================================================== [1] 故障树
+print(&quot;=&quot; * 78)
+print(&quot;[1] 故障树：先验 × 似然 → 后验。四个可检查的独立信号&quot;)
+CAUSES = [&quot;上游 schema 变更&quot;, &quot;流量构成变化&quot;, &quot;检索索引陈旧&quot;, &quot;模型/配置变更&quot;]
+PRIOR = {&quot;上游 schema 变更&quot;: 0.30, &quot;流量构成变化&quot;: 0.25, &quot;检索索引陈旧&quot;: 0.20, &quot;模型/配置变更&quot;: 0.25}
+# 每个检查的 (有故障时通过率, 无故障时通过率)
+CHECKS = {
+    &quot;校验上游 schema 版本&quot;: {&quot;上游 schema 变更&quot;: 0.05, &quot;流量构成变化&quot;: 0.95, &quot;检索索引陈旧&quot;: 0.95, &quot;模型/配置变更&quot;: 0.90},
+    &quot;对比近 24h 的流量构成&quot;: {&quot;上游 schema 变更&quot;: 0.80, &quot;流量构成变化&quot;: 0.10, &quot;检索索引陈旧&quot;: 0.85, &quot;模型/配置变更&quot;: 0.85},
+    &quot;比对索引的 doc 数与 hash&quot;: {&quot;上游 schema 变更&quot;: 0.90, &quot;流量构成变化&quot;: 0.85, &quot;检索索引陈旧&quot;: 0.05, &quot;模型/配置变更&quot;: 0.80},
+    &quot;核对 manifest/binding 哈希&quot;: {&quot;上游 schema 变更&quot;: 0.85, &quot;流量构成变化&quot;: 0.90, &quot;检索索引陈旧&quot;: 0.85, &quot;模型/配置变更&quot;: 0.03},
+}
+COST = {&quot;校验上游 schema 版本&quot;: 3.0, &quot;对比近 24h 的流量构成&quot;: 10.0, &quot;比对索引的 doc 数与 hash&quot;: 4.0, &quot;核对 manifest/binding 哈希&quot;: 1.0}
+print(&quot;  先验：&quot;, &quot;，&quot;.join(&quot;%s %.2f&quot; % (c, p) for c, p in PRIOR.items()))
+print(&quot;  %-28s %8s %8s %14s %14s&quot;
+      % (&quot;检查&quot;, &quot;耗时/分&quot;, &quot;先验熵&quot;, &quot;期望后验熵&quot;, &quot;单位成本增益&quot;))
+h0 = entropy(PRIOR)
+rank = []
+for name, lrs in CHECKS.items():
+    exp_h = 0.0
+    for outcome in (0, 1):     # 0 = 检查失败（发现异常），1 = 检查通过
+        lr = {c: (1.0 - lrs[c]) if outcome == 0 else lrs[c] for c in CAUSES}
+        post = update(PRIOR, lr)
+        p_fail = sum(PRIOR[c] * lr[c] for c in CAUSES)
+        exp_h += (p_fail if outcome == 0 else (1 - p_fail)) * entropy(post)
+    gain = (h0 - exp_h) / COST[name]
+    rank.append((gain, name, exp_h))
+    print(&quot;  %-28s %8.1f %8.4f %14.4f %14.4f&quot; % (name, COST[name], h0, exp_h, gain))
+rank.sort(reverse=True)
+print(&quot;  按单位成本信息增益排序：&quot;, &quot; &gt; &quot;.join(n for _, n, _ in rank))
+print(&quot;  -&gt; 最强信号是「核对 manifest 哈希」（KL 最大）且最便宜，所以排第一；&quot;)
+print(&quot;     「对比流量构成」虽然也有信息，但耗时是它的 10 倍，单位成本增益掉到最后&quot;)
+
+# ==================================================================== [2] 排序对比
+print(&quot;=&quot; * 78)
+print(&quot;[2] 排序策略对比：同一个「检查清单」，只换顺序，结论差多少&quot;)
+TARGET = 0.80
+CHECK_NAMES = list(CHECKS)
+order_fixed = list(CHECK_NAMES)
+order_random = list(CHECK_NAMES)
+random.Random(20240301).shuffle(order_random)
+order_gain = [n for _, n, _ in rank]
+STRATEGIES = {&quot;固定清单（按字母序）&quot;: order_fixed, &quot;随机顺序&quot;: order_random, &quot;成本加权信息增益&quot;: order_gain}
+print(&quot;  停止判据：真因的后验 &gt;= %.2f；命中率 = 在清单走完之前就已经达标的比例&quot; % TARGET)
+print(&quot;  %-24s %-22s %9s %9s %10s %14s&quot;
+      % (&quot;策略&quot;, &quot;真因&quot;, &quot;平均步数&quot;, &quot;命中率&quot;, &quot;平均耗时&quot;, &quot;未命中后验均值&quot;))
+rng = random.Random(8675309)
+for true_cause in (&quot;上游 schema 变更&quot;, &quot;模型/配置变更&quot;):
+    fail_prob = {name: 1.0 - lrs[true_cause] for name, lrs in CHECKS.items()}
+    for sname, order in STRATEGIES.items():
+        steps, times, hit, miss_post = [], [], 0, []
+        for _ in range(4000):
+            post = dict(PRIOR)
+            used, t_used, reached = 0, 0.0, False
+            for name in order:
+                used += 1
+                t_used += COST[name]
+                found = rng.random() &lt; fail_prob[name]
+                lrs = CHECKS[name]
+                lr = {c: (1.0 - lrs[c]) if found else lrs[c] for c in CAUSES}
+                post = update(post, lr)
+                if post[true_cause] &gt;= TARGET:
+                    reached = True
+                    break
+            steps.append(used)
+            times.append(t_used)
+            hit += 1 if reached else 0
+            if not reached:
+                miss_post.append(post[true_cause])
+        print(&quot;  %-24s %-22s %9.2f %9.4f %10.2f %14.4f&quot;
+              % (sname, true_cause, mean(steps), hit / 4000, mean(times),
+                 mean(miss_post) if miss_post else 0.0))
+print(&quot;  -&gt; 真因是「上游 schema 变更」时，字母序恰好把它排在第一位（平均 1.15 步），&quot;)
+print(&quot;     信息增益顺序因为把最便宜的检查排在前面，平均 2.40 步 —— 顺序的好坏依赖真因。&quot;)
+print(&quot;  -&gt; 真因是「模型/配置变更」时，字母序把最强的两个检查都排到了最后，&quot;)
+print(&quot;     平均步数与耗时都明显高于信息增益顺序。这正是「按先验+似然排序」的价值。&quot;)
+print(&quot;  -&gt; 结论不是「某个顺序最好」，而是：清单的顺序必须用「先验 × 似然 / 成本」算出来，&quot;)
+print(&quot;     而且要按真因分层评估（最可能的几个真因各自多久能定位）&quot;)
+
+# ==================================================================== [3] 分层延迟
+print(&quot;=&quot; * 78)
+print(&quot;[3] 越往下游越晚：分层监控能多快看见一件事&quot;)
+print(&quot;  设定：一次上游数据事故；各层用自己的窗口与阈值，检出延迟 = 传播 + 窗口/2 + 决策&quot;)
+print(&quot;  %-8s %-30s %10s %12s %12s %12s&quot;
+      % (&quot;层&quot;, &quot;信号&quot;, &quot;传播/分&quot;, &quot;窗口/分&quot;, &quot;决策/分&quot;, &quot;总延迟/分&quot;))
+SIGNALS = [
+    (&quot;输入&quot;, &quot;schema 版本 / 字段单位&quot;, 0, 1, 1),
+    (&quot;输入&quot;, &quot;特征分布漂移（PSI）&quot;, 5, 15, 5),
+    (&quot;输出&quot;, &quot;拒答率 / 格式失败率&quot;, 2, 1, 1),
+    (&quot;输出&quot;, &quot;离线指标（次日标签）&quot;, 720, 60, 60),
+    (&quot;延迟&quot;, &quot;p99 端到端延迟&quot;, 1, 5, 3),
+    (&quot;成本&quot;, &quot;每千 token 成本&quot;, 1, 30, 10),
+    (&quot;业务&quot;, &quot;人工客服工单量&quot;, 45, 120, 60),
+]
+tot = 0.0
+rows = []
+for (layer, name, prop, win, dec) in SIGNALS:
+    t = prop + win / 2.0 + dec
+    rows.append((layer, name, prop, win, dec, t))
+    print(&quot;  %-8s %-30s %10.0f %12.0f %12.0f %12.1f&quot; % (layer, name, prop, win, dec, t))
+fast = min(rows, key=lambda r: r[5])
+slow = max(rows, key=lambda r: r[5])
+print(&quot;  -&gt; 最快的一层 %s（%s）：%.1f 分；最慢的 %s（%s）：%.1f 分 —— 差 %.0f 倍&quot;
+      % (fast[1], fast[0], fast[5], slow[1], slow[0], slow[5], slow[5] / fast[5]))
+print(&quot;     所以「先看哪里」的第一条规则是：按延迟从小到大读，而不是按仪表盘的美观程度&quot;)
+print(&quot;     但要注意：最快的层未必是根因所在的层，它只是最先说话的那一层&quot;)
+
+# ==================================================================== [4] 相关性
+print(&quot;=&quot; * 78)
+print(&quot;[4] 相关性漂移：两个特征的边际都没动，逐特征监控全部静默&quot;)
+rng = random.Random(2024)
+N = 4000
+base_x = [rng.gauss(0, 1) for _ in range(N)]
+base_y = [0.0 * x + math.sqrt(1 - 0.0 ** 2) * rng.gauss(0, 1) for x in base_x]
+new_x = [rng.gauss(0, 1) for _ in range(N)]
+new_y = [0.8 * x + math.sqrt(1 - 0.8 ** 2) * rng.gauss(0, 1) for x in new_x]
+
+
+def pearson(a, b):
+    ma, mb = mean(a), mean(b)
+    sa = math.sqrt(sum((v - ma) ** 2 for v in a))
+    sb = math.sqrt(sum((v - mb) ** 2 for v in b))
+    return sum((u - ma) * (v - mb) for u, v in zip(a, b)) / (sa * sb)
+
+
+def ks_stat(a, b):
+    sa, sb = sorted(a), sorted(b)
+    i = j = 0
+    best = 0.0
+    while i &lt; len(sa) or j &lt; len(sb):
+        if j &gt;= len(sb) or (i &lt; len(sa) and sa[i] &lt;= sb[j]):
+            v = sa[i]
+            while i &lt; len(sa) and sa[i] == v:
+                i += 1
+        else:
+            v = sb[j]
+            while j &lt; len(sb) and sb[j] == v:
+                j += 1
+        best = max(best, abs(i / len(sa) - j / len(sb)))
+    return best
+
+
+crit = 1.36 / math.sqrt(N)
+print(&quot;  构造：相关系数从 %.1f 变成 %.1f，两列的均值与方差都保持不变&quot; % (0.0, 0.8))
+print(&quot;  逐特征看：x 的 KS = %.4f（临界 %.4f）、y 的 KS = %.4f（临界 %.4f）&quot;
+      % (ks_stat(base_x, new_x), crit, ks_stat(base_y, new_y), crit))
+print(&quot;  逐特征看：x 的均值 %.4f → %.4f、y 的均值 %.4f → %.4f&quot;
+      % (mean(base_x), mean(new_x), mean(base_y), mean(new_y)))
+r_base, r_new = pearson(base_x, base_y), pearson(new_x, new_y)
+z_corr = (r_new - r_base) * math.sqrt(N - 3) / math.sqrt(1 - r_new ** 2)
+print(&quot;  联合看  ：相关系数 %.4f → %.4f（Fisher z 变换：z = %.1f，p &lt; 1e-10）&quot;
+      % (r_base, r_new, z_corr))
+print(&quot;  -&gt; 两条 KS 都在临界值以下（静默），但相关性从 0.00 涨到 %.2f ——&quot;
+      % pearson(new_x, new_y))
+print(&quot;     任何「逐列看边际」的监控体系都看不见这种漂移，必须留一条联合判据&quot;)
+
+# ==================================================================== [5] 定位置信
+print(&quot;=&quot; * 78)
+print(&quot;[5] 定位的停止判据：什么时候可以停止排查、开始处置&quot;)
+TRUE_CAUSE = &quot;上游 schema 变更&quot;
+FAIL_PROB = {name: 1.0 - lrs[TRUE_CAUSE] for name, lrs in CHECKS.items()}
+post = dict(PRIOR)
+print(&quot;  规则：真因后验 &gt;= %.2f 即停止排查；走完清单仍不达标 → 升级人工&quot; % TARGET)
+print(&quot;  %-26s %-8s %12s %12s %12s&quot; % (&quot;检查&quot;, &quot;结论&quot;, &quot;真因后验&quot;, &quot;最大后验&quot;, &quot;熵&quot;))
+print(&quot;  %-26s %-8s %12.4f %12.4f %12.4f&quot;
+      % (&quot;（未查）&quot;, &quot;—&quot;, post[TRUE_CAUSE], max(post.values()), entropy(post)))
+rng = random.Random(4242)
+spent = 0.0
+for name in order_gain:
+    found = rng.random() &lt; FAIL_PROB[name]
+    lrs = CHECKS[name]
+    lr = {c: (1.0 - lrs[c]) if found else lrs[c] for c in CAUSES}
+    post = update(post, lr)
+    spent += COST[name]
+    print(&quot;  %-26s %-8s %12.4f %12.4f %12.4f&quot;
+          % (name, &quot;异常&quot; if found else &quot;正常&quot;, post[TRUE_CAUSE], max(post.values()), entropy(post)))
+    if post[max(post, key=post.get)] &gt;= TARGET:
+        print(&quot;  -&gt; 停止条件满足：最大后验 %.4f，已用 %.0f 分钟；剩余检查不必再做&quot;
+              % (max(post.values()), spent))
+        break
+print(&quot;  -&gt; 关键：停止条件是「后验超过阈值」，不是「把清单走完」。&quot;)
+print(&quot;     没有这个判据，排查会退化成执行清单；有了它，最贵的那一步常常可以省掉。&quot;)
+print(&quot;     但它也要付代价：当信号弱到后验永远到不了 %.2f，就必须有升级人工的出口。&quot;
+      % TARGET)</code></pre>
+<p><strong>实跑输出</strong>（<code>python3 /tmp/mlops_ch3_l4.py</code>，逐字节粘贴）：</p>
+<pre data-lang="text"><code class="language-text">==============================================================================
+[0] 基础函数自检
+  H(均匀 4 类) = 1.3863（解析 1.3863）
+  KL(0.9||0.5) = 0.3681；KL(0.55||0.5) = 0.0050
+  -&gt; 自检留在代码里：熵或 KL 错一点，检查顺序就排反
+==============================================================================
+[1] 故障树：先验 × 似然 → 后验。四个可检查的独立信号
+  先验： 上游 schema 变更 0.30，流量构成变化 0.25，检索索引陈旧 0.20，模型/配置变更 0.25
+  检查                               耗时/分      先验熵          期望后验熵         单位成本增益
+  校验上游 schema 版本                    3.0   1.3762         0.5761         0.2667
+  对比近 24h 的流量构成                    10.0   1.3762         0.7918         0.0584
+  比对索引的 doc 数与 hash                 4.0   1.3762         0.6845         0.1729
+  核对 manifest/binding 哈希            1.0   1.3762         0.7023         0.6739
+  按单位成本信息增益排序： 核对 manifest/binding 哈希 &gt; 校验上游 schema 版本 &gt; 比对索引的 doc 数与 hash &gt; 对比近 24h 的流量构成
+  -&gt; 最强信号是「核对 manifest 哈希」（KL 最大）且最便宜，所以排第一；
+     「对比流量构成」虽然也有信息，但耗时是它的 10 倍，单位成本增益掉到最后
+==============================================================================
+[2] 排序策略对比：同一个「检查清单」，只换顺序，结论差多少
+  停止判据：真因的后验 &gt;= 0.80；命中率 = 在清单走完之前就已经达标的比例
+  策略                       真因                          平均步数       命中率       平均耗时        未命中后验均值
+  固定清单（按字母序）               上游 schema 变更                1.15    0.9485       3.77         0.1534
+  随机顺序                     上游 schema 变更                3.19    0.8087      14.77         0.4917
+  成本加权信息增益                 上游 schema 变更                2.40    0.8015       6.78         0.4937
+  固定清单（按字母序）               模型/配置变更                     4.00    0.6042      18.00         0.4863
+  随机顺序                     模型/配置变更                     3.26    0.7408      15.04         0.4343
+  成本加权信息增益                 模型/配置变更                     2.25    0.8728       5.78         0.2904
+  -&gt; 真因是「上游 schema 变更」时，字母序恰好把它排在第一位（平均 1.15 步），
+     信息增益顺序因为把最便宜的检查排在前面，平均 2.40 步 —— 顺序的好坏依赖真因。
+  -&gt; 真因是「模型/配置变更」时，字母序把最强的两个检查都排到了最后，
+     平均步数与耗时都明显高于信息增益顺序。这正是「按先验+似然排序」的价值。
+  -&gt; 结论不是「某个顺序最好」，而是：清单的顺序必须用「先验 × 似然 / 成本」算出来，
+     而且要按真因分层评估（最可能的几个真因各自多久能定位）
+==============================================================================
+[3] 越往下游越晚：分层监控能多快看见一件事
+  设定：一次上游数据事故；各层用自己的窗口与阈值，检出延迟 = 传播 + 窗口/2 + 决策
+  层        信号                                   传播/分         窗口/分         决策/分        总延迟/分
+  输入       schema 版本 / 字段单位                        0            1            1          1.5
+  输入       特征分布漂移（PSI）                             5           15            5         17.5
+  输出       拒答率 / 格式失败率                             2            1            1          3.5
+  输出       离线指标（次日标签）                            720           60           60        810.0
+  延迟       p99 端到端延迟                               1            5            3          6.5
+  成本       每千 token 成本                             1           30           10         26.0
+  业务       人工客服工单量                                45          120           60        165.0
+  -&gt; 最快的一层 schema 版本 / 字段单位（输入）：1.5 分；最慢的 离线指标（次日标签）（输出）：810.0 分 —— 差 540 倍
+     所以「先看哪里」的第一条规则是：按延迟从小到大读，而不是按仪表盘的美观程度
+     但要注意：最快的层未必是根因所在的层，它只是最先说话的那一层
+==============================================================================
+[4] 相关性漂移：两个特征的边际都没动，逐特征监控全部静默
+  构造：相关系数从 0.0 变成 0.8，两列的均值与方差都保持不变
+  逐特征看：x 的 KS = 0.0210（临界 0.0215）、y 的 KS = 0.0253（临界 0.0215）
+  逐特征看：x 的均值 -0.0097 → 0.0070、y 的均值 0.0307 → -0.0066
+  联合看  ：相关系数 -0.0244 → 0.8035（Fisher z 变换：z = 87.9，p &lt; 1e-10）
+  -&gt; 两条 KS 都在临界值以下（静默），但相关性从 0.00 涨到 0.80 ——
+     任何「逐列看边际」的监控体系都看不见这种漂移，必须留一条联合判据
+==============================================================================
+[5] 定位的停止判据：什么时候可以停止排查、开始处置
+  规则：真因后验 &gt;= 0.80 即停止排查；走完清单仍不达标 → 升级人工
+  检查                         结论               真因后验         最大后验            熵
+  （未查）                       —              0.3000       0.3000       1.3762
+  核对 manifest/binding 哈希     正常             0.3878       0.3878       1.1351
+  校验上游 schema 版本             异常             0.9220       0.9220       0.3375
+  -&gt; 停止条件满足：最大后验 0.9220，已用 4 分钟；剩余检查不必再做
+  -&gt; 关键：停止条件是「后验超过阈值」，不是「把清单走完」。
+     没有这个判据，排查会退化成执行清单；有了它，最贵的那一步常常可以省掉。
+     但它也要付代价：当信号弱到后验永远到不了 0.80，就必须有升级人工的出口。</code></pre>
+<h4 id="h-54-四处关键设计决策">5.4 四处关键设计决策<a class="anchor" href="#h-54-四处关键设计决策" aria-label="本节链接">#</a></h4>
+<ol>
+<li><p><strong>停止阈值 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">θ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.80</span></span></span></span> 用&quot;最大后验&quot;而不是&quot;某个指定原因的后验&quot;</strong>。理由：排查的<strong>输出</strong>不是&quot;我认为是 X&quot;，而是&quot;我要开始处置，处置方向是 X&quot;。用最大后验作为判据，等价于&quot;我已经有把握把动作押在这一个原因上&quot;。若用某个固定原因的后验，那排查就变成了&quot;证明我是对的&quot;，会漏掉&quot;其实是另一个原因、只是我一直在查错的方向&quot;这种情况。</p>
+</li>
+<li><p><strong>命中率与&quot;未命中后验均值&quot;两列一起看</strong>。命中率单独看会误导：一个策略可能命中率高（早停），但它早停的时候后验只有 0.81；另一个策略命中率低（走得远），但没命中时后验也到了 0.49。<strong>两列合起来才能判断&quot;这个停止是不是有意义的停止&quot;</strong>。实测字母序在&quot;模型/配置变更&quot;下的命中率只有 0.6042、未命中后验均值 0.4863 —— 这就是&quot;走完清单也没查出来&quot;的真实比例。</p>
+</li>
+<li><p><strong>分层延迟表格里加&quot;业务&quot;那一行</strong>。它不属于四层指标（ch3-l2 的四层是输入/输出/延迟/成本），但它是最慢、也是最终拍板的那一层。把它放进表格，是为了让&quot;为什么不能等业务指标再动手&quot;这个结论有数字支撑：810 分钟与 165 分钟都远超任何合理的 MTTR。</p>
+</li>
+<li><p><strong>相关性实验用 Fisher <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.044em;">z</span></span></span></span> 变换而不是直接比较相关系数</strong>。<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">ρ</span></span></span></span> 的抽样分布在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">∣</span><span class="mord mathnormal">ρ</span><span class="mord">∣</span></span></span></span> 接近 1 时严重偏斜（标准误 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4831em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.1156em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal">ρ</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span><span class="mclose">)</span><span class="mord">/</span><span class="mord sqrt"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8656em;"><span class="svg-align" style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord" style="padding-left:0.833em;"><span class="mord mathnormal">n</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord">3</span></span></span><span style="top:-2.8256em;"><span class="pstrut" style="height:3em;"></span><span class="hide-tail" style="min-width:0.853em;height:1.08em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="1.08em" viewBox="0 0 400000 1080" preserveAspectRatio="xMinYMin slice"><path d="M95,702
+c-2.7,0,-7.17,-2.7,-13.5,-8c-5.8,-5.3,-9.5,-10,-9.5,-14
+c0,-2,0.3,-3.3,1,-4c1.3,-2.7,23.83,-20.7,67.5,-54
+c44.2,-33.3,65.8,-50.3,66.5,-51c1.3,-1.3,3,-2,5,-2c4.7,0,8.7,3.3,12,10
+s173,378,173,378c0.7,0,35.3,-71,104,-213c68.7,-142,137.5,-285,206.5,-429
+c69,-144,104.5,-217.7,106.5,-221
+l0 -0
+c5.3,-9.3,12,-14,20,-14
+H400000v40H845.2724
+s-225.272,467,-225.272,467s-235,486,-235,486c-2.7,4.7,-9,7,-19,7
+c-6,0,-10,-1,-12,-3s-194,-422,-194,-422s-65,47,-65,47z
+M834 80h400000v40h-400000z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.1744em;"><span></span></span></span></span></span></span></span></span>），所以在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">ρ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.80</span></span></span></span> 附近直接比较会<strong>低估显著性</strong>。改用它：</p>
+</li>
+</ol>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.044em;">z</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mop"><span class="mord mathrm">artanh</span></span><span class="mopen">(</span><span class="mord mathnormal">ρ</span><span class="mclose">)</span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathrm">SE</span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.044em;">z</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.2514em;vertical-align:-0.93em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3214em;"><span style="top:-2.2444em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord sqrt"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8656em;"><span class="svg-align" style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord" style="padding-left:0.833em;"><span class="mord mathnormal">n</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord">3</span></span></span><span style="top:-2.8256em;"><span class="pstrut" style="height:3em;"></span><span class="hide-tail" style="min-width:0.853em;height:1.08em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="1.08em" viewBox="0 0 400000 1080" preserveAspectRatio="xMinYMin slice"><path d="M95,702
+c-2.7,0,-7.17,-2.7,-13.5,-8c-5.8,-5.3,-9.5,-10,-9.5,-14
+c0,-2,0.3,-3.3,1,-4c1.3,-2.7,23.83,-20.7,67.5,-54
+c44.2,-33.3,65.8,-50.3,66.5,-51c1.3,-1.3,3,-2,5,-2c4.7,0,8.7,3.3,12,10
+s173,378,173,378c0.7,0,35.3,-71,104,-213c68.7,-142,137.5,-285,206.5,-429
+c69,-144,104.5,-217.7,106.5,-221
+l0 -0
+c5.3,-9.3,12,-14,20,-14
+H400000v40H845.2724
+s-225.272,467,-225.272,467s-235,486,-235,486c-2.7,4.7,-9,7,-19,7
+c-6,0,-10,-1,-12,-3s-194,-422,-194,-422s-65,47,-65,47z
+M834 80h400000v40h-400000z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.1744em;"><span></span></span></span></span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.93em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></p>
+<p>于是检验统计量 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.044em;">z</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:-0.044em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">test</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.044em;">z</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.044em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.24em;vertical-align:-0.2822em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.044em;">z</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.044em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mord sqrt"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8656em;"><span class="svg-align" style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord" style="padding-left:0.833em;"><span class="mord mathnormal">n</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord">3</span></span></span><span style="top:-2.8256em;"><span class="pstrut" style="height:3em;"></span><span class="hide-tail" style="min-width:0.853em;height:1.08em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="1.08em" viewBox="0 0 400000 1080" preserveAspectRatio="xMinYMin slice"><path d="M95,702
+c-2.7,0,-7.17,-2.7,-13.5,-8c-5.8,-5.3,-9.5,-10,-9.5,-14
+c0,-2,0.3,-3.3,1,-4c1.3,-2.7,23.83,-20.7,67.5,-54
+c44.2,-33.3,65.8,-50.3,66.5,-51c1.3,-1.3,3,-2,5,-2c4.7,0,8.7,3.3,12,10
+s173,378,173,378c0.7,0,35.3,-71,104,-213c68.7,-142,137.5,-285,206.5,-429
+c69,-144,104.5,-217.7,106.5,-221
+l0 -0
+c5.3,-9.3,12,-14,20,-14
+H400000v40H845.2724
+s-225.272,467,-225.272,467s-235,486,-235,486c-2.7,4.7,-9,7,-19,7
+c-6,0,-10,-1,-12,-3s-194,-422,-194,-422s-65,47,-65,47z
+M834 80h400000v40h-400000z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.1744em;"><span></span></span></span></span></span><span class="mord">/</span><span class="mord sqrt"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.9578em;"><span class="svg-align" style="top:-3.2em;"><span class="pstrut" style="height:3.2em;"></span><span class="mord" style="padding-left:1em;"><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord"><span class="mord mathnormal">ρ</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.7401em;"><span style="top:-2.989em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span><span style="top:-2.9178em;"><span class="pstrut" style="height:3.2em;"></span><span class="hide-tail" style="min-width:1.02em;height:1.28em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="1.28em" viewBox="0 0 400000 1296" preserveAspectRatio="xMinYMin slice"><path d="M263,681c0.7,0,18,39.7,52,119
+c34,79.3,68.167,158.7,102.5,238c34.3,79.3,51.8,119.3,52.5,120
+c340,-704.7,510.7,-1060.3,512,-1067
+l0 -0
+c4.7,-7.3,11,-11,19,-11
+H40000v40H1012.3
+s-271.3,567,-271.3,567c-38.7,80.7,-84,175,-136,283c-52,108,-89.167,185.3,-111.5,232
+c-22.3,46.7,-33.8,70.3,-34.5,71c-4.7,4.7,-12.3,7,-23,7s-12,-1,-12,-1
+s-109,-253,-109,-253c-72.7,-168,-109.3,-252,-110,-252c-10.7,8,-22,16.7,-34,26
+c-22,17.3,-33.3,26,-34,26s-26,-26,-26,-26s76,-59,76,-59s76,-60,76,-60z
+M1001 80h400000v40h-400000z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2822em;"><span></span></span></span></span></span></span></span></span>（代码里的写法）。实测 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.044em;">z</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">87.9</span></span></span></span>，与&quot;两条 KS 都不显著&quot;形成鲜明对照。</p>
+<h3 id="h-练习">练习<a class="anchor" href="#h-练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><p><strong>写出你的故障树</strong>：选一个你熟悉的告警（比如&quot;检索命中率下降&quot;）。
+（a）列出 <strong>4 个互斥的原因</strong>，给出先验（并说明依据：过去半年各占几次）；
+（b）为每个原因列出 <strong>3 个可检查的信号</strong>，写出&quot;该原因成立时这个检查通过的概率&quot;（用区间估计，并标注区间宽度）；
+（c）算出每个检查的<strong>期望后验熵</strong>与<strong>单位成本信息增益</strong>，排出顺序；
+（d）用这张表回答：在查第一个检查之前，你的最大后验是多少？查完之后最多能到多少？</p>
+</li>
+<li><p><strong>时间线对齐</strong>：给出下面的事件表，判断哪个变更事件最可能是根因，并说明依据。</p>
+<pre><code>01:40  上游数据管道发版（字段 unit: s -&gt; ms）
+01:55  缓存配置变更（TTL 30min -&gt; 5min）
+02:30  模型服务扩缩容（pod 8 -&gt; 12）
+02:35  输入层「空值率」首次越阈值
+02:38  输出层「拒答率」首次越阈值
+02:52  成本层「每千 token 成本」上涨 8%
+03:30  业务工单量上涨（人工客服）</code></pre>
+<p>（a）对每个变更事件算出&quot;距首次告警的时间差&quot;；
+（b）用 §一 的检出延迟表判断哪些事件&quot;来不及&quot;产生对应层的信号；
+（c）给出你会在前 10 分钟内做的三个动作，按顺序；
+（d）说明如果一个变更事件<strong>既可能是原因也可能是症状</strong>（比如扩缩容），你会用什么信号区分它们。</p>
+</li>
+<li><p><strong>停止判据的敏感性</strong>：用本节的故障树与先验，但把 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">θ</span></span></span></span> 改成 0.60、0.90。
+（a）用 §五 的那一次证据（manifest 检查正常、schema 检查异常）算出两种 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">θ</span></span></span></span> 下的停止步数；
+（b）说明 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">θ</span></span></span></span> 从 0.80 降到 0.60 会让&quot;未命中后验均值&quot;怎么变（定性即可，但要给出理由）；
+（c）如果每次检查的<strong>误判代价</strong>是&quot;一次无效重训（3 小时 + 一次发布）&quot;，而&quot;继续查&quot;的成本是 10 分钟，用 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">θ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">错判</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord">/</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0077em;">R</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">错判</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span></span></span></span> 算出一个合理的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">θ</span></span></span></span>（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">错判</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 与 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0077em;">R</span></span></span></span> 都用你估的量级）；
+（d）回答：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">θ</span></span></span></span> 应该按&quot;告警级别&quot;分别设，还是全局一个？为什么？</p>
+</li>
+<li><p><strong>顺序改进</strong>：本节的字母序在&quot;模型/配置变更&quot;下要 4.00 步、18 分钟。
+（a）如果把 <code>核对 manifest/binding 哈希</code> 提到第一位，两种真因下的平均步数各变成多少？（可以用本节的似然表手算最前面两步的后验）
+（b）算出新顺序在两个真因下的&quot;平均耗时&quot;；
+（c）说明这个改动有没有副作用（提示：考虑&quot;上游 schema 变更&quot;这一真因的先验是 0.30，是四个里最大的）；
+（d）给出一个&quot;两全&quot;的规则：如何用一个可算的判据决定&quot;哪个检查放第一&quot;？</p>
+</li>
+<li><p><strong>相关性盲区的处置</strong>：你的模型有 40 个特征，逐列 KS 全绿，但业务反馈&quot;结果变差了&quot;。
+（a）写出你会优先算的三个联合判据（提示：MMD、两样本分类器、相关系数矩阵）；
+（b）如果两样本分类器的 AUC 是 0.95，说明什么？如果 AUC 是 0.55 呢？
+（c）说明这两个 AUC 值下你会采取的不同动作；
+（d）给出一个&quot;逐列判据 + 联合判据&quot;的报警分工方案（哪一层用哪个、误报预算各是多少）。</p>
+</li>
+<li><p><strong>一次复盘的时间线重建</strong>：选一次你们团队真实（或合理编造）的事故。
+（a）按&quot;告警时刻 / 首次响应 / 定位时刻 / 处置开始 / 恢复&quot;五个时间点重建时间线；
+（b）把本节的检出延迟公式套进去，算出&quot;理论最快定位时间&quot;，与实际的&quot;定位时刻&quot;比较；
+（c）指出时间花在了哪一段（传播 / 窗口 / 决策 / 排查顺序 / 权限申请）；
+（d）给出<strong>两条</strong>可验证的改进项（每条要能写出&quot;怎么验证它生效了&quot;）。</p>
+</li>
+<li><p><strong>开放题（接第 4 节之后）</strong>：本节把&quot;定位&quot;做成了可算的过程，但留下一个口子：<strong>处置动作本身会成为下一轮排查的先验</strong>。请追问五个问题（提示：先验怎么更新、误判的处置会不会污染故障树、跨团队共享故障树时的口径、故障树多久复算一次、以及&quot;未判定&quot;的统计），并说明哪个问题最可能让故障树在半年后失效。</p>
+</li>
+</ol>
+<h3 id="h-小结">小结<a class="anchor" href="#h-小结" aria-label="本节链接">#</a></h3>
+<ul>
+<li><strong>排查的第一条规则是算术不是经验</strong>：四层信号的检出延迟 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">detect</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.9694em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">prop</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">window</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord">/2</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">decision</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 差着数量级（实测输入层 schema 检查 1.5 分钟 vs 输出层次日离线指标 810 分钟，<strong>差 540 倍</strong>）。<strong>先读慢的层等于浪费十几个小时</strong>：那些信息在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7224em;vertical-align:-0.0391em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&lt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">810</span></span></span></span> 分钟时根本不存在。</li>
+<li><strong>告警时间线必须先和变更事件对齐</strong>。&quot;三条告警同一分钟出现&quot;指向共同上游原因；&quot;距首次告警的时间差&quot;能排除&quot;来不及&quot;的变更。这一步成本几分钟、收益是砍掉一半假设。</li>
+<li><strong>检查顺序是可算的</strong>：故障树（先验 × 似然）→ 期望后验熵 → <strong>单位成本信息增益</strong>。实测排序：核对 manifest 哈希（0.6739）&gt; 校验 schema（0.2667）&gt; 比对索引（0.1729）&gt; 对比流量构成（0.0584）。最强信号未必最便宜也未必最贵，而是<strong>增益/成本最优</strong>的那一个。</li>
+<li><strong>没有全局最优的检查顺序，只有按真因分布评估的顺序</strong>：真因是&quot;上游 schema 变更&quot;时，字母序恰好平均 <strong>1.15 步 / 3.77 分钟</strong>（巧合地把最强检查排到了第一）；真因是&quot;模型/配置变更&quot;时字母序要 <strong>4.00 步 / 18.00 分钟、命中率仅 0.6042</strong>，而信息增益顺序只要 <strong>2.25 步 / 5.78 分钟 / 命中率 0.8728</strong>。所以要按&quot;最可能的三个真因&quot;分层评估顺序。</li>
+<li><strong>停止判据是&quot;最大后验 ≥ θ&quot;，不是&quot;把清单走完&quot;</strong>：实测走两步（1 + 3 = 4 分钟）后验到 <strong>0.9220</strong>，越过 0.80 → 停止排查，剩余检查（4 分钟 + 10 分钟）不必做。<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">θ</span></span></span></span> 由错判代价比决定（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">θ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">错判</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord">/</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0077em;">R</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">错判</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span></span></span></span>），不是拍的。</li>
+<li><strong>&quot;未判定&quot;必须是一个合法输出</strong>。走完清单仍不达标时，要输出&quot;当前假设排名 + 各自的概率 + 建议扩大故障树&quot;，而不是&quot;没有异常&quot;。否则所有&quot;证据不足&quot;的情况都会被静默归零。</li>
+<li><strong>逐特征监控有结构性盲区</strong>：实测相关系数从 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">−</span><span class="mord">0.0244</span></span></span></span> 变成 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.8035</span></span></span></span>（Fisher <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.044em;">z</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">87.9</span></span></span></span>）时，两条 KS 是 0.0210 与 0.0253（临界 0.0215）——<strong>一在临界值上下摆动、会被静默</strong>。排查清单里必须有一条联合判据，并且&quot;输入正常&quot;这个结论要写明它覆盖到几阶依赖。</li>
+<li><strong>似然是从历史事故里估的，不是给的</strong>：事故样本极少、检查有假阴性、检查之间不独立（会让贝叶斯连乘过度自信）。所以<strong>故障树是排序工具，不是概率真相机</strong> —— 它的输出（先查哪个、查到什么程度可以停）比它的中间量（后验的具体数值）更可靠。</li>
+<li><strong>处置动作要回写先验</strong>：这次事故是&quot;上游字段单位变了&quot;，下次同类告警时&quot;上游 schema 变更&quot;的先验就该调高。故障树是活的，需要按季度复算 —— 否则半年后它的排序会因为先验过期而失效。</li>
+</ul>
+<blockquote>
+<p>本章到此结束：第 1 节把&quot;漂移&quot;拆成可分别检验的断言（数据 / 概念 / 标签），给出两条带标准误的判据；第 2 节把监控做成四层指标表，并给每个指标配上样本量与不确定度（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7719em;vertical-align:-0.136em;"></span><span class="mord mathnormal">n</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≥</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.0641em;vertical-align:-0.25em;"></span><span class="mord">1/</span><span class="mopen">(</span><span class="mord mathnormal">p</span><span class="mord"><span class="mord mathnormal">ρ</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span><span class="mclose">)</span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7719em;vertical-align:-0.136em;"></span><span class="mord mathnormal">n</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≥</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">3/</span><span class="mord mathnormal">p</span></span></span></span>、p99 的区间宽 22.9%）；第 3 节把阈值写成代价模型的最小值点（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6887em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6887em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span></span></span></span></span></span></span></span> 恰好压在 SLO 折点上，误报率 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">8.21</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span></span>）；第 4 节把告警之后的排查写成故障树 + 贝叶斯更新，给出&quot;4 分钟停止排查&quot;的判据。四条线合起来是一句话：<strong>监控的价值 = 它最早说出的那句话的准确性 − 它让人付出的注意力成本；而这句话里的每一个量（判据的判定阈值、指标的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">λ</span></span></span></span>、告警的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span> 与 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">E</span><span class="mopen">[</span><span class="mord mathnormal" style="margin-right:0.0278em;">D</span><span class="mclose">]</span></span></span></span>、检查的单位成本增益）都必须能被测量，或者被明确假设。</strong></p>
+</blockquote>

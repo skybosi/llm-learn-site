@@ -1,0 +1,477 @@
+<h2 id="h-常量传播与折叠死代码消除公共子表达式">常量传播与折叠、死代码消除、公共子表达式<a class="anchor" href="#h-常量传播与折叠死代码消除公共子表达式" aria-label="本节链接">#</a></h2>
+<p>第 4 章末尾那次 lowering 留下了一串&quot;看得见的低效&quot;：<code>t2 = sum + i; sum = t2</code>、同一个 <code>a + b</code> 算了两次、某些临时名根本没人用。这些不是 lowering 写错了，而是留给优化 pass 的作业。这一课把上一课的三个数据流分析变成三个具体改写：常量传播与折叠、公共子表达式消除（CSE）、死代码消除（DCE）。跑完还会撞见一个反直觉的事实：一轮 pass 往往不够，得跑到不动点。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-折叠是局部的传播是全局的">1. 折叠是局部的，传播是全局的<a class="anchor" href="#h-1-折叠是局部的传播是全局的" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>常量折叠</strong>（constant folding）：同一条指令的两个操作数在编译期都已知，直接算出结果。它只看指令本身，块内一趟扫描就够。</li>
+<li><strong>常量传播</strong>（constant propagation）：把&quot;某变量在某点必然为常量&quot;的事实沿 CFG 传下去，让远处的指令也有机会折叠。</li>
+</ul>
+<p>传播用的格有三个元素：<code>UNDEF</code>（还没有信息，是 meet 的单位元）、<code>CONST(c)</code>、<code>NAC</code>（not-a-constant，一条路径上不是常量就永远是它）。两个不同常量在汇合点 meet 成 <code>NAC</code>——这就是&quot;两条分支分别赋 d = 1 与 d = 2、汇合点无法折叠&quot;的来源。</p>
+<p>Kaleidoscope 教程第 4 章给了直观对照：<code>1+2+x</code> 在构造 IR 时就被 <code>IRBuilder</code> 顺手折成 <code>3+x</code>（&quot;trivial constant folding&quot;）；但 <code>(1+2+x)*(x+(1+2))</code> 里左右两棵子树同值，需要 <strong>reassociation</strong>（把加法重排成字面相同）加 <strong>CSE</strong> 才能消掉一次加法。折叠能在前端顺手做，传播与 CSE 必须是独立 pass。</p>
+<h4 id="h-2-公共子表达式消除需要两个事实">2. 公共子表达式消除需要两个事实<a class="anchor" href="#h-2-公共子表达式消除需要两个事实" aria-label="本节链接">#</a></h4>
+<p>CSE 的判据听起来简单：&quot;右值相同的两条指令只留一条&quot;。要让它<strong>正确</strong>，需要两个事实合起来：</p>
+<ol>
+<li>这个右值在这一点<strong>必然已经算过</strong>——上一课的可用表达式（前向 + ∩ + Must）。</li>
+<li>那个&quot;已经算过的结果&quot;现在落在哪个变量里——<strong>值编号</strong>（value numbering），或者 SSA 直接给出。</li>
+</ol>
+<p>只拿第 1 条就动手会出错：知道&quot;<code>a+b</code> 算过&quot;不等于知道&quot;结果还在 <code>t1</code> 里&quot;。只要 <code>t1</code> 被重新赋值，旧结果就作废——传递函数里的 KILL 正是在维护这件事。</p>
+<h4 id="h-3-复制传播是-cse-的收尾也是-dce-的前提">3. 复制传播是 CSE 的收尾，也是 DCE 的前提<a class="anchor" href="#h-3-复制传播是-cse-的收尾也是-dce-的前提" aria-label="本节链接">#</a></h4>
+<p>CSE 的产物通常是 <code>t = copy t1</code>（&quot;这个值等于 t1&quot;）。就此收手的话，程序里多了一堆 <code>copy</code>，DCE 也不敢删（它们还被后面的指令用着）。标准做法是紧接着做<strong>复制传播</strong>：把后续对 <code>t</code> 的使用都换成 <code>t1</code>，于是 <code>t</code> 变成一条没人使用的 <code>copy</code>，DCE 才能清掉它。本课代码把三步串起来，最终 4 条指令就是它们的联合成果。</p>
+<h4 id="h-4-死代码消除的判据无使用-且-无副作用">4. 死代码消除的判据：无使用 <strong>且</strong> 无副作用<a class="anchor" href="#h-4-死代码消除的判据无使用-且-无副作用" aria-label="本节链接">#</a></h4>
+<p>DCE 只有一条硬规则：<strong>结果无人使用，并且这条指令不会产生可观察行为</strong>。判据要记牢：</p>
+<table>
+<thead>
+<tr>
+<th>指令</th>
+<th>结果没人用能否删</th>
+<th>原因</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>copy</code> / 加 / 减 / 乘 / 比较</td>
+<td>能</td>
+<td>纯计算，不影响可观察状态</td>
+</tr>
+<tr>
+<td>除法、可能越界的 load</td>
+<td>视情况</td>
+<td>可能陷阱，删掉会改变&quot;程序是否出错&quot;</td>
+</tr>
+<tr>
+<td>store、函数调用</td>
+<td>不能</td>
+<td>副作用本身就可观察</td>
+</tr>
+</tbody></table>
+<p>&quot;删掉一条没人用的除法&quot;是真实编译器里最常见的正确性 bug 之一，第 5 课会用差分测试把它抓出来。DCE 还必须<strong>迭代</strong>：删掉 <code>t9 = c * 100</code> 之后，可能又有新的死代码浮出来。</p>
+<h4 id="h-5-一轮-pass-不够实测-19--6--4--4">5. 一轮 pass 不够：实测 19 → 6 → 4 → 4<a class="anchor" href="#h-5-一轮-pass-不够实测-19--6--4--4" aria-label="本节链接">#</a></h4>
+<p>第 1 轮输出里有一件奇怪的事：<code>f = cc add d</code> 没被折叠，尽管 <code>cc</code> 已经是 18。原因是第 1 轮开始时 <code>d</code> 在两条分支上分别是 1 和 2，汇合点只能保守地判 <code>NAC</code>。直到常量条件 <code>9 &gt; 10</code> 被折成假、<code>B2</code> 变不可达、<code>B1/B3/B4</code> 合并成直线之后，<code>d = 2</code> 才第一次成为<strong>确定</strong>的事实，第 2 轮才把 <code>f</code> 折成 20：</p>
+<table>
+<thead>
+<tr>
+<th>轮次</th>
+<th>指令数</th>
+<th>本轮折叠</th>
+<th>本轮删除</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>起始</td>
+<td>19</td>
+<td>—</td>
+<td>—</td>
+<td>算术指令 8 条</td>
+</tr>
+<tr>
+<td>1</td>
+<td>6</td>
+<td>4</td>
+<td>9</td>
+<td>常量条件 → 删不可达块、合并、CSE、DCE</td>
+</tr>
+<tr>
+<td>2</td>
+<td>4</td>
+<td>1</td>
+<td>2</td>
+<td><code>d = 2</code> 确定后 <code>f</code> 折叠</td>
+</tr>
+<tr>
+<td>3</td>
+<td>4</td>
+<td>0</td>
+<td>0</td>
+<td>无任何改写 → 到达不动点</td>
+</tr>
+</tbody></table>
+<p>Kaleidoscope 第 4 章挂在 <code>FunctionPassManager</code> 上的四个 pass 就是最小组合：<code>InstCombine</code>（窥孔与位运算化简）→ <code>Reassociate</code>（重排加法暴露 CSE 机会）→ <code>GVN</code>（全局值编号做 CSE）→ <code>SimplifyCFG</code>（删不可达块、简化分支）。</p>
+<p><figure><img class="md-img" src="content/courses/compiler-foundations/assets/chapter-5-figure-03.svg" alt="四步优化管线与多轮迭代：一轮 pass 不够，跑到不动点" loading="lazy" decoding="async"><figcaption>四步优化管线与多轮迭代：一轮 pass 不够，跑到不动点</figcaption></figure>
+</p>
+<h4 id="h-6-常见坑">6. 常见坑<a class="anchor" href="#h-6-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>折叠会陷阱的表达式</strong>：<code>100 / 0</code> 不能&quot;折叠成一个陷阱&quot;，因为原程序可能根本不执行那条指令。</li>
+<li><strong>忽略溢出语义</strong>：<code>x * 2 → x + x</code> 在补码回绕下等价，但 <code>x / 2 → x &gt;&gt; 1</code> 不等价（第 5 课给反例）。</li>
+<li><strong>DCE 把 store 或调用删掉</strong>：&quot;结果没人用&quot;对副作用指令不成立。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面这段纯 Python 实现一条四段式过程内管线：常量传播/折叠（CFG 上的前向不动点）→ 删不可达块与合并线性链 → 块内值编号（CSE）与复制传播 → 死代码消除。外层驱动一直跑到&quot;本轮没有任何改写&quot;为止，并把每一轮的指令序列打印出来。</p>
+<pre data-lang="python"><code class="language-python"># ---- 常量传播/折叠 + 分支化简 + 复制传播/CSE + 死代码消除（纯 Python，无第三方依赖）----
+BIN = {&#39;add&#39;, &#39;sub&#39;, &#39;mul&#39;, &#39;div&#39;}
+OPS = {&#39;add&#39;: lambda x, y: x + y, &#39;sub&#39;: lambda x, y: x - y,
+       &#39;mul&#39;: lambda x, y: x * y, &#39;div&#39;: lambda x, y: x // y}
+CMPS = {&#39;&gt;&#39;: lambda x, y: x &gt; y, &#39;&lt;&#39;: lambda x, y: x &lt; y,
+        &#39;&gt;=&#39;: lambda x, y: x &gt;= y, &#39;&lt;=&#39;: lambda x, y: x &lt;= y,
+        &#39;==&#39;: lambda x, y: x == y, &#39;!=&#39;: lambda x, y: x != y}
+
+
+def nm(x):
+    return (&#39;name&#39;, x)
+
+
+def ct(k):
+    return (&#39;const&#39;, k)
+
+
+def op_str(x):
+    return str(x[1]) if x else &#39;-&#39;
+
+
+def fmt(ins):
+    op = ins[0]
+    if op == &#39;copy&#39;:
+        return f&#39;{ins[3]} = {op_str(ins[1])}&#39;
+    if op in BIN:
+        return f&#39;{ins[3]} = {op_str(ins[1])} {op} {op_str(ins[2])}&#39;
+    if op == &#39;cmp&#39;:
+        return f&#39;{ins[4]} = {op_str(ins[2])} {ins[1]} {op_str(ins[3])}&#39;
+    if op == &#39;ifgoto&#39;:
+        return f&#39;if {op_str(ins[1])} goto {ins[2]} else {ins[3]}&#39;
+    if op == &#39;goto&#39;:
+        return f&#39;goto {ins[1]}&#39;
+    if op == &#39;return&#39;:
+        return f&#39;return {op_str(ins[1])}&#39;
+    return str(ins)
+
+
+def def_use(ins):
+    op = ins[0]
+    if op == &#39;copy&#39;:
+        return ins[3], [ins[1]]
+    if op in BIN:
+        return ins[3], [ins[1], ins[2]]
+    if op == &#39;cmp&#39;:
+        return ins[4], [ins[2], ins[3]]
+    if op in (&#39;ifgoto&#39;, &#39;return&#39;):
+        return None, [ins[1]]
+    return None, []
+
+
+PROG = {
+    &#39;B1&#39;: [(&#39;copy&#39;, ct(3), None, &#39;n&#39;),
+           (&#39;copy&#39;, ct(4), None, &#39;a&#39;),
+           (&#39;copy&#39;, ct(5), None, &#39;b&#39;),
+           (&#39;add&#39;, nm(&#39;a&#39;), nm(&#39;b&#39;), &#39;t1&#39;),
+           (&#39;mul&#39;, nm(&#39;t1&#39;), ct(2), &#39;c&#39;),
+           (&#39;cmp&#39;, &#39;&gt;&#39;, nm(&#39;t1&#39;), ct(10), &#39;t2&#39;),
+           (&#39;ifgoto&#39;, nm(&#39;t2&#39;), &#39;B2&#39;, &#39;B3&#39;)],
+    &#39;B2&#39;: [(&#39;copy&#39;, ct(1), None, &#39;d&#39;), (&#39;goto&#39;, &#39;B4&#39;)],
+    &#39;B3&#39;: [(&#39;copy&#39;, ct(2), None, &#39;d&#39;), (&#39;goto&#39;, &#39;B4&#39;)],
+    &#39;B4&#39;: [(&#39;add&#39;, nm(&#39;p&#39;), nm(&#39;q&#39;), &#39;e&#39;),
+           (&#39;copy&#39;, nm(&#39;c&#39;), None, &#39;cc&#39;),
+           (&#39;add&#39;, nm(&#39;cc&#39;), nm(&#39;d&#39;), &#39;f&#39;),
+           (&#39;mul&#39;, nm(&#39;c&#39;), ct(100), &#39;t9&#39;),
+           (&#39;add&#39;, nm(&#39;p&#39;), nm(&#39;q&#39;), &#39;g&#39;),
+           (&#39;add&#39;, nm(&#39;e&#39;), nm(&#39;f&#39;), &#39;r&#39;),
+           (&#39;add&#39;, nm(&#39;r&#39;), nm(&#39;g&#39;), &#39;s&#39;),
+           (&#39;return&#39;, nm(&#39;s&#39;))],
+}
+
+
+def succ_of(prog):
+    s = {}
+    for b, ins_list in prog.items():
+        last = ins_list[-1] if ins_list else None
+        if last and last[0] == &#39;goto&#39;:
+            s[b] = [last[1]]
+        elif last and last[0] == &#39;ifgoto&#39;:
+            s[b] = [last[2], last[3]]
+        else:
+            s[b] = []
+    return s
+
+
+def preds_of(prog):
+    succ, order = succ_of(prog), list(prog)
+    return {b: [p for p in order if b in succ[p]] for b in order}
+
+
+# ---------- pass 1：常量传播 + 常量折叠（CFG 上的前向不动点，格 = UNDEF/常量/NAC）----------
+def lattice_value(ins, state):
+    &quot;&quot;&quot;指令执行后，结果变量的格值：(&#39;C&#39;, v) 或 (&#39;NAC&#39;,)；无定义返回 None&quot;&quot;&quot;
+    op = ins[0]
+    d, ops = def_use(ins)
+    if d is None:
+        return None
+    vals = [state.get(x[1]) if x[0] == &#39;name&#39; else (&#39;C&#39;, x[1]) for x in ops]
+    if op == &#39;copy&#39;:
+        return vals[0] if vals[0] and vals[0][0] == &#39;C&#39; else (&#39;NAC&#39;,)
+    if all(v and v[0] == &#39;C&#39; for v in vals):
+        f = OPS[op] if op in BIN else CMPS[ins[1]]
+        return (&#39;C&#39;, int(f(*[v[1] for v in vals])))
+    return (&#39;NAC&#39;,)
+
+
+def const_prop(prog):
+    order, entry = list(prog), list(prog)[0]
+    pred = preds_of(prog)
+
+    def meet(maps):
+        keys = set().union(*[set(m) for m in maps]) if maps else set()
+        out = {}
+        for k in keys:
+            vals = [m.get(k) for m in maps]
+            if any(v is None for v in vals):
+                continue                                # 某条路径还没有信息 → UNDEF 是单位元
+            out[k] = vals[0] if all(v == vals[0] for v in vals) else (&#39;NAC&#39;,)
+        return out
+
+    IN, folds, props = {b: {} for b in order}, 0, 0
+    for _ in range(50):                                 # 阶段 A：只算不动点，不改程序
+        changed = False
+        for b in order:
+            nin = {} if b == entry else (meet([IN[p] for p in pred[b]]) if pred[b] else {})
+            state, cur = dict(nin), dict(nin)
+            for ins in prog[b]:
+                v = lattice_value(ins, cur)
+                if v is not None:
+                    cur[def_use(ins)[0]] = v
+            if cur != IN[b]:
+                IN[b], changed = cur, True
+        if not changed:
+            break
+
+    out_prog = {}
+    for b in order:                                     # 阶段 B：带着定局的信息改写指令
+        nin = {} if b == entry else (meet([IN[p] for p in pred[b]]) if pred[b] else {})
+        state, new_list = dict(nin), []
+        for ins in prog[b]:
+            op = ins[0]
+            if op == &#39;goto&#39;:
+                new_list.append(ins)
+                continue
+            if op == &#39;ifgoto&#39;:
+                v = state.get(ins[1][1])
+                if v and v[0] == &#39;C&#39;:                   # 条件已知 → 分支退化成一条边
+                    new_list.append((&#39;goto&#39;, ins[2] if v[1] else ins[3]))
+                else:
+                    new_list.append(ins)
+                continue
+            d, ops = def_use(ins)
+            vals = [state.get(x[1]) if x[0] == &#39;name&#39; else (&#39;C&#39;, x[1]) for x in ops]
+            known = all(v and v[0] == &#39;C&#39; for v in vals)
+            if op == &#39;copy&#39; and known:
+                if ops[0][0] == &#39;name&#39;:
+                    props += 1
+                new_list.append((&#39;copy&#39;, ct(vals[0][1]), None, d))
+            elif op in BIN or op == &#39;cmp&#39;:
+                if known:
+                    folds += 1
+                    f = OPS[op] if op in BIN else CMPS[ins[1]]
+                    new_list.append((&#39;copy&#39;, ct(int(f(*[v[1] for v in vals]))), None, d))
+                else:
+                    new_ops = [ct(state[x[1]][1]) if x[0] == &#39;name&#39; and state.get(x[1], (&#39;NAC&#39;,))[0] == &#39;C&#39; else x
+                               for x in ops]
+                    new_list.append((&#39;copy&#39;, new_ops[0], None, d) if op == &#39;copy&#39; else
+                                    ((op, new_ops[0], new_ops[1], d) if op in BIN else
+                                     (&#39;cmp&#39;, ins[1], new_ops[0], new_ops[1], d)))
+            else:
+                new_list.append(ins)
+            v = lattice_value(ins, state)
+            if v is not None:
+                state[d] = v
+        out_prog[b] = new_list
+    return out_prog, folds, props
+
+
+# ---------- pass 2：删不可达块 + 合并线性链 ----------
+def prune_and_merge(prog):
+    reach, stack = {list(prog)[0]}, [list(prog)[0]]
+    while stack:
+        for s in succ_of(prog)[stack.pop()]:
+            if s not in reach:
+                reach.add(s)
+                stack.append(s)
+    prog = {b: prog[b] for b in prog if b in reach}
+    merged = True
+    while merged:
+        merged = False
+        succ, pred = succ_of(prog), preds_of(prog)
+        for b in list(prog):
+            s = succ[b]
+            if len(s) == 1 and s[0] != b and len(pred[s[0]]) == 1 and prog[b][-1][0] == &#39;goto&#39;:
+                tgt = s[0]
+                body = prog[b][:-1] + prog[tgt]
+                prog = {k: (body if k == b else v) for k, v in prog.items() if k != tgt}
+                merged = True
+                break
+    return prog
+
+
+# ---------- pass 3：块内值编号（CSE）+ 复制传播 ----------
+def cse_and_copy_prop(prog):
+    for b, ins_list in prog.items():
+        vn, out = {}, []
+        for ins in ins_list:
+            op = ins[0]
+            if op == &#39;copy&#39;:
+                key = (&#39;copy&#39;, ins[1])
+                if key in vn:
+                    out.append((&#39;copy&#39;, nm(vn[key]), None, ins[3]))
+                else:
+                    vn[key] = ins[3]
+                    out.append(ins)
+                continue
+            if op not in BIN and op != &#39;cmp&#39;:
+                out.append(ins)
+                continue
+            key = (op, ins[1], ins[2]) if op in BIN else (op, ins[1], ins[2], ins[3])
+            d = ins[3] if op in BIN else ins[4]
+            if key in vn:                               # 右值相同 → 复用已有结果
+                out.append((&#39;copy&#39;, nm(vn[key]), None, d))
+            else:
+                vn[key] = d
+                out.append(ins)
+                for k in [k for k in vn if any(isinstance(x, tuple) and x == nm(d) for x in k[1:])]:
+                    del vn[k]                           # d 被重定义 → 含它的表达式失效
+        prog[b] = out
+    alias = {}
+    for b in prog:                                      # 复制传播
+        for i, ins in enumerate(prog[b]):
+            if ins[0] == &#39;copy&#39; and ins[1] and ins[1][0] == &#39;name&#39;:
+                src = alias.get(ins[1][1], ins[1][1])
+                alias[ins[3]] = src
+                prog[b][i] = (&#39;copy&#39;, nm(src), None, ins[3])
+    for b in prog:
+        prog[b] = [rewrite(ins, alias) for ins in prog[b]]
+    return prog
+
+
+def rewrite(ins, alias):
+    op = ins[0]
+
+    def sub(x):
+        return nm(alias[x[1]]) if x and x[0] == &#39;name&#39; and x[1] in alias else x
+    if op == &#39;copy&#39;:
+        return (&#39;copy&#39;, sub(ins[1]), None, ins[3])
+    if op in BIN:
+        return (op, sub(ins[1]), sub(ins[2]), ins[3])
+    if op == &#39;cmp&#39;:
+        return (&#39;cmp&#39;, ins[1], sub(ins[2]), sub(ins[3]), ins[4])
+    if op == &#39;ifgoto&#39;:
+        return (&#39;ifgoto&#39;, sub(ins[1]), ins[2], ins[3])
+    return ins
+
+
+# ---------- pass 4：死代码消除（迭代到不动点）----------
+def dce(prog):
+    removed = 0
+    while True:
+        used = {x[1] for b in prog for ins in prog[b] for x in def_use(ins)[1]
+                if x and x[0] == &#39;name&#39;}
+        new, cut = {}, 0
+        for b in prog:
+            keep = []
+            for ins in prog[b]:
+                d, _ = def_use(ins)
+                if d is not None and d not in used:     # 结果无人使用且无副作用 → 删
+                    cut += 1
+                    continue
+                keep.append(ins)
+            new[b] = keep
+        removed, prog = removed + cut, new
+        if cut == 0:
+            return prog, removed
+
+
+def stats(prog):
+    return (sum(len(v) for v in prog.values()),
+            sum(1 for v in prog.values() for i in v if i[0] in BIN))
+
+
+prog = PROG
+print(&#39;=== 原始程序 ===&#39;)
+for b in prog:
+    for ins in prog[b]:
+        print(f&#39;  {b}: {fmt(ins)}&#39;)
+print(f&#39;  指令 {stats(prog)[0]} 条，算术 {stats(prog)[1]} 条\n&#39;)
+
+tot_f = tot_p = tot_d = 0
+for rnd in range(1, 6):
+    before = repr(prog)
+    prog, folds, props = const_prop(prog)
+    prog = prune_and_merge(prog)
+    prog = cse_and_copy_prop(prog)
+    prog, cut = dce(prog)
+    tot_f, tot_p, tot_d = tot_f + folds, tot_p + props, tot_d + cut
+    n, arith = stats(prog)
+    print(f&#39;=== 第 {rnd} 轮 pass 管线：指令 {n} 条 / 算术 {arith} 条&#39;
+          f&#39;（本轮折叠 {folds}、常量传播 {props}、删除 {cut}）===&#39;)
+    for b in prog:
+        for ins in prog[b]:
+            print(f&#39;  {b}: {fmt(ins)}&#39;)
+    print()
+    if repr(prog) == before and folds == props == cut == 0:
+        print(&#39;本轮没有任何改写 → pass 管线到达不动点，停止&#39;)
+        break
+print(f&#39;累计：常量折叠 {tot_f} 次、常量传播 {tot_p} 次、死代码删除 {tot_d} 条；&#39;
+      f&#39;算术指令 {stats(PROG)[1]} → {stats(prog)[1]}&#39;)</code></pre>
+<p>运行结果：</p>
+<pre><code>=== 原始程序 ===
+  B1: n = 3
+  B1: a = 4
+  B1: b = 5
+  B1: t1 = a add b
+  B1: c = t1 mul 2
+  B1: t2 = t1 &gt; 10
+  B1: if t2 goto B2 else B3
+  B2: d = 1
+  B2: goto B4
+  B3: d = 2
+  B3: goto B4
+  B4: e = p add q
+  B4: cc = c
+  B4: f = cc add d
+  B4: t9 = c mul 100
+  B4: g = p add q
+  B4: r = e add f
+  B4: s = r add g
+  B4: return s
+  指令 19 条，算术 8 条
+
+=== 第 1 轮 pass 管线：指令 6 条 / 算术 4 条（本轮折叠 4、常量传播 1、删除 9）===
+  B1: d = 2
+  B1: e = p add q
+  B1: f = 18 add d
+  B1: r = e add f
+  B1: s = r add e
+  B1: return s
+
+=== 第 2 轮 pass 管线：指令 4 条 / 算术 3 条（本轮折叠 1、常量传播 0、删除 2）===
+  B1: e = p add q
+  B1: r = e add 20
+  B1: s = r add e
+  B1: return s
+
+=== 第 3 轮 pass 管线：指令 4 条 / 算术 3 条（本轮折叠 0、常量传播 0、删除 0）===
+  B1: e = p add q
+  B1: r = e add 20
+  B1: s = r add e
+  B1: return s
+
+本轮没有任何改写 → pass 管线到达不动点，停止
+累计：常量折叠 5 次、常量传播 1 次、死代码删除 11 条；算术指令 8 → 3</code></pre>
+<p>逐行核对三处：第 1 轮输出里 <code>d = 2</code>、<code>e = p add q</code>、<code>s = r add e</code> 说明&quot;分支被折掉、CSE 与复制传播生效&quot;（CSE 生成的 <code>g = copy e</code> 已被复制传播与 DCE 消化）；第 2 轮 <code>r = e add 20</code> 是&quot;汇合点常量变确定&quot;之后才发生的折叠；第 3 轮零改写即不动点。最终 8 条算术指令只剩 3 条，19 条总指令只剩 4 条。</p>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选（需本机有 clang / opt）：同一段源码走真实管线 ----
+# 存为 demo.c：
+#   int demo(int a, int b, int c) { int d = (a + b) * c; int e = (a + b) / c; return d + e; }
+#   clang -O0 -S -emit-llvm demo.c -o demo_O0.ll            # 未优化：两次加法都在
+#   opt -passes=&#39;instcombine,reassociate,gvn,simplifycfg&#39; -S demo_O0.ll -o demo_opt.ll
+#   clang -O2 -S demo.c -o demo_O2.s                        # 直接看汇编
+# 本机 clang -O2 实测：汇编里 (a + b) 只剩一条加法（CSE 生效）。
+# 没有 clang/opt 不影响本课：上面的 Python 版把同一条管线跑通并打印了每一轮。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：给常量格加&quot;除零/移位量非法 → 拒绝折叠&quot;的保护，用 <code>t = 100 / y</code>（y 未知）验证它不会被折成常量；再把 <code>y</code> 换成常量 0，观察输出变成什么（提示：真实编译器的选择是保留这条指令，而不是制造一个编译期错误）。</li>
+<li><strong>解释</strong>：为什么 CSE 需要&quot;可用表达式 + 值编号&quot;两件事？只拿&quot;可用表达式&quot;会写错在哪一步？只拿&quot;块内值编号&quot;又会漏掉什么？</li>
+<li><strong>对比/验证</strong>：把管线里的 DCE 去掉跑一遍，指出第 1 轮输出里多出哪些指令；再去掉 CSE 与复制传播，比较最终指令数（提示：体会三个 pass 的收益是乘法关系，不是各自独立相加）。</li>
+<li><strong>思考</strong>：如果把顺序换成&quot;先 DCE 再折叠再 CSE&quot;，最终程序会不会一样？举一个某种顺序需要多跑一轮、而另一种顺序一轮就够的例子。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Aho, Lam, Sethi, Ullman, <em>Compilers: Principles, Techniques, and Tools</em>（龙书）第 9 章 §9.1「The Principal Sources of Optimization」（常量折叠、复制传播、公共子表达式、死代码消除的源头清单）：<a href="https://suif.stanford.edu/dragonbook/" target="_blank" rel="noopener noreferrer">https://suif.stanford.edu/dragonbook/</a></li>
+<li>同上，§9.4「Constant Propagation」（常量格的传播算法与 NAC 语义）</li>
+<li>LLVM 官方 Kaleidoscope 教程第 4 章「Adding JIT and Optimizer Support」（<code>IRBuilder</code> 的 trivial constant folding；<code>InstCombine</code>/<code>Reassociate</code>/<code>GVN</code>/<code>SimplifyCFG</code> 的组合）：<a href="https://llvm.org/docs/tutorial/MyFirstLanguageFrontend/LangImpl04.html" target="_blank" rel="noopener noreferrer">https://llvm.org/docs/tutorial/MyFirstLanguageFrontend/LangImpl04.html</a></li>
+<li>LLVM <code>opt</code> 命令行指南（<code>-passes=</code> 语法，按名字调用上述 pass）：<a href="https://llvm.org/docs/CommandGuide/opt.html" target="_blank" rel="noopener noreferrer">https://llvm.org/docs/CommandGuide/opt.html</a></li>
+</ul>
+<p><a href="#/l/cf-ch5-l3">下一课：内联、循环识别与不变量外提</a></p>

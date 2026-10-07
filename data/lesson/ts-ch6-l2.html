@@ -1,0 +1,139 @@
+<h2 id="h-完整预测流程">完整预测流程<a class="anchor" href="#h-完整预测流程" aria-label="本节链接">#</a></h2>
+<p>规划做好了，这一课我们把一个预测项目从头到尾跑通：从原始数据，到训练集、验证集、测试集，到模型训练、调参、最终在测试集上做一次&quot;只许用一次&quot;的评估，最后把预测还原成业务可读的结果。这是一条<strong>标准化流水线</strong>，掌握了它，任何预测任务都能照葫芦画瓢地走完。我们用一个 LSTM 多变量模型作例子，但流水线的每一步与模型无关——换成 Transformer 或 Informer 只需替换中间的模型模块。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-流水线的六步骨架">1. 流水线的六步骨架<a class="anchor" href="#h-1-流水线的六步骨架" aria-label="本节链接">#</a></h4>
+<p>一个完整的预测项目，无论用什么模型，都逃不过这六步：</p>
+<ol>
+<li><strong>加载与清洗</strong>：读入数据、处理缺失与异常、对齐时间戳；</li>
+<li><strong>特征工程</strong>：构造协变量、周期特征、滞后特征；</li>
+<li><strong>划分与标准化</strong>：按时间顺序切 train/val/test，用训练集统计量做标准化；</li>
+<li><strong>建窗口样本</strong>：把序列切成 <code>(输入窗口, 输出窗口)</code> 的监督学习样本；</li>
+<li><strong>训练与验证</strong>：在训练集上优化，在验证集上选超参、做早停；</li>
+<li><strong>测试与还原</strong>：在测试集上评估一次，逆标准化还原真实量纲。</li>
+</ol>
+<p>其中最关键、最容易被做错的是<strong>第 3、4 步</strong>——时序的切分和窗口构造必须严格避免未来信息泄露。</p>
+<h4 id="h-2-标准化的正确姿势">2. 标准化的正确姿势<a class="anchor" href="#h-2-标准化的正确姿势" aria-label="本节链接">#</a></h4>
+<p>标准化（z-score）必须<strong>只用训练集的均值和方差</strong>，然后用同一组统计量去标准化验证集和测试集。因为验证集、测试集模拟的是&quot;未来&quot;，未来数据的统计量在真实部署时是拿不到的。如果用全量数据算均值方差，等于偷偷告诉了模型未来的信息。预测后，还要用训练集那组统计量<strong>逆标准化</strong>，把预测值还原回原始量纲。</p>
+<h4 id="h-3-窗口构造监督学习的视角">3. 窗口构造：监督学习的视角<a class="anchor" href="#h-3-窗口构造监督学习的视角" aria-label="本节链接">#</a></h4>
+<p>窗口构造是把时序问题转成监督学习的关键一步。用输入窗口长度 <code>in_len</code> 和输出窗口长度 <code>out_len</code>，在序列上滑动，每个窗口产生一条样本：输入 <code>[x_t, ..., x_{t+in_len-1}]</code>，标签 <code>[x_{t+in_len}, ..., x_{t+in_len+out_len-1}]</code>。注意窗口只能在<strong>训练段内部</strong>滑动，绝不能滑过训练/验证的边界——否则训练样本里就混进了验证集的信息。</p>
+<h4 id="h-4-验证与早停防止过拟合">4. 验证与早停：防止过拟合<a class="anchor" href="#h-4-验证与早停防止过拟合" aria-label="本节链接">#</a></h4>
+<p>训练时每过几个 epoch 就在验证集上算一次 loss。验证 loss 不降反升且持续若干轮，就<strong>早停</strong>并回滚到验证 loss 最优的权重。这防止模型把训练集的噪声也背下来。验证集是&quot;调参的裁判&quot;，测试集是&quot;最终验收的裁判&quot;，两者要严格隔离——测试集<strong>只在最后一刻用一次</strong>，反复在测试集上调参等于把测试集也变成了验证集。</p>
+<h4 id="h-5-最终产出还原--可视化--指标">5. 最终产出：还原 + 可视化 + 指标<a class="anchor" href="#h-5-最终产出还原--可视化--指标" aria-label="本节链接">#</a></h4>
+<p>在测试集上跑出预测后，先逆标准化，再和真实值画对比图，计算 MAE/RMSE 等指标。图和指标都要看：图能暴露&quot;指标看着还行、但相位整体错位&quot;这类系统性问题，指标能给出可比较的量化结论。二者结合，才算一个完整的交付。</p>
+<p><figure><img class="md-img" src="content/courses/time-series/assets/chapter-6-figure-02.svg" alt="完整预测流水线六步：清洗→特征→切分→窗口→训练→测试还原" loading="lazy" decoding="async"><figcaption>完整预测流水线六步：清洗→特征→切分→窗口→训练→测试还原</figcaption></figure>
+</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面把六步完整走一遍。数据沿用上一课的日销量（趋势 + 周周期 + 噪声），模型用 LSTM，输入过去 14 天预测未来 7 天。每一步都标了序号，与骨架一一对应。</p>
+<pre data-lang="python"><code class="language-python">import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+
+torch.manual_seed(0)
+np.random.seed(0)
+
+# ① 加载与清洗：构造一份&quot;日销量&quot;，含周周期
+dates = pd.date_range(&quot;2022-01-01&quot;, periods=730, freq=&quot;D&quot;)
+t = np.arange(730)
+sales = 0.05 * t + 8 * np.sin(t * 2 * np.pi / 7) + np.random.randn(730) * 2
+sales[200] = 80                                   # 异常值
+sales[400:405] = np.nan                           # 缺失
+df = pd.DataFrame({&quot;date&quot;: dates, &quot;sales&quot;: sales})
+df[&quot;sales&quot;] = df[&quot;sales&quot;].ffill()                 # 简单前向填充
+
+# ② 特征工程：加&quot;星期几&quot;作为协变量（周期特征，未来可知）
+df[&quot;dow&quot;] = df[&quot;date&quot;].dt.dayofweek.values / 6.0  # 归一化到 [0,1]
+values = df[[&quot;sales&quot;, &quot;dow&quot;]].values.astype(np.float32)   # (730, 2)
+
+# ③ 划分与标准化：先按时间切分，再用&quot;训练集&quot;统计量标准化
+n = len(values)
+tr_end, va_end = int(n * 0.7), int(n * 0.85)
+train_raw, val_raw, test_raw = values[:tr_end], values[tr_end:va_end], values[va_end:]
+mu, sigma = train_raw.mean(axis=0), train_raw.std(axis=0) + 1e-6
+train = (train_raw - mu) / sigma
+val = (val_raw - mu) / sigma
+test = (test_raw - mu) / sigma
+
+# ④ 建窗口样本：输入 in_len 步，输出 out_len 步（只预测 sales，第 0 列）
+IN_LEN, OUT_LEN = 14, 7
+def make_dataset(seg):
+    X, y = [], []
+    for i in range(len(seg) - IN_LEN - OUT_LEN):
+        X.append(seg[i:i + IN_LEN])                    # (in_len, 2)
+        y.append(seg[i + IN_LEN:i + IN_LEN + OUT_LEN, 0])  # (out_len,)
+    return (torch.tensor(X), torch.tensor(y))
+
+X_tr, y_tr = make_dataset(train)
+X_va, y_va = make_dataset(val)
+X_te, y_te = make_dataset(test)
+print(&quot;样本数  训练/验证/测试:&quot;, X_tr.shape[0], X_va.shape[0], X_te.shape[0])
+
+# ⑤ 训练与验证：LSTM 多步预测 + 早停
+class ForecastLSTM(nn.Module):
+    def __init__(self, in_feat=2, hidden=32, out_len=7):
+        super().__init__()
+        self.lstm = nn.LSTM(in_feat, hidden, batch_first=True)
+        self.fc = nn.Linear(hidden, out_len)
+    def forward(self, x):
+        out, (h, c) = self.lstm(x)
+        return self.fc(h[-1])                          # 最后一步隐藏状态 → 未来 7 步
+
+model = ForecastLSTM()
+criterion = nn.MSELoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+best_va, best_state, patience = float(&quot;inf&quot;), None, 0
+for epoch in range(2000):
+    model.train()
+    optimizer.zero_grad()
+    loss = criterion(model(X_tr), y_tr)
+    loss.backward()
+    optimizer.step()
+    # 验证 + 早停
+    model.eval()
+    with torch.no_grad():
+        va_loss = criterion(model(X_va), y_va).item()
+    if va_loss &lt; best_va:
+        best_va, patience, best_state = va_loss, 0, model.state_dict()
+    else:
+        patience += 1
+        if patience &gt;= 30:
+            print(f&quot;早停于 epoch {epoch+1}，验证 loss={best_va:.4f}&quot;)
+            break
+
+model.load_state_dict(best_state)
+
+# ⑥ 测试与还原：测试集只评估这一次
+model.eval()
+with torch.no_grad():
+    pred = model(X_te).numpy()                          # (n_test, 7)
+# 逆标准化：只还原第 0 列（sales）
+pred_sales = pred * sigma[0] + mu[0]
+true_sales = y_te.numpy() * sigma[0] + mu[0]
+mae = mean_absolute_error(true_sales, pred_sales)
+rmse = np.sqrt(mean_squared_error(true_sales, pred_sales))
+print(f&quot;测试集  MAE={mae:.3f}  RMSE={rmse:.3f}&quot;)
+print(&quot;首个测试样本：真实未来7天 vs 预测7天&quot;)
+print(&quot;真实:&quot;, np.round(true_sales[0], 1))
+print(&quot;预测:&quot;, np.round(pred_sales[0], 1))</code></pre>
+<p>走完这六步，你就拥有了一个可复用的预测流水线。几个必须记住的细节：</p>
+<ul>
+<li>标准化的 <code>mu/sigma</code> <strong>只来自训练集</strong>，验证/测试用同一组，预测后再逆标准化——三处必须严格配对；</li>
+<li>窗口在<strong>各自段内</strong>滑动，训练样本与验证样本不重叠，杜绝边界泄露；</li>
+<li>测试集在全程只被调用了一次（最后一步），早停和调参全靠验证集，这是&quot;测试集只许用一次&quot;的纪律。</li>
+</ul>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>把 LSTM 换成你在第五章学的 Transformer 编码器（只替换模型类），其余流水线不动，跑一遍并比较 MAE。体会&quot;流水线与模型解耦&quot;的设计价值。</li>
+<li>去掉 <code>dow</code> 协变量（只保留 sales 一列）重跑，观察周周期是否更难学到。这说明了特征工程对精度的贡献。</li>
+<li>把 <code>IN_LEN</code> 从 14 改成 7 和 28，观察验证 loss 变化。输入窗口长度如何影响模型&quot;看到多少历史&quot;与&quot;过拟合风险&quot;？</li>
+<li>写一段代码，检查训练样本与验证样本在时间轴上是否重叠。如果重叠，会怎样污染评估？你如何修正？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Hyndman &amp; Athanasopoulos · Forecasting: Principles and Practice（第 7 章 回归与 第 10 章 实践）：<a href="https://otexts.com/fpp3/" target="_blank" rel="noopener noreferrer">https://otexts.com/fpp3/</a></li>
+<li>PyTorch 官方文档 · Saving and Loading Models：<a href="https://pytorch.org/tutorials/beginner/saving_loading_models.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/tutorials/beginner/saving_loading_models.html</a></li>
+<li>scikit-learn 官方文档 · Metrics and scoring：<a href="https://scikit-learn.org/stable/modules/model_evaluation.html" target="_blank" rel="noopener noreferrer">https://scikit-learn.org/stable/modules/model_evaluation.html</a></li>
+</ul>
+<p><a href="#/l/ts-ch6-l3">下一课：结果评估与复盘</a></p>

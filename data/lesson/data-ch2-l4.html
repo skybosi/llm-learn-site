@@ -1,0 +1,804 @@
+<h2 id="h-内容提取与规范化顺序幂等与可复现">内容提取与规范化：顺序、幂等与可复现<a class="anchor" href="#h-内容提取与规范化顺序幂等与可复现" aria-label="本节链接">#</a></h2>
+<h3 id="h-这一节要解决什么">这一节要解决什么<a class="anchor" href="#h-这一节要解决什么" aria-label="本节链接">#</a></h3>
+<p>&quot;清洗&quot;这个词给人的印象是把脏东西擦掉。但这一步真正在做的事情是<strong>定义等价类</strong>：哪些文本表示应当被视为同一份内容？哪些差异是有意义的、必须保留？</p>
+<p>这个视角的转换会立刻带来三个具体问题，而它们都不是&quot;用什么库&quot;能回答的：</p>
+<ol>
+<li><strong>规范化的有损性</strong>。Unicode 的 NFKC 形式会把 <code>x² + y²</code> 变成 <code>x2 + y2</code> —— 上标没了，代码里 <code>x2</code> 与 <code>x²</code> 的区分被抹掉。哪些损失可以接受？这取决于你的语料里有什么。</li>
+<li><strong>不可见字符</strong>。<code>a</code> + 零宽空格 + <code>b</code> 与 <code>ab</code> 在人眼里完全相同，在字节上不同，在 tokenizer 里也可能不同，在去重指纹上一定不同。零宽字符还是 prompt injection 的常用载体。</li>
+<li><strong>管线的顺序不是随意的</strong>。本节代码会给出两个实测：去重键放在规范化<strong>之前</strong>，两份只差全角/连字/空白的文档不会被识别为重复（唯一指纹 3 个 vs 规范化后的 2 个）；把<strong>随机化</strong>的 PII 脱敏放在去重之前，两份完全相同的内容会得到不同指纹（<code>c65569d81d16</code> vs <code>b2af89c7f0ab</code>），去重直接失效。</li>
+</ol>
+<p>最后落到全课程的基础设施：<strong>确定性</strong>（同输入同输出，逐字节）、<strong>幂等性</strong>（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="mopen">(</span><span class="mord mathnormal">x</span><span class="mclose">))</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="mopen">(</span><span class="mord mathnormal">x</span><span class="mclose">)</span></span></span></span>）、以及<strong>数据版本 = 输入指纹 + 管线版本 + 参数</strong>。这三件东西是后面所有关于可复现训练、配比实验、撤下重跑的讨论的前提。</p>
+<h3 id="h-一为什么提取是质量的第一道关">一、为什么&quot;提取&quot;是质量的第一道关<a class="anchor" href="#h-一为什么提取是质量的第一道关" aria-label="本节链接">#</a></h3>
+<h4 id="h-11-网页欠提取与过提取">1.1 网页：欠提取与过提取<a class="anchor" href="#h-11-网页欠提取与过提取" aria-label="本节链接">#</a></h4>
+<p>把 HTML 变成正文有两种失败，方向相反，危害不同：</p>
+<table>
+<thead>
+<tr>
+<th>失败</th>
+<th>表现</th>
+<th>危害</th>
+<th>检测</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>欠提取</strong></td>
+<td>正文没抓到（空壳、只留标题）</td>
+<td>有效内容丢失；大量空文档进入语料</td>
+<td>提取后长度 / 原始 HTML 长度 的比值过低</td>
+</tr>
+<tr>
+<td><strong>过提取</strong></td>
+<td>导航、广告、页脚、评论区混入正文</td>
+<td><strong>boilerplate 被当成&quot;正文&quot;</strong>，见 1.2</td>
+<td>链接密度、重复块检测</td>
+</tr>
+</tbody></table>
+<p><strong>欠提取最容易被发现</strong>（长度比异常），因为它的结果是&quot;内容不见了&quot;。<strong>过提取最危险</strong>，因为它的结果看起来很正常 —— 一段有意义的正文，后面跟着一段版权声明。而这正是下一小节要说的。</p>
+<h4 id="h-12-过提取的隐蔽危害">1.2 过提取的隐蔽危害<a class="anchor" href="#h-12-过提取的隐蔽危害" aria-label="本节链接">#</a></h4>
+<p>假设一个站点的页脚是&quot;版权所有 © 2026 示例公司 京ICP备…&quot;，被 200 万页过提取进正文。会发生什么？</p>
+<ol>
+<li><strong>这 200 万个样本不是&quot;重复&quot;</strong>（它们的主体内容各不相同，文档级 Jaccard 很低），所以文档级去重不会动它们；</li>
+<li><strong>但这段页脚在语料里出现了 200 万次</strong> —— 它是一个<strong>高频 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span>-gram</strong>。后果有三：<ul>
+<li>子串级去重要处理一个 200 万文档的巨型簇（第 2 节 8.1 的&quot;巨型桶&quot;问题）；</li>
+<li>模型会把这串字当成&quot;正文的一部分&quot;来建模，可能学会在生成时输出它（记忆化 + 逐字复读）；</li>
+<li>它污染了&quot;重复率&quot;等一切基于 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span>-gram 的质量指标（第 1 章 4.1 的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span>-gram 污染检测里，&quot;仅模板&quot;的误报率是 100%）。</li>
+</ul>
+</li>
+<li><strong>它还会成为统计陷阱</strong>：所有基于&quot;文档级相似度&quot;的去重报告都会显示&quot;重复率很低&quot;，于是团队认为数据很干净。</li>
+</ol>
+<p><strong>所以&quot;去除 boilerplate&quot;不是可选的优化，而是去重与质量度量的前置条件。</strong> 本节代码的第一段就演示了这个打分过程：一个 167 字的页面，提取后剩 123 字，<strong>去掉 26% 的模板噪声</strong>。</p>
+<h4 id="h-13-pdf另一套完全不同的失败模式">1.3 PDF：另一套完全不同的失败模式<a class="anchor" href="#h-13-pdf另一套完全不同的失败模式" aria-label="本节链接">#</a></h4>
+<p>PDF 没有&quot;正文&quot;这个结构概念，只有绘制指令。抽取时的问题：</p>
+<ul>
+<li><strong>文本层 vs 扫描件</strong>：有文本层的 PDF 可以直接抽字符（但顺序可能乱）；扫描件必须先 OCR，OCR 错误会成为语料里的系统性噪声。</li>
+<li><strong>阅读顺序</strong>：多栏排版、浮动图注、脚注，抽取器按坐标顺序读会得到交错的两栏文字 —— 语义完全乱掉，但<strong>看起来像正常的句子</strong>（因为没有错别字）。这是最阴险的一类：语料看起来干净，逻辑是错的。</li>
+<li><strong>连字符断行</strong>：行尾的 <code>-</code> 是断词符还是真正的连字符？判错会把 <code>train-ing</code> 与 <code>training</code> 变成两个 token。</li>
+<li><strong>页眉页脚页码</strong>：与网页的 boilerplate 同样的问题（1.2）。</li>
+<li><strong>表格与公式</strong>：表格会被拉平成一行数字（丢失列对应关系）；公式变成乱码或丢失。</li>
+</ul>
+<p><strong>工程结论</strong>：PDF 抽取必须<strong>按来源做质量校验</strong>（长度比、语言识别置信度、替换字符比例、以及&quot;句子完整性&quot;启发式），并且把每一个 PDF 来源的抽取器版本记进 manifest（换抽取器 = 数据变了）。</p>
+<h4 id="h-14-失效清单写管线时逐条过">1.4 失效清单（写管线时逐条过）<a class="anchor" href="#h-14-失效清单写管线时逐条过" aria-label="本节链接">#</a></h4>
+<ul>
+<li>空壳页（JS 渲染）：HTML 有内容、文本为空 → 长度比 ≈ 0</li>
+<li>反爬登录页：第 1 章 4.4 已讲</li>
+<li>编码猜测错误：GBK 当 UTF-8 解 → 大量 <code>U+FFFD</code></li>
+<li>单栏正文被识别成多块：只取到一段（本节代码里&quot;只取最高分块&quot;就是这个失败）</li>
+<li>评论区被当正文：论坛页的正文其实是评论，而&quot;帖子&quot;是标题 → 选错块</li>
+<li>图文页：正文在图片里 → 文本长度为 0 但有大量 <code>&lt;img&gt;</code></li>
+<li>无限滚动的&quot;加载更多&quot;占位符 → 混入语料</li>
+</ul>
+<h3 id="h-二正文提取的原理">二、正文提取的原理<a class="anchor" href="#h-二正文提取的原理" aria-label="本节链接">#</a></h3>
+<h4 id="h-21-单页启发式块打分">2.1 单页启发式（块打分）<a class="anchor" href="#h-21-单页启发式块打分" aria-label="本节链接">#</a></h4>
+<p>主流单页算法的核心是<strong>把 DOM 切成候选块，给每块打分，选最高分（并合并相邻高分块）</strong>。打分的信号：</p>
+<table>
+<thead>
+<tr>
+<th>信号</th>
+<th>方向</th>
+<th>理由</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>文本长度</td>
+<td><strong>加分</strong></td>
+<td>正文块通常比导航块长得多</td>
+</tr>
+<tr>
+<td>链接密度（链接文本长度 / 总文本长度）</td>
+<td><strong>减分</strong></td>
+<td>导航、页脚、相关阅读都是链接堆</td>
+</tr>
+<tr>
+<td>标点密度</td>
+<td><strong>加分（有上限）</strong></td>
+<td>正文是句子；导航是无标点的短语堆</td>
+</tr>
+<tr>
+<td>标签的语义权重</td>
+<td>加分</td>
+<td><code>&lt;article&gt;</code>、<code>&lt;p&gt;</code> 优于 <code>&lt;div&gt;</code></td>
+</tr>
+<tr>
+<td>class/id 关键词</td>
+<td>加分/减分</td>
+<td><code>comment</code>、<code>nav</code>、<code>footer</code> 减分；<code>content</code>、<code>post</code> 加分</td>
+</tr>
+</tbody></table>
+<p>⚠️ 最后一项（关键词）是最不稳健的：它依赖站点命名习惯，且会被对抗性地绕过（把广告栏命名为 <code>content</code>）。它有效但必须与其他信号一起用。</p>
+<p>本节代码的实现是前三个信号的最小组合：</p>
+<pre><code>块序号   文本长度   链接密度   得分
+  0       17      0.706     2.0     &lt;- 导航（短 + 高链接密度）
+  1       71      0.000    36.4     &lt;- 正文第一段
+  2       51      0.000    26.4     &lt;- 正文第二段
+  3        0      0.000     0.0
+  4       23      0.348     6.0     &lt;- 页脚（版权声明）
+  5        0      0.000     0.0</code></pre>
+<p><strong>注意这里的&quot;合并&quot;步骤是必需的</strong>：只取最高分块会得到 71 字（只有第一段），合并相邻高分块后得到 123 字（两段）。<strong>真实实现里&quot;正文&quot;总是被切成多个 <code>&lt;p&gt;</code></strong>，所以&quot;选一个块&quot;这种简化会在真实数据上系统性欠提取。</p>
+<h4 id="h-22-站点级模板挖掘为什么它更准">2.2 站点级模板挖掘：为什么它更准<a class="anchor" href="#h-22-站点级模板挖掘为什么它更准" aria-label="本节链接">#</a></h4>
+<p>单页启发式只看一页；<strong>模板挖掘看同一站点的多页</strong>：把 N 个页面切成 DOM 子树，统计每个子树的&quot;出现率&quot;。<strong>出现率接近 100% 的子树就是模板</strong>（导航、页脚、侧栏）；出现率低但文本占比高的就是正文。</p>
+<p><strong>为什么它比单页启发式准</strong>：它用的是<strong>跨文档的统计证据</strong>，而不是单页的启发式阈值。一个只有 50 字的短正文页，在单页启发式下会被导航块打败（导航可能有 80 字），但在模板挖掘下：导航在 1000 个页面里都出现 → 判为模板删掉；那 50 字只在这一页出现 → 判为正文保留。</p>
+<p><strong>代价</strong>：</p>
+<ul>
+<li>必须<strong>按站点批量处理</strong>（需要先按域名分组，改变管线的数据流形状）；</li>
+<li>对<strong>新站点/低频站点</strong>无效（样本不足）；</li>
+<li>站点改版会让模板集合失效（必须按时间窗口重新挖掘，并记录模板版本）。</li>
+</ul>
+<p><strong>工程上的组合</strong>：先按站点做模板挖掘，对样本不足的站点回退到单页启发式。两条路径都要记进 manifest（因为它们的输出不同）。</p>
+<h4 id="h-23-提取质量的校验">2.3 提取质量的校验<a class="anchor" href="#h-23-提取质量的校验" aria-label="本节链接">#</a></h4>
+<p>提取器是<strong>不可信的</strong>，必须让它的输出通过一组校验（本节代码第 4 段）：</p>
+<table>
+<thead>
+<tr>
+<th>校验</th>
+<th>判据（示意）</th>
+<th>触发后</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>长度比</td>
+<td>提取文本长度 / HTML 长度 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7719em;vertical-align:-0.136em;"></span><span class="mrel">≥</span></span></span></span> 某个下限</td>
+<td>判为欠提取，丢弃或换抽取器</td>
+</tr>
+<tr>
+<td>绝对长度</td>
+<td>提取文本 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7719em;vertical-align:-0.136em;"></span><span class="mrel">≥</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">100</span></span></span></span> 字符</td>
+<td>空壳页，丢弃</td>
+</tr>
+<tr>
+<td>链接密度</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7719em;vertical-align:-0.136em;"></span><span class="mrel">≤</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.6</span></span></span></span></td>
+<td>判为导航页/列表页，丢弃或标记</td>
+</tr>
+<tr>
+<td>替换字符</td>
+<td><code>U+FFFD</code> 比例 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5782em;vertical-align:-0.0391em;"></span><span class="mrel">&gt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0</span></span></span></span></td>
+<td><strong>编码错误</strong>，进人工队列（不要静默保留）</td>
+</tr>
+<tr>
+<td>语言识别</td>
+<td>置信度 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7719em;vertical-align:-0.136em;"></span><span class="mrel">≥</span></span></span></span> 阈值且与预期语言一致</td>
+<td>否则丢弃（防止混入其它语言/乱码）</td>
+</tr>
+<tr>
+<td>重复块</td>
+<td>该块在本站点出现率 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5782em;vertical-align:-0.0391em;"></span><span class="mrel">&gt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">90%</span></span></span></span></td>
+<td>判为模板，删除</td>
+</tr>
+</tbody></table>
+<p>本节代码的实测：</p>
+<pre><code>正常页        文本长度 167  链接密度 0.12  替换字符 0  -&gt; 通过
+空壳页（JS 渲染） 文本长度   0  链接密度 0.00  替换字符 0  -&gt; 可疑
+导航页        文本长度 110  链接密度 1.00  替换字符 0  -&gt; 可疑</code></pre>
+<p><strong>三条规则分别抓住了三种完全不同的失败</strong>：长度抓空壳，链接密度抓导航，替换字符抓编码。<strong>它们的作用是让&quot;提取失败&quot;从静默变成可见</strong> —— 这是本节最重要的一条工程原则。</p>
+<p><figure><img class="md-img" src="content/courses/data-engineering/assets/chapter-2-figure-04.svg" alt="自举坍缩：每轮丢掉最不典型的那 10%" loading="lazy" decoding="async"><figcaption>自举坍缩：每轮丢掉最不典型的那 10%</figcaption></figure>
+</p>
+<h3 id="h-三unicode-规范化定义等价类">三、Unicode 规范化：定义等价类<a class="anchor" href="#h-三unicode-规范化定义等价类" aria-label="本节链接">#</a></h3>
+<h4 id="h-31-四种形式">3.1 四种形式<a class="anchor" href="#h-31-四种形式" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>形式</th>
+<th>做什么</th>
+<th>典型用途</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>NFC</strong></td>
+<td>规范合成：把&quot;基字符 + 组合符&quot;合成预组合字符</td>
+<td>通用文本（最常用）</td>
+</tr>
+<tr>
+<td><strong>NFD</strong></td>
+<td>规范分解：把预组合字符拆成基字符 + 组合符</td>
+<td>需要按字符比较（如重音不敏感搜索）</td>
+</tr>
+<tr>
+<td><strong>NFKC</strong></td>
+<td>兼容合成：在 NFC 基础上再做<strong>兼容分解</strong></td>
+<td>搜索、去重（<strong>有损</strong>）</td>
+</tr>
+<tr>
+<td><strong>NFKD</strong></td>
+<td>兼容分解</td>
+<td>同上，需要拆开时</td>
+</tr>
+</tbody></table>
+<p>关键区分：<strong>&quot;规范&quot;（canonical）变换是无损的</strong>（NFC 与 NFD 互为逆），<strong>&quot;兼容&quot;（compatibility）变换是有损的</strong>。这一条是本节的核心。</p>
+<h4 id="h-32-nfkc-的有损性具体损失清单">3.2 NFKC 的有损性：具体损失清单<a class="anchor" href="#h-32-nfkc-的有损性具体损失清单" aria-label="本节链接">#</a></h4>
+<p>本节代码的实测（原始 → NFKC）：</p>
+<table>
+<thead>
+<tr>
+<th>原始</th>
+<th>NFKC</th>
+<th>损失了什么</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>① 第一步</code></td>
+<td><code>1 第一步</code></td>
+<td>&quot;带圈&quot;这个语义（有序列表符号 / 编号样式）</td>
+</tr>
+<tr>
+<td><code>ﬁnal</code></td>
+<td><code>final</code></td>
+<td>连字（影响字符串长度与视觉）</td>
+</tr>
+<tr>
+<td><code>ＡＢＣ１２３</code></td>
+<td><code>ABC123</code></td>
+<td>全角（在某些文本里有对齐/艺术用途）</td>
+</tr>
+<tr>
+<td><code>x² + y²</code></td>
+<td><code>x2 + y2</code></td>
+<td><strong>上标</strong> —— 数学语义丢失，且 <code>x²</code> 与变量 <code>x2</code> 不再可区分</td>
+</tr>
+<tr>
+<td><code>㍿東京</code></td>
+<td><code>株式会社東京</code></td>
+<td>方形连字被展开（长度变化 1 → 4）</td>
+</tr>
+<tr>
+<td><code>café</code></td>
+<td><code>café</code></td>
+<td>无（NFC 与 NFKC 在此相同）</td>
+</tr>
+</tbody></table>
+<p><strong>最重要的两行</strong>：</p>
+<ul>
+<li><strong>上标丢失是数学/科学语料的实质损失</strong>：<code>x²</code> 变成 <code>x2</code> 后，模型无法区分&quot;<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">x</span></span></span></span> 的平方&quot;与&quot;变量 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">x</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>&quot;。如果你的语料含公式、化学式（<code>H₂O</code>）、单位（<code>m³</code>），<strong>NFKC 会系统性地破坏它们</strong>。</li>
+<li><strong>方形连字展开会改变长度</strong>：<code>㍿</code> 一个字符变四个字符，于是<strong>基于字符长度的所有启发式规则（词数区间、长度分位）都会偏移</strong>。这类变化量小但全局，很难发现。</li>
+</ul>
+<p><strong>因此规范化的选择必须按域决定</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>语料</th>
+<th>推荐</th>
+<th>理由</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>自然语言（网页、对话、书籍）</td>
+<td>NFKC</td>
+<td>合并全角/连字带来的冗余收益大于损失</td>
+</tr>
+<tr>
+<td>代码</td>
+<td><strong>NFC</strong>（或只做空白与零宽清理）</td>
+<td>NFKC 会把全角括号、上标改成半角，破坏标识符与字符串</td>
+</tr>
+<tr>
+<td>数学/科学</td>
+<td><strong>NFC</strong> + 单独的上标/下标保留规则</td>
+<td>NFKC 破坏公式语义</td>
+</tr>
+<tr>
+<td>标识符/ID/URL</td>
+<td><strong>完全不规范化</strong>（或另存一份规范化的）</td>
+<td>改一个字符就改了指代对象</td>
+</tr>
+</tbody></table>
+<h4 id="h-33-不可见字符四类双重影响">3.3 不可见字符：四类，双重影响<a class="anchor" href="#h-33-不可见字符四类双重影响" aria-label="本节链接">#</a></h4>
+<p>本节代码的实测（肉眼都像 <code>ab</code>）：</p>
+<pre><code>&#39;ab&#39;         len=2  sha256[:12]=fb8e20fc2e4c  含不可见=False
+&#39;a\u200bb&#39;   len=3  sha256[:12]=8df62aef5f92  含不可见=True   &lt;- 零宽空格 ZWSP
+&#39;a\ufeffb&#39;   len=3  sha256[:12]=47a12dcb64e9  含不可见=True   &lt;- BOM / 零宽不换行空格
+&#39;a\xadb&#39;     len=3  sha256[:12]=15463234df2c  含不可见=True   &lt;- 软连字符
+&#39;a\u200db&#39;   len=3  sha256[:12]=57d3077bde56  含不可见=True   &lt;- 零宽连接符 ZWJ</code></pre>
+<p>四类要处理的东西：</p>
+<table>
+<thead>
+<tr>
+<th>类别</th>
+<th>Unicode 类别</th>
+<th>例子</th>
+<th>为什么要处理</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>零宽字符</strong></td>
+<td><code>Cf</code></td>
+<td>ZWSP <code>U+200B</code>、ZWNJ <code>U+200C</code>、ZWJ <code>U+200D</code></td>
+<td>视觉不可见、影响 tokenizer 与去重；<strong>是 prompt injection 的常用载体</strong>（把 &quot;ignore previous instructions&quot; 用零宽字符打断以绕过关键词过滤）</td>
+</tr>
+<tr>
+<td><strong>BOM / 方向控制</strong></td>
+<td><code>Cf</code></td>
+<td><code>U+FEFF</code>、<code>U+202A</code>~`U+202E`（双向覆盖）</td>
+<td>文件头的 BOM 会进入第一个 token；<strong>双向控制字符能让显示的文本顺序与字节顺序不同</strong>（欺骗性很强）</td>
+</tr>
+<tr>
+<td><strong>软连字符 / 不换行空格</strong></td>
+<td><code>Cf</code> / <code>Zs</code></td>
+<td><code>U+00AD</code>、<code>U+00A0</code></td>
+<td>断词与空白语义；<code>U+00A0</code> 会被很多 tokenizer 当普通空格，但字符串比较不等</td>
+</tr>
+<tr>
+<td><strong>组合标记</strong></td>
+<td><code>Mn</code></td>
+<td><code>U+0301</code>（重音）</td>
+<td><strong>不要删</strong>（它是内容），用 NFC 合成即可</td>
+</tr>
+</tbody></table>
+<p><strong>本节代码的 <code>canon</code> 选择删掉所有 <code>Cf</code> 类字符</strong>（零宽、BOM、方向控制、软连字符），保留 <code>Mn</code>（组合符交给 NFC 处理）。这是一个可以 defended 的选择：<code>Cf</code> 是&quot;格式控制&quot;而非内容，且它们的存在通常来自复制粘贴或抓取噪声。<strong>但要注意它的代价</strong>：某些语言里 ZWJ/ZWNJ 是<strong>必需的</strong>（如波斯语、印地语的正字法），删掉会改变词形。所以如果你的语料包含这些语言，规则要按语言分支。</p>
+<h4 id="h-34-ufffd-是上游错误的信号">3.4 <code>U+FFFD</code> 是上游错误的信号<a class="anchor" href="#h-34-ufffd-是上游错误的信号" aria-label="本节链接">#</a></h4>
+<p><code>U+FFFD</code>（替换字符 <code>�</code>）的意思是&quot;编码解码失败，我不知道这个字节是什么&quot;。它出现在语料里意味着<strong>上游有编码错误</strong>（用了错误的字符集解码）。</p>
+<p><strong>正确处理不是&quot;去掉它&quot;，而是把它当成一个信号</strong>：</p>
+<ul>
+<li>统计每个来源的 <code>U+FFFD</code> 比例；</li>
+<li>比例异常高的来源 → 编码猜测错误 → <strong>换编码重解</strong>（或标记为不可用）；</li>
+<li>比例很低的 → 保留并记录（因为去掉它会把&quot;某个字符无法解码&quot;这个事实抹掉，反而让语料看起来更干净）。</li>
+</ul>
+<p><strong>为什么不能静默保留</strong>：一个 <code>U+FFFD</code> 可能替换掉了 1 个字符也可能替换掉了 100 个字节（取决于错误类型）。它会让长度统计、语言识别、以及下游的可读性都失真。</p>
+<h4 id="h-35-空白大小写标点">3.5 空白、大小写、标点<a class="anchor" href="#h-35-空白大小写标点" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>空白</strong>：<code>\r\n</code> → <code>\n</code>、连续空白折叠、去首尾。但<strong>不能折叠代码的缩进</strong>（Python 的缩进是语法）与 Markdown 的结构（两个空格 = 换行）。</li>
+<li><strong>大小写</strong>：小写化会丢 NER 信号（<code>Apple</code> 公司 vs <code>apple</code> 水果）、代码标识符（<code>Foo</code> 类 vs <code>foo</code> 变量）。<strong>除非有明确的理由（比如做大小写不敏感的匹配），不要小写化。</strong></li>
+<li><strong>标点</strong>：去标点会丢数学、代码、句边界。唯一的例外是标点变体归一（全角 ↔ 半角），但那属于 NFKC 的范畴。</li>
+</ul>
+<p><strong>判据</strong>：任何有损操作都要能回答&quot;我丢了什么、为什么可以丢、有多少样本受影响&quot;。答不上来就不要做。</p>
+<h4 id="h-36-核心原则">3.6 核心原则<a class="anchor" href="#h-36-核心原则" aria-label="本节链接">#</a></h4>
+<blockquote>
+<p><strong>规范化只能合并真正等价的表示。任何&quot;为了好看&quot;或&quot;为了统一&quot;的有损变换，都必须有明确的、可测量的理由。</strong></p>
+</blockquote>
+<p>这条原则有一个很实用的推论：<strong>规范化应该按域分层</strong>，而不是全管线一套。自然语言走 NFKC，代码走 NFC，标识符不动 —— 代价是维护多套指纹（第 2 节的去重必须按域分开做，否则跨域指纹不可比），收益是不丢信息。</p>
+<h3 id="h-四管线的顺序为什么不能随意">四、管线的顺序：为什么不能随意<a class="anchor" href="#h-四管线的顺序为什么不能随意" aria-label="本节链接">#</a></h3>
+<h4 id="h-41-推荐顺序">4.1 推荐顺序<a class="anchor" href="#h-41-推荐顺序" aria-label="本节链接">#</a></h4>
+<pre data-lang="text"><code class="language-text">原始快照（raw，只追加）
+ → 解码/编码修复（含 U+FFFD 比例统计）
+ → Unicode 规范化（按域选择 NFC / NFKC）
+ → 去不可见字符与格式控制（Cf 类）
+ → 空白规范化（按内容类型分支：自然语言折叠，代码保留）
+ → 语言识别（在规范化之后）
+ → 正文提取 / boilerplate 去除（DOM 层或站点模板层）
+ → 质量打分与过滤
+ → PII 脱敏（必须是确定性的）
+ → 去重（精确 → 近似 → 子串级）
+ → 分词 / 打包</code></pre>
+<h4 id="h-42-三条判据记住这三条顺序基本就定了">4.2 三条判据（记住这三条，顺序基本就定了）<a class="anchor" href="#h-42-三条判据记住这三条顺序基本就定了" aria-label="本节链接">#</a></h4>
+<ol>
+<li><p><strong>去重之前的所有步骤都必须确定性且幂等。</strong>
+理由：去重键是内容的指纹。如果指纹函数对同一内容在不同时间/不同路径给出不同结果，去重就是随机的。<strong>任何随机化或非幂等的变换必须放在去重之后。</strong></p>
+</li>
+<li><p><strong>有损操作要尽量靠后，且有明确理由。</strong>
+理由：一旦信息丢了，后面的步骤（语言识别、质量打分、去重）都无法再恢复。例如把 NFKC 放在语言识别之前是对的（它提高短文本的语言识别准确率），但把 NFKC 放在<strong>代码语料</strong>上是错的（它破坏标识符）。</p>
+</li>
+<li><p><strong>语言识别放在规范化之后、过滤之前。</strong>
+理由：短文本的语言识别对不可见字符与全角字符很敏感；规范化能显著提高它的准确率。而质量过滤常常<strong>依赖语言</strong>（不同语言的阈值不同），所以语言识别必须先于过滤。</p>
+</li>
+</ol>
+<h4 id="h-43-顺序错误的三个代价都有代码实测">4.3 顺序错误的三个代价（都有代码实测）<a class="anchor" href="#h-43-顺序错误的三个代价都有代码实测" aria-label="本节链接">#</a></h4>
+<p><strong>代价一：去重键放在规范化之前 → 去重失效。</strong></p>
+<pre><code>原始文本指纹:   d1=ea919a5c7ce9  d2=120ba4a7c9f7  d3=8a2f41f56289  -&gt; 唯一 3 个
+规范化后指纹:   d1=703705905ed9  d2=703705905ed9  d3=8a2f41f56289  -&gt; 唯一 2 个</code></pre>
+<p><code>d1</code> 与 <code>d2</code> 只差全角数字、连字、多余空格与一个零宽字符 —— 人眼看是同一份文档，<strong>规范化后指纹相同，规范化前完全不同</strong>。这是&quot;顺序错误&quot;最常见的一种：管线里明明有规范化，只是位置放错了，于是去重率低得莫名其妙，而任何报告都不会指出原因。</p>
+<p><strong>代价二：随机化的脱敏放在去重之前 → 去重失效。</strong></p>
+<pre><code>随机占位符  : 两份相同内容的指纹 = c65569d81d16 / b2af89c7f0ab -&gt; 不一致（去重失效）
+确定性占位符: 两份相同内容的指纹 = e4fa4af947cb / e4fa4af947cb -&gt; 一致</code></pre>
+<p>这一条比第一条更隐蔽，因为&quot;随机替换 PII&quot;听起来是个<strong>更安全</strong>的做法（避免所有样本共享同一个占位符，从而减少占位符本身成为高频 token 的风险）。但它把去重键破坏了。</p>
+<p><strong>解法不是二选一</strong>：用<strong>确定性替换</strong>（同一实体 → 同一占位符，例如对原实体做加盐哈希后映射到固定长度的占位符，再加一张仅存于安全域的映射表）。这样既避免了&quot;所有邮箱都变成 <code>&lt;邮箱&gt;</code>&quot;的过度合并，又保持了去重的确定性。</p>
+<p><strong>代价三：非幂等的步骤放在去重之前 → 结果不可复现。</strong></p>
+<pre><code>canon       非幂等样本 0 个 []
+canon_bad   非幂等样本 1 个 [&#39;&amp;amp;amp;x&#39;]</code></pre>
+<p><code>canon_bad</code> 只做一趟 HTML 实体解码，于是 <code>&amp;amp;amp;x</code> 第一次变成 <code>&amp;amp;x</code>、第二次变成 <code>&amp;x</code> —— <strong>同一份内容在&quot;处理一次&quot;与&quot;处理两次&quot;之后指纹不同</strong>。这在批处理管线里可能看不出问题（每份文档只处理一次），但在<strong>流式/增量管线里是致命的</strong>：同一份文档可能被处理两次（重跑、补数据、去重失败重试），于是产生两个不同指纹、两份&quot;不同&quot;的数据。</p>
+<p><strong>幂等性是去重可复现的前提</strong>，而它也是最便宜的检查：<code>f(f(x)) == f(x)</code> 对一批样本跑一遍。</p>
+<h4 id="h-44-pii-脱敏作为一种规范化">4.4 PII 脱敏作为一种规范化<a class="anchor" href="#h-44-pii-脱敏作为一种规范化" aria-label="本节链接">#</a></h4>
+<p>把 4.3 的代价二推到底，会得到一条对 PII 处理的完整要求：</p>
+<table>
+<thead>
+<tr>
+<th>要求</th>
+<th>理由</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>确定性</strong></td>
+<td>保证去重键稳定（同一内容 → 同一指纹）</td>
+</tr>
+<tr>
+<td><strong>一致性</strong></td>
+<td>同一实体在全语料中要么全删要么全留（否则模型学到部分信息，可从&quot;未脱敏的部分&quot;反推）</td>
+</tr>
+<tr>
+<td><strong>不引入新碰撞</strong></td>
+<td>若所有邮箱都变成 <code>&lt;邮箱&gt;</code>，两篇只在邮箱上不同的文档会变成&quot;完全相同&quot; → 被误判重复</td>
+</tr>
+<tr>
+<td><strong>映射表本身要保护</strong></td>
+<td>映射表（原值 → 占位符）就是 PII 本身，必须与训练数据隔离存储与访问</td>
+</tr>
+</tbody></table>
+<p><strong>&quot;不引入新碰撞&quot;这一条最容易被忽略</strong>：它意味着占位符必须<strong>保留区分度</strong>（同一实体的不同实例共享占位符，不同实体不同占位符）。做法是对原实体做带密钥的哈希，取前 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 位作为占位符后缀。代价：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 小则碰撞多（误去重），<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 大则占位符多样（占位符本身成为长尾 token）。这是一个可以量化的取舍：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">64</span></span></span></span> bit 时碰撞概率在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">8</span></span></span></span></span></span></span></span></span></span></span> 个实体下约为 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">3</span></span></span></span></span></span></span></span></span></span></span></span> 量级。</p>
+<h3 id="h-五可复现把管线做成确定性函数">五、可复现：把管线做成确定性函数<a class="anchor" href="#h-五可复现把管线做成确定性函数" aria-label="本节链接">#</a></h3>
+<h4 id="h-51-不确定性来源清单">5.1 不确定性来源清单<a class="anchor" href="#h-51-不确定性来源清单" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>来源</th>
+<th>表现</th>
+<th>修法</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>多进程/线程完成顺序</td>
+<td>合并结果的顺序不同</td>
+<td>排序后归并（按稳定键）</td>
+</tr>
+<tr>
+<td><code>set</code> / <code>dict</code> 遍历顺序</td>
+<td>输出顺序不同（Python 3.7+ 的 <code>dict</code> 保序但仍依赖插入顺序）</td>
+<td>显式排序</td>
+</tr>
+<tr>
+<td>未固定的随机种子</td>
+<td>采样、打乱、去重保留、哈希</td>
+<td>所有随机性走同一注入的种子</td>
+</tr>
+<tr>
+<td>哈希函数</td>
+<td>Python <code>hash()</code> 带进程随机化</td>
+<td>用 <code>hashlib</code> 的确定性哈希</td>
+</tr>
+<tr>
+<td>时间戳进入内容</td>
+<td>每次运行内容不同</td>
+<td>时间戳只记录在元数据里</td>
+</tr>
+<tr>
+<td>浮点求和顺序</td>
+<td>打分或统计量在小数位抖动</td>
+<td>固定聚合顺序（或用量化后的整数分数）</td>
+</tr>
+<tr>
+<td>文件系统遍历顺序</td>
+<td>输入顺序不同</td>
+<td>显式排序输入</td>
+</tr>
+<tr>
+<td>并行归约的分片边界</td>
+<td>边界变化导致浮点结果变化</td>
+<td>固定分片方案</td>
+</tr>
+</tbody></table>
+<p><strong>本节代码的最后一段给了一个可用的检查</strong>：两次运行同一批文档，输出列表与整批指纹完全一致（<code>两次运行输出一致 = True</code>）。</p>
+<h4 id="h-52-幂等性">5.2 幂等性<a class="anchor" href="#h-52-幂等性" aria-label="本节链接">#</a></h4>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="mopen">(</span><span class="mord mathnormal">x</span><span class="mclose">))</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="mopen">(</span><span class="mord mathnormal">x</span><span class="mclose">)</span></span></span></span></span></p>
+<p><strong>为什么它是&quot;最小充分检查&quot;</strong>：如果管线满足幂等性，那么&quot;处理一次&quot;与&quot;处理两次&quot;结果相同 —— 这在<strong>流式/增量/重试</strong>的场景里直接决定了正确性。而且它很容易测：拿一批样本跑一遍，再跑一遍，比较。</p>
+<p><strong>什么样的变换不幂等</strong>（都会破坏它）：</p>
+<ul>
+<li>单趟解码/替换（<code>&amp;amp;amp;</code> → <code>&amp;amp;</code>）；</li>
+<li>截断（按长度截断到 1000 字符，第二次不变 —— 这个其实幂等）；</li>
+<li>追加标记（加 <code>[已处理]</code> 前缀）；</li>
+<li>带状态的去重（第二次运行时&quot;已经见过&quot;）；</li>
+<li>随机化的脱敏。</li>
+</ul>
+<h4 id="h-53-manifest数据版本三元组">5.3 manifest：数据版本三元组<a class="anchor" href="#h-53-manifest数据版本三元组" aria-label="本节链接">#</a></h4>
+<p>把整条管线的产出做成可追溯的：</p>
+<pre data-lang="python"><code class="language-python">manifest = {
+    &quot;input&quot;:  {&quot;source_id&quot;: &quot;web-crawl-01&quot;, &quot;n_docs&quot;: 120000, &quot;fingerprint&quot;: &quot;...&quot;},
+    &quot;pipeline&quot;: {&quot;version&quot;: &quot;clean-2.3.0&quot;, &quot;git_commit&quot;: &quot;a1b2c3d&quot;},
+    &quot;params&quot;: {&quot;unicode_form&quot;: &quot;NFKC&quot;, &quot;min_len&quot;: 100, &quot;dedup_tau&quot;: 0.8,
+               &quot;dedup_shingle_k&quot;: 8, &quot;pii_mode&quot;: &quot;deterministic_hmac&quot;},
+    &quot;output&quot;: {&quot;n_docs&quot;: 41200, &quot;unique_tokens&quot;: 812345678, &quot;fingerprint&quot;: &quot;...&quot;},
+    &quot;stats&quot;:  {&quot;pii_hits&quot;: 5123, &quot;u_fffd_docs&quot;: 42, &quot;dedup_removed&quot;: 78800},
+}</code></pre>
+<p><strong>四个字段各自的作用</strong>：</p>
+<ul>
+<li><code>input.fingerprint</code> + <code>pipeline.version</code> + <code>params</code> → <strong>数据版本</strong>（三元组唯一确定一份数据）；</li>
+<li><code>output.fingerprint</code> → <strong>验收</strong>（重跑能复现同一个指纹，说明管线是确定的）；</li>
+<li><code>stats</code> → <strong>审计</strong>（<code>u_fffd_docs = 42</code> 是一个要在评审里被看到的质量信号，不是日志噪声）；</li>
+<li><code>params</code> 里的每一个值都要能被追溯到一次决策（为什么 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.8</span></span></span></span>？PR 曲线在哪？）。</li>
+</ul>
+<h3 id="h-六取舍清单">六、取舍清单<a class="anchor" href="#h-六取舍清单" aria-label="本节链接">#</a></h3>
+<table>
+<thead>
+<tr>
+<th>取舍</th>
+<th>一端</th>
+<th>另一端</th>
+<th>怎么选</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>规范化强度</strong></td>
+<td>只做 NFC（保信息）</td>
+<td>NFKC（合并冗余）</td>
+<td>按域：自然语言 NFKC，代码/数学 NFC</td>
+</tr>
+<tr>
+<td><strong>不可见字符</strong></td>
+<td>全删（干净）</td>
+<td>保留（保语言正确性）</td>
+<td>除非含波斯/印地语等 ZWJ 必需的语言，全删 <code>Cf</code></td>
+</tr>
+<tr>
+<td><strong>大小写</strong></td>
+<td>小写化（合并冗余）</td>
+<td>保留（保 NER/代码信号）</td>
+<td>默认保留；只在明确需要不敏感匹配时小写</td>
+</tr>
+<tr>
+<td><strong>正文提取</strong></td>
+<td>单页启发式（简单、可流式）</td>
+<td>站点模板挖掘（更准、需批量）</td>
+<td>组合使用：有批量则模板挖掘，否则启发式 + 质量校验</td>
+</tr>
+<tr>
+<td><strong>PII 脱敏</strong></td>
+<td>全部替换成同一占位符</td>
+<td>保留区分度的确定性占位符</td>
+<td>后者（避免误去重），代价是多一张受保护的映射表</td>
+</tr>
+<tr>
+<td><strong>pdf 抽取</strong></td>
+<td>快（按坐标顺序）</td>
+<td>慢（重排阅读顺序）</td>
+<td>语料价值高的来源用重排；其余标记风险等级</td>
+</tr>
+<tr>
+<td><strong>幂等 vs 便利</strong></td>
+<td>严格幂等（可复现）</td>
+<td>允许单趟变换（代码简洁）</td>
+<td>严格幂等 —— 这是可复现的前提，不是偏好</td>
+</tr>
+</tbody></table>
+<h3 id="h-代码">代码<a class="anchor" href="#h-代码" aria-label="本节链接">#</a></h3>
+<p>四段：Unicode 规范化的有损性、正文提取与质量校验、管线顺序与确定性、以及幂等性检查。</p>
+<pre data-lang="python"><code class="language-python"># -*- coding: utf-8 -*-
+&quot;&quot;&quot;内容提取与规范化：NFKC 的有损性、正文提取、管线顺序、确定性。&quot;&quot;&quot;
+import hashlib
+import re
+import unicodedata
+
+# ============ 1. Unicode 规范化：四种形式的差别与&quot;有损&quot;在哪 ============
+SAMPLES = [&quot;① 第一步&quot;, &quot;ﬁnal&quot;, &quot;ＡＢＣ１２３&quot;, &quot;x² + y²&quot;, &quot;㍿東京&quot;,
+           &quot;e\u0301cole&quot;, &quot;a\u200bb&quot;, &quot;\ufeff开头&quot;, &quot;soft\u00adhyphen&quot;, &quot;caf\u00e9&quot;]
+print(&quot;=== 1. 四种规范化形式（只列出发生变化且值得注意的）===&quot;)
+print(f&quot;{&#39;原始&#39;:&gt;14} {&#39;NFC&#39;:&gt;14} {&#39;NFKC&#39;:&gt;16} {&#39;NFD&#39;:&gt;14} 说明&quot;)
+NOTES = {&quot;① 第一步&quot;: &quot;带圈数字：NFKC 变普通数字（丢语义）&quot;,
+         &quot;ﬁnal&quot;: &quot;连字：NFKC 分解为两个字母&quot;,
+         &quot;ＡＢＣ１２３&quot;: &quot;全角：NFKC 转半角&quot;,
+         &quot;x² + y²&quot;: &quot;上标：NFKC 降为普通数字 -&gt; x2 与变量名歧义&quot;,
+         &quot;㍿東京&quot;: &quot;方形连字：NFKC 展开成多个字&quot;,
+         &quot;e\u0301cole&quot;: &quot;组合字符：NFC 合成，NFD 分解&quot;,
+         &quot;a\u200bb&quot;: &quot;零宽空格：四种形式都不动它（不可见字符）&quot;,
+         &quot;\ufeff开头&quot;: &quot;BOM：四种形式都不动它&quot;,
+         &quot;soft\u00adhyphen&quot;: &quot;软连字符：四种形式都不动它&quot;,
+         &quot;caf\u00e9&quot;: &quot;预组合字符：NFD 分解&quot;}
+for s in SAMPLES:
+    nfc = unicodedata.normalize(&quot;NFC&quot;, s)
+    nfkc = unicodedata.normalize(&quot;NFKC&quot;, s)
+    nfd = unicodedata.normalize(&quot;NFD&quot;, s)
+    print(f&quot;{s!r:&gt;14} {nfc!r:&gt;14} {nfkc!r:&gt;16} {nfd!r:&gt;14} {NOTES.get(s,&#39;&#39;)}&quot;)
+
+print(&quot;\n=== 1b. 不可见字符：肉眼相同，字节不同 -&gt; token / 去重都受影响 ===&quot;)
+for t in [&quot;ab&quot;, &quot;a\u200bb&quot;, &quot;a\ufeffb&quot;, &quot;a\u00adb&quot;, &quot;a\u200db&quot;]:
+    print(f&quot;   {t!r:16s} len={len(t)}  sha256[:12]={hashlib.sha256(t.encode()).hexdigest()[:12]}&quot;
+          f&quot;  含不可见={any(unicodedata.category(c) in (&#39;Cf&#39;,&#39;Mn&#39;) for c in t)}&quot;)
+
+# ============ 2. 正文提取：最小 Readability 类（块打分） ============
+TAG = re.compile(r&quot;&lt;(/?)(\w+)[^&gt;]*&gt;&quot;)
+def text_of(html):
+    return re.sub(r&quot;&lt;[^&gt;]+&gt;&quot;, &quot;&quot;, html)
+
+CLOSE = re.compile(r&quot;&lt;/(?:p|div|li)&gt;&quot;)
+def blocks(html):
+    &quot;&quot;&quot;把 HTML 粗切成候选块：以 &lt;p&gt;/&lt;div&gt;/&lt;li&gt; 的闭合为界（教学用极简解析）。&quot;&quot;&quot;
+    out, buf = [], &quot;&quot;
+    for tok in re.split(r&quot;(&lt;/(?:p|div|li)&gt;)&quot;, html):
+        buf += tok
+        if CLOSE.fullmatch(tok):
+            out.append(buf); buf = &quot;&quot;
+    if buf.strip():
+        out.append(buf)
+    return [b for b in out if b.strip()]
+
+def score_block(b):
+    txt = text_of(b)
+    ln = len(txt.strip())
+    link_len = sum(len(text_of(m)) for m in re.findall(r&quot;&lt;a\b.*?&lt;/a&gt;&quot;, b, flags=re.S))
+    link_density = link_len / max(1, ln)
+    punct = len(re.findall(r&quot;[。！？；，.!?;,]&quot;, txt)) / max(1, ln)
+    # 打分：长文本加分、链接密度与标点密度过低减分
+    return ln * (1 - link_density) * (0.4 + 2.0 * min(punct, 0.25)), ln, link_density
+
+PAGE = &quot;&quot;&quot;&lt;html&gt;&lt;head&gt;&lt;title&gt;示例页&lt;/title&gt;&lt;/head&gt;&lt;body&gt;
+&lt;div id=&quot;nav&quot;&gt;&lt;a href=&quot;/a&quot;&gt;首页&lt;/a&gt;&lt;a href=&quot;/b&quot;&gt;产品&lt;/a&gt;&lt;a href=&quot;/c&quot;&gt;价格&lt;/a&gt;
+&lt;a href=&quot;/d&quot;&gt;关于&lt;/a&gt;&lt;a href=&quot;/e&quot;&gt;联系&lt;/a&gt;&lt;a href=&quot;/f&quot;&gt;招聘&lt;/a&gt;&lt;/div&gt;
+&lt;div class=&quot;article&quot;&gt;
+&lt;p&gt;大规模语言模型的训练依赖高质量语料。语料的质量决定了模型的上限，而清洗与去重是其中最关键的环节。本文从来源、许可、去重与过滤四个方面展开讨论。&lt;/p&gt;
+&lt;p&gt;去重的第一步是定义&quot;重复&quot;。字节级相同只是最简单的一种情形，模板化与改写后的近重复同样会主导训练分布。&lt;/p&gt;
+&lt;/div&gt;
+&lt;div id=&quot;footer&quot;&gt;&lt;a href=&quot;/tos&quot;&gt;服务条款&lt;/a&gt;&lt;a href=&quot;/privacy&quot;&gt;隐私政策&lt;/a&gt;
+版权所有 示例公司 2026&lt;/div&gt;
+&lt;/body&gt;&lt;/html&gt;&quot;&quot;&quot;
+
+print(&quot;\n=== 2. 正文提取：块打分 + 相邻块合并 ===&quot;)
+print(f&quot;{&#39;块序号&#39;:&gt;6} {&#39;文本长度&#39;:&gt;8} {&#39;链接密度&#39;:&gt;9} {&#39;得分&#39;:&gt;9}&quot;)
+scored = []
+for i, b in enumerate(blocks(PAGE)):
+    sc, ln, ld = score_block(b)
+    scored.append((sc, b))
+    print(f&quot;{i:6d} {ln:8d} {ld:9.3f} {sc:9.1f}&quot;)
+best_i = max(range(len(scored)), key=lambda i: scored[i][0])
+best_sc = scored[best_i][0]
+# 合并相邻的高分块（真实实现里正文常被切成多个 &lt;p&gt;）
+keep = [i for i in range(len(scored)) if scored[i][0] &gt;= 0.5 * best_sc]
+merged = &quot; &quot;.join(text_of(scored[i][1]).strip() for i in keep)
+print(f&quot;\n   最高分块 = {best_i}；合并的高分块 = {keep}&quot;)
+print(f&quot;   提取正文（前 60 字）：{merged[:60]}...&quot;)
+print(f&quot;   全文文本长度 {len(text_of(PAGE).strip())}  -&gt;  提取长度 {len(merged)}&quot;
+      f&quot;（去掉 {1 - len(merged)/len(text_of(PAGE).strip()):.0%} 的模板噪声）&quot;)
+
+# ============ 3. 管线顺序与确定性 ============
+WS = re.compile(r&quot;\s+&quot;)
+def canon(t):
+    &quot;&quot;&quot;确定性且幂等：NFKC + 空白折叠 + 去控制/零宽字符。&quot;&quot;&quot;
+    t = unicodedata.normalize(&quot;NFKC&quot;, t)
+    t = &quot;&quot;.join(c for c in t if unicodedata.category(c) != &quot;Cf&quot;)   # 去掉格式字符（零宽/BOM）
+    return WS.sub(&quot; &quot;, t).strip()
+
+def key(t):
+    return hashlib.sha256(t.encode(&quot;utf-8&quot;)).hexdigest()[:12]
+
+# 三份内容：d1 与 d2 只差全角/连字/空白/零宽，d3 是不同内容
+d1 = &quot;研究报告：ﬁnal 结果见 ① 附录。作者  张三&quot;
+d2 = &quot;研究报告：final 结果见 1 附录。作者\u200b 张三&quot;
+d3 = &quot;完全不同的另一篇文档内容。&quot;
+docs = {&quot;d1&quot;: d1, &quot;d2&quot;: d2, &quot;d3&quot;: d3}
+
+print(&quot;\n=== 3a. 去重键放在规范化之前 vs 之后 ===&quot;)
+raw_keys = {k: key(v) for k, v in docs.items()}
+can_keys = {k: key(canon(v)) for k, v in docs.items()}
+print(f&quot;   原始文本指纹: {raw_keys}  -&gt; 唯一 {len(set(raw_keys.values()))} 个&quot;)
+print(f&quot;   规范化后指纹: {can_keys}  -&gt; 唯一 {len(set(can_keys.values()))} 个&quot;)
+print(&quot;   结论：先规范化再去重，d1 与 d2 才被识别为同一份；顺序反了就去不掉&quot;)
+
+print(&quot;\n=== 3b. 非确定性的脱敏放在去重之前：指纹不稳定 ===&quot;)
+import random
+EMAIL = re.compile(r&quot;[\w.+-]+@[\w-]+\.[\w.]+&quot;)
+def mask_random(t, seed):
+    r = random.Random(seed)                     # 随机占位符：同一实体每次不一样
+    return EMAIL.sub(lambda m: f&quot;&lt;EMAIL_{r.randrange(16**4):04x}&gt;&quot;, t)
+def mask_det(t):
+    return EMAIL.sub(&quot;&lt;邮箱&gt;&quot;, t)
+e1 = &quot;联系方式 zhang@example.com，请勿外传。&quot;
+e2 = &quot;联系方式 zhang@example.com，请勿外传。&quot;
+for name, f in ((&quot;随机占位符&quot;, lambda t, s: mask_random(t, s)), (&quot;确定性占位符&quot;, lambda t, s: mask_det(t))):
+    k1, k2 = key(canon(f(e1, 1))), key(canon(f(e2, 2)))
+    print(f&quot;   {name:8s}: 两份相同内容的指纹 = {k1} / {k2} -&gt; {&#39;一致&#39; if k1 == k2 else &#39;不一致（去重失效）&#39;}&quot;)
+
+print(&quot;\n=== 3c. 幂等性与两次运行一致性 ===&quot;)
+def canon_bad(t):
+    &quot;&quot;&quot;反例：只做一次单趟实体解码 —— 不幂等。&quot;&quot;&quot;
+    return t.replace(&quot;&amp;amp;&quot;, &quot;&amp;&quot;).replace(&quot;&amp;lt;&quot;, &quot;&lt;&quot;)
+for name, f in ((&quot;canon&quot;, canon), (&quot;canon_bad&quot;, canon_bad), (&quot;mask_det&quot;, mask_det)):
+    samples = [&quot;  多  空白 &quot;, &quot;&amp;amp;amp;x&quot;, &quot;ＡＢＣ&quot;, &quot;a\u200bb&quot;]
+    bad = [s for s in samples if f(f(s)) != f(s)]
+    print(f&quot;   {name:9s} 非幂等样本 {len(bad)} 个 {bad[:2]}&quot;)
+before = [canon(d) for d in docs.values()]
+after = [canon(d) for d in docs.values()]
+print(f&quot;   两次运行输出一致 = {before == after}   &quot;
+      f&quot;整批指纹 = {hashlib.sha256(&#39;&#39;.join(sorted(can_keys.values())).encode()).hexdigest()[:16]}&quot;)
+
+# ============ 4. 提取质量校验与 PII ============
+print(&quot;\n=== 4. 提取质量校验：长度比 / 链接密度 / 替换字符 ===&quot;)
+for name, html in ((&quot;正常页&quot;, PAGE), (&quot;空壳页（JS 渲染）&quot;, &quot;&lt;html&gt;&lt;div id=&#39;app&#39;&gt;&lt;/div&gt;&lt;/html&gt;&quot;),
+                   (&quot;导航页&quot;, &quot;&lt;html&gt;&quot; + &quot;&quot;.join(f&quot;&lt;a href=&#39;/{i}&#39;&gt;链接{i}&lt;/a&gt;&quot; for i in range(30)) + &quot;&lt;/html&gt;&quot;)):
+    txt = text_of(html).strip()
+    ld = sum(len(text_of(m)) for m in re.findall(r&quot;&lt;a\b.*?&lt;/a&gt;&quot;, html, flags=re.S)) / max(1, len(txt))
+    bad = txt.count(&quot;\ufffd&quot;)
+    flag = &quot;可疑&quot; if (len(txt) &lt; 100 or ld &gt; 0.6 or bad &gt; 0) else &quot;通过&quot;
+    print(f&quot;   {name:16s} 文本长度 {len(txt):4d}  链接密度 {ld:.2f}  替换字符 {bad}  -&gt; {flag}&quot;)</code></pre>
+<p>实际输出：</p>
+<pre><code>=== 1. 四种规范化形式（只列出发生变化且值得注意的）===
+            原始            NFC             NFKC            NFD 说明
+       &#39;① 第一步&#39;        &#39;① 第一步&#39;          &#39;1 第一步&#39;        &#39;① 第一步&#39; 带圈数字：NFKC 变普通数字（丢语义）
+        &#39;ﬁnal&#39;         &#39;ﬁnal&#39;          &#39;final&#39;         &#39;ﬁnal&#39; 连字：NFKC 分解为两个字母
+      &#39;ＡＢＣ１２３&#39;       &#39;ＡＢＣ１２３&#39;         &#39;ABC123&#39;       &#39;ＡＢＣ１２３&#39; 全角：NFKC 转半角
+     &#39;x² + y²&#39;      &#39;x² + y²&#39;        &#39;x2 + y2&#39;      &#39;x² + y²&#39; 上标：NFKC 降为普通数字 -&gt; x2 与变量名歧义
+         &#39;㍿東京&#39;          &#39;㍿東京&#39;         &#39;株式会社東京&#39;          &#39;㍿東京&#39; 方形连字：NFKC 展开成多个字
+      &#39;école&#39;        &#39;école&#39;          &#39;école&#39;       &#39;école&#39; 组合字符：NFC 合成，NFD 分解
+    &#39;a\u200bb&#39;     &#39;a\u200bb&#39;       &#39;a\u200bb&#39;     &#39;a\u200bb&#39; 零宽空格：四种形式都不动它（不可见字符）
+    &#39;\ufeff开头&#39;     &#39;\ufeff开头&#39;       &#39;\ufeff开头&#39;     &#39;\ufeff开头&#39; BOM：四种形式都不动它
+&#39;soft\xadhyphen&#39; &#39;soft\xadhyphen&#39; &#39;soft\xadhyphen&#39; &#39;soft\xadhyphen&#39; 软连字符：四种形式都不动它
+        &#39;café&#39;         &#39;café&#39;           &#39;café&#39;        &#39;café&#39; 预组合字符：NFD 分解
+
+=== 1b. 不可见字符：肉眼相同，字节不同 -&gt; token / 去重都受影响 ===
+   &#39;ab&#39;             len=2  sha256[:12]=fb8e20fc2e4c  含不可见=False
+   &#39;a\u200bb&#39;       len=3  sha256[:12]=8df62aef5f92  含不可见=True
+   &#39;a\ufeffb&#39;       len=3  sha256[:12]=47a12dcb64e9  含不可见=True
+   &#39;a\xadb&#39;         len=3  sha256[:12]=15463234df2c  含不可见=True
+   &#39;a\u200db&#39;       len=3  sha256[:12]=57d3077bde56  含不可见=True
+
+=== 2. 正文提取：块打分 + 相邻块合并 ===
+   块序号     文本长度      链接密度        得分
+     0       17     0.706       2.0
+     1       71     0.000      36.4
+     2       51     0.000      26.4
+     3        0     0.000       0.0
+     4       23     0.348       6.0
+     5        0     0.000       0.0
+
+   最高分块 = 1；合并的高分块 = [1, 2]
+   提取正文（前 60 字）：大规模语言模型的训练依赖高质量语料。语料的质量决定了模型的上限，而清洗与去重是其中最关键的环节。本文从来源、许可、去重与...
+   全文文本长度 167  -&gt;  提取长度 123（去掉 26% 的模板噪声）
+
+=== 3a. 去重键放在规范化之前 vs 之后 ===
+   原始文本指纹: {&#39;d1&#39;: &#39;ea919a5c7ce9&#39;, &#39;d2&#39;: &#39;120ba4a7c9f7&#39;, &#39;d3&#39;: &#39;8a2f41f56289&#39;}  -&gt; 唯一 3 个
+   规范化后指纹: {&#39;d1&#39;: &#39;703705905ed9&#39;, &#39;d2&#39;: &#39;703705905ed9&#39;, &#39;d3&#39;: &#39;8a2f41f56289&#39;}  -&gt; 唯一 2 个
+   结论：先规范化再去重，d1 与 d2 才被识别为同一份；顺序反了就去不掉
+
+=== 3b. 非确定性的脱敏放在去重之前：指纹不稳定 ===
+   随机占位符   : 两份相同内容的指纹 = c65569d81d16 / b2af89c7f0ab -&gt; 不一致（去重失效）
+   确定性占位符  : 两份相同内容的指纹 = e4fa4af947cb / e4fa4af947cb -&gt; 一致
+
+=== 3c. 幂等性与两次运行一致性 ===
+   canon     非幂等样本 0 个 []
+   canon_bad 非幂等样本 1 个 [&#39;&amp;amp;amp;x&#39;]
+   mask_det  非幂等样本 0 个 []
+   两次运行输出一致 = True   整批指纹 = a518840e10c7d3dd
+
+=== 4. 提取质量校验：长度比 / 链接密度 / 替换字符 ===
+   正常页              文本长度  167  链接密度 0.12  替换字符 0  -&gt; 通过
+   空壳页（JS 渲染）       文本长度    0  链接密度 0.00  替换字符 0  -&gt; 可疑
+   导航页              文本长度  110  链接密度 1.00  替换字符 0  -&gt; 可疑</code></pre>
+<p><strong>七个实现决策背后的理由：</strong></p>
+<ul>
+<li><strong>第 1 段把所有变化都打印出来，而不是只打印&quot;哪个不同&quot;</strong>：规范化的危害只在<strong>具体的字符</strong>上才能被评审。看到 <code>x² + y²</code> → <code>x2 + y2</code> 的人会立刻意识到&quot;我的语料里有公式&quot;，而看到&quot;NFKC 是有损的&quot;这句话不会。</li>
+<li><strong>第 1b 段用 <code>sha256</code> 而不是&quot;看起来不同&quot;来说明问题</strong>：<code>a\u200bb</code> 与 <code>ab</code> 在终端里可能是同一个样子，指纹是唯一能让人<strong>相信</strong>它们不同的证据。这一段同时也是&quot;不可见字符会破坏去重&quot;的最小证明。</li>
+<li><strong>第 2 段的 <code>score_block</code> 只用三个信号</strong>（长度、链接密度、标点密度）：刻意不加 class/id 关键词，因为关键词规则依赖站点习惯，会掩盖&quot;结构信号的泛化能力&quot;。实测结果（导航 2.0 / 正文 36.4 / 页脚 6.0）说明这三个信号已经足够分开三类块。</li>
+<li><strong>第 2 段的&quot;合并相邻高分块&quot;</strong>：这一行是必需的，因为正文总是被切成多个 <code>&lt;p&gt;</code>。第一版实现只取最高分块，提取长度 71（只有第一段）；合并后 123。<strong>这个差别在真实数据上就是&quot;每篇文档丢掉一半内容&quot;，而长度校验不会报警</strong>（71 字仍然超过下限）。</li>
+<li><strong><code>canon</code> 用 <code>unicodedata.category(c) != &quot;Cf&quot;</code> 而不是列一张字符黑名单</strong>：黑名单永远不全（零宽字符有二十多个变体，方向控制有九个）。按 Unicode 类别过滤是<strong>完备的</strong>，代价是要接受&quot;删掉所有格式字符&quot;这个语义（4.3 节的边界：某些语言需要 ZWJ）。</li>
+<li><strong>第 3a/3b 两组对照都是&quot;只改一处&quot;</strong>：3a 只改去重键的位置，3b 只改脱敏的确定性。<strong>这是做取舍实验的基本纪律</strong> —— 一次改两个变量，得到的结论无法归因。</li>
+<li><strong>第 3b 段揭示了一个反向直觉</strong>：随机化脱敏&quot;看起来更安全&quot;，实际破坏了去重。这类&quot;为了安全引入的不确定性&quot;是最难发现的，因为它只在下游（去重率异常低）表现，而在脱敏这一步看起来完全正常。</li>
+<li><strong>第 4 段用三条规则抓三种不同的失败</strong>，并让它们<strong>显式变成&quot;可疑&quot;标记</strong>而不是静默丢弃。<strong>提取失败必须可见</strong> —— 这是本节的工程核心：一个静默的欠提取会让整个来源的数据质量被高估。</li>
+<li>⚠️ 本段代码是<strong>教学实现</strong>：正文提取用的是极简解析（不处理嵌套、不处理 <code>&lt;script&gt;</code> 内容、不做实体解码），生产环境要用成熟的抽取库，并<strong>记录抽取器版本</strong>（换版本 = 数据变了）。Unicode 部分则是完整的 —— 它直接用标准库的 <code>unicodedata</code>，没有简化。</li>
+</ul>
+<h3 id="h-练习">练习<a class="anchor" href="#h-练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><p><strong>规范化的损失评估</strong>：取一份你熟悉的语料（代码片段、数学文本、中文网页各一段）。
+（a）对每一段分别算 NFC 与 NFKC 后的结果，列出<strong>所有</strong>不同的位置；
+（b）对每个差异判断&quot;语义是否改变&quot;，给出一个判定标准；
+（c）据此为三类语料各选定一个规范化形式，并写出这个选择在 manifest 里对应的字段。</p>
+</li>
+<li><p><strong>不可见字符的攻防</strong>：用零宽字符构造一个绕过关键词过滤的样本。
+（a）把&quot;忽略之前的所有指令&quot;用至少两种方式插入零宽字符，展示字符串比较与正则匹配效果的差异；
+（b）设计一个清洗函数把它还原（说明你怎么保证它幂等）；
+（c）说明这个清洗对波斯语/印地语语料的副作用，以及你会怎么按语言分支。</p>
+</li>
+<li><p><strong>提取质量校验的阈值标定</strong>：本节代码用&quot;长度 &lt; 100、链接密度 &gt; 0.6、替换字符 &gt; 0&quot;三条规则。
+（a）收集 50 个真实网页（或用你自己的语料），人工标&quot;提取正确/错误&quot;，测这三条规则的 precision/recall；
+（b）调整阈值使 recall 达到 0.95，报告此时的 precision 与误杀率；
+（c）说明为什么&quot;长度比&quot;（提取长度 / HTML 长度）比&quot;绝对长度&quot;更适合作为跨站点的判据，以及它自己的失效条件。</p>
+</li>
+<li><p><strong>顺序的形式化</strong>：把管线步骤记为 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="minner">…</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">n</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>，其中一些是幂等的（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0785em;">I</span></span></span></span> 类），一些不是（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span></span></span></span> 类）。
+（a）证明：若所有 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6891em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0785em;">I</span></span></span></span> 且两两可交换，则整个管线幂等；
+（b）举一个反例说明&quot;两两可交换&quot;这个条件不能去掉；
+（c）给出你的规则：&quot;去重必须排在所有 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span></span></span></span> 类步骤之后&quot;，并用 (a)(b) 论证它。若某个 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span></span></span></span> 类步骤必须放在去重之前（例如语言识别），你怎么办？</p>
+</li>
+<li><p><strong>PII 占位符的区分度</strong>：设你有 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">8</span></span></span></span></span></span></span></span></span></span></span> 个不同的邮箱实体，占位符用&quot;HMAC 前 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 位&quot;。
+（a）用生日问题估计 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">32</span></span></span></span> 与 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">64</span></span></span></span> 时的碰撞对数；
+（b）说明碰撞会造成什么后果（提示：会制造假重复，第 2 节的 FP）；
+（c）在&quot;碰撞少&quot;与&quot;占位符多样（占位符本身成为长尾 token）&quot;之间，你会选哪个 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span>？为什么？</p>
+</li>
+<li><p><strong>确定性审计</strong>：为你手上的（或假想的一条）管线写一个&quot;确定性审计&quot;脚本。
+（a）列出你会检查的 8 个不确定性来源（对照 5.1 的表），并为每个写出一个可执行的检查；
+（b）设计一个验收测试：同输入跑两次，比较哪些量（输出字节指纹？样本数？唯一 token 数？）；
+（c）如果两次运行的&quot;唯一 token 数&quot;一致但&quot;输出字节指纹&quot;不同，最可能的原因是什么？</p>
+</li>
+</ol>
+<h3 id="h-小结">小结<a class="anchor" href="#h-小结" aria-label="本节链接">#</a></h3>
+<ul>
+<li><strong>这一步的实质是定义等价类</strong>，不是&quot;擦掉脏东西&quot;：哪些差异应当被合并（全角/连字/不可见字符），哪些必须保留（上标、大小写、代码缩进）。</li>
+<li><strong>正文提取的两种失败方向相反</strong>：欠提取（内容不见了，容易被长度校验发现）与过提取（boilerplate 混入，<strong>最危险</strong>）。过提取的危害是<strong>隐性的</strong>：模板在百万页里重复 → 高频 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span>-gram → 记忆化风险 + 巨型簇 + 污染一切基于 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span>-gram 的质量指标（代码实测：去掉 26% 模板噪声）。</li>
+<li><strong>站点级模板挖掘比单页启发式更准</strong>（用跨文档统计证据），代价是需要按站点批量处理、对新站点无效、站点改版后要重挖。工程上是两者组合 + 质量校验。</li>
+<li><strong>NFKC 是有损的</strong>，具体损失包括：带圈数字、连字、全角、<strong>上标（<code>x²</code> → <code>x2</code>，数学语义丢失）</strong>、方形连字展开（改变长度）。所以规范化必须<strong>按域选择</strong>：自然语言用 NFKC，代码/数学用 NFC，标识符不动。</li>
+<li><strong>不可见字符（零宽、BOM、方向控制、软连字符）肉眼不可见但字节不同</strong> —— 代码实测五组&quot;看起来一样&quot;的字符串全部有不同指纹。它们既破坏去重，也是 prompt injection 的载体。处理方式是<strong>按 Unicode 类别（<code>Cf</code>）过滤</strong>而不是列黑名单，但要按语言分支（ZWJ 在某些语言里必需）。</li>
+<li><strong><code>U+FFFD</code> 是上游编码错误的信号</strong>，不能静默保留也不能静默删除 —— 要按来源统计比例，异常高的换编码重解。</li>
+<li><strong>管线的顺序由三条判据决定</strong>：① 去重之前所有步骤必须<strong>确定性且幂等</strong>；② 有损操作尽量靠后且有理由；③ 语言识别放在规范化之后、过滤之前。代码实测了两个反面：去重键放在规范化之前 → 唯一指纹 3 个而不是 2 个；随机化脱敏放在去重之前 → 同一内容指纹不同（<code>c65569d81d16</code> vs <code>b2af89c7f0ab</code>）。</li>
+<li><strong>PII 脱敏的要求不止&quot;删掉&quot;</strong>：还要确定性、一致性、不引入新碰撞、映射表受保护。占位符的区分度（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 位哈希）是一个可量化的取舍。</li>
+<li><strong>可复现 = 确定性 + 幂等 + manifest</strong>。不确定性来源有八类（并行顺序、<code>set</code> 遍历、随机种子、<code>hash()</code>、时间戳、浮点求和、文件遍历、分片边界），逐条可查；幂等性 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="mopen">(</span><span class="mord mathnormal">x</span><span class="mclose">))</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="mopen">(</span><span class="mord mathnormal">x</span><span class="mclose">)</span></span></span></span> 是最便宜的充分检查；manifest 用<strong>输入指纹 + 管线版本 + 参数</strong>三元组定义数据版本，并用输出指纹做验收。</li>
+</ul>

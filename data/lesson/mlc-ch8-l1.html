@@ -1,0 +1,252 @@
+<h2 id="h-图执行与运行时内存池cuda-graphs执行顺序">图执行与运行时：内存池、CUDA Graphs、执行顺序<a class="anchor" href="#h-图执行与运行时内存池cuda-graphs执行顺序" aria-label="本节链接">#</a></h2>
+<p>一个编译得很漂亮的 kernel，可能因为&quot;下发它的那几微秒&quot;而白干：decode 阶段每次推理只算 33 MFLOP，而每个算子都要宿主侧调用一次驱动——算得少、等得多。落地之后，决定每次推理耗时的是三件运行时的事：按什么顺序走表、中间张量放在哪、下发本身要花多少。本课把执行器、内存池与 CUDA Graphs 拆开讲，并用纯 Python 模型把三类开销分别打印出来。</p>
+<p><figure><img class="md-img" src="content/courses/ml-compilers/assets/chapter-8-figure-01.svg" alt="运行时把编译产物变成一次推理" loading="lazy" decoding="async"><figcaption>运行时把编译产物变成一次推理</figcaption></figure>
+</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-编译产物只是一张表和一组函数">1. 编译产物只是一张表和一组函数<a class="anchor" href="#h-1-编译产物只是一张表和一组函数" aria-label="本节链接">#</a></h4>
+<p><strong>运行时</strong>（runtime）负责加载编译产物、分配内存、按下发顺序调用 kernel；<strong>执行器</strong>（executor）是运行时里&quot;走表&quot;的部分；<strong>执行计划</strong>（execution plan，也叫算子表）是有序的 (kernel 入口, 输入槽, 输出槽) 列表。TVM 说得最直白：编译产物的单位是 Module，用户从中取函数（PackedFunc）来调，并缓存首次取到的句柄；官方把运行时核心刻意做小，<strong>约 200K–600K 字节，取决于是否带上 CUDA 之类的 driver 模块</strong>——这正是端侧部署的硬约束（第 2 课展开）。走表方式决定开销从哪来：</p>
+<table>
+<thead>
+<tr>
+<th>执行器</th>
+<th>顺序由谁决定</th>
+<th>主要开销来源</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>逐算子解释（eager）</td>
+<td>宿主语言逐行调用</td>
+<td>每次调用都要查表 + 下发</td>
+</tr>
+<tr>
+<td>图执行器（graph executor）</td>
+<td>编译期排好表，运行期循环</td>
+<td>每次仍要下发一次 kernel</td>
+</tr>
+<tr>
+<td>图回放（CUDA Graphs）</td>
+<td>驱动抓一次，之后整段重放</td>
+<td>一次 replay 摊掉 N 次下发</td>
+</tr>
+</tbody></table>
+<h4 id="h-2-执行顺序拓扑序不唯一这是运行时的自由度">2. 执行顺序：拓扑序不唯一，这是运行时的自由度<a class="anchor" href="#h-2-执行顺序拓扑序不唯一这是运行时的自由度" aria-label="本节链接">#</a></h4>
+<p>第 3 课已确定&quot;图是 DAG&quot;，直接推论是<strong>拓扑序不唯一</strong>：只要每条边都指向下游，任何顺序都合法。代码第 1 节给出两条完全不同的执行顺序，数值结果逐元素一致。自由度是优化空间，也把三件事交给运行时：排对同一 buffer 的写后读、决定哪些节点能并到不同流并发、在哪里插同步点。顺序还决定内存峰值——早释放的张量能让后续分配复用地址，所以&quot;顺序&quot;与&quot;内存池&quot;是一体两面。</p>
+<h4 id="h-3-内存池把地址在计划期就定死">3. 内存池：把地址在计划期就定死<a class="anchor" href="#h-3-内存池把地址在计划期就定死" aria-label="本节链接">#</a></h4>
+<p>按需分配（一个张量一次 <code>cudaMalloc</code>）有三个代价：分配器调用是宿主侧串行点、显存碎片化、<strong>地址每次都可能不同</strong>——最后一条直接否掉图回放（它要求地址固定）。所以运行时普遍用<strong>内存池</strong>：编译期算好生命周期区间与复用关系（第 4 课的静态内存规划），执行期只从池里切块，按 256~512 字节对齐。TVM 用统一静态内存规划把这件事落在编译器侧，PyTorch 对应 caching allocator，capture 时切成图私有池。</p>
+<p>代码第 2 节把池跑了一遍：<strong>激活区 6.0 MiB → 2.0 MiB（降 66.7%），全图峰值只降 2.2%</strong>——因为 128 MiB 权重完全主导。报&quot;峰值降了多少&quot;必须说清是哪一块，否则数字既不可比也不可复现。</p>
+<h4 id="h-4-cuda-graphs把-n-次下发压成-1-次">4. CUDA Graphs：把 N 次下发压成 1 次<a class="anchor" href="#h-4-cuda-graphs把-n-次下发压成-1-次" aria-label="本节链接">#</a></h4>
+<p>CUDA Graph 的做法是<strong>捕获</strong>（capture）一段已在旁路流上执行过的 kernel 序列，实例化成一张图，之后每次推理只做一次<strong>回放</strong>（replay）。约束全来自&quot;图里的东西必须静态&quot;：地址、形状静态，捕获期间不得分配显存与做 CPU 同步、不得有依赖数据的动态控制流；要变的输入必须 <code>copy_</code> 进固定缓冲。PyTorch 封装为 <code>torch.cuda.CUDAGraph</code> 与 <code>torch.cuda.graphs.graph_pool_handle()</code>（私有池），<code>torch.compile(mode=&quot;reduce-overhead&quot;)</code> 就是把生成的 kernel 段交给它。</p>
+<p>关键是<strong>什么时候才值</strong>：代码第 3 节（参数为假设模型参数）里 decode 单 token 回放快 5.12 倍，prefill 512 token 只剩 1.12 倍——回放省的是固定 host 开销，算得越多它占比越小。</p>
+<h4 id="h-5-常见坑">5. 常见坑<a class="anchor" href="#h-5-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>换输入就换张量对象</strong>：地址一变图就失效，要往捕获时的静态缓冲拷数据。</li>
+<li><strong>捕获期间分配</strong>：必须走图私有内存池，否则捕获失败或回放越界。</li>
+<li><strong>动态形状</strong>：guard 失败要重编译并重建图，第 2 课的冷启动代价会再付一次。</li>
+<li><strong>池与回放叠加</strong>：池地址固定是回放的前提，但池的重用策略一变，旧图就得重捕。</li>
+<li><strong>对齐想当然</strong>：池按 512 字节切块，个别 kernel 的对齐要求更大，跨块共享 buffer 会踩到。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面这段纯 Python（无第三方依赖）实现三件事：<strong>两种合法拓扑序</strong>、<strong>按生命周期复用的内存池</strong>（含对齐与空洞合并）、<strong>eager 与 graph replay 的时间分解</strong>。硬件常量都写成显式假设的模型参数并打印，避免与实测混淆。</p>
+<pre data-lang="python"><code class="language-python"># ---- 第 1 课示例：纯 Python 模拟&quot;运行时 = 执行器 + 内存池 + 图回放&quot; ----
+# 无 GPU、无第三方依赖。下面所有硬件参数都是**显式假设的模型参数**，不是任何真实设备的实测值。
+ALIGN      = 512        # 池内块对齐字节数（分配器普遍按 256~512 B 对齐）
+LAUNCH_US  = 3.0        # 假设：一次 kernel 下发的 host 侧开销（模型参数）
+REPLAY_US  = 5.0        # 假设：一次 graph replay 的固定开销（模型参数）
+PEAK_TFLOP = 100.0      # 假设：峰值算力 100 TFLOP/s（模型参数）
+F32        = 4
+
+def T(name, shape, resident=False):
+    n = 1
+    for d in shape: n *= d
+    return {&#39;name&#39;: name, &#39;bytes&#39;: n * F32, &#39;resident&#39;: resident}
+
+# 图 = 节点表（沿用第 3/4 课的表示）：(op, deps, out)。表顺序只是&quot;可读&quot;，不是执行顺序。
+# resident=True 表示常驻张量（权重/输入缓冲），激活张量由内存池按生命周期复用。
+def build_graph():
+    return [
+        (&#39;input&#39;, [],           T(&#39;x&#39;,  (64, 4096), True)),
+        (&#39;param&#39;, [],           T(&#39;W1&#39;, (4096, 4096), True)),
+        (&#39;param&#39;, [],           T(&#39;b1&#39;, (4096,), True)),
+        (&#39;mm&#39;,    [&#39;x&#39;, &#39;W1&#39;],  T(&#39;y1&#39;, (64, 4096))),
+        (&#39;add&#39;,   [&#39;y1&#39;, &#39;b1&#39;], T(&#39;y2&#39;, (64, 4096))),
+        (&#39;relu&#39;,  [&#39;y2&#39;],       T(&#39;y3&#39;, (64, 4096))),
+        (&#39;param&#39;, [],           T(&#39;W2&#39;, (4096, 4096), True)),
+        (&#39;mm&#39;,    [&#39;y3&#39;, &#39;W2&#39;], T(&#39;y4&#39;, (64, 4096))),
+        (&#39;add&#39;,   [&#39;y4&#39;, &#39;b1&#39;], T(&#39;out&#39;, (64, 4096))),
+        (&#39;relu&#39;,  [&#39;y2&#39;],       T(&#39;aux&#39;, (64, 4096))),   # 分支：与主链独立的辅助输出
+    ]
+
+def topo(nodes, key=None):
+    &quot;&quot;&quot;拓扑序：依赖先于使用者；key 让&quot;同层可交换&quot;显式化，从而暴露顺序自由度。&quot;&quot;&quot;
+    idx = {n[2][&#39;name&#39;]: i for i, n in enumerate(nodes)}
+    done, out, pending = set(), [], list(nodes)
+    while pending:
+        ready = [n for n in pending if all(d in done for d in n[1])]
+        if not ready: raise ValueError(&#39;图里有环&#39;)
+        ready.sort(key=key or (lambda n: idx[n[2][&#39;name&#39;]]))
+        n = ready[0]; pending.remove(n); done.add(n[2][&#39;name&#39;]); out.append(n)
+    return out
+
+def last_use(order):
+    &quot;&quot;&quot;每个张量&quot;最后一次被读&quot;在第几步 —— 内存池据此决定何时回收。&quot;&quot;&quot;
+    lu = {}
+    for i, (op, deps, out) in enumerate(order):
+        for d in deps: lu[d] = i
+    return lu
+
+class Pool:
+    &quot;&quot;&quot;按对齐切块的内存池：free 后合并相邻空洞；地址一旦分配就不再移动。&quot;&quot;&quot;
+    def __init__(self, align): self.align, self.blocks, self.high = align, [], 0
+    def alloc(self, size):
+        size = -(-size // self.align) * self.align
+        for i, (off, sz) in enumerate(self.blocks):
+            if sz &gt;= size:
+                if sz == size: self.blocks.pop(i)
+                else: self.blocks[i] = (off + size, sz - size)
+                return off, size
+        off = self.high; self.high += size
+        return off, size
+    def free(self, off, size):
+        self.blocks.append((off, size)); self.blocks.sort()
+        merged = []
+        for off, sz in self.blocks:
+            if merged and merged[-1][0] + merged[-1][1] == off:
+                merged[-1] = (merged[-1][0], merged[-1][1] + sz)
+            else: merged.append((off, sz))
+        self.blocks = merged
+
+def run_with_pool(nodes, order):
+    lu, pool, live, log = last_use(order), Pool(ALIGN), {}, []
+    for i, (op, deps, out) in enumerate(order):
+        nm, sz, off = out[&#39;name&#39;], out[&#39;bytes&#39;], 0
+        off, got = pool.alloc(sz)
+        log.append((nm, i, off, got, &#39;常驻&#39; if out[&#39;resident&#39;] else &#39;激活&#39;))
+        if not out[&#39;resident&#39;]:
+            live[nm] = (off, got)
+        for d in deps:                       # 依赖读完之后立即回收
+            if d in live and lu.get(d) == i: pool.free(*live.pop(d))
+    return pool.high, log
+
+def naive_bytes(items):
+    return sum(-(-t[&#39;bytes&#39;] // ALIGN) * ALIGN for t in items)
+
+if __name__ == &#39;__main__&#39;:
+    g = build_graph()
+    print(&#39;=== 1. 两种合法执行顺序（拓扑序不唯一）===&#39;)
+    o1 = topo(g)
+    o2 = topo(g, key=lambda n: -list(x[2][&#39;name&#39;] for x in g).index(n[2][&#39;name&#39;]))
+    print(&#39;  顺序 A（表序）:&#39;, &#39; → &#39;.join(n[2][&#39;name&#39;] for n in o1))
+    print(&#39;  顺序 B（部分逆序）:&#39;, &#39; → &#39;.join(n[2][&#39;name&#39;] for n in o2))
+    print(f&#39;  依赖全部满足，两个结果都对：顺序自由度 = {[n[2][&quot;name&quot;] for n in o1] != [n[2][&quot;name&quot;] for n in o2]}&#39;)
+
+    order = o1
+    print(f&#39;\n=== 2. 内存池分配（对齐 {ALIGN} B；块在最后一次使用后立刻回收）===&#39;)
+    peak, log = run_with_pool(g, order)
+    for nm, i, off, sz, kind in log:
+        print(f&#39;  step{i:&gt;2}  {nm:&lt;4} {kind}  offset={off:&gt;10}  size={sz:&gt;10} B&#39;)
+    act = [n[2] for n in g if not n[2][&#39;resident&#39;]]
+    na_act = naive_bytes(act)
+    pk_act = 0                                   # 激活区峰值 = 池里同时活着的最多字节
+    live, lu, cur = {}, last_use(order), 0
+    for i, (op, deps, out) in enumerate(order):
+        if not out[&#39;resident&#39;]:
+            live[out[&#39;name&#39;]] = out[&#39;bytes&#39;]; cur += -(-out[&#39;bytes&#39;] // ALIGN) * ALIGN
+        for d in deps:
+            if d in live and lu.get(d) == i: cur -= -(-live.pop(d) // ALIGN) * ALIGN
+        pk_act = max(pk_act, cur)
+    allt = [n[2] for n in g]
+    print(f&#39;\n  激活区：朴素 {na_act} B（{na_act/2**20:.1f} MiB）→ 池化峰值 {pk_act} B（{pk_act/2**20:.1f} MiB）&#39;
+          f&#39;  降 {(1-pk_act/na_act)*100:.1f}%&#39;)
+    print(f&#39;  全图  ：朴素 {naive_bytes(allt)} B（{naive_bytes(allt)/2**20:.1f} MiB）→ 池化 {peak} B（{peak/2**20:.1f} MiB）&#39;
+          f&#39;  降 {(1-peak/naive_bytes(allt))*100:.1f}%&#39;)
+    print(&#39;  注意：总峰值被 128 MiB 权重主导，池真正优化的是激活区 —— 报&quot;峰值降了多少&quot;必须说清是哪一块&#39;)
+
+    print(&#39;\n=== 3. 一次推理的时间分解：图回放什么时候才值（全部为假设模型参数）===&#39;)
+    print(f&#39;  假设：单次下发 {LAUNCH_US} µs，一次 replay {REPLAY_US} µs，峰值 {PEAK_TFLOP:.0f} TFLOP/s，算子数固定为 9&#39;)
+    print(f&#39;  {&quot;场景&quot;:&lt;22}{&quot;FLOPs&quot;:&gt;14}{&quot;纯计算&quot;:&gt;10}{&quot;eager&quot;:&gt;10}{&quot;replay&quot;:&gt;10}{&quot;加速比&quot;:&gt;9}&#39;)
+    cases = [(&#39;decode 单 token&#39;, 2*1*4096*4096), (&#39;小 batch 推理(8)&#39;, 2*8*4096*4096),
+             (&#39;prefill 512 token&#39;, 2*512*4096*4096), (&#39;训练型 batch=64&#39;, 2*64*4096*4096)]
+    for name, fl in cases:
+        comp = fl / (PEAK_TFLOP*1e12) * 1e6
+        ea, gr = comp + 9*LAUNCH_US, comp + REPLAY_US
+        print(f&#39;  {name:&lt;22}{fl:&gt;14,}{comp:&gt;9.2f}µ{ea:&gt;9.2f}µ{gr:&gt;9.2f}µ{ea/gr:&gt;8.2f}x&#39;)
+    print(&#39;  读法：算得越少，host 侧下发越像瓶颈 → 回放收益越大；计算量上去后两者收敛&#39;)
+
+    print(&#39;\n=== 4. 正确性：两条执行顺序必须算出同一结果（小张量实算）===&#39;)
+    import random
+    rnd = random.Random(0)
+    env = {&#39;x&#39;: [rnd.uniform(-1, 1) for _ in range(4)], &#39;W1&#39;: [rnd.uniform(-1, 1) for _ in range(4)],
+           &#39;b1&#39;: [0.5, -0.5], &#39;W2&#39;: [rnd.uniform(-1, 1) for _ in range(8)]}
+    def mm2(a, b, m, n, k):
+        return [sum(a[i*k+t]*b[t*n+j] for t in range(k)) for i in range(m) for j in range(n)]
+    def exec_order(env, order):
+        e = dict(env)
+        for op, deps, out in order:
+            nm = out[&#39;name&#39;]
+            if op in (&#39;input&#39;, &#39;param&#39;): continue
+            if op == &#39;mm&#39;:   e[nm] = mm2(e[deps[0]], e[deps[1]], 2, 2, 2) if len(e[deps[0]]) == 4 else mm2(e[deps[0]], e[deps[1]], 2, 4, 2)
+            elif op == &#39;add&#39;: e[nm] = [u + v for u, v in zip(e[deps[0]], [0.5, -0.5]*2)]
+            elif op == &#39;relu&#39;: e[nm] = [max(u, 0.0) for u in e[deps[0]]]
+        return e
+    ra, rb = exec_order(env, o1), exec_order(env, o2)
+    print(&#39;  顺序 A out:&#39;, [round(v, 6) for v in ra[&#39;out&#39;]])
+    print(&#39;  顺序 B out:&#39;, [round(v, 6) for v in rb[&#39;out&#39;]])
+    print(&#39;  逐元素一致:&#39;, all(ra[k] == rb[k] for k in (&#39;y1&#39;,&#39;y2&#39;,&#39;y3&#39;,&#39;y4&#39;,&#39;out&#39;,&#39;aux&#39;)))</code></pre>
+<p>实际运行结果（Python 3.14，无第三方依赖）：</p>
+<pre data-lang="text"><code class="language-text">=== 1. 两种合法执行顺序（拓扑序不唯一）===
+  顺序 A（表序）: x → W1 → b1 → y1 → y2 → y3 → W2 → y4 → out → aux
+  顺序 B（部分逆序）: W2 → b1 → W1 → x → y1 → y2 → aux → y3 → y4 → out
+  依赖全部满足，两个结果都对：顺序自由度 = True
+
+=== 2. 内存池分配（对齐 512 B；块在最后一次使用后立刻回收）===
+  step 0  x    常驻  offset=         0  size=   1048576 B
+  step 1  W1   常驻  offset=   1048576  size=  67108864 B
+  step 2  b1   常驻  offset=  68157440  size=     16384 B
+  step 3  y1   激活  offset=  68173824  size=   1048576 B
+  step 4  y2   激活  offset=  69222400  size=   1048576 B
+  step 5  y3   激活  offset=  68173824  size=   1048576 B
+  step 6  W2   常驻  offset=  70270976  size=  67108864 B
+  step 7  y4   激活  offset= 137379840  size=   1048576 B
+  step 8  out  激活  offset=  68173824  size=   1048576 B
+  step 9  aux  激活  offset= 137379840  size=   1048576 B
+
+  激活区：朴素 6291456 B（6.0 MiB）→ 池化峰值 2097152 B（2.0 MiB）  降 66.7%
+  全图  ：朴素 141574144 B（135.0 MiB）→ 池化 138428416 B（132.0 MiB）  降 2.2%
+  注意：总峰值被 128 MiB 权重主导，池真正优化的是激活区 —— 报&quot;峰值降了多少&quot;必须说清是哪一块
+
+=== 3. 一次推理的时间分解：图回放什么时候才值（全部为假设模型参数）===
+  假设：单次下发 3.0 µs，一次 replay 5.0 µs，峰值 100 TFLOP/s，算子数固定为 9
+  场景                             FLOPs       纯计算     eager    replay      加速比
+  decode 单 token            33,554,432     0.34µ    27.34µ     5.34µ    5.12x
+  小 batch 推理(8)            268,435,456     2.68µ    29.68µ     7.68µ    3.86x
+  prefill 512 token     17,179,869,184   171.80µ   198.80µ   176.80µ    1.12x
+  训练型 batch=64           2,147,483,648    21.47µ    48.47µ    26.47µ    1.83x
+  读法：算得越少，host 侧下发越像瓶颈 → 回放收益越大；计算量上去后两者收敛
+
+=== 4. 正确性：两条执行顺序必须算出同一结果（小张量实算）===
+  顺序 A out: [0.462164, -0.365194, 0.489574, -0.462855]
+  顺序 B out: [0.462164, -0.365194, 0.489574, -0.462855]
+  逐元素一致: True</code></pre>
+<p>四处可核对结论：<strong>顺序自由度是真实的</strong>（两条不同顺序输出逐元素一致，这是运行时能重排的依据）；<strong>池只优化激活区</strong>（6.0→2.0 MiB），内存结论必须带口径；<strong>回放收益与计算量成反比</strong>（5.12x vs 1.12x），选它是看阶段不是看名气；<strong>地址固定才可回放</strong>，复用策略一变旧图就得重捕。</p>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选：需要 GPU（自备或云上按需），用于把上面的模型参数换成实测值 ----
+# python3 -c &quot;import torch; g=torch.cuda.CUDAGraph(); \
+#   print(torch.cuda.graphs.graph_pool_handle() is not None)&quot;   # 只验证 API 可用
+# 实测路径：① 用 torch.cuda.Event 计时，量 eager 与 reduce-overhead 两种模式的同一模型；
+# ② 用 torch.cuda.memory_stats() 取 allocated/reserved 峰值，和本课的&quot;激活区&quot;口径对比；
+# ③ 打开 TORCH_LOGS=graph_breaks,perf_hints 观察哪些段没被捕获。
+# 没有 GPU 不影响本课：上面纯 Python 版本已经把顺序、池、回放的账算清了。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：给 <code>Pool</code> 加&quot;保留余量&quot;参数（每块向上取整到 1 MiB，模拟整块预留），重跑第 2 节，看激活区与总峰值各变多少，解释总峰值为何几乎不动。</li>
+<li><strong>解释</strong>：第 3 节把算子数固定为 9。若融合（第 5 章）把它降到 4，四个场景的回放收益会怎么变？用代码验算，并说明&quot;融合&quot;与&quot;图回放&quot;是互补还是替代。</li>
+<li><strong>对比/验证</strong>：把 <code>topo</code> 的排序键改成&quot;输出字节数从大到小&quot;，看池化峰值是否变化——这暴露&quot;执行顺序&quot;与&quot;内存峰值&quot;的哪种依赖？</li>
+<li><strong>思考</strong>：CUDA Graph 要求&quot;地址与形状静态&quot;。若 batch 大小随请求波动（服务端常态），有哪些可行设计？提示：列出&quot;按 bucket 捕获多张图&quot;与&quot;回放 + 动态形状重编&quot;两条路的代价。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Tianqi Chen et al., <em>TVM: An Automated End-to-End Optimizing Compiler for Deep Learning</em>（OSDI&#39;18；图执行器与运行时的最小化设计、静态内存规划）：<a href="https://www.usenix.org/conference/osdi18/presentation/chen" target="_blank" rel="noopener noreferrer">https://www.usenix.org/conference/osdi18/presentation/chen</a></li>
+<li>Apache TVM, <em>TVM Runtime System</em>（PackedFunc / Module 的职责划分、函数句柄首次调用后缓存、运行时体积随 driver 模块在 200K–600K 量级）：<a href="https://tvm.apache.org/docs/arch/runtime.html" target="_blank" rel="noopener noreferrer">https://tvm.apache.org/docs/arch/runtime.html</a></li>
+<li>PyTorch 官方文档 <em>torch.cuda.CUDAGraph</em>（捕获/实例化/回放 API 与静态地址、私有内存池等约束）：<a href="https://docs.pytorch.org/docs/stable/generated/torch.cuda.CUDAGraph.html" target="_blank" rel="noopener noreferrer">https://docs.pytorch.org/docs/stable/generated/torch.cuda.CUDAGraph.html</a></li>
+<li>PyTorch 官方文档 <em>torch.compile</em>（<code>mode=&quot;reduce-overhead&quot;</code> 与 Inductor 生成的执行计划、CUDA Graphs 的分段处理）：<a href="https://docs.pytorch.org/docs/stable/torch.compiler.html" target="_blank" rel="noopener noreferrer">https://docs.pytorch.org/docs/stable/torch.compiler.html</a></li>
+</ul>
+<p><a href="#/l/mlc-ch8-l2">下一课：编译缓存与多设备：端侧与云侧的差异</a></p>

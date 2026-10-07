@@ -1,0 +1,87 @@
+<h2 id="h-pagedattention">PagedAttention<a class="anchor" href="#h-pagedattention" aria-label="本节链接">#</a></h2>
+<p>上一课我们算清了 KV Cache 的账，但还没回答一个更隐蔽的问题：<strong>这些 KV Cache 在显存里怎么放？</strong> 如果给每个请求预先分配一大块&quot;最大可能长度&quot;的连续显存，就会产生大量碎片和浪费。PagedAttention 把操作系统的&quot;分页&quot;思想搬进了 KV Cache 管理，是 vLLM 吞吐能提升 2–4 倍的核心技术之一。学完本课，你应当能画出 PagedAttention 的 block table 结构，并说出它解决的三个问题。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-朴素分配的三大浪费">1. 朴素分配的三大浪费<a class="anchor" href="#h-1-朴素分配的三大浪费" aria-label="本节链接">#</a></h4>
+<p>如果沿用&quot;每个请求预分配一整段连续显存&quot;的做法，会遇到三个问题：</p>
+<ul>
+<li><strong>内部碎片</strong>：请求实际只生成了 50 个 token，却按上限预留了 2048 个 token 的空间，中间的差就是白白占用的碎片；</li>
+<li><strong>外部碎片</strong>：不同请求的缓存反复分配/释放，显存被切成许多用不上的小块，即使总量够也拼不出一块大的；</li>
+<li><strong>无法共享</strong>：两个请求有相同的 prompt 前缀（比如同一个系统提示词），朴素做法各存一份，重复占用。</li>
+</ul>
+<h4 id="h-2-核心思想把-kv-cache-切块按需分配">2. 核心思想：把 KV Cache 切块、按需分配<a class="anchor" href="#h-2-核心思想把-kv-cache-切块按需分配" aria-label="本节链接">#</a></h4>
+<p>PagedAttention 借鉴<strong>操作系统的虚拟内存分页</strong>：</p>
+<ol>
+<li>把 KV Cache 划分成<strong>固定大小的 block（页）</strong>，例如每 block 存 16 个 token 的 KV；</li>
+<li>一个请求的 KV Cache 由<strong>若干个非连续的 block</strong> 组成，用一张 <strong>block table（页表）</strong> 记录&quot;逻辑 token 位置 → 物理 block 地址&quot;的映射；</li>
+<li>请求需要更多空间时，<strong>按 block 动态申请</strong>，只申请当前真的需要的量，几乎不产生内部碎片；</li>
+<li>请求结束，block 归还到空闲池，可被新请求立刻复用。</li>
+</ol>
+<p>注意力计算时，GPU 通过 block table 找到每个 token 的 KV 在哪，按块做 kernel 计算——结果与连续存储<strong>完全一致</strong>，只是物理位置不同。</p>
+<h4 id="h-3-三个直接收益">3. 三个直接收益<a class="anchor" href="#h-3-三个直接收益" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>显存利用率大幅提升</strong>：碎片消除后，同一张卡能装下<strong>更多并发请求</strong>（论文报告可提升至 2–4 倍 batch），吞吐随之上升；</li>
+<li><strong>内存共享</strong>：block 是只读的、可复制的，多个请求共享同一个前缀时，可以让它们的 block table <strong>指向同一批物理 block</strong>（写时复制），beam search 或并行采样也能共享 prompt 前缀；</li>
+<li><strong>灵活调度</strong>：因为缓存是分块的，continuous batching（第 1 章）里请求的动态进出、KV 的动态增删都变得非常自然。</li>
+</ul>
+<h4 id="h-4-一个直观类比">4. 一个直观类比<a class="anchor" href="#h-4-一个直观类比" aria-label="本节链接">#</a></h4>
+<p>把 KV Cache 想象成一本<strong>活页笔记本</strong>：普通做法是给每个学生发一本固定页数、装订死的本子（会浪费、不好复用）；PagedAttention 是发<strong>可插拔的活页</strong>，用到几页发几页，用完回收给下一个人，两个人还能<strong>共用同一页笔记</strong>。页表（block table）就是&quot;这本笔记哪些内容在第几页&quot;的目录。</p>
+<h3 id="h-二可运行示例">二、可运行示例<a class="anchor" href="#h-二可运行示例" aria-label="本节链接">#</a></h3>
+<p>下面的 Python 用简化的 block 池 + 页表，模拟 PagedAttention 的按需分配、碎片对比与前缀共享。</p>
+<pre data-lang="python"><code class="language-python"># -*- coding: utf-8 -*-
+# 模拟 PagedAttention：block 池 + 页表，对比朴素分配
+
+BLOCK_TOKENS = 16  # 每个 block 存 16 个 token 的 KV
+
+def naive_memory(requests, max_len=2048):
+    &quot;&quot;&quot;朴素分配：每个请求预分配 max_len 的连续空间。&quot;&quot;&quot;
+    return len(requests) * max_len
+
+def paged_memory(requests):
+    &quot;&quot;&quot;PagedAttention：按实际长度向上取整到 block，且共享相同前缀。&quot;&quot;&quot;
+    prefix_blocks = {}   # 前缀内容 -&gt; 已分配的 block 列表
+    total = 0
+    for prompt, gen in requests:
+        total_len = prompt + gen
+        blocks = (total_len + BLOCK_TOKENS - 1) // BLOCK_TOKENS
+        # 若 prompt 前缀已存在，则那部分 block 可共享（写时复制）
+        if prompt not in prefix_blocks:
+            prefix_blocks[prompt] = True
+            total += blocks
+        else:
+            # 前缀已共享，只新增&quot;生成部分&quot;的 block（简化）
+            gen_blocks = (gen + BLOCK_TOKENS - 1) // BLOCK_TOKENS
+            total += gen_blocks
+    return total
+
+# 20 个请求，多数共享同一个 128 token 的系统提示词，生成长度随机
+requests = [(&quot;SYS:&quot; * 32, 200) for _ in range(20)]  # prompt 约 128 token
+naive = naive_memory(requests)
+paged = paged_memory(requests)
+print(f&quot;朴素分配（预留2048）：{naive} token 空间&quot;)
+print(f&quot;PagedAttention（按需+共享）：{paged} token 空间&quot;)
+print(f&quot;显存节约：{(1 - paged/naive)*100:.0f}%&quot;)
+
+# 展示一张请求的页表结构
+print(&quot;\n某请求的页表示例（逻辑位置 -&gt; 物理 block）：&quot;)
+prompt, gen = requests[0]
+total_len = prompt + gen
+blocks = (total_len + BLOCK_TOKENS - 1) // BLOCK_TOKENS
+for i in range(blocks):
+    print(f&quot;  token [{i*BLOCK_TOKENS:&gt;3} .. {min((i+1)*BLOCK_TOKENS, total_len):&gt;3}] -&gt; block #{100+i}&quot;)</code></pre>
+<p>运行后你会发现，PagedAttention 按实际用量分配、且共享相同前缀时，能省下大量显存——这正是它能把更多请求塞进同一张卡的原因。</p>
+<p><figure><img class="md-img" src="content/courses/llm-inference-optimization/assets/chapter-2-figure-03.svg" alt="PagedAttention 页表结构图：左侧画&quot;逻辑 KV（按 token 顺序）&quot;一条长条，被切分成若干等宽的块并编号逻辑块 0、1、2、3……；右侧画&quot;物理显存（block 池）&quot;，里面是若干离散的 block 格子，编号 block #7、#12、#3、#19……；中间用带箭头的页表（block table）连接：逻辑块 0→物理 block #7、逻辑块 1→block #12、逻辑块 2→block #3，表示非连续映射；另画一个红色虚线框圈出&quot;两个请求共享的前缀 block&quot;（两条箭头指向同一个物理 block #7），标注&quot;写时复制共享前缀&quot;；底部一句话&quot;KV Cache 切成活页，按需分配、可共享、无碎片&quot;" loading="lazy" decoding="async"><figcaption>PagedAttention 页表结构图：左侧画&quot;逻辑 KV（按 token 顺序）&quot;一条长条，被切分成若干等宽的块并编号逻辑块 0、1、2、3……；右侧画&quot;物理显存（block 池）&quot;，里面是若干离散的 block 格子，编号 block #7、#12、#3、#19……；中间用带箭头的页表（block table）连接：逻辑块 0→物理 block #7、逻辑块 1→block #12、逻辑块 2→block #3，表示非连续映射；另画一个红色虚线框圈出&quot;两个请求共享的前缀 block&quot;（两条箭头指向同一个物理 block #7），标注&quot;写时复制共享前缀&quot;；底部一句话&quot;KV Cache 切成活页，按需分配、可共享、无碎片&quot;</figcaption></figure>
+</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>改 block 大小</strong>：把 <code>BLOCK_TOKENS</code> 从 16 改成 8、32，观察总分配量的变化，讨论 block 太大/太小的各自缺点（太大→内部碎片，太小→页表开销大）。</li>
+<li><strong>去掉共享</strong>：把 <code>paged_memory</code> 里&quot;前缀共享&quot;那段改成&quot;每个请求都独立分配&quot;，显存节约率还剩多少？说明&quot;共享前缀&quot;这一项对系统提示词场景的价值。</li>
+<li><strong>加动态增长</strong>：模拟一个请求先生成 100 再继续生成 200 token，展示它如何&quot;边生成边追加 block&quot;，体会按需分配对连续批处理的配合。</li>
+<li><strong>思考</strong>：PagedAttention 的 block table 本身也要占显存（页表开销）。在什么极端场景下，页表开销可能超过它的收益？结合第 2 课的公式谈谈。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>vLLM 论文《Efficient Memory Management for Large Language Model Serving with PagedAttention》：<a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2309.06180</a></li>
+<li>vLLM 文档：PagedAttention 设计说明：<a href="https://docs.vllm.ai/en/latest/design/paged_attention.html" target="_blank" rel="noopener noreferrer">https://docs.vllm.ai/en/latest/design/paged_attention.html</a></li>
+<li>操作系统虚拟内存分页概念（block table 类比来源）：<a href="https://en.wikipedia.org/wiki/Page_table" target="_blank" rel="noopener noreferrer">https://en.wikipedia.org/wiki/Page_table</a></li>
+</ul>
+<p><a href="#/l/inf-ch3-l1">下一课：vLLM</a></p>

@@ -1,0 +1,216 @@
+<h2 id="h-拓扑感知rail-optimized-与跨域通信为何骤降">拓扑感知：rail-optimized 与跨域通信为何骤降<a class="anchor" href="#h-拓扑感知rail-optimized-与跨域通信为何骤降" aria-label="本节链接">#</a></h2>
+<p>上一课把跨机通信当成&quot;一条边&quot;，但真实集群里节点之间并不平等：卡 0 到对端卡 0 只需要过一台 leaf 交换机（一跳），卡 0 到对端卡 3 却要穿过 spine 层。更反直觉的是——<strong>同一份梯度、同一个 ring 算法，只把 rank 的排列顺序换一下，预测时间就从 121 ms 掉到 40 ms（3 倍）</strong>。本课用一张分层的拓扑加上一段可运行的排法模拟，把&quot;跨域骤降&quot;算成账。</p>
+<p><figure><img class="md-img" src="content/courses/distributed-training-systems/assets/chapter-3-figure-02.svg" alt="rail-optimized：同号卡进同一条 rail，跨 rail 才过 spine" loading="lazy" decoding="async"><figcaption>rail-optimized：同号卡进同一条 rail，跨 rail 才过 spine</figcaption></figure>
+</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-集群不是一堆-gpu而是三层">1. 集群不是&quot;一堆 GPU&quot;，而是三层<a class="anchor" href="#h-1-集群不是一堆-gpu而是三层" aria-label="本节链接">#</a></h4>
+<p>把 8 卡机接到集群上，通信要穿过的层级：</p>
+<table>
+<thead>
+<tr>
+<th>层级</th>
+<th>介质</th>
+<th>典型带宽量级</th>
+<th>谁在这里竞争</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>节点内（NVLink 域）</td>
+<td>NVLink + NVSwitch</td>
+<td>数百 GB/s 单向</td>
+<td>同机其它 GPU</td>
+</tr>
+<tr>
+<td>rail（leaf 内）</td>
+<td>IB/RoCE，同号卡一台 leaf</td>
+<td>数十 GB/s 单向/口</td>
+<td>同 rail 的所有节点</td>
+</tr>
+<tr>
+<td>spine（跨 rail）</td>
+<td>leaf–spine–leaf</td>
+<td>受收敛比打折</td>
+<td>全集群跨 rail 流量</td>
+</tr>
+</tbody></table>
+<p>NVIDIA 的 DGX SuperPOD 参考架构写得很直白：每 32 节点一组 <strong>rail-aligned</strong>，同一 rail 到其它 31 个节点的流量<strong>永远只有一跳</strong>，而节点间或 rail 间的流量要经过 <strong>spine 层</strong>。这就是本课的全部物理前提。</p>
+<h4 id="h-2-rail-optimized-是什么">2. rail-optimized 是什么<a class="anchor" href="#h-2-rail-optimized-是什么" aria-label="本节链接">#</a></h4>
+<p><strong>定义</strong>：机内槽位 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6595em;"></span><span class="mord mathnormal">i</span></span></span></span> 的 GPU 通过自己的 NIC 接到第 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6595em;"></span><span class="mord mathnormal">i</span></span></span></span> 条 rail 的 leaf；因此&quot;所有节点的第 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6595em;"></span><span class="mord mathnormal">i</span></span></span></span> 号卡&quot;共享同一条 rail。8 卡机就有 8 条 rail，每条一台（或一对）leaf。</p>
+<p>三个直接后果：</p>
+<ul>
+<li><strong>同号卡通信只过 leaf</strong>：<code>节点a.卡i ↔ 节点b.卡i</code> 不需要看到 spine。</li>
+<li><strong>跨号卡通信必须过 spine</strong>：<code>卡i → 卡j (i≠j)</code> 是 leaf(i)–spine–leaf(j)，跳数与延迟都增加。</li>
+<li><strong>spine 是共享资源</strong>：多条跨 rail 流一起排队，收敛比大于 1 时有效带宽按比例下降。</li>
+</ul>
+<p>所以&quot;拓扑感知&quot;不是玄学，它只有一句话：<strong>尽量让通信发生在同号卡之间</strong>。</p>
+<h4 id="h-3-环的排法决定一切">3. 环的排法决定一切<a class="anchor" href="#h-3-环的排法决定一切" aria-label="本节链接">#</a></h4>
+<p>ring AllReduce 每一步里环上所有边同时传输，所以<strong>步时间 = 最慢那条环边的时间</strong>，总时间 = <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">2</span><span class="mopen">(</span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span><span class="mord">×</span></span></span></span>步时间——环边经过哪些设备直接决定总时间。三种排法：</p>
+<table>
+<thead>
+<tr>
+<th>排法</th>
+<th>跨越点落在哪</th>
+<th>跨 rail 环边数</th>
+<th>spine 流量（8 节点 × 8 卡，1 GiB）</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>naive（节点顺序）</td>
+<td>每节点末尾接下一节点开头 → 卡7→卡0</td>
+<td>8</td>
+<td>16128 MiB</td>
+</tr>
+<tr>
+<td><strong>aligned（节点交替反向）</strong></td>
+<td>两个跨越点落在<strong>同一条 rail</strong> 上</td>
+<td><strong>0</strong></td>
+<td><strong>0 MiB</strong></td>
+</tr>
+<tr>
+<td>interleaved（rail 交错）</td>
+<td>每个跨越点都换 rail</td>
+<td>8（另有 56 条同 rail）</td>
+<td>16128 MiB</td>
+</tr>
+</tbody></table>
+<p><code>aligned</code> 的做法只有一句：偶数号节点按 0→7 排、奇数号节点按 7→0 排，于是出、回两条跨越边的两端同号——跨越点自动对齐到 rail。示例 1 的模拟结果：</p>
+<table>
+<thead>
+<tr>
+<th>排法</th>
+<th>2 节点 × 8 卡</th>
+<th>8 节点 × 8 卡</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>naive</td>
+<td>121.10 ms</td>
+<td>128.10 ms</td>
+</tr>
+<tr>
+<td>aligned</td>
+<td><strong>40.45 ms</strong></td>
+<td><strong>43.03 ms</strong></td>
+</tr>
+<tr>
+<td>interleaved</td>
+<td>121.10 ms</td>
+<td>128.10 ms</td>
+</tr>
+</tbody></table>
+<h4 id="h-4-跨域为何骤降两个乘数相乘">4. 跨域为何骤降：两个乘数相乘<a class="anchor" href="#h-4-跨域为何骤降两个乘数相乘" aria-label="本节链接">#</a></h4>
+<p>跨 rail 的代价由两项相乘：</p>
+<ul>
+<li><strong>跳数</strong>：同 rail 一跳，跨 rail leaf→spine→leaf；延迟项从 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span> 涨到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7519em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.7519em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">′</span></span></span></span></span></span></span></span></span></span></span></span>；</li>
+<li><strong>收敛比</strong>：spine 上行被多条 rail 共享。示例取 3:1，则跨 rail 的有效带宽从 50 GB/s 降到 <strong>16.7 GB/s</strong>，即每条跨 rail 环边的带宽项扩大到 3 倍。</li>
+</ul>
+<p>两者叠加：以 2 节点 × 8 卡、每步每条环边 64 MiB 为例，同 rail 环边 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">6</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.3923em;vertical-align:-0.52em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8723em;"><span style="top:-2.655em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">50</span><span class="mord text mtight"><span class="mord mtight">GB/s</span></span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.394em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">64</span><span class="mord text mtight"><span class="mord mtight">MiB</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.52em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1.35</span></span></span></span> ms，跨 rail 环边 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">10</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.3923em;vertical-align:-0.52em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8723em;"><span style="top:-2.655em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">16.7</span><span class="mord text mtight"><span class="mord mtight">GB/s</span></span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.394em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">64</span><span class="mord text mtight"><span class="mord mtight">MiB</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.52em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4.04</span></span></span></span> ms；整步时间由这条最慢边决定（30 步合计 40.45 ms vs 121.10 ms）。naive 与 interleaved 的差别则在 spine 总流量（都过 spine，叠加程度不同）——<strong>spine 流量就是拥塞风险的账本</strong>。</p>
+<p>示例模型按&quot;每条环边独立&quot;计算，是<strong>下界</strong>：未计多条流在 spine 上的排队，真实差距通常更大。</p>
+<h4 id="h-5-nccl-在工程上怎么做">5. NCCL 在工程上怎么做<a class="anchor" href="#h-5-nccl-在工程上怎么做" aria-label="本节链接">#</a></h4>
+<p>NCCL 自己会探测拓扑并挑选路径，需要知道的开关有：</p>
+<ul>
+<li><code>NCCL_CROSS_NIC</code>：<code>0</code>＝同一 ring/tree 固定用同一块 NIC，<strong>避免跨 rail</strong>（官方建议用于&quot;每 NIC 一台 leaf、rail 间连接慢&quot;的网络）；<code>1</code> 允许换 NIC；<code>2</code>（默认）尽量同 NIC、必要时才换。</li>
+<li><code>NCCL_NET_MERGE_POLICY=RAIL</code>：rail-optimized 系统专用——按 rail 合并多口网卡，避免把不同 rail 的设备合成一个；<code>NCCL_IB_HCA</code> 还支持 <code>&lt;hca&gt;:&lt;port&gt;:&lt;rail&gt;:&lt;plane&gt;</code>，可手工标注 rail/plane 身份。</li>
+<li><code>NCCL_TOPO_FILE</code> / <code>NCCL_TOPO_DUMP_FILE</code>：导入/导出拓扑 XML。官方提醒：多节点 NVLink 系统导出的 XML 含整个 NVLink 域，但<strong>回填 <code>NCCL_TOPO_FILE</code> 时只应写单节点拓扑</strong>。</li>
+<li>算法层面：两级算法先在节点内用 NVLink 合并，再让节点代表走同 rail 的 NIC——&quot;把跨域通信压到最少&quot;的通用配方。</li>
+</ul>
+<h4 id="h-6-常见坑">6. 常见坑<a class="anchor" href="#h-6-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>把&quot;同 rail&quot;当成&quot;相邻 rank&quot;</strong>：同号卡才是同 rail；按 rank 顺序排环，跨越点常落在不同号卡上。</li>
+<li><strong>只调算法不管 rank 顺序</strong>：同样的 ring，排法不同差 3 倍。</li>
+<li><strong>手写 <code>NCCL_TOPO_FILE</code> 出错</strong>：多节点 NVLink 系统只写单节点拓扑；写错会让 NCCL 按错误距离决策，带宽莫名不达标。</li>
+<li><strong>忽略收敛比</strong>：账上&quot;每口 400 Gb/s&quot;要乘 spine 的实际收敛比，才是跨 rail 的可用带宽。</li>
+</ul>
+<h4 id="h-7-这一课到哪里为止">7. 这一课到哪里为止<a class="anchor" href="#h-7-这一课到哪里为止" aria-label="本节链接">#</a></h4>
+<p>现在你有了三层带宽与&quot;跨域更贵&quot;的结论。把它放回训练循环，就能回答最后一个问题：为什么加卡不是线性加速——下一课给出带宽、延迟、同步三本账。</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>示例 1 把 rail-optimized 拓扑抽象成&quot;边分类器&quot;，对三种 rank 排法做账本审计：每条环边的类别、spine 上要搬多少字节、按 α-β 模型预测的时间。纯标准库。</p>
+<pre data-lang="python"><code class="language-python"># ===== 示例 1：rail-optimized 拓扑上，rank 的排法决定通信走不走 spine =====
+GPUS = 8
+
+
+def edge_class(a, b):
+    &quot;&quot;&quot;a、b 是 (节点号, 卡号)。返回 (类别, α_μs, β_GB/s)。
+    节点内走 NVSwitch；跨节点同号卡走本 rail 的 leaf（一跳）；跨节点不同号卡必须过 spine。&quot;&quot;&quot;
+    (na, ga), (nb, gb) = a, b
+    if na == nb:
+        return &quot;节点内 NVLink&quot;, 2.0, 450.0
+    if ga == gb:
+        return &quot;跨机 同 rail&quot;, 6.0, 50.0
+    return &quot;跨机 跨 rail&quot;, 10.0, 50.0 / 3.0        # spine 3:1 收敛，有效带宽降到 1/3
+
+
+def ring_orders(nodes):
+    &quot;&quot;&quot;三种排法：naive=节点顺序；aligned=每节点交替方向，让两个跨越点落在同一条 rail；
+    interleaved=按 rail 交错（同 rail 的卡挨着，但每个跨越点都换 rail）。&quot;&quot;&quot;
+    naive = [(n, g) for n in range(nodes) for g in range(GPUS)]
+    aligned = []
+    for n in range(nodes):
+        gs = range(GPUS) if n % 2 == 0 else range(GPUS - 1, -1, -1)
+        aligned += [(n, g) for g in gs]
+    interleaved = [(n, g) for g in range(GPUS) for n in range(nodes)]
+    return {&quot;naive&quot;: naive, &quot;aligned&quot;: aligned, &quot;interleaved&quot;: interleaved}
+
+
+def audit(order, grad_mib=1024.0):
+    &quot;&quot;&quot;按 ring AllReduce 的账本统计：每条环节点的类别、spine 上要搬多少字节、总时间。&quot;&quot;&quot;
+    P = len(order)
+    s = grad_mib * 2**20 / P                     # 每步每条环边的消息字节数
+    edges = [edge_class(order[i], order[(i + 1) % P]) for i in range(P)]
+    cross = [e for e in edges if e[0] == &quot;跨机 跨 rail&quot;]
+    step_us = max(a + s / (b * 1e9) * 1e6 for _, a, b in edges)   # 每步所有环边同时动，取最慢边
+    spine_bytes = len(cross) * 2 * (P - 1) * s
+    kinds = {k: sum(1 for e in edges if e[0] == k) for k in
+             (&quot;节点内 NVLink&quot;, &quot;跨机 同 rail&quot;, &quot;跨机 跨 rail&quot;)}
+    return kinds, spine_bytes, 2 * (P - 1) * step_us / 1e3
+
+
+for nodes in (2, 8):
+    P = nodes * GPUS
+    print(f&quot;\n{nodes} 节点 × {GPUS} 卡 = {P} rank，1 GiB 梯度，每步消息 {1024 / P:.2f} MiB：&quot;)
+    for name, order in ring_orders(nodes).items():
+        kinds, spine, ms = audit(order)
+        print(f&quot;  {name:&lt;12} 环边={kinds}  spine 流量={spine / 2**20:9.1f} MiB&quot;
+              f&quot;  预测时间={ms:8.2f} ms&quot;)</code></pre>
+<p>在 Python 3.14.5（仅标准库）下实际运行结果：</p>
+<pre data-lang="text"><code class="language-text">
+2 节点 × 8 卡 = 16 rank，1 GiB 梯度，每步消息 64.00 MiB：
+  naive        环边={&#39;节点内 NVLink&#39;: 14, &#39;跨机 同 rail&#39;: 0, &#39;跨机 跨 rail&#39;: 2}  spine 流量=   3840.0 MiB  预测时间=  121.10 ms
+  aligned      环边={&#39;节点内 NVLink&#39;: 14, &#39;跨机 同 rail&#39;: 2, &#39;跨机 跨 rail&#39;: 0}  spine 流量=      0.0 MiB  预测时间=   40.45 ms
+  interleaved  环边={&#39;节点内 NVLink&#39;: 0, &#39;跨机 同 rail&#39;: 8, &#39;跨机 跨 rail&#39;: 8}  spine 流量=  15360.0 MiB  预测时间=  121.10 ms
+
+8 节点 × 8 卡 = 64 rank，1 GiB 梯度，每步消息 16.00 MiB：
+  naive        环边={&#39;节点内 NVLink&#39;: 56, &#39;跨机 同 rail&#39;: 0, &#39;跨机 跨 rail&#39;: 8}  spine 流量=  16128.0 MiB  预测时间=  128.10 ms
+  aligned      环边={&#39;节点内 NVLink&#39;: 56, &#39;跨机 同 rail&#39;: 8, &#39;跨机 跨 rail&#39;: 0}  spine 流量=      0.0 MiB  预测时间=   43.03 ms
+  interleaved  环边={&#39;节点内 NVLink&#39;: 0, &#39;跨机 同 rail&#39;: 56, &#39;跨机 跨 rail&#39;: 8}  spine 流量=  16128.0 MiB  预测时间=  128.10 ms</code></pre>
+<p><code>naive</code> 与 <code>interleaved</code> 的<strong>预测时间相同</strong>（都受最慢环边支配），但 <code>interleaved</code> 的 spine 流量是 2 节点情形的 4 倍——这是&quot;每边独立&quot;模型看不到、实际会更慢的部分。</p>
+<p>下面这段是<strong>可选</strong>实验：两台机器、各 1~2 张卡即可（云上按需开两台单卡机也行）；单机时只能用 rank 顺序与拓扑日志练手，不影响结论。</p>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选：有 2 台机器就能实测；单机时看日志的拓扑判读 ----
+# 1) 让 NCCL 打印拓扑探测与算法选择（跑一次跨机集合通信即可）
+NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,GRAPH,NET \
+  ./build/all_reduce_perf -b 8 -e 1G -f 2 -g 2
+# 2) 导出/导入拓扑 XML（注意：跨机 NVLink 系统导出的 XML 不能整体回填）
+NCCL_TOPO_DUMP_FILE=/tmp/topo.xml NCCL_DEBUG=INFO ./build/all_reduce_perf -b 8 -e 1G -f 2 -g 2
+
+# 3) 强制&quot;不跨 rail&quot;与&quot;允许跨 rail&quot;对比，看带宽差多少
+NCCL_CROSS_NIC=0 ./build/all_reduce_perf -b 8 -e 1G -f 2 -g 2     # 同一 ring 固定同一 NIC
+NCCL_CROSS_NIC=2 ./build/all_reduce_perf -b 8 -e 1G -f 2 -g 2     # 默认：允许换 NIC
+
+# 4) 看物理布线的 rail（IB 集群；无 IB 时用 `nvidia-smi topo -m` 的 NIC 列代替）
+ibnetdiscover | head -40        # 交换拓扑；iblinkinfo 看每条链路的速率与宽度
+nvidia-smi topo -m              # GPU ↔ NIC 归属，确认&quot;卡 i 是否接在 rail i 上&quot;</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：把 <code>ring_orders</code> 扩到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span></span></span></span> 个节点、每节点 4 卡，再写一个通用的 <code>aligned</code> 构造（提示：让跨越点落在两端节点同号的那条 rail 上），再用 <code>audit</code> 验证跨 rail 环边数为 0。</li>
+<li><strong>解释</strong>：为什么 ring 的步时间取&quot;最慢环边&quot;而不是&quot;所有环边之和&quot;？请用&quot;所有环边同时传输&quot;这个事实说明。</li>
+<li><strong>对比/验证</strong>：把 <code>edge_class</code> 里 spine 的 3:1 改成 1:1（不收敛），重跑示例 1；再解释为什么真实集群会主动选择收敛比 &gt; 1 的设计。</li>
+<li><strong>思考</strong>：如果训练用的是张量并行（TP），你会把它放在节点内、同 rail，还是跨 rail？请从&quot;每步通信量&quot;与&quot;每步延迟次数&quot;两个角度各给一条理由。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>NVIDIA, <em>DGX SuperPOD Reference Architecture — Network Fabrics</em>（rail-aligned 布局：每 32 节点一组 rail 对齐、同一 rail 到其它节点恒为一跳、节点间与 rail 间流量走 spine 层）：<a href="https://docs.nvidia.com/dgx-superpod/reference-architecture-scalable-infrastructure-h100/latest/network-fabrics.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/dgx-superpod/reference-architecture-scalable-infrastructure-h100/latest/network-fabrics.html</a></li>
+<li>NVIDIA, <em>NCCL User Guide</em> — Environment Variables（<code>NCCL_CROSS_NIC</code> 的 0/1/2 语义与&quot;避免跨 rail&quot;的建议、<code>NCCL_NET_MERGE_POLICY=RAIL</code>、<code>NCCL_IB_HCA</code> 的 rail/plane 字段、<code>NCCL_TOPO_FILE</code>/<code>NCCL_TOPO_DUMP_FILE</code> 的单节点拓扑注意事项）：<a href="https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html</a></li>
+<li>P. Patarasuk, X. Yuan, <em>Bandwidth optimal all-reduce algorithms for clusters of workstations</em>, J. Parallel Distrib. Comput.（ring AllReduce 的 reduce-scatter + allgather 结构与 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">2</span><span class="mopen">(</span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span></span></span></span> 步结论，本课&quot;步时间取最慢环边&quot;的算法前提）：<a href="https://doi.org/10.1016/j.jpdc.2008.09.002" target="_blank" rel="noopener noreferrer">https://doi.org/10.1016/j.jpdc.2008.09.002</a></li>
+<li>Baidu Research, <em>Bringing HPC Techniques to Deep Learning</em>（把 ring AllReduce 带进深度学习训练工程，含带宽最优论证与两级/分层做法）：<a href="https://research.baidu.com/Blog/index-view?id=55" target="_blank" rel="noopener noreferrer">https://research.baidu.com/Blog/index-view?id=55</a></li>
+</ul>
+<p><a href="#/l/dts-ch3-l4">下一课：多卡为何不线性：带宽、延迟、同步三处找原因</a></p>

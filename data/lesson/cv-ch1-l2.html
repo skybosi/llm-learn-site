@@ -1,0 +1,105 @@
+<h2 id="h-r-cnn-系列">R-CNN 系列<a class="anchor" href="#h-r-cnn-系列" aria-label="本节链接">#</a></h2>
+<p>上一课我们定义了检测任务和它的标尺（IoU/mAP）。这一课回答第一个架构问题：<strong>怎么让 CNN 从&quot;分类整张图&quot;进化到&quot;框出多个物体&quot;？</strong></p>
+<p>R-CNN 系列（R-CNN → Fast R-CNN → Faster R-CNN）是理解这条进化路最清晰的样本。它的价值不在&quot;今天谁还在用它&quot;，而在于：它把检测拆成了哪几个子问题，以及每一步演进<strong>为什么要那样改</strong>。这套&quot;问题 → 痛点 → 改进&quot;的推导逻辑，几乎原封不动地复用在后面 YOLO、Mask R-CNN 上。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-起点把检测降维成分类">1. 起点：把检测&quot;降维&quot;成分类<a class="anchor" href="#h-1-起点把检测降维成分类" aria-label="本节链接">#</a></h4>
+<p>最朴素的想法是<strong>滑动窗口</strong>：用一个窗口在图上平移、缩放，每个位置裁一块出来送进分类器判断&quot;这里有没有物体&quot;。问题很明显——候选窗口数量爆炸，且窗口尺度固定，物体大小一变就漏。于是 R-CNN 换了个思路：<strong>先猜哪里可能有物体，再对候选区域分类</strong>。猜候选区域用的是 <strong>Selective Search（选择性搜索）</strong>：基于颜色、纹理、大小的相似度，把像素从小区域合并成大区域，最终每张图产出约 2000 个<strong>候选框（region proposal）</strong>。</p>
+<p>R-CNN 的流程四步走：</p>
+<ol>
+<li>用 Selective Search 生成约 2000 个候选框；</li>
+<li>每个候选框<strong>裁剪 + 缩放到固定尺寸</strong>，送进 CNN（当时是 AlexNet）提取特征；</li>
+<li>每个候选的特征送进一个 <strong>SVM</strong> 判断类别；</li>
+<li>再训练一个<strong>边界框回归器</strong>，微调候选框的位置。</li>
+</ol>
+<p>它把 mAP 大幅抬高，宣告了&quot;CNN 特征 + 候选区域&quot;路线的统治地位。但痛点极其明显：</p>
+<ul>
+<li><strong>慢</strong>：约 2000 个候选框要各自过一次 CNN，一张图几秒到几十秒；</li>
+<li><strong>笨重</strong>：训练是多阶段拼装（CNN 微调、SVM、回归器各训各的），特征还要落盘缓存，工程上极痛苦。</li>
+</ul>
+<h4 id="h-2-fast-r-cnn把-2000-次前向压成-1-次">2. Fast R-CNN：把 2000 次前向压成 1 次<a class="anchor" href="#h-2-fast-r-cnn把-2000-次前向压成-1-次" aria-label="本节链接">#</a></h4>
+<p>痛点一针见血：<strong>2000 个候选框有大量重叠，却各自独立过一遍 CNN，重复计算了同一片像素</strong>。Fast R-CNN 的答案：</p>
+<ul>
+<li><strong>整张图只过一遍 CNN</strong>，得到一张特征图；</li>
+<li>把每个候选框<strong>映射到特征图上</strong>，用 <strong>RoI 池化（RoI Pooling）</strong> 把任意大小的候选区域切成固定网格（如 7×7），每格取最大值，统一成固定尺寸的特征；</li>
+<li>这个固定特征后面接<strong>两个并行的全连接头</strong>：一个做 softmax 分类，一个做框回归。分类和回归<strong>共享同一个特征、联合训练</strong>，损失就是&quot;分类交叉熵 + 平滑 L1 回归损失&quot;的加权和。</li>
+</ul>
+<p>这一步把&quot;多阶段、各自为政&quot;改成了<strong>多任务端到端学习</strong>，速度提升一个量级。但它仍留着一个软肋：候选框还是 Selective Search 给的——<strong>最慢、最不可学习的一环居然不在网络里</strong>。</p>
+<h4 id="h-3-faster-r-cnn把候选框生成也装进网络">3. Faster R-CNN：把候选框生成也装进网络<a class="anchor" href="#h-3-faster-r-cnn把候选框生成也装进网络" aria-label="本节链接">#</a></h4>
+<p>于是自然的问题：候选框为什么不能用网络自己学出来？<strong>Faster R-CNN 用一个子网络 RPN（Region Proposal Network，区域候选网络）替换了 Selective Search</strong>。</p>
+<p>RPN 的思路极其精巧，值得反复咀嚼：</p>
+<ul>
+<li>在共享特征图的每个空间位置，预先铺一组<strong>锚框（anchor）</strong>——通常是 3 种尺度 × 3 种长宽比 = 9 个矩形，作为&quot;默认候选框&quot;；</li>
+<li>每个 anchor 用一个小卷积头输出两个东西：<strong>前景/背景二分类分数</strong>，以及<strong>相对 anchor 的偏移量</strong>（<code>dx, dy, dw, dh</code>，即&quot;这个 anchor 该怎么挪、怎么缩放才框得准&quot;）；</li>
+<li>训练时，与某个真值框 IoU 最高的 anchor（或 IoU &gt; 0.7 的）被标为正样本，IoU &lt; 0.3 的为负样本，据此学习&quot;哪个 anchor 有物体、该往哪挪&quot;。</li>
+</ul>
+<p>RPN 产出的候选框，再喂给 RoI 池化 + 分类/回归头做精修——这就构成了完整的 <strong>Faster R-CNN</strong>：RPN 与检测头<strong>共享同一份骨干特征</strong>，全网络可以联合训练，成为真正意义上<strong>端到端</strong>的两阶段检测器。</p>
+<p><figure><img class="md-img" src="content/courses/cv-advanced/assets/chapter-1-figure-03.svg" alt="R-CNN → Fast R-CNN → Faster R-CNN 的演进：候选框来源从外部算法变成网络自身" loading="lazy" decoding="async"><figcaption>R-CNN → Fast R-CNN → Faster R-CNN 的演进：候选框来源从外部算法变成网络自身</figcaption></figure>
+</p>
+<p><figure><img class="md-img" src="content/courses/cv-advanced/assets/chapter-1-figure-04.svg" alt="RPN 的 anchor 机制：每个特征点铺 9 个锚框，输出前景分数与偏移" loading="lazy" decoding="async"><figcaption>RPN 的 anchor 机制：每个特征点铺 9 个锚框，输出前景分数与偏移</figcaption></figure>
+</p>
+<h4 id="h-4-两阶段的本质与代价">4. &quot;两阶段&quot;的本质与代价<a class="anchor" href="#h-4-两阶段的本质与代价" aria-label="本节链接">#</a></h4>
+<p>Faster R-CNN 确立了<strong>两阶段范式</strong>：第一阶段（RPN）粗筛候选，第二阶段（RoI 头）精修。它的优点是<strong>精度高</strong>——候选框先被筛选、再被精细回归，小目标、密集目标处理得更好。代价是<strong>结构复杂、推理偏慢</strong>：候选框要经过两次前向、还要做 RoI 对齐与逐框分类。</p>
+<p>这套&quot;高精度但偏慢&quot;的两阶段范式，和下一课&quot;更快但略糙&quot;的一阶段 YOLO 形成一组张力，成为检测领域贯穿至今的主线。理解了 Faster R-CNN 的 anchor 与 RPN，你就握住了理解现代检测器（包括 YOLO 后续版本、Mask R-CNN）的钥匙。</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面用 torchvision 直接调用预训练的 Faster R-CNN 做推理，再用一个<strong>自编的简化 RoI 池化</strong>演示&quot;任意尺寸候选框 → 固定尺寸特征&quot;这一关键机制（需要 <code>pip install torchvision</code>，首次运行会下载权重）。</p>
+<pre data-lang="python"><code class="language-python">import torch
+import torch.nn.functional as F
+from torchvision.models.detection import fasterrcnn_resnet50_fpn, FasterRCNN_ResNet50_FPN_Weights
+from torchvision.transforms import functional as TF
+
+# ---------- 1) 预训练 Faster R-CNN 推理 ----------
+weights = FasterRCNN_ResNet50_FPN_Weights.DEFAULT
+model = fasterrcnn_resnet50_fpn(weights=weights).eval()
+
+# 用一张 3x800x800 的随机图演示（真实使用时换成 PIL 图片并走 weights.transforms() 预处理）
+img = torch.rand(3, 800, 800)
+with torch.no_grad():
+    out = model([img])[0]
+print(&quot;检测到的框数量：&quot;, len(out[&quot;boxes&quot;]))
+if len(out[&quot;boxes&quot;]):
+    print(&quot;第一个框坐标：&quot;, out[&quot;boxes&quot;][0].tolist())
+    print(&quot;第一个框类别：&quot;, out[&quot;labels&quot;][0].item(), &quot; 分数：&quot;, round(out[&quot;scores&quot;][0].item(), 3))
+
+# ---------- 2) 自编简化 RoI 池化：把任意大小候选框统一成固定尺寸 ----------
+def simple_roi_pool(feature_map, boxes, out_h=7, out_w=7):
+    &quot;&quot;&quot;
+    feature_map: (C, H, W) 单张特征图
+    boxes: (N, 4) 候选框，格式 [x1, y1, x2, y2]，坐标相对特征图
+    做法：把每个候选框区域裁剪出来，再用双线性插值缩放到 out_h x out_w。
+    （真实 RoI Pooling 按子网格取最大，RoIAlign 用双线性采样；此处示意&quot;变定长&quot;的思想）
+    &quot;&quot;&quot;
+    C = feature_map.shape[0]
+    results = []
+    for box in boxes:
+        x1, y1, x2, y2 = box.int().tolist()
+        # 裁剪并保证不越界
+        x1, y1 = max(x1, 0), max(y1, 0)
+        x2, y2 = min(x2, feature_map.shape[2]), min(y2, feature_map.shape[1])
+        crop = feature_map[:, y1:y2, x1:x2].unsqueeze(0)   # (1, C, h, w)
+        # 双线性插值缩放到固定尺寸（align_corners=False 与多数实现一致）
+        pooled = F.interpolate(crop, size=(out_h, out_w), mode=&quot;bilinear&quot;, align_corners=False)
+        results.append(pooled.squeeze(0))
+    return torch.stack(results, dim=0)                       # (N, C, out_h, out_w)
+
+feat = torch.rand(256, 50, 50)                               # 假设骨干输出 256 通道、50x50 特征图
+boxes = torch.tensor([[2.0, 2.0, 20.0, 20.0],
+                      [10.0, 10.0, 45.0, 40.0]])             # 两个大小不同的候选框
+pooled = simple_roi_pool(feat, boxes)
+print(&quot;RoI 池化后形状：&quot;, tuple(pooled.shape))              # 期望 (2, 256, 7, 7)</code></pre>
+<p>注意第 2 部分我用<strong>双线性插值</strong>而不是真正的&quot;逐格取最大&quot;来示意，是为了和下一章要讲的 RoIAlign 呼应——两者都在解决&quot;把不定尺寸候选变成定尺寸特征&quot;，差别只在采样方式（量化取整 vs 浮点插值）。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>把 <code>simple_roi_pool</code> 里的双线性插值改成&quot;把候选框等分成 7×7 子网格、每格取最大&quot;的<strong>真 RoI Pooling</strong>，对比两者在候选框坐标是小数（如 <code>2.3</code>）时的差异，理解量化误差的来源。</li>
+<li>用 torchvision 的 <code>FasterRCNN_ResNet50_FPN_Weights</code> 对一张真实照片做推理（注意用 <code>weights.transforms()</code> 做预处理），把阈值设成 0.3 和 0.8 各跑一次，观察框的数量与精度变化。</li>
+<li>解释：为什么 RPN 要同时预测&quot;前景分数&quot;和&quot;框偏移&quot;，而不是只预测&quot;框偏移&quot;？如果只保留前景分数、去掉框回归，会发生什么？</li>
+<li>用一句话说明 Faster R-CNN 相比 Fast R-CNN 的<strong>根本性</strong>改进，并指出它仍然保留的&quot;两阶段&quot;代价是什么。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>R-CNN 原论文：<a href="https://arxiv.org/abs/1311.2524" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1311.2524</a></li>
+<li>Fast R-CNN 原论文：<a href="https://arxiv.org/abs/1504.08083" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1504.08083</a></li>
+<li>Faster R-CNN 原论文：<a href="https://arxiv.org/abs/1506.01497" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1506.01497</a></li>
+<li>特征金字塔网络 FPN（Faster R-CNN + FPN 基础）：<a href="https://arxiv.org/abs/1612.03144" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1612.03144</a></li>
+<li>PyTorch 官方文档 · torchvision 检测模型：<a href="https://pytorch.org/vision/stable/models.html#object-detection" target="_blank" rel="noopener noreferrer">https://pytorch.org/vision/stable/models.html#object-detection</a></li>
+</ul>
+<p><a href="#/l/cv-ch1-l3">下一课：YOLO 系列</a></p>

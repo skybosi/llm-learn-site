@@ -1,0 +1,112 @@
+<h2 id="h-成本核算与降本">成本核算与降本<a class="anchor" href="#h-成本核算与降本" aria-label="本节链接">#</a></h2>
+<p>前面两课分别解决了&quot;省资源&quot;（量化）和&quot;榨吞吐&quot;（批处理）。但真正决定一个推理服务赚不赚钱的，是最后这道算术题：<strong>花出去的 GPU 钱，换回了多少 token，每百万 token 的成本是多少，以及能不能再降</strong>。这一课建立一套可复用的成本核算模型，并把前面的优化手段串成一张&quot;降本清单&quot;。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-推理成本几乎就是-gpu-时间">1. 推理成本几乎就是 GPU 时间<a class="anchor" href="#h-1-推理成本几乎就是-gpu-时间" aria-label="本节链接">#</a></h4>
+<p>推理服务的成本构成里，GPU 占绝对大头（通常 80% 以上），其余是 CPU/内存/网络/存储和运维人力。所以核算的起点永远是<strong>GPU 单价 × 使用时长</strong>，再把&quot;时长&quot;折算成&quot;服务了多少 token&quot;。核心公式：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord text"><span class="mord cjk_fallback">每百万</span><span class="mord"> token </span><span class="mord cjk_fallback">成本</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.363em;vertical-align:-0.936em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.427em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord text"><span class="mord cjk_fallback">吞吐（</span><span class="mord">token/</span><span class="mord cjk_fallback">秒）</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord">3600</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord text"><span class="mord">GPU </span><span class="mord cjk_fallback">单价（元</span><span class="mord">/</span><span class="mord cjk_fallback">小时）</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.936em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8641em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8641em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">6</span></span></span></span></span></span></span></span></span></span></span></span></p>
+<p>举个数：一张 H100 按 40 元/小时算，如果它稳定跑出 3000 token/s，则每百万 token 成本 = 40 ÷ (3000 × 3600) × 1,000,000 ≈ <strong>3.7 元</strong>。如果同样的卡只跑出 1000 token/s（参数没调好或负载不满），成本立刻变成约 11 元——<strong>吞吐差 3 倍，单位成本就贵 3 倍</strong>。</p>
+<h4 id="h-2-利用率最容易忽略的隐性成本">2. 利用率：最容易忽略的隐性成本<a class="anchor" href="#h-2-利用率最容易忽略的隐性成本" aria-label="本节链接">#</a></h4>
+<p>上面公式隐含了一个假设：GPU 一直满负载。现实中 GPU 大量时间在<strong>空转</strong>——夜里没人用、按峰值买了却只在高峰忙。于是有了第二个关键概念：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord cjk_fallback">有效单价</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.0463em;vertical-align:-0.686em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3603em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord text"><span class="mord cjk_fallback">利用率</span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord text"><span class="mord">GPU </span><span class="mord cjk_fallback">单价</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></p>
+<p>一台 40 元/小时的卡，如果利用率只有 25%，你实际为&quot;每个有用的 token&quot;付的是 160 元/小时。<strong>闲置 GPU 是推理服务最大的隐性浪费</strong>，比任何量化方案都&quot;贵&quot;。</p>
+<h4 id="h-3-计费模式按需预留抢占">3. 计费模式：按需、预留、抢占<a class="anchor" href="#h-3-计费模式按需预留抢占" aria-label="本节链接">#</a></h4>
+<p>云厂商提供三种 GPU 计费，本质是&quot;价格 vs 稳定性&quot;的取舍：</p>
+<table>
+<thead>
+<tr>
+<th>模式</th>
+<th>单价</th>
+<th>特点</th>
+<th>适合场景</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>按需（on-demand）</td>
+<td>高</td>
+<td>随时可用，随时释放</td>
+<td>突发、不可预测流量</td>
+</tr>
+<tr>
+<td>预留（reserved）</td>
+<td>中（省 30~60%）</td>
+<td>承诺 1~3 年</td>
+<td>稳定的基线负载</td>
+</tr>
+<tr>
+<td>抢占/竞价（spot）</td>
+<td>低（省 60~90%）</td>
+<td>可能被随时回收</td>
+<td>离线批处理、可重试任务</td>
+</tr>
+</tbody></table>
+<p>一个成熟的降本策略是<strong>分层</strong>：用预留实例扛基线负载，用按需扛高峰，用 spot 跑离线评测、数据合成、批量摘要这类&quot;不着急、可重试&quot;的任务。</p>
+<h4 id="h-4-降本三板斧把前面所有课串起来">4. 降本三板斧（把前面所有课串起来）<a class="anchor" href="#h-4-降本三板斧把前面所有课串起来" aria-label="本节链接">#</a></h4>
+<ol>
+<li><strong>选对量化</strong>：INT4/FP8 让同样一张卡装下更大模型或更高并发 → 单位吞吐成本下降（上一课第 5 章 l1）；</li>
+<li><strong>榨干吞吐</strong>：调好批处理参数、开 prefix caching、开 chunked prefill → 同样的卡每秒多出 token（第 5 章 l2 与推理优化课）；</li>
+<li><strong>用对计费 + 弹性伸缩</strong>：预留打底、spot 削峰填谷、低谷缩容到 0 → 把利用率从 25% 拉到 80%。</li>
+</ol>
+<p>三者相乘，往往比单点优化降幅大得多：量化省 40%、吞吐翻倍省 50%、利用率翻倍省 50%，叠加后单位成本可降到原来的六分之一以下。</p>
+<h4 id="h-5-容量规划与盈亏">5. 容量规划与盈亏<a class="anchor" href="#h-5-容量规划与盈亏" aria-label="本节链接">#</a></h4>
+<p>规划时先估两个数：<strong>峰值吞吐需求</strong>（QPS × 平均输出 token 数）和<strong>单位成本红线</strong>（每百万 token 不能超过多少元）。用公式反推需要几张卡、什么计费组合，再和&quot;不降价就赔钱&quot;的红线比对，决定是否值得做更强的量化或裁剪。</p>
+<p><figure><img class="md-img" src="content/courses/llm-deployment-practice/assets/chapter-5-figure-03.svg" alt="成本构成瀑布图：左侧一根&quot;单位成本&quot;长柱，内部用色块切分为&quot;GPU 时间(占大头)、CPU/内存/网络、运维人力&quot;；右侧三个箭头分别指向三个降本手段&quot;量化省显存&quot;&quot;批处理榨吞吐&quot;&quot;弹性伸缩提利用率&quot;，每个箭头旁标&quot;省 X%&quot;；底部一句话&quot;三者相乘，单位成本可降到原来的几分之一&quot;" loading="lazy" decoding="async"><figcaption>成本构成瀑布图：左侧一根&quot;单位成本&quot;长柱，内部用色块切分为&quot;GPU 时间(占大头)、CPU/内存/网络、运维人力&quot;；右侧三个箭头分别指向三个降本手段&quot;量化省显存&quot;&quot;批处理榨吞吐&quot;&quot;弹性伸缩提利用率&quot;，每个箭头旁标&quot;省 X%&quot;；底部一句话&quot;三者相乘，单位成本可降到原来的几分之一&quot;</figcaption></figure>
+</p>
+<h3 id="h-二可运行示例">二、可运行示例<a class="anchor" href="#h-二可运行示例" aria-label="本节链接">#</a></h3>
+<h4 id="h-示例-1算每百万-token-成本">示例 1：算每百万 token 成本<a class="anchor" href="#h-示例-1算每百万-token-成本" aria-label="本节链接">#</a></h4>
+<pre data-lang="python"><code class="language-python"># -*- coding: utf-8 -*-
+# 从&quot;GPU 单价 + 吞吐&quot;直接算出每百万 token 成本
+def cost_per_million_tokens(gpu_price_per_hour, tokens_per_second):
+    tokens_per_hour = tokens_per_second * 3600
+    cost_per_token = gpu_price_per_hour / tokens_per_hour
+    return cost_per_token * 1_000_000
+
+scenarios = [
+    (&quot;FP16 未调优&quot;, 40.0, 1000),     # 40元/小时，1000 token/s
+    (&quot;FP16 调优后&quot;, 40.0, 3000),
+    (&quot;INT4 + 调优&quot;, 40.0, 6000),     # 量化后同卡吞吐翻倍
+]
+for name, price, tps in scenarios:
+    c = cost_per_million_tokens(price, tps)
+    print(f&quot;{name:&gt;12}: {c:6.2f} 元/百万token&quot;)</code></pre>
+<h4 id="h-示例-2把利用率算进有效单价">示例 2：把利用率算进有效单价<a class="anchor" href="#h-示例-2把利用率算进有效单价" aria-label="本节链接">#</a></h4>
+<pre data-lang="python"><code class="language-python"># -*- coding: utf-8 -*-
+# 闲置 GPU 会显著抬高&quot;有效单价&quot;
+def effective_price(gpu_price, utilization):
+    return gpu_price / utilization
+
+for util in [1.0, 0.5, 0.25]:
+    print(f&quot;利用率 {util*100:&gt;3.0f}% 时，40 元/小时的卡，有效单价 = &quot;
+          f&quot;{effective_price(40.0, util):6.1f} 元/小时&quot;)</code></pre>
+<p>你会看到：利用率 25% 时，有效单价飙到 160 元/小时——<strong>先把空转的卡填满，比换任何更便宜的卡都划算</strong>。</p>
+<h4 id="h-示例-3计费组合的成本对比">示例 3：计费组合的成本对比<a class="anchor" href="#h-示例-3计费组合的成本对比" aria-label="本节链接">#</a></h4>
+<pre data-lang="python"><code class="language-python"># -*- coding: utf-8 -*-
+# 同一份负载，三种计费策略的月成本对比
+def monthly_cost(gpu_price, n_gpus, hours_per_month=730):
+    return gpu_price * n_gpus * hours_per_month
+
+# 假设基线需 4 张卡常驻，另有峰值溢出与离线任务
+on_demand_only = monthly_cost(40.0, 4)                       # 全按需
+reserved_base  = monthly_cost(22.0, 4)                       # 预留(约55折)打底
+# 混合：2 张预留打底 + 峰值 2 张按需(每天只跑 4 小时) + spot 跑离线(约 1 折)
+mixed = (monthly_cost(22.0, 2)
+         + monthly_cost(40.0, 2) * (4 / 24)
+         + monthly_cost(4.0, 2) * (8 / 24))
+
+print(f&quot;全按需        : {on_demand_only:&gt;9,.0f} 元/月&quot;)
+print(f&quot;全预留        : {reserved_base:&gt;9,.0f} 元/月&quot;)
+print(f&quot;混合(预留+按需+spot): {mixed:&gt;9,.0f} 元/月&quot;)</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>用示例 1 的公式，把你的实际吞吐代入，算出当前每百万 token 成本；再把吞吐乘 1.5（假设优化后），看成本降到多少，量化&quot;调优的 ROI&quot;。</li>
+<li>把示例 2 的利用率从 25% 提到 80%，计算有效单价的变化，说明为什么&quot;弹性伸缩到 0&quot;是降本的关键。</li>
+<li>设计一个三层的计费组合：给&quot;在线对话、离线批处理、评测跑分&quot;三类任务各选一种计费模式，并说明理由。</li>
+<li>思考：如果单位成本红线是&quot;每百万 token ≤ 2 元&quot;，而当前成本是 3.7 元，列出你能用的所有降本手段，并估算叠加后能否达标。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>AWS · EC2 实例类型与 GPU 定价：<a href="https://aws.amazon.com/ec2/instance-types/" target="_blank" rel="noopener noreferrer">https://aws.amazon.com/ec2/instance-types/</a></li>
+<li>Google Cloud · GPU 定价：<a href="https://cloud.google.com/compute/gpus-pricing" target="_blank" rel="noopener noreferrer">https://cloud.google.com/compute/gpus-pricing</a></li>
+<li>Microsoft Azure · 虚拟机定价：<a href="https://azure.microsoft.com/pricing/details/virtual-machines/linux/" target="_blank" rel="noopener noreferrer">https://azure.microsoft.com/pricing/details/virtual-machines/linux/</a></li>
+<li>vLLM 文档 · 部署与服务：<a href="https://docs.vllm.ai/" target="_blank" rel="noopener noreferrer">https://docs.vllm.ai/</a></li>
+</ul>
+<p><a href="#/l/deploy-ch6-l1">下一课：项目规划</a></p>

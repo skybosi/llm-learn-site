@@ -1,0 +1,223 @@
+<h2 id="h-nccl-调优常用环境变量与收益场景">NCCL 调优：常用环境变量与收益场景<a class="anchor" href="#h-nccl-调优常用环境变量与收益场景" aria-label="本节链接">#</a></h2>
+<p>网上流传的&quot;NCCL 调参配方&quot;大多是把几十个环境变量抄成一段 <code>export</code>，跑一次基准看到变快就收工。官方文档的口径恰好相反：这些开关里有一半是<strong>诊断用、用完即撤</strong>的，而通用性调参在基准里赚到的收益，换个规模往往会亏回去。所以本课的顺序是：先分辨变量属于哪一类，再把参数写成 α-β 账本，最后算清&quot;就算调到完美，最多能赚多少&quot;。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-官方把环境变量分成两类这个分法决定它能不能留在脚本里">1. 官方把环境变量分成两类，这个分法决定它能不能留在脚本里<a class="anchor" href="#h-1-官方把环境变量分成两类这个分法决定它能不能留在脚本里" aria-label="本节链接">#</a></h4>
+<p>NCCL 官方文档把环境变量明确分为两类：</p>
+<table>
+<thead>
+<tr>
+<th>类别</th>
+<th>用途</th>
+<th>能不能留在训练脚本</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>System configuration</td>
+<td>让 NCCL 适配本机系统配置（网卡、接口、rail）</td>
+<td>可以，且应该固化到 <code>/etc/nccl.conf</code> 或 <code>$NCCL_CONF_FILE</code></td>
+</tr>
+<tr>
+<td>Debugging</td>
+<td>诊断与临时绕行</td>
+<td><strong>不该</strong>：官方原话是&quot;should not be used in production nor retained in scripts&quot;，留着可能导致次优、崩溃或挂死</td>
+</tr>
+</tbody></table>
+<h4 id="h-2-system-configuration-类错了会慢一个数量级">2. System configuration 类：错了会慢一个数量级<a class="anchor" href="#h-2-system-configuration-类错了会慢一个数量级" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>变量</th>
+<th>官方语义（要点）</th>
+<th>典型误用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>NCCL_SOCKET_IFNAME</code></td>
+<td>用前缀过滤接口，<code>^</code> 表示排除，<code>=</code> 表示精确名；默认优先 <code>ib*</code>，<code>lo</code> 与 <code>docker*</code> 除非没有别的接口才会选中</td>
+<td>手工指定后<strong>自动选择算法被绕过</strong>，多网卡机器上选错面</td>
+</tr>
+<tr>
+<td><code>NCCL_IB_HCA</code></td>
+<td>过滤 RDMA 设备，建议一律加 <code>=</code> 前缀（否则 <code>mlx5_1</code> 会连上 <code>mlx5_10</code> 之类）；NCCL 支持的 HCA 数上限为 32</td>
+<td>漏掉某张卡，跨机路径骤降</td>
+</tr>
+<tr>
+<td><code>NCCL_IB_GID_INDEX</code></td>
+<td>RoCE 模式下指定 GID 索引（用 <code>show_gids</code> 查）</td>
+<td>RoCE 环境选了错的 GID 导致链路选错</td>
+</tr>
+<tr>
+<td><code>NCCL_CROSS_NIC</code></td>
+<td><code>0</code> 只用同一张 NIC（rail 优化网络）；<code>1</code> 允许不同 NIC；<strong>默认 <code>2</code></strong>：优先同一张，但允许为性能改用别的</td>
+<td>在 rail 优化网络里设成 1，制造跨 rail 拥塞</td>
+</tr>
+<tr>
+<td><code>NCCL_SOCKET_NTHREADS</code> × <code>NCCL_NSOCKS_PERTHREAD</code></td>
+<td>每个连接的辅助线程数 × 每线程 socket 数；两者<strong>乘积不得超过 64</strong>；默认 1×1，AWS 上 2×8，100G 网络官方建议 4×4</td>
+<td>只调一个、撞上 64 的上限</td>
+</tr>
+</tbody></table>
+<h4 id="h-3-影响内核行为的变量把参数写进---账本">3. 影响内核行为的变量：把参数写进 α-β 账本<a class="anchor" href="#h-3-影响内核行为的变量把参数写进---账本" aria-label="本节链接">#</a></h4>
+<p><code>NCCL_BUFFSIZE</code> 默认 <strong>4 MiB</strong>，是&quot;每对 GPU 之间通信用的缓冲大小&quot;；<code>NCCL_NTHREADS</code> 是每 block 线程数（默认 512，允许 64/128/256/512）；通道数由 <code>NCCL_MIN_CTAS</code> / <code>NCCL_MAX_CTAS</code> 控制（<code>NCCL_MIN/MAX_NCHANNELS</code> 自 2.17 弃用）。把一次 ring 的每步数据 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">s</span><span class="mord">/</span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span></span></span></span> 切成 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">⌈(</span><span class="mord mathnormal">s</span><span class="mord">/</span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="mclose">)</span><span class="mord">/</span><span class="mord mathnormal" style="margin-right:0.0502em;">B</span><span class="mclose">⌉</span></span></span></span> 个缓冲，每步时间就是</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.9012em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">step</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">buf</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0037em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">buf</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:2.3991em;vertical-align:-0.9721em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.427em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal" style="margin-right:0.0528em;">β</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0528em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">agg</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="mclose">)</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">s</span><span class="mord">/</span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.9721em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">2</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.0361em;vertical-align:-0.2861em;"></span><span class="mord">1</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">step</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span></span></span></p>
+<p>示例（100 MiB、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">8</span></span></span></span>、示例 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.9805em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0528em;">β</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0528em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">peak</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">300</span></span></span></span> GB/s）：<code>NCCL_BUFFSIZE</code> 从 4 MiB 降到 0.25 MiB，每步缓冲数从 4 涨到 50，总时间从 <strong>0.72 ms 涨到 2.01 ms</strong>；反过来放大到 16 MiB 只再省 0.08 ms。通道数从 1 加到 4 让有效带宽从 75 GB/s 升到 300 GB/s（<strong>2.56 ms → 0.72 ms</strong>），再加到 32 一点不变。而显存账是：<code>C=8</code> 约 64 MiB/rank，<code>C=32</code> 约 256 MiB/rank。<code>NCCL_CHUNK_SIZE</code> 与 <code>NCCL_IB_QPS_PER_CONNECTION</code>（默认 1，RoCE 与多端口 NIC 上常需提高）属于同一类&quot;改内核切块与链路并行度&quot;的变量。</p>
+<h4 id="h-4-先算收益天花板再决定要不要调">4. 先算收益天花板，再决定要不要调<a class="anchor" href="#h-4-先算收益天花板再决定要不要调" aria-label="本节链接">#</a></h4>
+<p>调参最多能赚多少，取决于通信占步长多少：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">comm</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.2222em;">V</span><span class="mord">/</span><span class="mord text"><span class="mord">busbw</span></span></span></span></span>（<code>V</code> 是每步通信量，<code>busbw</code> 取 nccl-tests 实测），完全遮住时的加速上限是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0361em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">step</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mord">/</span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">step</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">comm</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span></span></span></span>。用示例（576 MiB 梯度、步长 400 ms）：</p>
+<table>
+<thead>
+<tr>
+<th>实测 busbw</th>
+<th>通信时间</th>
+<th>占步长</th>
+<th>加速上限</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>5 GB/s</td>
+<td>120.80 ms</td>
+<td>30.2%</td>
+<td>1.433×</td>
+</tr>
+<tr>
+<td>12.5 GB/s</td>
+<td>48.32 ms</td>
+<td>12.1%</td>
+<td>1.137×</td>
+</tr>
+<tr>
+<td>25 GB/s</td>
+<td>24.16 ms</td>
+<td>6.0%</td>
+<td>1.064×</td>
+</tr>
+<tr>
+<td>100 GB/s</td>
+<td>6.04 ms</td>
+<td>1.5%</td>
+<td>1.015×</td>
+</tr>
+</tbody></table>
+<p>一句话：<strong>通信占比低于 10% 时，调 NCCL 环境变量的收益上限也就 6%~13%</strong>；这时更该看的是计算效率与重叠。反过来，如果 busbw 只有链路峰值的零头，问题多半不在&quot;参数没调&quot;，而在拓扑、rail 或协议选择—先去第 4 课的排查路径。</p>
+<p><figure><img class="md-img" src="content/courses/distributed-training-systems/assets/chapter-4-figure-04.svg" alt="NCCL 变量分两类，以及调参的收益天花板在哪" loading="lazy" decoding="async"><figcaption>NCCL 变量分两类，以及调参的收益天花板在哪</figcaption></figure>
+</p>
+<h4 id="h-5-常被忽略的一类cpu--numa-亲和">5. 常被忽略的一类：CPU / NUMA 亲和<a class="anchor" href="#h-5-常被忽略的一类cpu--numa-亲和" aria-label="本节链接">#</a></h4>
+<p>官方明确：NCCL 默认取&quot;从启动器继承的 CPU 亲和&quot;与&quot;GPU 亲和&quot;的交集；交集为空时保留继承值；<code>NCCL_IGNORE_CPU_AFFINITY=1</code> 表示只用 GPU 亲和。注意它<strong>无法使用被 cpuset/cgroup/容器排除的 CPU</strong>。检查方法是 <code>NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,GRAPH,ENV</code> 并找 <code>ncclTopoGetCpuAffinity: Affinity for GPU ...</code> 一行，配合 <code>nvidia-smi topo -m</code>、<code>lscpu --extended=CPU,NODE,SOCKET,CORE</code> 交叉核对。</p>
+<h4 id="h-6-常见坑">6. 常见坑<a class="anchor" href="#h-6-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li>把诊断类变量（如 <code>NCCL_P2P_DISABLE</code>、<code>NCCL_PROTO</code>）留在生产脚本里&quot;试出来的能跑&quot;状态。</li>
+<li>用一个基准的收益往全规模推广：官方专门提醒&quot;tuning gain in one benchmark situation can lead to suboptimal settings elsewhere&quot;。</li>
+<li>改多个变量同时生效，无法归因；调参必须单变量 A/B。</li>
+<li>只看 busbw 峰值不看消息分布：小消息被 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span> 支配，收益点完全不同。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>第一段把 <code>NCCL_BUFFSIZE</code> 与通道数写进 α-β 账本；第二段算&quot;收益天花板&quot;；第三段用两个实测点反解 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0528em;">β</span></span></span></span>，验证方法本身。</p>
+<pre data-lang="python"><code class="language-python"># ===== 示例 1：NCCL_BUFFSIZE 与通道数怎么写进 α-β 账本（纯 Python，无 GPU） =====
+import math
+
+def ring_time(s_bytes, P=8, buf=4 &lt;&lt; 20, C=4, alpha_buf=2.0,
+              beta_peak=300.0, c_sat=4):
+    &quot;&quot;&quot;ring AllReduce：2(P-1) 步。每步把 chunk=s/P 切成 ceil(chunk/buf) 个缓冲，
+    每个缓冲各付一次固定开销；通道数把有效带宽抬到 min(C,c_sat)/c_sat 倍。&quot;&quot;&quot;
+    chunk = s_bytes / P
+    nb = math.ceil(chunk / buf)
+    beta_agg = beta_peak * min(C, c_sat) / c_sat
+    step_us = nb * alpha_buf + chunk / (beta_agg * 1e9) * 1e6
+    return 2 * (P - 1) * step_us, nb, beta_agg
+
+S = 100 * 2**20
+print(&quot;示例 1：100 MiB AllReduce（P=8，NVLink 级链路，示例 β_peak=300 GB/s）&quot;)
+print(&quot;  固定 BUFFSIZE=4 MiB（官方默认），扫通道数：&quot;)
+for C in (1, 2, 4, 8, 16, 32):
+    t, nb, b = ring_time(S, C=C)
+    print(f&quot;    通道 C={C:&lt;3} 有效带宽 {b:6.1f} GB/s  每步缓冲数 {nb}  总时间 {t/1e3:7.2f} ms&quot;)
+print(&quot;  固定 C=8，扫 BUFFSIZE：&quot;)
+for mib in (0.25, 1, 4, 16):
+    t, nb, _ = ring_time(S, C=8, buf=int(mib * 2**20))
+    print(f&quot;    BUFFSIZE={mib:&gt;5} MiB  每步缓冲数 {nb:&gt;4}  总时间 {t/1e3:7.2f} ms&quot;)
+print(&quot;  显存量级（示意：每通道一对缓冲）：&quot;)
+for C in (8, 32):
+    print(f&quot;    C={C:&lt;3} × 2 × 4 MiB = {C*2*4} MiB / rank&quot;)
+
+# ===== 示例 2：调参的收益天花板 —— 先量出通信占了多少，再决定要不要调 =====
+V = 576 * 2**20          # 每步要聚合的梯度 576 MiB
+STEP = 400.0             # 实测每步时间 (ms)
+print(f&quot;\n示例 2：收益天花板（梯度 {V/2**20:.0f} MiB，实测每步 {STEP:.0f} ms）&quot;)
+print(f&quot;{&#39;nccl-tests busbw&#39;:&gt;18} {&#39;通信时间&#39;:&gt;9} {&#39;占步长&#39;:&gt;8} {&#39;完全遮住后步长&#39;:&gt;14} {&#39;加速上限&#39;:&gt;9}&quot;)
+for busbw in (5.0, 12.5, 25.0, 100.0):
+    comm = V / (busbw * 1e9) * 1e3
+    floor = max(STEP - comm, 1e-9)
+    print(f&quot;{busbw:&gt;15.1f} GB/s {comm:&gt;8.2f}ms {comm/STEP:&gt;7.1%} &quot;
+          f&quot;{floor:&gt;12.2f}ms {STEP/floor:&gt;8.3f}x&quot;)
+
+# ===== 示例 3：两个实测点反解 α 与 β，判断瓶颈落在哪一项 =====
+def fit(sizes, times):
+    (s1, t1), (s2, t2) = list(zip(sizes, times))
+    beta = (s2 - s1) / ((t2 - t1) * 1e-6) / 1e9
+    return t1 - s1 / (beta * 1e9) * 1e6, beta
+
+print(&quot;\n示例 3：两个实测点反解 α 与 β（先用模型造数据，验证流程）&quot;)
+for alpha, beta in ((60.0, 250.0), (200.0, 20.0)):
+    sizes = [8 &lt;&lt; 20, 256 &lt;&lt; 20]                    # 两个点要落在不同区间
+    times = [alpha + s / (beta * 1e9) * 1e6 for s in sizes]
+    a, b = fit(sizes, times)
+    print(f&quot;  模型 α={alpha:&gt;5.1f}us β={beta:5.1f}GB/s → 反解 α={a:7.2f}us β={b:6.2f}GB/s&quot;
+          f&quot;  （8 MiB 那次调用延迟项占比 {alpha/times[0]:.1%}）&quot;)
+print(&quot;  读法：给 T = α + s/β 两点，斜率反解 β、截距反解 α；两点都在小消息区就量不准 β。&quot;)</code></pre>
+<p>在 Python 3.14.5 + numpy 2.5.3 环境下实际运行结果：</p>
+<pre data-lang="text"><code class="language-text">示例 1：100 MiB AllReduce（P=8，NVLink 级链路，示例 β_peak=300 GB/s）
+  固定 BUFFSIZE=4 MiB（官方默认），扫通道数：
+    通道 C=1   有效带宽   75.0 GB/s  每步缓冲数 4  总时间    2.56 ms
+    通道 C=2   有效带宽  150.0 GB/s  每步缓冲数 4  总时间    1.34 ms
+    通道 C=4   有效带宽  300.0 GB/s  每步缓冲数 4  总时间    0.72 ms
+    通道 C=8   有效带宽  300.0 GB/s  每步缓冲数 4  总时间    0.72 ms
+    通道 C=16  有效带宽  300.0 GB/s  每步缓冲数 4  总时间    0.72 ms
+    通道 C=32  有效带宽  300.0 GB/s  每步缓冲数 4  总时间    0.72 ms
+  固定 C=8，扫 BUFFSIZE：
+    BUFFSIZE= 0.25 MiB  每步缓冲数   50  总时间    2.01 ms
+    BUFFSIZE=    1 MiB  每步缓冲数   13  总时间    0.98 ms
+    BUFFSIZE=    4 MiB  每步缓冲数    4  总时间    0.72 ms
+    BUFFSIZE=   16 MiB  每步缓冲数    1  总时间    0.64 ms
+  显存量级（示意：每通道一对缓冲）：
+    C=8   × 2 × 4 MiB = 64 MiB / rank
+    C=32  × 2 × 4 MiB = 256 MiB / rank
+
+示例 2：收益天花板（梯度 576 MiB，实测每步 400 ms）
+  nccl-tests busbw      通信时间      占步长        完全遮住后步长      加速上限
+            5.0 GB/s   120.80ms   30.2%       279.20ms    1.433x
+           12.5 GB/s    48.32ms   12.1%       351.68ms    1.137x
+           25.0 GB/s    24.16ms    6.0%       375.84ms    1.064x
+          100.0 GB/s     6.04ms    1.5%       393.96ms    1.015x
+
+示例 3：两个实测点反解 α 与 β（先用模型造数据，验证流程）
+  模型 α= 60.0us β=250.0GB/s → 反解 α=  60.00us β=250.00GB/s  （8 MiB 那次调用延迟项占比 64.1%）
+  模型 α=200.0us β= 20.0GB/s → 反解 α= 200.00us β= 20.00GB/s  （8 MiB 那次调用延迟项占比 32.3%）
+  读法：给 T = α + s/β 两点，斜率反解 β、截距反解 α；两点都在小消息区就量不准 β。</code></pre>
+<p>读法：示例 1 的两张表就是&quot;该不该动这两个变量&quot;的依据—通道数已经饱和时调 <code>NCCL_MAX_CTAS</code> 是白费显存；<code>NCCL_BUFFSIZE</code> 只有在每步缓冲数明显大于 1 时才值得动。示例 2 告诉你调参的天花板在哪里。示例 3 是把基准数据变成结论的通用手法。</p>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选：需要 1~2 张 GPU（云上按需开一台）。调参必须是单变量 A/B ----
+# 1) 先确认变量真的生效：ENV 子系统会打印每个被识别的环境变量
+NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=ENV ./build/all_reduce_perf -b 1M -e 256M -f 2 -g 2
+# 2) 单变量 A/B：同一命令、同一消息区间、跑 3 次取中位数
+for c in 4 8 16; do
+  NCCL_MIN_CTAS=$c ./build/all_reduce_perf -b 1M -e 256M -f 2 -g 2 | tail -3
+done
+# 3) 大消息看 busbw、小消息看延迟；两段分别记账
+./build/all_reduce_perf -b 8 -e 8K   -f 2 -g 2     # 小消息区：α 主导
+./build/all_reduce_perf -b 32M -e 256M -f 2 -g 2   # 大消息区：β 主导
+# 4) 只有 1 张卡时：用 nvbandwidth 量 GPU↔GPU 与显存带宽，验证&quot;硬件上限&quot;
+#    再对照本课模型算出的期望值，判断是否存在配置问题（模型本身不需要多卡）</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：给示例 1 的 <code>ring_time</code> 加一个参数 <code>nthreads</code>，让 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0037em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">buf</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 随线程数增大而略降（自己定一条合理规则），找出在 100 MiB 下让总时间最小的 <code>(C, BUFFSIZE)</code> 组合，并说明该组合的显存代价。</li>
+<li><strong>解释</strong>：为什么&quot;通信占步长 6%&quot;时，把 busbw 从 25 GB/s 提到 100 GB/s 的端到端收益不到 5%？用示例 2 的表回答。</li>
+<li><strong>对比/验证</strong>：用示例 3 的 <code>fit</code> 处理你自己机器上的两组 <code>(size, time)</code>，比较反解出的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0528em;">β</span></span></span></span> 与 <code>nvidia-smi topo -m</code> 给出的链路等级是否一致；不一致时列出三种可能原因。</li>
+<li><strong>思考</strong>：一个团队接手了别人的训练脚本，里面有 12 个 <code>NCCL_*</code> 变量。设计一个最小实验方案，在两次基准运行内判断这些变量是&quot;仍然需要&quot;还是&quot;历史遗留&quot;，并说明为什么不能一次全删。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>NVIDIA, <em>NCCL User Guide</em> —「Environment Variables」（两类变量的官方划分与&quot;Debugging 类不应留在脚本中&quot;的原文；<code>NCCL_SOCKET_IFNAME</code>/<code>NCCL_IB_HCA</code>/<code>NCCL_IB_GID_INDEX</code>/<code>NCCL_CROSS_NIC</code> 默认 2/<code>NCCL_SOCKET_NTHREADS</code>×<code>NCCL_NSOCKS_PERTHREAD</code>≤64/<code>NCCL_IB_TIMEOUT</code> 与 <code>NCCL_IB_RETRY_CNT</code>/<code>NCCL_BUFFSIZE</code> 默认 4 MiB/<code>NCCL_NTHREADS</code> 512 与允许值/<code>NCCL_MAX_CTAS</code> 与 <code>NCCL_MAX_NCHANNELS</code> 的弃用关系）：<a href="https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html</a></li>
+<li>NVIDIA, <em>NCCL User Guide</em> —「Tuning NCCL configuration」（官方推荐先量的参数：<code>NCCL_MIN/MAX_CTAS</code>、<code>NCCL_CHUNK_SIZE</code>、<code>NCCL_IB_QPS_PER_CONNECTION</code> 默认 1、<code>NCCL_CROSS_NIC</code>；以及&quot;不建议在生产中长期使用这些变量&quot;的提醒）：<a href="https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/troubleshooting/performance_and_tuning.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/troubleshooting/performance_and_tuning.html</a></li>
+<li>NVIDIA, <em>NCCL User Guide</em> —「Performance and tuning」的 CPU 与内存亲和一节（默认取继承亲和与 GPU 亲和的交集、<code>NCCL_IGNORE_CPU_AFFINITY=1</code>、如何用 <code>NCCL_DEBUG_SUBSYS=INIT,GRAPH,ENV</code> 查看 <code>ncclTopoGetCpuAffinity</code>）：<a href="https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/troubleshooting/performance_and_tuning.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/troubleshooting/performance_and_tuning.html</a></li>
+<li>NVIDIA, <em>nccl-tests</em>（<code>all_reduce_perf</code> 的 <code>-b/-e/-f/-g</code> 参数与 bus bandwidth 输出口径，本课 A/B 实验的工具）：<a href="https://github.com/NVIDIA/nccl-tests" target="_blank" rel="noopener noreferrer">https://github.com/NVIDIA/nccl-tests</a></li>
+<li>R. W. Hockney, <em>The communication challenge for MPP: Intel Paragon and Meiko CS-2</em>, Parallel Computing 20(3)（α-β 通信模型的原始出处，本课把环境变量折算成 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0528em;">β</span></span></span></span> 两项的依据）：<a href="https://doi.org/10.1016/S0167-8191(06)80021-9" target="_blank" rel="noopener noreferrer">https://doi.org/10.1016/S0167-8191(06)80021-9</a></li>
+</ul>
+<p><a href="#/l/dts-ch4-l4">下一课：故障排查：带宽不达标、hang / timeout 的定位路径</a></p>

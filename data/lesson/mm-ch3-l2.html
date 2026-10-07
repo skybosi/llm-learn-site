@@ -1,0 +1,76 @@
+<h2 id="h-文本条件与引导">文本条件与引导<a class="anchor" href="#h-文本条件与引导" aria-label="本节链接">#</a></h2>
+<p>上一课搭好了 Stable Diffusion 的骨架，但没讲最关键的一环：<strong>文字是怎么&quot;指挥&quot;图像生成的？</strong> 这一课回答两件事——文本条件如何注入去噪网络（<strong>交叉注意力</strong>），以及如何让模型&quot;更听话&quot;地遵循文本（<strong>无分类器引导 CFG</strong>）。理解这两点，你就掌握了现代文生图模型&quot;可控性&quot;的核心。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-文本编码clip-把词变成图像语义向量">1. 文本编码：CLIP 把词变成&quot;图像语义向量&quot;<a class="anchor" href="#h-1-文本编码clip-把词变成图像语义向量" aria-label="本节链接">#</a></h4>
+<p>文本条件的第一步，是让模型&quot;读懂&quot; prompt。CLIP 文本编码器把一段自然语言变成一个<strong>序列化的语义向量</strong>（通常取末位 token 的输出作为整体表征）。因为 CLIP 是在<strong>图文对</strong>上用对比学习训练的（让&quot;匹配的图文&quot;表征相近、&quot;不匹配的&quot;拉远），它的文本向量天然携带了<strong>图像可理解</strong>的语义——这正是它能当文生图条件的根本原因。</p>
+<h4 id="h-2-交叉注意力让潜变量看到文本">2. 交叉注意力：让潜变量&quot;看到&quot;文本<a class="anchor" href="#h-2-交叉注意力让潜变量看到文本" aria-label="本节链接">#</a></h4>
+<p>文本向量怎么进入去噪 U-Net？答案是<strong>交叉注意力（cross-attention）</strong>。回想 Transformer 的注意力（你在 LLM 课程里实现过）：<code>Attention(Q, K, V)</code> 里，<code>Q</code> 来自&quot;当前需要查询的位置&quot;，<code>K/V</code> 来自&quot;要参考的序列&quot;。</p>
+<p>在 Stable Diffusion 的 U-Net 里：</p>
+<ul>
+<li><strong><code>Q</code> 来自潜变量</strong>（去噪过程中的图像特征）；</li>
+<li><strong><code>K</code>、<code>V</code> 来自文本嵌入</strong>（CLIP 输出的向量序列）。</li>
+</ul>
+<p>于是每个图像位置都在&quot;问&quot;文本：&quot;我这里的特征，应该和哪些词对齐？&quot; 文本语义被<strong>逐层、逐空间位置</strong>地注入图像特征。这就是&quot;红熊猫在读一本书&quot;这句话，能具体落到&quot;红熊猫&quot;&quot;书&quot;这些视觉元素上的机制。</p>
+<p><figure><img class="md-img" src="content/courses/multimodal-diffusion/assets/chapter-3-figure-02.svg" alt="交叉注意力文本注入示意：左边一列是潜变量特征（若干方块，标 Q），右边一列是文本 token 嵌入（&quot;a red panda reading a book&quot;，标 K/V）；中间用连线表示&quot;每个图像位置查询每个文本 token&quot;，连线的粗细代表注意力权重（如&quot;red panda&quot;位置的图像特征与&quot;red panda&quot;token 连线最粗）；底部标注&quot;Q 来自图像，K/V 来自文本&quot;" loading="lazy" decoding="async"><figcaption>交叉注意力文本注入示意：左边一列是潜变量特征（若干方块，标 Q），右边一列是文本 token 嵌入（&quot;a red panda reading a book&quot;，标 K/V）；中间用连线表示&quot;每个图像位置查询每个文本 token&quot;，连线的粗细代表注意力权重（如&quot;red panda&quot;位置的图像特征与&quot;red panda&quot;token 连线最粗）；底部标注&quot;Q 来自图像，K/V 来自文本&quot;</figcaption></figure>
+</p>
+<h4 id="h-3-引导从无条件生成到有文本引导">3. 引导：从&quot;无条件生成&quot;到&quot;有文本引导&quot;<a class="anchor" href="#h-3-引导从无条件生成到有文本引导" aria-label="本节链接">#</a></h4>
+<p>训练文生图模型时有个技巧：<strong>以一定概率（如 10%）把文本随机置空</strong>，让模型同时学会&quot;无条件生成&quot;和&quot;有条件生成&quot;两种模式。这样在推理时，就能比较两者，放大&quot;文本带来的差异&quot;——这就是<strong>无分类器引导（Classifier-Free Guidance, CFG）</strong>。</p>
+<p>CFG 的合并公式非常简洁：</p>
+<pre><code>ε̂_θ(x_t, t, c) = ε_θ(x_t, t, ∅)  +  w · ( ε_θ(x_t, t, c) - ε_θ(x_t, t, ∅) )
+                  └── 无条件分支 ──┘      └── 文本带来的&quot;方向&quot; ──┘</code></pre>
+<p>其中 <code>c</code> 是文本条件、<code>∅</code> 是空条件、<code>w</code> 是<strong>引导强度（guidance scale）</strong>。直观理解：<strong>用&quot;有文本的预测&quot;减去&quot;无文本的预测&quot;，得到文本施加的&quot;修正方向&quot;，再把它放大 <code>w</code> 倍加上去</strong>，让生成结果更贴合文本。</p>
+<h4 id="h-4-w-的取舍一致性与多样性的权衡">4. <code>w</code> 的取舍：一致性与多样性的权衡<a class="anchor" href="#h-4-w-的取舍一致性与多样性的权衡" aria-label="本节链接">#</a></h4>
+<ul>
+<li><code>w = 1</code>：退化为纯条件生成，不带额外引导；</li>
+<li><code>w</code> 适中（如 7.5）：文本一致性显著提升，是 Stable Diffusion 的常用默认值；</li>
+<li><code>w</code> 过大（如 15+）：图像过饱和、对比过强、多样性崩溃，出现&quot;过度锐利&quot;的塑料感。</li>
+</ul>
+<p>这背后的张力是：<code>w</code> 越大越&quot;听话&quot;，但越偏离真实数据分布、多样性越低。<strong>引导强度是文生图最重要的超参数之一。</strong></p>
+<p><figure><img class="md-img" src="content/courses/multimodal-diffusion/assets/chapter-3-figure-03.svg" alt="CFG 引导示意图：中间画一个&quot;噪声预测&quot;向量空间。一个箭头 ε_θ(x_t,t,∅) 指向&quot;无条件预测&quot;，另一个箭头 ε_θ(x_t,t,c) 指向&quot;条件预测&quot;；两者之差画成虚线（&quot;文本方向&quot;）；最终箭头 ε̂ 从无条件箭头出发，沿文本方向外推 w 倍，标注&quot;w 越大越听话、多样性越低&quot;；旁边放三张小图示意 w=1（贴合但模糊）、w=7.5（清晰且一致）、w=15（过饱和）" loading="lazy" decoding="async"><figcaption>CFG 引导示意图：中间画一个&quot;噪声预测&quot;向量空间。一个箭头 ε_θ(x_t,t,∅) 指向&quot;无条件预测&quot;，另一个箭头 ε_θ(x_t,t,c) 指向&quot;条件预测&quot;；两者之差画成虚线（&quot;文本方向&quot;）；最终箭头 ε̂ 从无条件箭头出发，沿文本方向外推 w 倍，标注&quot;w 越大越听话、多样性越低&quot;；旁边放三张小图示意 w=1（贴合但模糊）、w=7.5（清晰且一致）、w=15（过饱和）</figcaption></figure>
+</p>
+<h4 id="h-5-与分类器引导的对比">5. 与&quot;分类器引导&quot;的对比<a class="anchor" href="#h-5-与分类器引导的对比" aria-label="本节链接">#</a></h4>
+<p>在 CFG 之前，早期工作用<strong>分类器引导（classifier guidance）</strong>：额外训练一个分类器，用其梯度 <code>∇ log p(c|x_t)</code> 引导采样。它的问题是要<strong>额外训练、且在噪声图上分类</strong>。CFG 完全绕开了分类器——只用<strong>同一个去噪网络跑两次</strong>（有条件/无条件），因此成为主流，也是 Stable Diffusion 的默认做法。</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>手动实现 CFG 的合并公式，看清&quot;同一网络跑两次 + 外推&quot;的精髓。</p>
+<pre data-lang="python"><code class="language-python">import torch
+
+# —— 伪代码：无分类器引导（CFG）的合并 ——
+def guided_noise(unet, latent, t, text_emb, uncond_emb, w=7.5):
+    # 1) 条件分支：带文本
+    eps_cond = unet(latent, t, encoder_hidden_states=text_emb).sample
+    # 2) 无条件分支：空文本（训练时置空的 token）
+    eps_uncond = unet(latent, t, encoder_hidden_states=uncond_emb).sample
+    # 3) CFG：在&quot;文本方向&quot;上外推 w 倍
+    return eps_uncond + w * (eps_cond - eps_uncond)</code></pre>
+<p>在 <code>diffusers</code> 里，<code>guidance_scale</code> 参数就是这里的 <code>w</code>，管线内部自动做了上面这件事：</p>
+<pre data-lang="python"><code class="language-python">from diffusers import StableDiffusionPipeline
+import torch
+
+pipe = StableDiffusionPipeline.from_pretrained(
+    &quot;runwayml/stable-diffusion-v1-5&quot;, torch_dtype=torch.float16
+).to(&quot;cuda&quot;)
+
+prompt = &quot;a red panda reading a book, studio light&quot;
+
+# 同一句 prompt，不同引导强度
+for w in [1.0, 5.0, 7.5, 12.0]:
+    img = pipe(prompt, num_inference_steps=25, guidance_scale=w).images[0]
+    img.save(f&quot;cfg_{w}.png&quot;)
+    print(f&quot;w={w} 已保存 cfg_{w}.png&quot;)</code></pre>
+<p>对比四张图：<code>w=1</code> 时文本约束弱、画面松散；<code>w</code> 越大越&quot;听话&quot;，但 <code>w=12</code> 可能开始过饱和、出现塑料感。<strong>这组对比就是 CFG 公式在视觉上的直接体现。</strong></p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>运行上面的循环，肉眼比较 <code>w</code> 从 1 到 12 的变化，用一句话描述每个档位的画面特征（贴合度、饱和度和多样性）。</li>
+<li>手推 CFG 公式：说明为什么 <code>w=1</code> 时退化为纯条件预测、<code>w=0</code> 时退化为纯无条件预测，以及 <code>w&gt;1</code> 时的&quot;外推&quot;几何含义。</li>
+<li>在 <code>guided_noise</code> 里，把 <code>w</code> 换成负数（如 -1），分析结果会发生什么，并解释为什么实际从不这么用。</li>
+<li>思考题：为什么 CFG 需要训练时&quot;随机置空文本&quot;？如果模型从未见过空条件，推理时的 <code>ε_θ(x_t,t,∅)</code> 还有意义吗？</li>
+<li>调研题：查阅 Classifier-Free Guidance 原论文，说明它相比&quot;分类器引导&quot;省掉了什么、又付出了什么（两次前向的算力代价）。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Ho &amp; Salimans, <em>Classifier-Free Diffusion Guidance</em>（CFG 原论文）：<a href="https://arxiv.org/abs/2207.12598" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2207.12598</a></li>
+<li>Radford et al., <em>Learning Transferable Visual Models From Natural Language Supervision</em>（CLIP）：<a href="https://arxiv.org/abs/2103.00020" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2103.00020</a></li>
+<li>Rombach et al., <em>High-Resolution Image Synthesis with Latent Diffusion Models</em>（交叉注意力条件注入）：<a href="https://arxiv.org/abs/2112.10752" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2112.10752</a></li>
+<li>Dhariwal &amp; Nichol, <em>Diffusion Models Beat GANs on Image Synthesis</em>（分类器引导）：<a href="https://arxiv.org/abs/2105.05233" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2105.05233</a></li>
+</ul>
+<p><a href="#/l/mm-ch3-l3">下一课：采样与加速</a></p>

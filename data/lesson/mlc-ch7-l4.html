@@ -1,0 +1,305 @@
+<h2 id="h-量化--稀疏--低精度的编译支持与算子约束">量化 / 稀疏 / 低精度的编译支持与算子约束<a class="anchor" href="#h-量化--稀疏--低精度的编译支持与算子约束" aria-label="本节链接">#</a></h2>
+<p>量化、稀疏、低精度经常被讲成&quot;训练技巧&quot;，但对编译器来说它们是三组<strong>写进类型的契约</strong>：数据的位宽变了，反量化必须融进 epilogue；累加的位宽变了，kernel 里就要多出几个修正项；稀疏的模式是编译期常量，换了模式就得重新压缩、重新编译、重新调优。这些约束不是可以事后补上的优化，而是算子能否被生成的前提。本课用 numpy 把量化 GEMM 的对齐条件、bf16/fp16/fp8 的误差与范围、以及 2:4 稀疏的存储与语义逐项算出来。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-量化storage-type-与-expressed-type-是两层">1. 量化：storage type 与 expressed type 是两层<a class="anchor" href="#h-1-量化storage-type-与-expressed-type-是两层" aria-label="本节链接">#</a></h4>
+<p>第 3 章已经说过，量化 dtype 要拆成&quot;真正存的整数&quot;（storage type，如 int8）与&quot;它代表的浮点&quot;（expressed type，如 fp32），二者由 <strong>scale</strong> 与 <strong>zero_point</strong> 换算。MLIR 用 <code>quant</code> dialect 把这些参数写进类型系统，StableHLO 则用 <code>!quant.uniform&lt;i8:f32, scale:zero_point&gt;</code> 这类类型并支持 per-axis（每个切片一组 scale）。<strong>scale 的粒度是编译期决策</strong>：代码第 1 节里，<code>(4,64)</code> 的权重用 per-tensor 时误差占各行动态范围的 1.26%<del>24.26%，换成 per-channel 全部落到 0.38%</del>0.39%，代价只是每行多一个 float32 scale。</p>
+<h4 id="h-2-反量化必须能折进-epilogue">2. 反量化必须能折进 epilogue<a class="anchor" href="#h-2-反量化必须能折进-epilogue" aria-label="本节链接">#</a></h4>
+<p>量化 kernel 的结构是固定的：int8 读入 → int32 累加 → 乘 <code>scale_a × scale_b</code> → 可能的 bias 修正 → 写回。如果反量化不能折进 epilogue，就要多一次&quot;整张输出张量读再写&quot;的往返，量化的带宽收益会被吃掉一半。代码第 2 节验证了这条路径的自洽性：反量化后做 float 乘、与 int32 乘完再外提 scale，两者最大差只有 <code>1.526e-05</code>（fp32 舍入），所以硬件选后者是安全的。</p>
+<p>但<strong>零点不为零时，scale 不能直接外提</strong>：<code>zp_a=7, zp_b=-3</code> 时朴素做法误差 <code>24.4</code>，补上三个修正项（<code>-zp_b·ΣA</code>、<code>-zp_a·ΣB</code>、<code>+K·zp_a·zp_b</code>）后回到 <code>1.240e-05</code>。这就是量化 GEMM 里那几个&quot;bias 补偿&quot;项的来历——它们不是调优，是数学。</p>
+<h4 id="h-3-累加位宽与精度是两件事">3. 累加位宽与精度是两件事<a class="anchor" href="#h-3-累加位宽与精度是两件事" aria-label="本节链接">#</a></h4>
+<p>int8 输入配 int32 累加是常规做法：最坏单项 <code>127×127 = 16129</code>，int32 能装 <code>K ≤ 133144</code> 项。代码第 3 节把 int8 累加的回绕模拟出来：第 0 行第 0 列从 int32 的 <code>14814</code> 变成 int8 的 <code>-34</code>。<strong>累加位宽不够，误差不是&quot;变小&quot;，而是完全随机</strong>——这类 bug 在测试集上未必暴露，但分布会变。</p>
+<h4 id="h-4-低精度尾数定相对误差指数定范围">4. 低精度：尾数定相对误差，指数定范围<a class="anchor" href="#h-4-低精度尾数定相对误差指数定范围" aria-label="本节链接">#</a></h4>
+<p>bf16 与 fp32 共用 8 位指数，因此范围相同、尾数只剩 7 位显式（有效位 8）：<code>[1,2)</code> 区间最坏相对舍入误差 <strong>0.3906%</strong>（= 2⁻⁸），fp16 是 0.0488%（= 2⁻¹¹）。但<strong>累加器放低精度</strong>时误差会滚雪球：1 万个标准正态值求和，fp32 累加相对误差 5.81e-07，bf16 累加则到了 15.5%。这条数字是混合精度训练坚持&quot;低精度算、fp32 存与累加&quot;的直接理由。</p>
+<p>fp8 的 E4M3 更极端：从位布局可以直接推出它只能表示到 <strong>448</strong>（1.75×2⁸，4 位指数 + 3 位尾数），而且 fn 变体<strong>没有 inf 编码</strong>（<code>0x7F</code> 解出来是 NaN），溢出只能饱和或变 NaN，量化器必须自己 clamp。fp16 则是另一端：最大有限值 65504，<code>300×300 = 90000</code> 直接变 <code>inf</code>，后面任何算子都救不回来。<strong>范围是硬约束，精度是可调项</strong>——这一条决定了 fp8 通常必须配 per-channel/per-block scale。</p>
+<h4 id="h-5-稀疏pattern-是编译期常量">5. 稀疏：pattern 是编译期常量<a class="anchor" href="#h-5-稀疏pattern-是编译期常量" aria-label="本节链接">#</a></h4>
+<p>NVIDIA Ampere 的 2:4 结构化稀疏规定&quot;每 4 个连续元素里至少 2 个为 0&quot;，只作用于 GEMM 的一个操作数，可把该操作数的数据量与带宽减半，并用元数据记录非零位置。代码第 7 节实现了完整的压缩—解压—乘，验证稀疏 kernel 与稠密语义<strong>逐元素相等</strong>；存储上，值占 50%、本课的玩具元数据占 12.5%（真实格式更紧凑，NVIDIA 的说法是 small amount of metadata）。对编译器而言关键是：<strong>pattern 必须在 codegen 之前已知</strong>；权重可以离线压缩，激活一般保持稠密；重新剪枝意味着重新压缩、重新编译、重新调优。</p>
+<h4 id="h-6-常见坑">6. 常见坑<a class="anchor" href="#h-6-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>只改 dtype 不改累加</strong>：int8 输入配 int8 累加，结果随机。</li>
+<li><strong>零点不为零却只乘 scale</strong>：丢掉修正项，误差随 K 线性增长。</li>
+<li><strong>fp8 不做 clamp</strong>：fn 变体没有 inf，溢出直接变 NaN 污染后续计算。</li>
+<li><strong>把量化尺度当成运行期参数</strong>：per-channel scale 若在编译期算不出，整段只能回退。</li>
+<li><strong>稀疏 pattern 变了却复用编译缓存</strong>：算的是老模式，静默错（第 3 课的台账能抓出来）。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>numpy 版（本机 <code>python3.10.16</code> + <code>numpy 1.26.2</code> 实跑，无需 GPU）。七段：仿射量化 per-tensor vs per-channel、量化 GEMM 的两条路径与零点修正项、累加位宽、bf16/fp16 尾数与累加、fp16 溢出、fp8 E4M3 的位布局与两级 scale、2:4 稀疏的压缩与语义对拍。</p>
+<pre data-lang="python"><code class="language-python"># ---- 第 4 课：量化 / 稀疏 / 低精度的编译支持（numpy，本机 python3.10.16 + numpy 1.26.2 实跑）----
+import numpy as np
+
+rng = np.random.default_rng(0)
+np.seterr(over=&quot;ignore&quot;)
+
+# ================= 1. 仿射量化：per-tensor vs per-channel =================
+def quant_affine(x, s, zp, qmin, qmax):
+    return np.clip(np.rint(x / s) + zp, qmin, qmax).astype(np.int32)
+
+def dequant_affine(q, s, zp):
+    return (q.astype(np.float32) - zp) * s
+
+def rel_to_range(x, xhat):
+    return np.abs(x - xhat).max() / np.abs(x).max()      # 相对「本行动态范围」的误差
+
+W = (rng.standard_normal((4, 64)) * np.array([[0.05], [1.0], [4.0], [0.3]])).astype(np.float32)
+print(&quot;=== 1. 权重 (4,64)：per-tensor 一个 scale 会毁掉小通道 ===&quot;)
+s_t = np.float32(W.max() / 127.0)
+q_t = quant_affine(W, s_t, 0, -127, 127)
+print(f&quot;  per-tensor：scale = {s_t:.6f}（由全局最大值决定）；误差按「绝对误差 / 本行最大 |W|」计&quot;)
+for r in range(4):
+    a = np.abs(W[r] - dequant_affine(q_t[r], s_t, 0)).max()
+    print(f&quot;    第 {r} 行 绝对误差&lt;={a:.5f}  占本行动态范围 {rel_to_range(W[r], dequant_affine(q_t[r], s_t, 0)):.2%}&quot;)
+
+s_c = (np.abs(W).max(axis=1, keepdims=True) / np.float32(127.0)).astype(np.float32)
+q_c = quant_affine(W, s_c, 0, -127, 127)
+print(f&quot;  per-channel（每行一个 scale）= {np.round(s_c.ravel(), 5).tolist()}&quot;)
+for r in range(4):
+    d = dequant_affine(q_c[r], s_c[r], 0)
+    print(f&quot;    第 {r} 行 绝对误差&lt;={np.abs(W[r] - d).max():.5f}  占本行动态范围 {rel_to_range(W[r], d):.2%}&quot;)
+print(&quot;  存储代价：每行多一个 float32 scale（4 行共 16 字节），换回小通道的全部有效位&quot;)
+
+# ================= 2. 量化 GEMM：int32 累加 + 零点修正 =================
+A_f = (rng.standard_normal((16, 64)) * 2).astype(np.float32)
+B_f = (rng.standard_normal((64, 8)) * 2).astype(np.float32)
+s_a = np.float32(np.abs(A_f).max() / 127.0)
+s_b = np.float32(np.abs(B_f).max() / 127.0)
+A_i = quant_affine(A_f, s_a, 0, -127, 127)
+B_i = quant_affine(B_f, s_b, 0, -127, 127)
+
+acc32 = A_i.astype(np.int32) @ B_i.astype(np.int32)        # 硬件路径：int8 输入、int32 累加
+float_path = dequant_affine(A_i, s_a, 0) @ dequant_affine(B_i, s_b, 0)
+int_path = acc32.astype(np.float32) * np.float32(s_a * s_b)
+exact = A_f @ B_f
+print(&quot;\n=== 2. 量化 GEMM：两条路径必须一致，量化误差本身是另一回事 ===&quot;)
+print(f&quot;  反量化后做 float 乘 vs int32 乘再外提 scale：最大绝对差 = {np.abs(float_path - int_path).max():.3e}&quot;)
+print(f&quot;  量化本身带来的误差（相对 fp32 参考，按输出均值归一）：&quot;
+      f&quot;{np.abs(int_path - exact).mean() / np.abs(exact).mean():.1%}  ← 这是位宽决定的，不是编译器 bug&quot;)
+
+zp_a, zp_b = np.int32(7), np.int32(-3)                     # 非对称量化：零点不为 0
+A_q = quant_affine(A_f, s_a, zp_a, -128, 127)
+B_q = quant_affine(B_f, s_b, zp_b, -128, 127)
+correct = dequant_affine(A_q, s_a, zp_a) @ dequant_affine(B_q, s_b, zp_b)
+raw = A_q.astype(np.int32) @ B_q.astype(np.int32)
+naive = raw.astype(np.float32) * np.float32(s_a * s_b)
+K = A_q.shape[1]
+corr = np.float32(s_a * s_b) * (raw - zp_b * A_q.sum(axis=1, keepdims=True)
+                                - zp_a * B_q.sum(axis=0, keepdims=True) + K * zp_a * zp_b)
+print(f&quot;  非对称量化（zp_a={zp_a}, zp_b={zp_b}）：只乘 scale 的误差 = {np.abs(correct - naive).max():.3f}&quot;)
+print(f&quot;  补上三个修正项后误差 = {np.abs(correct - corr).max():.3e}（修正项就是量化 kernel 里的 bias 补偿）&quot;)
+
+# ================= 3. 累加位宽：int8 会回绕，int32 不会 =================
+bound = 127 * 127
+k_max = (2**31 - 1) // bound
+acc8 = np.zeros(8, dtype=np.int8)
+for k in range(K):
+    acc8 = (acc8.astype(np.int32) + A_i[0, k] * B_i[k]).astype(np.int8)   # 模拟 int8 累加回绕
+print(&quot;\n=== 3. 累加位宽不是可选项 ===&quot;)
+print(f&quot;  int8 累加（模拟回绕）：[0,0] = {acc8[0]}；int32 = {acc32[0, 0]}；差 {acc32[0, 0] - int(acc8[0])}&quot;)
+print(f&quot;  最坏单项 = 127×127 = {bound}；int32 最多容纳 K ≤ {k_max} 项（(2^31-1) // {bound}）&quot;)
+print(f&quot;  本课 K={K}，远在安全区内；K 超过 {k_max} 才需要别的累加策略（分块累加/降 scale）&quot;)
+
+# ================= 4. bf16 / fp16：尾数位决定误差 =================
+def round_mantissa_f32(x, drop):
+    &quot;&quot;&quot;round-to-nearest-even 丢掉低 drop 位；bf16 即丢掉 fp32 的低 16 位。&quot;&quot;&quot;
+    b = np.asarray(x, dtype=np.float32).view(np.uint32).astype(np.uint64)
+    half = np.uint64(1) &lt;&lt; np.uint64(drop - 1)
+    keep = ~((np.uint64(1) &lt;&lt; np.uint64(drop)) - np.uint64(1))
+    rem, base = b &amp; ~keep, b &amp; keep
+    up = (rem &gt; half) | ((rem == half) &amp; ((base &amp; (np.uint64(1) &lt;&lt; np.uint64(drop))) != 0))
+    return (base + np.where(up, np.uint64(1) &lt;&lt; np.uint64(drop), np.uint64(0))).astype(np.uint32).view(np.float32)
+
+def bf16(x):
+    return round_mantissa_f32(x, 16)
+
+grid = np.linspace(1.0, 2.0, 1 &lt;&lt; 16, dtype=np.float32)
+print(&quot;\n=== 4. 尾数位：bf16 有 8 位有效位，fp16 有 11 位 ===&quot;)
+print(f&quot;  [1,2) 区间最坏相对舍入误差：bf16 = {np.abs(bf16(grid) - grid).max():.4%}，&quot;
+      f&quot;fp16 = {np.abs(grid.astype(np.float16).astype(np.float32) - grid).max():.4%}&quot;)
+print(f&quot;  理论界：bf16 2^-8 = {2**-8:.4%}（1 位隐含 + 7 位显式），fp16 2^-11 = {2**-11:.4%}（1 + 10）&quot;)
+
+vals = rng.standard_normal(10000).astype(np.float32)
+acc_fp32 = np.float32(0.0)
+acc_bf16 = np.float32(0.0)
+for v in vals:                                   # 累加器分别在 fp32 / bf16 里更新
+    acc_fp32 = np.float32(acc_fp32 + np.float32(v))
+    acc_bf16 = np.float32(bf16(np.float32(acc_bf16 + bf16(v))))
+exact_sum = float(np.sum(vals, dtype=np.float64))
+print(f&quot;  1 万个标准正态值求和：fp64 精确值 = {exact_sum:.6f}&quot;)
+print(f&quot;    fp32 累加 = {float(acc_fp32):.6f}（相对误差 {abs(acc_fp32 - exact_sum) / abs(exact_sum):.2e}）&quot;)
+print(f&quot;    bf16 累加 = {float(acc_bf16):.6f}（相对误差 {abs(acc_bf16 - exact_sum) / abs(exact_sum):.2e}）&quot;)
+print(&quot;  逐个更新累加器时，低精度不是只丢一次舍入，而是每一轮都丢一次&quot;)
+
+# ================= 5. fp16 溢出的硬边界 =================
+print(&quot;\n=== 5. 低精度的范围边界是硬约束，不是精度问题 ===&quot;)
+print(f&quot;  fp16 最大有限值 = {np.finfo(np.float16).max}；300×300 = {300 * 300}&quot;)
+print(f&quot;  90000 转 fp16 = {float(np.float32(90000.0).astype(np.float16))}  ← 溢出成 inf，后面任何算子都救不回来&quot;)
+print(f&quot;  300 累加 250 次 = {300 * 250}：fp32 正常，fp16 = {float(np.float32(75000.0).astype(np.float16))}&quot;)
+
+# ================= 6. fp8 e4m3：从位布局推出可用范围 =================
+def decode_e4m3(byte):
+    s = -1.0 if (byte &gt;&gt; 7) else 1.0
+    e, m = (byte &gt;&gt; 3) &amp; 0xF, byte &amp; 0x7
+    if e == 0xF and m == 0x7:
+        return np.nan                              # fn 变体唯一的 NaN 编码，没有 inf
+    if e == 0:
+        return s * m * 2.0**-9                     # 次正规数
+    return s * (1.0 + m / 8.0) * 2.0**(e - 7)
+
+pos = np.sort(np.array([decode_e4m3(b) for b in range(256)
+                        if not np.isnan(decode_e4m3(b)) and decode_e4m3(b) &gt; 0], dtype=np.float32))
+print(&quot;\n=== 6. FP8 E4M3：位布局决定它能表示什么 ===&quot;)
+print(f&quot;  最大可表示正数 = {pos.max()}（= 1.75 × 2^8，4 位指数 + 3 位尾数）&quot;)
+print(f&quot;  最小正规正数 = {2.0**-6}，次正规最小步长 = {2.0**-9}&quot;)
+print(f&quot;  量级 400 附近的相邻可表示值 = {[float(v) for v in pos[pos &gt; 380]]}&quot;)
+
+def quant_fp8_e4m3(x, scale):
+    y = np.clip(x / np.float32(scale), -448.0, 448.0)
+    idx = np.clip(np.searchsorted(pos, np.abs(y)), 1, len(pos) - 1)
+    lo, hi = pos[idx - 1], pos[idx]
+    near = np.where(np.abs(np.abs(y) - lo) &lt;= np.abs(hi - np.abs(y)), lo, hi)
+    return np.sign(y) * near
+
+X = (rng.standard_normal((3, 128)) * np.array([[0.5], [8.0], [1.5]])).astype(np.float32)
+s_t8 = np.float32(np.abs(X).max() / 448.0)
+Xh = quant_fp8_e4m3(X, s_t8) * s_t8
+s_r8 = (np.abs(X).max(axis=1, keepdims=True) / np.float32(448.0)).astype(np.float32).ravel()
+Xh2 = np.stack([quant_fp8_e4m3(X[r], s_r8[r]) * s_r8[r] for r in range(3)])
+print(f&quot;  per-tensor：scale = {s_t8:.6f}（由全局最大值 8 决定）&quot;)
+print(f&quot;    scale 占用的位宽 = {np.float32(s_t8).astype(np.float16):.6f}（scale 本身也得存，通常是 fp16/fp32）&quot;)
+for r in range(3):
+    print(f&quot;    第 {r} 行 最大绝对误差 = {np.abs(X[r] - Xh[r]).max():.4f}&quot;
+          f&quot;  占本行动态范围 {np.abs(X[r] - Xh[r]).max() / np.abs(X[r]).max():.2%}&quot;)
+print(f&quot;  per-channel：scales = {np.round(s_r8, 6).tolist()}&quot;)
+for r in range(3):
+    print(f&quot;    第 {r} 行 最大绝对误差 = {np.abs(X[r] - Xh2[r]).max():.4f}&quot;
+          f&quot;  占本行动态范围 {np.abs(X[r] - Xh2[r]).max() / np.abs(X[r]).max():.2%}&quot;)
+print(f&quot;  0x7F 这个编码解码出来是 {decode_e4m3(0x7F)}：e4m3（fn 变体）没有 inf 编码，&quot;)
+print(&quot;  所以溢出只能是 NaN 或饱和 —— 量化器必须自己 clamp（上面代码里的 np.clip 就是这件事）&quot;)
+print(&quot;  粒度是编译期决定的：per-channel 让动态范围差异大的通道各自拿到合适的 scale，&quot;)
+print(&quot;  代价是每通道一组 scale（可以折进 epilogue），且后端必须支持这一层反量化&quot;)
+
+print(&quot;\n  每种表示的每元素字节数（不含 scale 的开销）：&quot;)
+for name, nbytes in [(&quot;fp32&quot;, 4), (&quot;bf16 / fp16&quot;, 2), (&quot;fp8 (e4m3) / int8&quot;, 1)]:
+    print(f&quot;    {name:&lt;20}{nbytes} 字节/元素  →  相对 fp32 的 {4 / nbytes:.0f}x&quot;)
+
+# ================= 7. 2:4 结构化稀疏 =================
+W_i = rng.integers(-9, 10, (8, 16)).astype(np.int32)
+mask = np.zeros_like(W_i, dtype=bool)              # 每 4 个连续元素保留 2 个
+for r in range(8):
+    for g in range(0, 16, 4):
+        order = np.argsort(-np.abs(W_i[r, g:g + 4]))[:2]
+        mask[r, g + order] = True
+W_sp = np.where(mask, W_i, 0)
+vals_c = W_i[mask].reshape(8, 8)                   # 压缩值：一半元素
+meta_c = np.zeros((8, 4), dtype=np.uint8)          # 玩具元数据：每组 4 元素占 1 字节
+for r in range(8):
+    for gi, g in enumerate(range(0, 16, 4)):
+        meta_c[r, gi] = sum((1 &lt;&lt; j) for j in range(4) if mask[r, g + j])
+X_i = rng.integers(-6, 7, (16, 5)).astype(np.int32)
+dense = W_sp @ X_i
+W_de = np.zeros_like(W_i)                          # 内核侧：用元数据把值放回原位（跳过零）
+for r in range(8):
+    for gi, g in enumerate(range(0, 16, 4)):
+        b, j = int(meta_c[r, gi]), 0
+        for k in range(4):
+            if b &gt;&gt; k &amp; 1:
+                W_de[r, g + k] = vals_c[r, gi * 2 + j]; j += 1
+sparse = W_de @ X_i
+print(&quot;\n=== 7. 2:4 结构化稀疏：数据减半，但元数据不是零 ===&quot;)
+print(&quot;  约束（NVIDIA Ampere 2:4）：每 4 个连续元素里至少 2 个为 0，且只对 GEMM 的一个操作数生效&quot;)
+print(f&quot;  稀疏 kernel 与稠密语义逐元素相等 = {np.array_equal(dense, sparse)}&quot;)
+print(f&quot;  存储：原始 {W_i.size * 4} 字节 → 值 {vals_c.size * 4} + 元数据 {meta_c.size} = &quot;
+      f&quot;{vals_c.size * 4 + meta_c.size} 字节（{(vals_c.size * 4 + meta_c.size) / (W_i.size * 4):.1%}）&quot;)
+print(&quot;  真实硬件格式的元数据比本课的 1 字节/组更紧凑（NVIDIA 的说法是 small amount of metadata）&quot;)
+print(&quot;  编译期约束：pattern 必须在 codegen 之前已知；权重可离线压缩，激活一般保持稠密，&quot;)
+print(&quot;  换 pattern（重训/重新剪枝）意味着重新压缩、重新编译、重新调优 —— 这是稀疏的工程成本&quot;)</code></pre>
+<p>实际运行结果：</p>
+<pre data-lang="text"><code class="language-text">=== 1. 权重 (4,64)：per-tensor 一个 scale 会毁掉小通道 ===
+  per-tensor：scale = 0.057212（由全局最大值决定）；误差按「绝对误差 / 本行最大 |W|」计
+    第 0 行 绝对误差&lt;=0.02746  占本行动态范围 23.62%
+    第 1 行 绝对误差&lt;=0.02844  占本行动态范围 1.26%
+    第 2 行 绝对误差&lt;=2.32703  占本行动态范围 24.26%
+    第 3 行 绝对误差&lt;=0.02849  占本行动态范围 3.06%
+  per-channel（每行一个 scale）= [0.0009200000204145908, 0.017720000818371773, 0.07553000003099442, 0.007340000011026859]
+    第 0 行 绝对误差&lt;=0.00044  占本行动态范围 0.38%
+    第 1 行 绝对误差&lt;=0.00866  占本行动态范围 0.38%
+    第 2 行 绝对误差&lt;=0.03775  占本行动态范围 0.39%
+    第 3 行 绝对误差&lt;=0.00354  占本行动态范围 0.38%
+  存储代价：每行多一个 float32 scale（4 行共 16 字节），换回小通道的全部有效位
+
+=== 2. 量化 GEMM：两条路径必须一致，量化误差本身是另一回事 ===
+  反量化后做 float 乘 vs int32 乘再外提 scale：最大绝对差 = 1.526e-05
+  量化本身带来的误差（相对 fp32 参考，按输出均值归一）：1.2%  ← 这是位宽决定的，不是编译器 bug
+  非对称量化（zp_a=7, zp_b=-3）：只乘 scale 的误差 = 24.400
+  补上三个修正项后误差 = 1.240e-05（修正项就是量化 kernel 里的 bias 补偿）
+
+=== 3. 累加位宽不是可选项 ===
+  int8 累加（模拟回绕）：[0,0] = -34；int32 = 14814；差 14848
+  最坏单项 = 127×127 = 16129；int32 最多容纳 K ≤ 133144 项（(2^31-1) // 16129）
+  本课 K=64，远在安全区内；K 超过 133144 才需要别的累加策略（分块累加/降 scale）
+
+=== 4. 尾数位：bf16 有 8 位有效位，fp16 有 11 位 ===
+  [1,2) 区间最坏相对舍入误差：bf16 = 0.3906%，fp16 = 0.0488%
+  理论界：bf16 2^-8 = 0.3906%（1 位隐含 + 7 位显式），fp16 2^-11 = 0.0488%（1 + 10）
+  1 万个标准正态值求和：fp64 精确值 = 101.766764
+    fp32 累加 = 101.766823（相对误差 5.81e-07）
+    bf16 累加 = 86.000000（相对误差 1.55e-01）
+  逐个更新累加器时，低精度不是只丢一次舍入，而是每一轮都丢一次
+
+=== 5. 低精度的范围边界是硬约束，不是精度问题 ===
+  fp16 最大有限值 = 65504.0；300×300 = 90000
+  90000 转 fp16 = inf  ← 溢出成 inf，后面任何算子都救不回来
+  300 累加 250 次 = 75000：fp32 正常，fp16 = inf
+
+=== 6. FP8 E4M3：位布局决定它能表示什么 ===
+  最大可表示正数 = 448.0（= 1.75 × 2^8，4 位指数 + 3 位尾数）
+  最小正规正数 = 0.015625，次正规最小步长 = 0.001953125
+  量级 400 附近的相邻可表示值 = [384.0, 416.0, 448.0]
+  per-tensor：scale = 0.037880（由全局最大值 8 决定）
+    scale 占用的位宽 = 0.037872（scale 本身也得存，通常是 fp16/fp32）
+    第 0 行 最大绝对误差 = 0.0657  占本行动态范围 4.60%
+    第 1 行 最大绝对误差 = 0.5736  占本行动态范围 3.38%
+    第 2 行 最大绝对误差 = 0.1433  占本行动态范围 3.47%
+  per-channel：scales = [0.0031900000758469105, 0.03787999972701073, 0.009216999635100365]
+    第 0 行 最大绝对误差 = 0.0497  占本行动态范围 3.48%
+    第 1 行 最大绝对误差 = 0.5736  占本行动态范围 3.38%
+    第 2 行 最大绝对误差 = 0.1349  占本行动态范围 3.27%
+  0x7F 这个编码解码出来是 nan：e4m3（fn 变体）没有 inf 编码，
+  所以溢出只能是 NaN 或饱和 —— 量化器必须自己 clamp（上面代码里的 np.clip 就是这件事）
+  粒度是编译期决定的：per-channel 让动态范围差异大的通道各自拿到合适的 scale，
+  代价是每通道一组 scale（可以折进 epilogue），且后端必须支持这一层反量化
+
+  每种表示的每元素字节数（不含 scale 的开销）：
+    fp32                4 字节/元素  →  相对 fp32 的 1x
+    bf16 / fp16         2 字节/元素  →  相对 fp32 的 2x
+    fp8 (e4m3) / int8   1 字节/元素  →  相对 fp32 的 4x
+
+=== 7. 2:4 结构化稀疏：数据减半，但元数据不是零 ===
+  约束（NVIDIA Ampere 2:4）：每 4 个连续元素里至少 2 个为 0，且只对 GEMM 的一个操作数生效
+  稀疏 kernel 与稠密语义逐元素相等 = True
+  存储：原始 512 字节 → 值 256 + 元数据 32 = 288 字节（56.2%）
+  真实硬件格式的元数据比本课的 1 字节/组更紧凑（NVIDIA 的说法是 small amount of metadata）
+  编译期约束：pattern 必须在 codegen 之前已知；权重可离线压缩，激活一般保持稠密，
+  换 pattern（重训/重新剪枝）意味着重新压缩、重新编译、重新调优 —— 这是稀疏的工程成本</code></pre>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选，需自备或云上按需：在真实工具链里看同一批类型 ----
+# MLIR（quant dialect 的类型长什么样）：
+#   # 用 mlir-opt 打印含 quant.uniform / qcast 的 IR：
+#   mlir-opt demo.mlir -pass-pipeline=&#39;builtin.module(func.func(cse))&#39;
+# PyTorch（float8 dtype 与 bf16 的现成实现；有 GPU 时更有意义）：
+#   python3 -c &quot;import torch; print(torch.float8_e4m3fn, torch.bfloat16)&quot;
+# NVIDIA cuSPARSELt（2:4 稀疏 GEMM 的官方入口：prune → compress → matmul）：
+#   # 见 NVIDIA 文档与 CUDALibrarySamples 里的 spmma 示例
+# 没有这些工具也不影响本课：上面的 numpy 版把量化/低精度/稀疏的数值都算出来了。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：给第 1 节加一个 <strong>per-block（例如每 32 个元素一组）</strong> 量化的 <code>scale</code>，比较 per-tensor / per-channel / per-block 三种粒度在同一份权重上的最大误差与元数据字节数，画出&quot;精度—开销&quot;的取舍表。</li>
+<li><strong>解释</strong>：为什么零点不为零时 <code>(A_i8 @ B_i8) × s_a × s_b</code> 会错？把三个修正项写成 <code>Σ</code> 的推导，并说明 K 很大时哪一项会主导误差。</li>
+<li><strong>对比/验证</strong>：把第 4 节的累加器从 bf16 换成 fp16，在同样 1 万个标准正态值上重跑求和；再故意把数据放大 1000 倍，观察 fp16 累加何时溢出成 <code>inf</code>，并解释为什么工程上通常只对激活做 fp8 量化、累加仍留 fp32。</li>
+<li><strong>思考</strong>：假设你维护一个编译器，要新增&quot;只支持 2:4 稀疏权重&quot;的 GEMM 算子。你会把 pattern 检查放在哪一层（前端导入 / 图级 pass / 代码生成前）？如果用户在运行期换了一个新剪枝的权重，哪一层该负责让缓存失效？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>MLIR 文档, <em>Quantization Dialect</em>（<code>quant</code> dialect 的类型与 <code>qcast</code> / <code>dqcast</code> 等算子：量化参数如何进入 IR 的类型系统）：<a href="https://mlir.llvm.org/docs/Dialects/QuantDialect/" target="_blank" rel="noopener noreferrer">https://mlir.llvm.org/docs/Dialects/QuantDialect/</a></li>
+<li>OpenXLA StableHLO 规范（量化类型 <code>!quant.uniform&lt;i8:f32, scale:zero_point&gt;</code> 与 per-axis 量化、<code>f8E4M3FN</code> 等低精度元素类型）：<a href="https://github.com/openxla/stablehlo/blob/main/docs/spec.md" target="_blank" rel="noopener noreferrer">https://github.com/openxla/stablehlo/blob/main/docs/spec.md</a></li>
+<li>NVIDIA Technical Blog, <em>Exploiting NVIDIA Ampere Structured Sparsity with cuSPARSELt</em>（2:4 结构化稀疏的定义、数据与带宽减半、元数据记录非零位置、prune→compress→matmul 工作流与 FP16/BF16/INT8 + FP32/INT32 累加）：<a href="https://developer.nvidia.com/blog/exploiting-ampere-structured-sparsity-with-cusparselt/" target="_blank" rel="noopener noreferrer">https://developer.nvidia.com/blog/exploiting-ampere-structured-sparsity-with-cusparselt/</a></li>
+<li>OCP, <em>8-bit Floating Point Specification (OFP8)</em>（E4M3 / E5M2 的位布局、动态范围与 NaN/inf 编码约定；具体实现以规范原文为准）：<a href="https://www.opencompute.org/documents/ocp-8-bit-floating-point-specification-ofp8-revision-1-1-final-pdf" target="_blank" rel="noopener noreferrer">https://www.opencompute.org/documents/ocp-8-bit-floating-point-specification-ofp8-revision-1-1-final-pdf</a></li>
+</ul>
+<p><a href="#/learn/../chapter-8/lesson-01">下一章：图执行与运行时：内存池、CUDA Graphs、执行顺序</a></p>

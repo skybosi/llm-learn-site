@@ -1,0 +1,650 @@
+<h2 id="h-可回滚的发布版本一致性缓存失效与回滚时间账本">可回滚的发布：版本一致性、缓存失效与回滚时间账本<a class="anchor" href="#h-可回滚的发布版本一致性缓存失效与回滚时间账本" aria-label="本节链接">#</a></h2>
+<h3 id="h-这一节要解决什么">这一节要解决什么<a class="anchor" href="#h-这一节要解决什么" aria-label="本节链接">#</a></h3>
+<p>前三节把&quot;该不该发&quot;做成了可复算的判据，也承认了一件事：<strong>门禁只能降低事故概率，不能消除它</strong>。所以每一次发布都必须回答一个更硬的问题：</p>
+<blockquote>
+<p>如果这次发出去坏了，我多久能回到&quot;上一个好状态&quot;？回到的是不是<strong>当时</strong>那个状态？</p>
+</blockquote>
+<p>&quot;回滚&quot;在软件里通常被等价成 <code>git revert</code> + 重新部署。在模型发布里这个等价关系在四个地方断裂：</p>
+<table>
+<thead>
+<tr>
+<th>断裂点</th>
+<th>软件</th>
+<th>模型发布</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>回滚的对象</strong></td>
+<td>代码（一个 commit）</td>
+<td>一个<strong>推理单元</strong>：权重 + tokenizer + prompt 模板 + 解码参数 + 引擎 + 后处理</td>
+</tr>
+<tr>
+<td><strong>&quot;上个版本&quot;是什么</strong></td>
+<td>上一个 commit，确定</td>
+<td>指针指向的<strong>那个当时的绑定</strong>，而不是&quot;用今天的数据重建的同一份代码&quot;</td>
+</tr>
+<tr>
+<td><strong>状态</strong></td>
+<td>大多无状态</td>
+<td>缓存、会话历史、特征服务、下游 schema 都可能已被新版本改写</td>
+</tr>
+<tr>
+<td><strong>时间</strong></td>
+<td>通常秒级</td>
+<td>探测 + 决策 + 传播 + 重启 + <strong>缓存预热</strong>，可能是分钟级</td>
+</tr>
+</tbody></table>
+<p>本节把&quot;可回滚&quot;做成一个<strong>可承诺、可测量、可演练</strong>的能力，四块内容：</p>
+<ol>
+<li><strong>版本一致性</strong>：把发布定义成一个不可变的绑定（manifest），任何一个部件漂移都改变整单元的哈希；以及为什么&quot;改了 prompt 没改权重&quot;是最常见的静默事故。</li>
+<li><strong>三层命名空间</strong>：内容寻址的制品层、只追加的逻辑版本层、可变的指针层。回滚 = 移动指针，不是重建制品。</li>
+<li><strong>缓存失效</strong>：缓存 key 必须含绑定哈希。不含它时，切换到新模型后会有<strong>约 60% 的回答来自旧模型</strong>（本节实测），而监控上看不出任何异常。</li>
+<li><strong>回滚时间账本（RTO 账本）</strong>：把 RTO 拆成探测 / 决策 / 传播 / 重启 / 预热五段，给出可算的预算分配，并说明<strong>先优化哪一段</strong>。</li>
+</ol>
+<p>一句话给出本节的结论：<strong>可回滚性 = 内容不可变 + 依赖版本化 + 状态可隔离 + RTO 可测量；四者缺一，回滚就只是&quot;希望&quot;。</strong></p>
+<h3 id="h-一发布单元一个不可变的绑定">一、发布单元：一个不可变的绑定<a class="anchor" href="#h-一发布单元一个不可变的绑定" aria-label="本节链接">#</a></h3>
+<h4 id="h-11-推理单元包含什么">1.1 推理单元包含什么<a class="anchor" href="#h-11-推理单元包含什么" aria-label="本节链接">#</a></h4>
+<p>ch1-l2 已经给出&quot;模型版本&quot;的正确对象是<strong>推理单元</strong>。本节把它变成一个可计算的东西：</p>
+<pre data-lang="text"><code class="language-text">manifest = {
+  weights       权重文件的内容哈希
+  tokenizer     分词器版本 + 词表哈希
+  prompt_tmpl   模板文本的哈希（含 system / few-shot / 变量顺序）
+  decode        temperature / top_p / max_tokens / stop 序列
+  engine        推理引擎及其版本（vLLM/TensorRT-LLM/自研）
+  postproc      后处理规则（归一化、过滤、格式化）
+}
+binding_hash = md5(canonical_json(manifest))</code></pre>
+<p><code>canonical_json</code> 的四条规范化规则（与 ch1-l1 的 config 哈希同源）：键排序、无多余空白、浮点统一 <code>repr</code>、缺省值显式化。代码实测：<strong>只改键序（等价 JSON）不改变哈希</strong>，而任何一个字段改变都会改变整单元的哈希：</p>
+<pre data-lang="text"><code class="language-text">  基线 manifest 哈希 = 2f5c8b75e4292f8130a03fd89fa695fe
+  改 weights      → 8dbb106047ca78f5d8a48cf39522367b  同基线: False
+  改 tokenizer    → e5e75f0d8a45b2b0db10843e4d386cbc  同基线: False
+  改 prompt_tmpl  → 05179d571df169e72005497eb4ff3af6  同基线: False
+  改 decode       → c09f3c859cbd53d8a1b27e89de7ab81a  同基线: False
+  改 engine       → 38f265d42d5c8fb56ef905219d759586  同基线: False
+  改 postproc     → 39ddf8c7d62eb5b43982fc3aebd01e06  同基线: False
+  只改键序（等价 JSON）：True</code></pre>
+<p><strong>为什么必须绑成一个哈希</strong>：制品库、配置中心、prompt 仓库、路由规则分散在四个系统里，发布时&quot;逐个更新&quot;必然出现&quot;一半新一半旧&quot;的中间态。绑成一个哈希以后，&quot;当前处于什么状态&quot;变成<strong>一个可比较的值</strong>，灰度检查、缓存 key、回滚目标全都从它派生。</p>
+<h4 id="h-12-版本漂移最常见的静默事故">1.2 版本漂移：最常见的静默事故<a class="anchor" href="#h-12-版本漂移最常见的静默事故" aria-label="本节链接">#</a></h4>
+<p>代码第 2 节把四个副本与目标 manifest 逐个比对：</p>
+<pre data-lang="text"><code class="language-text">  pod-0: 漂移字段 [&#39;prompt_tmpl&#39;, &#39;weights&#39;]
+  pod-2: 漂移字段 [&#39;prompt_tmpl&#39;, &#39;weights&#39;]
+  pod-3: 漂移字段 [&#39;prompt_tmpl&#39;]
+  一致副本 1 / 4；不一致副本必须逐个修复，否则流量分布被污染。</code></pre>
+<p>注意 <strong>pod-3 只漂移了 <code>prompt_tmpl</code></strong>：它的权重已经换成新版，prompt 还是旧版。这正是生产里最容易发生的事故形态：</p>
+<ul>
+<li>权重换了、prompt 没换 → 输出的风格/长度/格式变化<strong>无法归因</strong>（评测的 prompt 与新 prompt 不同）；</li>
+<li>prompt 换了、权重没换 → 看起来&quot;新版本变差了&quot;，其实只是模板变了；</li>
+<li>tokenizer 换了、权重没换 → 直接是错的（embedding 空间不匹配）。</li>
+</ul>
+<p><strong>纪律</strong>：发布系统必须原子地切换整个 manifest；灰度检查（每次滚动发布后）必须比较<strong>每个副本的 manifest 哈希</strong>，而不是&quot;进程起来了就算成功&quot;。</p>
+<h4 id="h-13-三层命名空间ch1-l2-在发布侧的落地">1.3 三层命名空间（ch1-l2 在发布侧的落地）<a class="anchor" href="#h-13-三层命名空间ch1-l2-在发布侧的落地" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>层</th>
+<th>可变性</th>
+<th>内容</th>
+<th>回滚时的操作</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>制品层</strong></td>
+<td>不可变、内容寻址</td>
+<td><code>w-7f3a</code> / <code>pt-11</code> 的实际字节</td>
+<td>不操作（必须还在）</td>
+</tr>
+<tr>
+<td><strong>逻辑版本层</strong></td>
+<td>只追加</td>
+<td><code>v41 = {weights: w-7f3a, prompt: pt-11, ...}</code> 的 manifest</td>
+<td>不操作</td>
+</tr>
+<tr>
+<td><strong>指针层</strong></td>
+<td>可变、留审计</td>
+<td><code>prod → v42</code>、<code>canary → v43</code></td>
+<td><strong>回滚就是移指针</strong></td>
+</tr>
+</tbody></table>
+<p>代码第 7 节的指针历史：</p>
+<pre data-lang="text"><code class="language-text">  2026-09-20T10:00Z prod → v41（权重 w-7f3a）
+  2026-09-21T09:30Z prod → v42（权重 w-9c01）
+  2026-09-21T11:10Z prod → v41（权重 w-7f3a）</code></pre>
+<p>三条纪律：</p>
+<ol>
+<li><strong>制品层不可覆写</strong>：<code>v41</code> 引用的权重文件必须永远按内容寻址可取回。一旦&quot;就地更新已发布版本&quot;，回滚就变成不可能（见第四节）。</li>
+<li><strong>逻辑版本只追加</strong>：修一个 bug 不能改写 <code>v41</code> 的内容，只能发布 <code>v43</code>。改写会让&quot;当时线上是 v41&quot;这个事实失效。</li>
+<li><strong>指针移动留审计</strong>：每条记录含时间戳、操作者、原因。事故复盘时，&quot;什么时候切的、切了几次&quot;必须能从指针历史回答。</li>
+</ol>
+<h3 id="h-二缓存失效一个哈希引起的-60-陈旧回答">二、缓存失效：一个哈希引起的 60% 陈旧回答<a class="anchor" href="#h-二缓存失效一个哈希引起的-60-陈旧回答" aria-label="本节链接">#</a></h3>
+<h4 id="h-21-问题">2.1 问题<a class="anchor" href="#h-21-问题" aria-label="本节链接">#</a></h4>
+<p>线上推理几乎都有缓存（prompt 级、前缀 KV、结果级）。缓存 key 的设计决定了<strong>切换版本时缓存是否失效</strong>：</p>
+<pre data-lang="text"><code class="language-text">错误： cache_key = hash(prompt)
+正确： cache_key = hash(prompt, manifest_hash)</code></pre>
+<p>代码第 3 节模拟一次 50% 处的版本切换（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">2</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">5</span></span></span></span></span></span></span></span></span></span></span>，切换前命中率 0.90，旧模型的缓存条目在切换后仍可命中），实测：</p>
+<pre data-lang="text"><code class="language-text">  切换前命中率 0.90（预热充分）
+  窗口总体命中率：key 含版本 = 0.450；key 不含版本 = 0.750
+  切换后仍命中旧条目的比例（=陈旧回答） = 0.599</code></pre>
+<p><strong>读法</strong>：key 不含版本时，切换到新模型后<strong>约 60% 的回答仍然来自旧模型</strong> —— 而且这是一个<strong>静默</strong>故障：</p>
+<ul>
+<li>监控上：命中率漂亮（0.75 vs 0.45），延迟更低，成本更低；</li>
+<li>灰度上：实验组里有 60% 的流量其实跑的是旧模型，<strong>效应被稀释一半以上</strong>（你以为在测新模型，实际在测 40% 新 + 60% 旧的混合体）；</li>
+<li>事故中：新模型明明有个 bug，但线上只是偶尔触发（40% 的请求），难以复现。</li>
+</ul>
+<p>这条把第 3 节的纪律补全了：<strong>灰度的四样对齐（权重 / tokenizer-prompt / 缓存 key / salt）里，缓存 key 是最容易漏、后果最隐蔽的一项。</strong></p>
+<h4 id="h-22-缓存的代价预热时间">2.2 缓存的代价：预热时间<a class="anchor" href="#h-22-缓存的代价预热时间" aria-label="本节链接">#</a></h4>
+<p>正确入 key 的代价是<strong>切换瞬间缓存全冷</strong>。预热时间：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">warm</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.1963em;vertical-align:-0.836em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3603em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0278em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">warm</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">cache</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.836em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0278em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">warm</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord text"><span class="mord cjk_fallback">并发</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord cjk_fallback">单请求生成速率</span></span></span></span></span></span></p>
+<p>代码实测：</p>
+<table>
+<thead>
+<tr>
+<th>缓存容量 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">C</span></span></span></span></th>
+<th>预热速率 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span></span></span></span></th>
+<th><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">warm</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span></th>
+<th>占 300s RTO</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>200 GB</td>
+<td>2.0 GB/s</td>
+<td>100.0 s</td>
+<td>33.3%</td>
+</tr>
+<tr>
+<td>200 GB</td>
+<td>20.0 GB/s</td>
+<td>10.0 s</td>
+<td>3.3%</td>
+</tr>
+<tr>
+<td>2000 GB</td>
+<td>20.0 GB/s</td>
+<td>100.0 s</td>
+<td>33.3%</td>
+</tr>
+</tbody></table>
+<p><strong>工程含义</strong>：预热时间与缓存容量成正比、与预热并发成正比。所以降低&quot;缓存全冷&quot;的冲击有三条路（按性价比排序）：</p>
+<ol>
+<li><strong>预热而非等待自然命中</strong>：切换前用影子流量把新版本的缓存条目预先建好（第 3 节的影子流量在这里有第二个用途）；</li>
+<li><strong>双缓存并存</strong>：新 key 空间独立，旧 key 空间保留，命中率平滑过渡（代价是内存翻倍）；</li>
+<li><strong>给 key 加&quot;版本代&quot;而不是全哈希</strong>：例如 <code>hash(prompt, manifest_major)</code>，兼容的 minor 变更共用缓存（代价是偶发的跨版本命中，需要判断是否可接受）。</li>
+</ol>
+<h4 id="h-23-缓存之外的三类状态">2.3 缓存之外的三类状态<a class="anchor" href="#h-23-缓存之外的三类状态" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>状态</th>
+<th>是否随回滚恢复</th>
+<th>处置</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>结果缓存 / 前缀 KV</td>
+<td><strong>否</strong>（key 正确时新版本自动隔离）</td>
+<td>key 含 manifest_hash</td>
+</tr>
+<tr>
+<td>会话历史</td>
+<td><strong>否</strong></td>
+<td>标记版本，回滚后新会话用旧模型，旧会话显式收尾</td>
+</tr>
+<tr>
+<td>下游特征/schema</td>
+<td><strong>否</strong></td>
+<td>依赖版本化 + 兼容窗口（见第四节）</td>
+</tr>
+<tr>
+<td>日志/指标口径</td>
+<td>是</td>
+<td>记录 manifest_hash 以便按版本切分</td>
+</tr>
+</tbody></table>
+<h3 id="h-三回滚时间账本rto-账本">三、回滚时间账本（RTO 账本）<a class="anchor" href="#h-三回滚时间账本rto-账本" aria-label="本节链接">#</a></h3>
+<h4 id="h-31-分解">3.1 分解<a class="anchor" href="#h-31-分解" aria-label="本节链接">#</a></h4>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord">RTO</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">探测</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">决策</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">传播</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">重启</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">预热</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span></span></p>
+<p>代码第 6 节的算例（预算 300s）：</p>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>耗时</th>
+<th>占比</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>探测（窗口 + 告警）</td>
+<td>30.0 s</td>
+<td>13.3%</td>
+</tr>
+<tr>
+<td>决策（人 / 自动）</td>
+<td>60.0 s</td>
+<td>26.7%</td>
+</tr>
+<tr>
+<td>传播（配置 / 路由下发）</td>
+<td>15.0 s</td>
+<td>6.7%</td>
+</tr>
+<tr>
+<td>重启 / 切流</td>
+<td>20.0 s</td>
+<td>8.9%</td>
+</tr>
+<tr>
+<td>缓存预热</td>
+<td>100.0 s</td>
+<td>44.4%</td>
+</tr>
+<tr>
+<td><strong>合计</strong></td>
+<td><strong>225.0 s</strong></td>
+<td>≤ 300 s ✅</td>
+</tr>
+</tbody></table>
+<p><strong>这张账本最重要的用法是排优先级</strong>：</p>
+<ul>
+<li>预热的绝对时间最大（100s），但它是<strong>可控的</strong>（加并发、预热、双缓存）；</li>
+<li>探测 + 决策 = 90s（40%），其中&quot;决策 60s&quot;说明回滚要<strong>等人点按钮</strong> —— 这是最该被自动化替换的一段；</li>
+<li>传播 15s + 重启 20s 是基础设施的固有延迟，压它需要架构改造（热切换），性价比通常最低。</li>
+</ul>
+<p><strong>承诺 RTO 的正确姿势</strong>：不是&quot;我们 5 分钟能回滚&quot;（没人知道哪一段慢），而是<strong>给每一段定预算并测量</strong>：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord text"><span class="mord">SLO</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">RTO</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8778em;vertical-align:-0.1944em;"></span><span class="mord">300</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">s</span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:1em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord cjk_fallback">预算</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord">30</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">60</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">15</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">20</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">100</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">s</span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:1em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord cjk_fallback">每段</span><span class="mord"> </span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">95</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord"> </span><span class="mord cjk_fallback">超预算即告警</span></span></span></span></span></span></p>
+<h4 id="h-32-探测与熔断不要用单个点触发回滚">3.2 探测与熔断：不要用单个点触发回滚<a class="anchor" href="#h-32-探测与熔断不要用单个点触发回滚" aria-label="本节链接">#</a></h4>
+<p>探测段的判据必须<strong>抗抖</strong>。代码第 5 节用&quot;连续 3 个窗口超阈值&quot;的规则（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7335em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">99</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&gt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">850</span></span></span></span>ms）实测：</p>
+<pre data-lang="text"><code class="language-text">  单点抖动     p99=[700, 900, 710, 720, 705, 715] → 第 6 个窗口 未熔断
+  持续劣化     p99=[700, 900, 910, 920, 930, 940] → 第 4 个窗口 熔断
+  边界震荡     p99=[700, 860, 840, 870, 830, 880] → 第 6 个窗口 未熔断</code></pre>
+<p>三个设计要点：</p>
+<ol>
+<li><strong>连续计数而不是单点</strong>：单点抖动（一次 900ms）不触发，持续劣化在第 4 个窗口就熔断；</li>
+<li><strong>熔断判据 ≠ 实验判据</strong>：熔断看的是<strong>工程护栏</strong>（错误率、p99、成本），要求&quot;立即、无争议&quot;；实验判据（第 2 节）看的是统计显著性，要求&quot;样本量与多重性&quot;。两者不能用同一个阈值；</li>
+<li><strong>窗口长度与最小样本量要写死</strong>：例如&quot;每 10 秒或每 1000 请求（取先到者）算一次 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">99</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>&quot;，避免单个慢请求触发全量回滚。</li>
+</ol>
+<h4 id="h-33-自动回滚的边界条件">3.3 自动回滚的边界条件<a class="anchor" href="#h-33-自动回滚的边界条件" aria-label="本节链接">#</a></h4>
+<p>自动回滚很诱人，但以下四种情况<strong>不能</strong>自动：</p>
+<table>
+<thead>
+<tr>
+<th>情况</th>
+<th>为什么</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>信号本身可疑（监控断流、上游抖动）</td>
+<td>回滚会掩盖真正的问题，且造成无谓抖动</td>
+</tr>
+<tr>
+<td>回滚需要数据/状态迁移</td>
+<td>自动执行可能造成不可逆的数据损失</td>
+</tr>
+<tr>
+<td>事故原因在依赖（下游 schema / 特征服务）</td>
+<td>回滚本模型无效</td>
+</tr>
+<tr>
+<td>无人值守时段</td>
+<td>回滚后无人验证，可能连环失败</td>
+</tr>
+</tbody></table>
+<p><strong>实践折中</strong>：分级自动 —— <strong>护栏熔断（延迟/错误率）全自动</strong>（能自愈、可逆），<strong>主指标下降（需要判断）半自动</strong>（自动准备好回滚动作，人工确认）。</p>
+<h3 id="h-四回滚的边界什么时候回不去">四、回滚的边界：什么时候回不去<a class="anchor" href="#h-四回滚的边界什么时候回不去" aria-label="本节链接">#</a></h3>
+<h4 id="h-41-四种场景">4.1 四种场景<a class="anchor" href="#h-41-四种场景" aria-label="本节链接">#</a></h4>
+<p>代码第 8 节把&quot;回滚能不能成功&quot;数量化：</p>
+<pre data-lang="text"><code class="language-text">  权重按内容寻址存放                  可恢复比例=1.00  把指针指回旧哈希即可，精确恢复
+  就地覆盖了已发布权重                 可恢复比例=0.00  无法恢复（除非另有备份）
+  下游特征服务已按新 schema 升级        可恢复比例=0.00  回滚权重无效：输入分布已变
+  会话状态里有新模型生成的 KV/历史         可恢复比例=0.00  回滚只对新会话生效
+  结论：可回滚性 = 内容不可变 + 依赖版本化 + 状态可隔离，三者缺一不可。</code></pre>
+<h4 id="h-42-两个必须提前设计的东西">4.2 两个必须提前设计的东西<a class="anchor" href="#h-42-两个必须提前设计的东西" aria-label="本节链接">#</a></h4>
+<p><strong>(a) 依赖的兼容窗口</strong>。发布的 manifest 不仅要绑自己，还要<strong>声明依赖的版本范围</strong>：</p>
+<pre data-lang="text"><code class="language-text">manifest.deps = {feature_service: &quot;&gt;=3.2,&lt;4&quot;, retrieval_index: &quot;idx-2201&quot;}</code></pre>
+<p>回滚的前提是&quot;旧 manifest 的依赖在新环境里仍然可用&quot;。所以：</p>
+<ul>
+<li><strong>下游升级要保留至少一个版本的向后兼容</strong>（旧 schema 继续可读）；</li>
+<li><strong>双写期</strong>：schema 变更时先双写、再迁移、最后删旧 —— 这样回滚窗口 = 双写期。</li>
+</ul>
+<p><strong>(b) 状态的隔离与清理</strong>。会话历史里如果混入了新模型生成的内容，回滚后这些会话要么：</p>
+<ul>
+<li>显式收尾（继续用旧模型处理，但历史里有新模型的内容）；</li>
+<li>或者重置到某个检查点（用户体验受损但一致）。</li>
+</ul>
+<p><strong>可算的判据</strong>：设新模型上线 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6151em;"></span><span class="mord mathnormal">t</span></span></span></span> 小时后回滚，受影响会话比例</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.1076em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">affected</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.0935em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">e</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8991em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mathnormal mtight">λ</span><span class="mord mathnormal mtight">t</span></span></span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">λ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord cjk_fallback">该用户群的会话到达率</span></span></span></span></span></span></p>
+<p>例如 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">λ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">0.5/</span><span class="mord text"><span class="mord">h</span></span></span></span></span>、上线 2 小时：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">63%</span></span></span></span>。这个数告诉你&quot;回滚的干净程度&quot;随时间快速下降 —— <strong>越早回滚越干净</strong>，这也是把 RTO 压进 5 分钟的真实价值。</p>
+<h4 id="h-43-回滚-vs-向前修复">4.3 回滚 vs 向前修复<a class="anchor" href="#h-43-回滚-vs-向前修复" aria-label="本节链接">#</a></h4>
+<p>并非所有故障都该回滚：</p>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>选择</th>
+<th>理由</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>新版本崩溃 / 严重错误率上升</td>
+<td><strong>回滚</strong></td>
+<td>旧版本已知良好</td>
+</tr>
+<tr>
+<td>新版本小幅劣化，但已定位原因</td>
+<td><strong>向前修复</strong>（roll forward）</td>
+<td>回滚会丢掉本次发布的全部收益，且要再做一次发布</td>
+</tr>
+<tr>
+<td>配置类问题（阈值、prompt）</td>
+<td><strong>向前修复</strong></td>
+<td>改配置比切版本快，且不需要重新预热缓存</td>
+</tr>
+<tr>
+<td>数据/schema 已迁移</td>
+<td><strong>只能向前</strong></td>
+<td>回滚会造成数据不一致</td>
+</tr>
+</tbody></table>
+<p><strong>最容易踩的坑</strong>：把&quot;回滚&quot;当成&quot;恢复到昨天的配置&quot;。如果期间有其他配置变更（限流阈值、路由权重），回滚代码版本会把它们一起带回去。所以指针必须指向<strong>完整的绑定</strong>（代码 + 配置 + manifest），且回滚操作要能选择&quot;只回滚模型、保留其他配置&quot;。</p>
+<h3 id="h-五取舍与边界">五、取舍与边界<a class="anchor" href="#h-五取舍与边界" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>绑定粒度越细，回滚越精确，但发布越慢</strong>：把 20 个参数全绑进 manifest，任何一个小改动都要走完整发布流程。折中：<strong>绑定&quot;影响输出的东西&quot;</strong>（权重、prompt、解码、引擎、后处理），不绑&quot;不影响输出的运维参数&quot;（副本数、日志级别）。</li>
+<li><strong>缓存 key 加版本的代价是命中率</strong>：每次发布都会缓存全冷（本例 0.90 → 0.45 的窗口总体命中率）。它换来的是<strong>正确性</strong>，不能省；但可以用预热/双缓存把代价压到可接受。</li>
+<li><strong>RTO 是分布不是常数</strong>：承诺 300s 意味着 <strong><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">95</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> ≤ 300s</strong>，而不是&quot;平均 300s&quot;。事故往往发生在高负载时段，此时重启和预热都更慢 —— RTO 要在<strong>峰值压力下</strong>演练，而不是在凌晨低峰测一次。</li>
+<li><strong>回滚演练必须定期做</strong>：不演练的回滚路径在真正需要时必然失败（权限过期、脚本位腐化、制品被清理）。<strong>建议每月一次&quot;无通知回滚演练&quot;</strong>，并把实际耗时记入账本。</li>
+<li><strong>&quot;能回滚&quot;不等于&quot;该发布&quot;</strong>：回滚能力降低事故代价（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">放</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>），按第 2 节的框架它会<strong>放宽最优 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span></strong>（更敢发）—— 但它不能替代门禁。正确的组合是：门禁挡住大部分明显坏的，可回滚性兜住剩下的。</li>
+</ol>
+<h3 id="h-代码">代码<a class="anchor" href="#h-代码" aria-label="本节链接">#</a></h3>
+<p>本节代码只用标准库，覆盖：manifest 绑定哈希、版本漂移检测、缓存失效模拟、预热时间、熔断判据、RTO 账本、指针历史。合成参数 ⚠️（哈希与模拟均固定，输出可逐字节复现）。</p>
+<pre data-lang="python"><code class="language-python">&quot;&quot;&quot;第 2 章第 4 节：可回滚的发布 —— manifest 绑定、漂移检测、缓存失效、RTO 账本。
+
+只用标准库。合成数据 ⚠️ 均已标注（固定种子，可逐字节复现）。
+&quot;&quot;&quot;
+import hashlib
+import json
+import random
+
+# ---------------------------------------------------------------- manifest 绑定
+FIELDS = [&quot;weights&quot;, &quot;tokenizer&quot;, &quot;prompt_tmpl&quot;, &quot;decode&quot;, &quot;engine&quot;, &quot;postproc&quot;]
+
+
+def canonical(obj):
+    &quot;&quot;&quot;规范化 JSON：键排序、无多余空白、浮点统一 repr。&quot;&quot;&quot;
+    return json.dumps(obj, sort_keys=True, separators=(&quot;,&quot;, &quot;:&quot;),
+                      ensure_ascii=False)
+
+
+def binding_hash(m):
+    &quot;&quot;&quot;整单元的绑定哈希：任何字段变化都会改变它。&quot;&quot;&quot;
+    return hashlib.md5(canonical(m).encode()).hexdigest()
+
+
+def manifest(weights, tokenizer, prompt_tmpl, decode, engine, postproc):
+    return {&quot;weights&quot;: weights, &quot;tokenizer&quot;: tokenizer,
+            &quot;prompt_tmpl&quot;: prompt_tmpl, &quot;decode&quot;: decode,
+            &quot;engine&quot;: engine, &quot;postproc&quot;: postproc}
+
+
+# ---------------------------------------------------------------- 漂移检测
+def drift(deployed, target):
+    &quot;&quot;&quot;返回漂移的字段列表（按字段名排序）。&quot;&quot;&quot;
+    return sorted(f for f in FIELDS if deployed.get(f) != target.get(f))
+
+
+def rollback_plan(deployed_list, target):
+    &quot;&quot;&quot;每个副本要改什么；返回 [(副本名, 漂移字段)] 与修复工作量估计。&quot;&quot;&quot;
+    plan = []
+    for name, dep in deployed_list:
+        d = drift(dep, target)
+        if d:
+            plan.append((name, d))
+    return plan
+
+
+# ---------------------------------------------------------------- 缓存失效
+def cache_sim(n, switch_at, old_hit, p_old_only=0.60, seed=11):
+    &quot;&quot;&quot;模拟一次版本切换前后各半个窗口的缓存命中。
+
+    key 正确（含 manifest_hash）vs key 错误（不含）两种实现的命中率对比。
+    &quot;&quot;&quot;
+    rng = random.Random(seed)
+    before = int(n * switch_at)
+    after = n - before
+    hits_correct = hits_wrong = stale = 0
+    for _ in range(before):
+        if rng.random() &lt; old_hit:
+            hits_correct += 1
+            hits_wrong += 1
+    for _ in range(after):
+        if rng.random() &lt; old_hit:
+            # 新模型的 key 正确版本：旧条目不再命中
+            pass
+        if rng.random() &lt; p_old_only:
+            hits_wrong += 1     # key 不含版本 → 命中旧条目
+            stale += 1
+    return {
+        &quot;hit_correct&quot;: hits_correct / n,
+        &quot;hit_wrong&quot;: hits_wrong / n,
+        &quot;stale_share&quot;: stale / after if after else 0.0,
+    }
+
+
+# ---------------------------------------------------------------- 熔断与 RTO
+def detect_latency(samples, threshold, need=3):
+    &quot;&quot;&quot;连续 need 个窗口超阈值才判定熔断（避免单点抖动触发回滚）。&quot;&quot;&quot;
+    streak = 0
+    for i, p99 in enumerate(samples, start=1):
+        streak = streak + 1 if p99 &gt; threshold else 0
+        if streak &gt;= need:
+            return i, True
+    return len(samples), False
+
+
+def rto_ledger(stages, budget):
+    &quot;&quot;&quot;累加各阶段耗时，给出门是否满足 RTO，并列出超预算项。&quot;&quot;&quot;
+    total = sum(v for _, v in stages)
+    worst = sorted(stages, key=lambda kv: -kv[1])[:2]
+    return total, total &lt;= budget, worst
+
+
+# ------------------------------------------------------------------ 主输出
+BASE = manifest(&quot;w-7f3a&quot;, &quot;tok-v2&quot;, &quot;pt-11&quot;, &quot;T0.7/top-p0.9&quot;, &quot;eng-2.4.1&quot;, &quot;pp-3&quot;)
+TARGET = manifest(&quot;w-9c01&quot;, &quot;tok-v2&quot;, &quot;pt-12&quot;, &quot;T0.7/top-p0.9&quot;, &quot;eng-2.4.1&quot;, &quot;pp-3&quot;)
+
+
+def main():
+    print(&quot;== 1. 绑定哈希：任何一个部件变了，整单元就变 ==&quot;)
+    print(f&quot;  基线 manifest 哈希 = {binding_hash(BASE)}&quot;)
+    for f in FIELDS:
+        m = dict(BASE)
+        m[f] = BASE[f] + &quot;-x&quot;
+        print(f&quot;  改 {f:12s} → {binding_hash(m)}  同基线:&quot;
+              f&quot; {binding_hash(m) == binding_hash(BASE)}&quot;)
+    print(f&quot;  只改键序（等价 JSON）：&quot;
+          f&quot;{binding_hash(dict(reversed(list(BASE.items())))) == binding_hash(BASE)}&quot;)
+
+    print()
+    print(&quot;== 2. 灰度中的版本漂移：哪些副本和 manifest 不一致 ==&quot;)
+    deployed = [
+        (&quot;pod-0&quot;, dict(BASE)),
+        (&quot;pod-1&quot;, dict(TARGET)),                                       # 已完全对齐
+        (&quot;pod-2&quot;, dict(BASE, weights=&quot;w-7f3a&quot;)),                       # 权重没换
+        (&quot;pod-3&quot;, dict(BASE, weights=&quot;w-9c01&quot;, prompt_tmpl=&quot;pt-11&quot;)),  # prompt 没换
+    ]
+    print(f&quot;  目标 manifest = {TARGET}&quot;)
+    plan = rollback_plan(deployed, TARGET)
+    for name, fields in plan:
+        print(f&quot;  {name}: 漂移字段 {fields}&quot;)
+    print(f&quot;  一致副本 {len(deployed) - len(plan)} / {len(deployed)}；&quot;
+          f&quot;不一致副本必须逐个修复，否则流量分布被污染。&quot;)
+
+    print()
+    print(&quot;== 3. 缓存 key：含不含 manifest_hash 的差别 ==&quot;)
+    res = cache_sim(n=200_000, switch_at=0.5, old_hit=0.90)
+    print(f&quot;  切换前命中率 {0.90:.2f}（预热充分）&quot;)
+    print(f&quot;  窗口总体命中率：key 含版本 = {res[&#39;hit_correct&#39;]:.3f}；&quot;
+          f&quot;key 不含版本 = {res[&#39;hit_wrong&#39;]:.3f}&quot;)
+    print(f&quot;  切换后仍命中旧条目的比例（=陈旧回答） = {res[&#39;stale_share&#39;]:.3f}&quot;)
+    print(&quot;  含版本的 key 在切换瞬间命中率下降（缓存冷），但不会返回旧模型结果。&quot;)
+
+    print()
+    print(&quot;== 4. 缓存重建代价：容量 C / 预热速率 r ==&quot;)
+    for C_GB, r_GBps in ((200, 2.0), (200, 20.0), (2000, 20.0)):
+        t = C_GB / r_GBps
+        print(f&quot;  C={C_GB:5d} GB, r={r_GBps:5.1f} GB/s → 预热 {t:6.1f} s&quot;
+              f&quot;（占 300 s RTO 的 {100 * t / 300:4.1f}%）&quot;)
+
+    print()
+    print(&quot;== 5. 熔断判据：连续 3 个窗口超 p99 阈值才回滚 ==&quot;)
+    thr = 850.0
+    cases = [
+        (&quot;单点抖动&quot;, [700, 900, 710, 720, 705, 715]),
+        (&quot;持续劣化&quot;, [700, 900, 910, 920, 930, 940]),
+        (&quot;边界震荡&quot;, [700, 860, 840, 870, 830, 880]),
+    ]
+    for lab, series in cases:
+        n, fired = detect_latency(series, thr, need=3)
+        print(f&quot;  {lab:8s} p99={series} → 第 {n} 个窗口 &quot;
+              f&quot;{&#39;熔断&#39; if fired else &#39;未熔断&#39;}&quot;)
+
+    print()
+    print(&quot;== 6. RTO 账本：把一个真实回滚拆成五段 ==&quot;)
+    stages = [(&quot;探测（窗口+告警）&quot;, 30.0), (&quot;决策（人/自动）&quot;, 60.0),
+              (&quot;传播（配置/路由下发）&quot;, 15.0), (&quot;重启/切流&quot;, 20.0),
+              (&quot;缓存预热&quot;, 100.0)]
+    total, ok, worst = rto_ledger(stages, budget=300.0)
+    for name, v in stages:
+        print(f&quot;  {name:22s} {v:7.1f} s  （占 RTO 的 {100 * v / total:4.1f}%）&quot;)
+    print(f&quot;  合计 {total:.1f} s ≤ 300 s ? {ok}；最大两项：{worst}&quot;)
+    print(f&quot;  压 RTO 优先动探测与决策（占 {100 * (30 + 60) / total:.0f}%），&quot;
+          f&quot;而不是缓存。&quot;)
+
+    print()
+    print(&quot;== 7. 指针层：每次移动都要留可解析的历史 ==&quot;)
+    pointer = [(&quot;2026-09-20T10:00Z&quot;, &quot;v41&quot;, &quot;w-7f3a&quot;), (&quot;2026-09-21T09:30Z&quot;, &quot;v42&quot;, &quot;w-9c01&quot;),
+               (&quot;2026-09-21T11:10Z&quot;, &quot;v41&quot;, &quot;w-7f3a&quot;)]
+    for ts, ver, w in pointer:
+        print(f&quot;  {ts} prod → {ver}（权重 {w}）&quot;)
+    print(&quot;  回滚 = 把指针指回 v41；因为 v41 的内容寻址制品没有被覆写，&quot;
+          &quot;恢复是精确的。&quot;)
+
+    print()
+    print(&quot;== 8. 四种回滚场景：哪些回得来、哪些回不来 ==&quot;)
+    scenarios = [
+        (&quot;权重按内容寻址存放&quot;, 1.00, &quot;把指针指回旧哈希即可，精确恢复&quot;),
+        (&quot;就地覆盖了已发布权重&quot;, 0.00, &quot;无法恢复（除非另有备份）&quot;),
+        (&quot;下游特征服务已按新 schema 升级&quot;, 0.00, &quot;回滚权重无效：输入分布已变&quot;),
+        (&quot;会话状态里有新模型生成的 KV/历史&quot;, 0.00, &quot;回滚只对新会话生效&quot;),
+    ]
+    for name, fixable, why in scenarios:
+        print(f&quot;  {name:26s} 可恢复比例={fixable:.2f}  {why}&quot;)
+    print(&quot;  结论：可回滚性 = 内容不可变 + 依赖版本化 + 状态可隔离，三者缺一不可。&quot;)
+
+
+main()</code></pre>
+<p><strong>实际运行输出</strong>（完整脚本运行，逐字节）：</p>
+<pre data-lang="text"><code class="language-text">== 1. 绑定哈希：任何一个部件变了，整单元就变 ==
+  基线 manifest 哈希 = 2f5c8b75e4292f8130a03fd89fa695fe
+  改 weights      → 8dbb106047ca78f5d8a48cf39522367b  同基线: False
+  改 tokenizer    → e5e75f0d8a45b2b0db10843e4d386cbc  同基线: False
+  改 prompt_tmpl  → 05179d571df169e72005497eb4ff3af6  同基线: False
+  改 decode       → c09f3c859cbd53d8a1b27e89de7ab81a  同基线: False
+  改 engine       → 38f265d42d5c8fb56ef905219d759586  同基线: False
+  改 postproc     → 39ddf8c7d62eb5b43982fc3aebd01e06  同基线: False
+  只改键序（等价 JSON）：True
+
+== 2. 灰度中的版本漂移：哪些副本和 manifest 不一致 ==
+  目标 manifest = {&#39;weights&#39;: &#39;w-9c01&#39;, &#39;tokenizer&#39;: &#39;tok-v2&#39;, &#39;prompt_tmpl&#39;: &#39;pt-12&#39;, &#39;decode&#39;: &#39;T0.7/top-p0.9&#39;, &#39;engine&#39;: &#39;eng-2.4.1&#39;, &#39;postproc&#39;: &#39;pp-3&#39;}
+  pod-0: 漂移字段 [&#39;prompt_tmpl&#39;, &#39;weights&#39;]
+  pod-2: 漂移字段 [&#39;prompt_tmpl&#39;, &#39;weights&#39;]
+  pod-3: 漂移字段 [&#39;prompt_tmpl&#39;]
+  一致副本 1 / 4；不一致副本必须逐个修复，否则流量分布被污染。
+
+== 3. 缓存 key：含不含 manifest_hash 的差别 ==
+  切换前命中率 0.90（预热充分）
+  窗口总体命中率：key 含版本 = 0.450；key 不含版本 = 0.750
+  切换后仍命中旧条目的比例（=陈旧回答） = 0.599
+  含版本的 key 在切换瞬间命中率下降（缓存冷），但不会返回旧模型结果。
+
+== 4. 缓存重建代价：容量 C / 预热速率 r ==
+  C=  200 GB, r=  2.0 GB/s → 预热  100.0 s（占 300 s RTO 的 33.3%）
+  C=  200 GB, r= 20.0 GB/s → 预热   10.0 s（占 300 s RTO 的  3.3%）
+  C= 2000 GB, r= 20.0 GB/s → 预热  100.0 s（占 300 s RTO 的 33.3%）
+
+== 5. 熔断判据：连续 3 个窗口超 p99 阈值才回滚 ==
+  单点抖动     p99=[700, 900, 710, 720, 705, 715] → 第 6 个窗口 未熔断
+  持续劣化     p99=[700, 900, 910, 920, 930, 940] → 第 4 个窗口 熔断
+  边界震荡     p99=[700, 860, 840, 870, 830, 880] → 第 6 个窗口 未熔断
+
+== 6. RTO 账本：把一个真实回滚拆成五段 ==
+  探测（窗口+告警）                 30.0 s  （占 RTO 的 13.3%）
+  决策（人/自动）                  60.0 s  （占 RTO 的 26.7%）
+  传播（配置/路由下发）               15.0 s  （占 RTO 的  6.7%）
+  重启/切流                     20.0 s  （占 RTO 的  8.9%）
+  缓存预热                     100.0 s  （占 RTO 的 44.4%）
+  合计 225.0 s ≤ 300 s ? True；最大两项：[(&#39;缓存预热&#39;, 100.0), (&#39;决策（人/自动）&#39;, 60.0)]
+  压 RTO 优先动探测与决策（占 40%），而不是缓存。
+
+== 7. 指针层：每次移动都要留可解析的历史 ==
+  2026-09-20T10:00Z prod → v41（权重 w-7f3a）
+  2026-09-21T09:30Z prod → v42（权重 w-9c01）
+  2026-09-21T11:10Z prod → v41（权重 w-7f3a）
+  回滚 = 把指针指回 v41；因为 v41 的内容寻址制品没有被覆写，恢复是精确的。
+
+== 8. 四种回滚场景：哪些回得来、哪些回不来 ==
+  权重按内容寻址存放                  可恢复比例=1.00  把指针指回旧哈希即可，精确恢复
+  就地覆盖了已发布权重                 可恢复比例=0.00  无法恢复（除非另有备份）
+  下游特征服务已按新 schema 升级        可恢复比例=0.00  回滚权重无效：输入分布已变
+  会话状态里有新模型生成的 KV/历史         可恢复比例=0.00  回滚只对新会话生效
+  结论：可回滚性 = 内容不可变 + 依赖版本化 + 状态可隔离，三者缺一不可。</code></pre>
+<h3 id="h-练习">练习<a class="anchor" href="#h-练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><p><strong>给你现在的发布写一份 manifest 与漂移检查</strong>：
+（a）列出&quot;改变输出&quot;的全部部件，写出 manifest 的字段与规范化规则（键序、浮点、缺省值）；
+（b）计算一次真实发布的 <code>binding_hash</code>，并验证&quot;只改键序不变、改任一字段必变&quot;；
+（c）设计滚动发布后的漂移检查：怎么取到每个副本的实际 manifest？多久查一次？发现漂移怎么处置？</p>
+</li>
+<li><p><strong>缓存 key 审计</strong>：
+（a）找出你系统里所有缓存（结果缓存、前缀 KV、embedding、检索结果），写出各自的 key 构成；
+（b）判断哪些 key 缺了 <code>manifest_hash</code>，估算&quot;切换版本后陈旧命中的比例&quot;（用本节 <code>cache_sim</code>，把 <code>p_old_only</code> 换成你的实测值）；
+（c）给出修复顺序（按影响面与改动成本排序）。</p>
+</li>
+<li><p><strong>RTO 账本实测</strong>：
+（a）把最近一次回滚（或一次演练）拆成五段，给出每段耗时；
+（b）计算各段占比，指出最该优化的一段；
+（c）写出你的 RTO SLO 与每段预算（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">95</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>），并设计&quot;超预算告警&quot;。</p>
+</li>
+<li><p><strong>熔断判据设计</strong>：
+（a）为错误率、p99 延迟、单请求成本各定窗口长度、最小样本量与连续窗口数；
+（b）用本节 <code>detect_latency</code> 检验你的判据对&quot;单点抖动&quot;和&quot;持续劣化&quot;的区分度；
+（c）说明哪些信号的熔断可以全自动，哪些必须人工确认，并给出理由。</p>
+</li>
+<li><p><strong>依赖兼容窗口</strong>：
+（a）列出你的模型依赖的外部服务/schema（特征、检索、工具、下游）；
+（b）为每一个写出&quot;回滚窗口&quot;（旧版本还能用多久），并把它写进 manifest 的 <code>deps</code>；
+（c）设计一个双写 + 迁移 + 删旧的计划，标出每一步的可回滚性。</p>
+</li>
+<li><p><strong>回滚演练</strong>：
+（a）设计一次&quot;无通知回滚演练&quot;的脚本：目标、判据、计时方式、成功标准；
+（b）在演练中记录实际 RTO，并与账本预算比较；
+（c）列出演练暴露的&quot;回不去&quot;问题（权限、制品被清理、脚本腐化、缓存未隔离），给出修复项。</p>
+</li>
+<li><p><strong>回滚 vs 向前修复的决策</strong>：
+（a）为四类故障（崩溃 / 指标劣化 / 配置错误 / 数据迁移）分别给出默认决策；
+（b）写出各自的判据（多久能定位？修复成本？回滚会造成什么数据不一致？）；
+（c）用一个真实案例复盘：当时选的是回滚还是向前修复？按你的判据应该选哪个？</p>
+</li>
+</ol>
+<h3 id="h-小结">小结<a class="anchor" href="#h-小结" aria-label="本节链接">#</a></h3>
+<ul>
+<li><strong>发布单元是一个绑定，不是一个文件</strong>：<code>manifest = {weights, tokenizer, prompt_tmpl, decode, engine, postproc}</code>，<code>binding_hash = md5(canonical_json(manifest))</code>。代码实测：改任一字段哈希必变，只改键序不变。<strong>pod-3 只漂移 <code>prompt_tmpl</code></strong> 是最典型的静默事故。</li>
+<li><strong>三层命名空间</strong>：内容寻址的不可变制品层、只追加的逻辑版本层、可变的指针层。<strong>回滚 = 移指针</strong>；制品被就地覆写，回滚就从原理上不可能（可恢复比例 = 0）。</li>
+<li><strong>缓存 key 必须含 <code>manifest_hash</code></strong>：不含它时，切换版本后约 <strong>60% 的回答来自旧模型</strong>，而命中率、延迟、成本全部&quot;看起来更好&quot;，灰度效应被稀释一半以上 —— 这是最隐蔽的一类发布故障。</li>
+<li><strong>缓存全冷的代价可算</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">warm</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="mord">/</span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span></span></span></span>。200GB / 2GBps = 100s，占 300s RTO 的 33%；200GB / 20GBps 只要 10s。处置优先级：切换前预热 &gt; 双缓存并存 &gt; 粗粒度版本代。</li>
+<li><strong>RTO 要拆账</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord">RTO</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">探测</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">决策</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">传播</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">重启</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">预热</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>。算例 30+60+15+20+100 = 225s ≤ 300s；占比最大的是缓存预热（44%）与人工决策（27%）。<strong>承诺 RTO 的正确方式是给每段定预算并测量 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">95</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>，而不是报平均值。</strong></li>
+<li><strong>熔断判据要抗抖</strong>：连续 3 个窗口超阈值 —— 单点 900ms 不触发、持续劣化第 4 个窗口熔断。<strong>工程熔断 ≠ 实验判据</strong>：前者要立即、无争议；后者要样本量与多重性。</li>
+<li><strong>回滚的边界是依赖与状态</strong>：下游 schema 已升级、会话状态已被写入时，回滚权重无效。对策是<strong>依赖版本范围写进 manifest + 兼容窗口（双写期）+ 状态隔离</strong>。受影响会话比例 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8491em;"></span><span class="mord"><span class="mord mathnormal">e</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8491em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mathnormal mtight">λ</span><span class="mord mathnormal mtight">t</span></span></span></span></span></span></span></span></span></span></span></span>，所以<strong>越早回滚越干净</strong>。</li>
+<li><strong>回滚演练是纪律不是选项</strong>：权限过期、制品被清理、脚本腐化都会让&quot;纸面上的回滚&quot;在真实事故中失效。每月一次无通知演练，把实测耗时记入账本。</li>
+</ul>
+<blockquote>
+<p>本章到此结束：第 1 节把数据门禁写成可算的期望成本，第 2 节把评测门禁写成假设检验 + 成本最优 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span>，第 3 节把发布门禁推到线上（影子 / 灰度 / 停止边界），第 4 节把&quot;坏了怎么办&quot;做成可承诺的 RTO。四条线合起来是一句话：<strong>流水线的价值 = 它拦下的事故的期望收益 − 它的运行成本；而这条式子里的每一个量（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">d</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">esc</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">拦</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord">/</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">放</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>、MDE、RTO）都必须能被测量或被明确假设。</strong> 测不出来的部分，就是这套流水线真正脆弱的地方。</p>
+</blockquote>

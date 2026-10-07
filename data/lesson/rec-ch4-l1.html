@@ -1,0 +1,125 @@
+<h2 id="h-排序问题与-gbdtlr">排序问题与 GBDT+LR<a class="anchor" href="#h-排序问题与-gbdtlr" aria-label="本节链接">#</a></h2>
+<blockquote>
+<p>前三章我们把&quot;给用户找候选物品&quot;这件事用协同过滤、矩阵分解解决了。但从本章开始要回答一个更精细的问题：候选物品已经摆在面前时，<strong>到底先给用户看哪个</strong>？这就是排序问题，而 GBDT+LR 是工业界第一次把&quot;自动特征组合&quot;搬进排序模型的经典方案。</p>
+</blockquote>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-排序问题从哪里来">1. 排序问题从哪里来<a class="anchor" href="#h-1-排序问题从哪里来" aria-label="本节链接">#</a></h4>
+<p>回顾一下推荐系统的流水线：召回阶段从百万级物品池里捞出几百上千个&quot;可能感兴趣&quot;的候选，但这些候选<strong>质量参差不齐</strong>，而用户的屏幕只能显示十几条。于是系统需要一个&quot;评分器&quot;，给每个候选算一个分数，按分数从高到低排出最终展示顺序。这个环节叫<strong>精排（ranking）</strong>。</p>
+<p>排序问题在工业界几乎总是被建模成<strong>点击率预估（CTR 预估）</strong>：给定用户 <code>u</code> 和候选物品 <code>i</code>，预测一个概率 <code>pCTR = P(点击 | u, i)</code>。为什么用&quot;概率&quot;而不是随便打个分？因为线上日志里我们能观测到的只有&quot;这条物品被曝光了、用户点没点&quot;，这是一堆 0/1 反馈。把问题写成概率估计，就能直接用最大似然（交叉熵损失）来训练，损失函数有明确的概率意义，模型输出的 0 到 1 之间的数也能直接用于排序和竞价。</p>
+<p>排序模型和前面矩阵分解的本质区别在于：矩阵分解只用了&quot;用户-物品&quot;的交互这一个信号，而排序模型可以<strong>吃进任意维度的特征</strong>——用户年龄、性别、历史行为序列、物品类目、价格、上下文（时间、场景、设备），甚至交叉特征。排序阶段是整个推荐系统里&quot;特征最丰富、模型最重&quot;的地方。</p>
+<p><figure><img class="md-img" src="content/courses/recommendation-systems/assets/chapter-4-figure-01.svg" alt="排序在推荐系统漏斗中的位置" loading="lazy" decoding="async"><figcaption>排序在推荐系统漏斗中的位置</figcaption></figure>
+</p>
+<h4 id="h-2-逻辑回归排序的起点与它的短板">2. 逻辑回归：排序的起点与它的短板<a class="anchor" href="#h-2-逻辑回归排序的起点与它的短板" aria-label="本节链接">#</a></h4>
+<p>逻辑回归（LR）是排序模型的&quot;地基&quot;。对特征向量 <code>x</code>，它输出：</p>
+<pre><code>pCTR = σ(wᵀx) = 1 / (1 + exp(-wᵀx))</code></pre>
+<p>LR 有三个工业级优点：<strong>可解释</strong>（每个特征的权重一目了然）、<strong>训练和在线打分都快</strong>（就是一次内积）、<strong>适合在线增量更新</strong>（新样本来了，用 FTRL 之类的在线优化器就能小步更新权重，不用全量重训）。因此在很长一段时间里，LR 是广告和推荐精排的主力。</p>
+<p>但 LR 有一个致命短板：它是<strong>线性模型</strong>，<code>wᵀx</code> 里只有&quot;每个特征单独乘一个权重再相加&quot;，<strong>无法表达特征之间的组合关系</strong>。举一个具体例子：单独看&quot;用户是 20 岁&quot;和&quot;物品是电竞游戏&quot;，两个特征本身可能都没有明显的正负倾向；但&quot;20 岁的用户 + 电竞游戏&quot;这个<strong>组合</strong>却强烈预示着点击。LR 学不出这种&quot;组合效应&quot;，除非你<strong>人工</strong>把这两个特征拼成一个新特征 <code>age_20 AND game_e-sports</code> 喂进去。</p>
+<p>于是问题变成了：<strong>谁来做特征组合？</strong> 靠人工特征工程，成本高、覆盖不全、还容易漏。这就是 GBDT+LR 登场的原因。</p>
+<h4 id="h-3-gbdtlr让树帮你做特征组合">3. GBDT+LR：让树帮你做特征组合<a class="anchor" href="#h-3-gbdtlr让树帮你做特征组合" aria-label="本节链接">#</a></h4>
+<p>GBDT+LR 最早由 Facebook 在 2014 年的一篇论文《Practical Lessons from Predicting Clicks on Ads at Facebook》里系统提出并公开。核心思想非常朴素，一句话概括：</p>
+<blockquote>
+<p><strong>先训练一棵（一组）GBDT 决策树，把&quot;样本落在每棵树的哪个叶子节点&quot;当作新的 one-hot 特征，再把这些叶子特征喂给 LR。</strong></p>
+</blockquote>
+<p>为什么要这样？因为<strong>决策树天然就是一个&quot;特征组合 + 自动分桶&quot;的机器</strong>。看一棵树的某一条从根到叶子的路径：</p>
+<pre><code>年龄 &lt; 25 ？ ──是──&gt; 类目 = 游戏 ？ ──是──&gt; 落到叶子 3</code></pre>
+<p>这条路径本身就在说&quot;年龄 &lt; 25 且 类目 = 游戏&quot;这个<strong>组合</strong>成立。样本落在叶子 3，就相当于把这个组合特征置为 1。一棵树的每个叶子，都是一组&quot;原始特征经过若干次与运算&quot;得到的组合特征。把多棵树的叶子拼起来，就得到了一堆<strong>自动挖掘出的高阶组合特征</strong>，而且连续特征在这个过程中被树的阈值切分自动离散化成了桶。</p>
+<p>整条数据流可以画成：</p>
+<pre><code>原始特征 x ──&gt; GBDT(若干棵树) ──&gt; 叶子编号 [3, 0, 5, ...] ──&gt; one-hot 稀疏向量 ──&gt; LR ──&gt; pCTR
+                 （做非线性特征组合）   （每条路径=一个组合特征）      （稀疏、可解释、可在线更新）</code></pre>
+<p>有了这些叶子特征，LR 仍然保持它&quot;快、可解释、可在线更新&quot;的优点，但表达能力被 GBDT 的组合特征补齐了。整个方案可以理解为一次<strong>分工</strong>：GBDT 负责&quot;非线性的特征构造&quot;，LR 负责&quot;线性的最终打分与在线学习&quot;。</p>
+<h4 id="h-4-训练流程拆解">4. 训练流程拆解<a class="anchor" href="#h-4-训练流程拆解" aria-label="本节链接">#</a></h4>
+<p>GBDT+LR 通常分两步（也可以联合微调，但工业界主流是两段式，简单稳定）：</p>
+<ol>
+<li><strong>训练 GBDT</strong>：用全部原始特征去拟合点击标签，得到 <code>T</code> 棵树。树的数量和深度是超参数，深度通常较浅（比如 3~4），叶子数有限，避免过拟合和特征爆炸。</li>
+<li><strong>叶子编码 + 训练 LR</strong>：把每个样本投进 GBDT，用 <code>apply</code> 得到它在每棵树上的叶子编号，对叶子编号做 one-hot 编码，得到稀疏的叶子特征向量；再把原始特征（可选）和叶子特征拼接，喂给 LR 训练。</li>
+</ol>
+<p>因为叶子编码是 one-hot 稀疏向量，LR 用稀疏表示就能高效处理；在线打分时，新样本同样先走一遍 GBDT 拿到叶子，再算一次 <code>wᵀx</code>，代价也很低。</p>
+<p>值得强调的一点是：GBDT 在这里承担了&quot;<strong>非线性 + 特征组合</strong>&quot;，它弥补的正是 LR 的最大短板；而 LR 保留了&quot;在线学习 + 可解释 + 快&quot;的长处。这个&quot;树 + 线性&quot;的组合，是理解后续所有深度排序模型（DeepFM、Wide&amp;Deep）的一把钥匙——后者的本质，都是用<strong>神经网络</strong>替换掉 GBDT 来做特征组合，同时保留一个&quot;线性部分&quot;去承接记忆能力。</p>
+<h3 id="h-二可运行示例">二、可运行示例<a class="anchor" href="#h-二可运行示例" aria-label="本节链接">#</a></h3>
+<h4 id="h-示例-1合成数据上的-gbdtlr-完整流程">示例 1：合成数据上的 GBDT+LR 完整流程<a class="anchor" href="#h-示例-1合成数据上的-gbdtlr-完整流程" aria-label="本节链接">#</a></h4>
+<p>用 <code>scikit-learn</code> 跑一遍完整的两段式流程，并和&quot;只用 LR&quot;对比 AUC，直观感受 GBDT 带来的特征组合收益。</p>
+<pre data-lang="python"><code class="language-python">import numpy as np
+from sklearn.datasets import make_classification
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score
+from sklearn.preprocessing import OneHotEncoder
+
+# 1. 生成合成数据：10 个特征，其中 label 与若干特征的非线性组合有关
+X, y = make_classification(n_samples=30000, n_features=10, n_informative=6,
+                           n_redundant=2, n_clusters_per_class=2, random_state=42)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+# 2. 训练 GBDT：树的集合负责&quot;挖掘特征组合&quot;
+gbrt = GradientBoostingClassifier(n_estimators=30, max_depth=4,
+                                  learning_rate=0.1, random_state=42)
+gbrt.fit(X_train, y_train)
+
+# 3. 用 apply 拿到每个样本在每棵树上的叶子编号
+#    GradientBoostingClassifier.apply 对二分类返回形状 (n_samples, n_estimators, n_classes)
+train_leaves = gbrt.apply(X_train)
+test_leaves = gbrt.apply(X_test)
+if train_leaves.ndim == 3:          # 防御性写法：取第一个类的叶子编号
+    train_leaves = train_leaves[:, :, 0]
+    test_leaves = test_leaves[:, :, 0]
+
+# 4. 把叶子编号 one-hot 编码，得到稀疏的组合特征
+enc = OneHotEncoder(handle_unknown=&quot;ignore&quot;)
+enc.fit(train_leaves)
+train_leaf_oh = enc.transform(train_leaves)
+test_leaf_oh = enc.transform(test_leaves)
+
+# 5. 用叶子特征训练 LR（可选的原始特征拼接略去，这里只演示叶子特征）
+lr = LogisticRegression(max_iter=2000, C=1.0)
+lr.fit(train_leaf_oh, y_train)
+auc_gbdt_lr = roc_auc_score(y_test, lr.predict_proba(test_leaf_oh)[:, 1])
+
+# 6. 对比：只用原始特征训练 LR
+lr_raw = LogisticRegression(max_iter=2000, C=1.0)
+lr_raw.fit(X_train, y_train)
+auc_lr = roc_auc_score(y_test, lr_raw.predict_proba(X_test)[:, 1])
+
+print(f&quot;只用 LR 的 AUC         : {auc_lr:.4f}&quot;)
+print(f&quot;GBDT+LR 的 AUC         : {auc_gbdt_lr:.4f}&quot;)
+print(f&quot;叶子特征总维度         : {train_leaf_oh.shape[1]}&quot;)</code></pre>
+<h4 id="h-示例-2直观理解一个叶子--一个组合特征">示例 2：直观理解&quot;一个叶子 = 一个组合特征&quot;<a class="anchor" href="#h-示例-2直观理解一个叶子--一个组合特征" aria-label="本节链接">#</a></h4>
+<p>用手写的一棵小决策树，演示叶子编号如何把&quot;年龄 + 类目&quot;编码成一个 one-hot 组合特征。</p>
+<pre data-lang="python"><code class="language-python"># 假设只有两个特征：年龄(连续) 和 类目(离散：0=游戏, 1=新闻, 2=音乐)
+# 手写一棵两层决策树的规则，返回每个样本的叶子编号
+def tiny_tree(age, category):
+    # 根节点按&quot;年龄 &lt; 25&quot;切分
+    #   左子树：类目 == 0（游戏）-&gt; 叶子 0，否则 -&gt; 叶子 1
+    #   右子树：类目 == 2（音乐）-&gt; 叶子 2，否则 -&gt; 叶子 3
+    if age &lt; 25:
+        return 0 if category == 0 else 1
+    else:
+        return 2 if category == 2 else 3
+
+samples = [
+    (20, 0),   # 年轻 + 游戏
+    (20, 1),   # 年轻 + 新闻
+    (40, 2),   # 年长 + 音乐
+    (40, 0),   # 年长 + 游戏
+]
+for age, cat in samples:
+    leaf = tiny_tree(age, cat)
+    # 叶子 one-hot 编码：4 个叶子 -&gt; 4 维向量，只有落到的位置为 1
+    oh = [1 if i == leaf else 0 for i in range(4)]
+    print(f&quot;age={age:&gt;2}, category={cat} -&gt; 叶子 {leaf} -&gt; one-hot {oh}&quot;)
+# 叶子 0 就代表&quot;年龄&lt;25 且 类目=游戏&quot;这个组合特征被点亮了</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>把示例 1 里 GBDT 的 <code>max_depth</code> 从 4 改成 1，观察叶子特征维度如何变化，并解释为什么深度越浅、叶子越少、组合特征的&quot;阶数&quot;也越低。</li>
+<li>在示例 1 的基础上，把 GBDT 的原始特征也拼进 LR（<code>hstack</code> 原始特征与叶子 one-hot），对比 AUC 变化，并说明&quot;原始特征 + 叶子特征&quot;分别提供了什么信息。</li>
+<li>用文字说明：为什么 GBDT+LR 里 LR 可以&quot;在线增量更新&quot;，而 GBDT 通常只能离线重训？这会给工程带来什么权衡？</li>
+<li>思考题：如果把 GBDT 换成随机森林（RandomForest），叶子编码喂 LR 的方案还成立吗？两者在&quot;特征组合&quot;能力上有什么差异？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Facebook《Practical Lessons from Predicting Clicks on Ads at Facebook》（GBDT+LR 原始来源）：<a href="https://research.facebook.com/publications/practical-lessons-from-predicting-clicks-on-ads-at-facebook/" target="_blank" rel="noopener noreferrer">https://research.facebook.com/publications/practical-lessons-from-predicting-clicks-on-ads-at-facebook/</a></li>
+<li>王喆《深度学习推荐系统》配套论文清单 Reco-papers：<a href="https://github.com/wzhe06/Reco-papers" target="_blank" rel="noopener noreferrer">https://github.com/wzhe06/Reco-papers</a></li>
+<li>scikit-learn 官方文档（GradientBoostingClassifier / LogisticRegression）：<a href="https://scikit-learn.org/" target="_blank" rel="noopener noreferrer">https://scikit-learn.org/</a></li>
+<li>《深度学习推荐系统》王喆著，电子工业出版社（公开目录与章节概览）：<a href="https://github.com/wzhe06/Reco-papers" target="_blank" rel="noopener noreferrer">https://github.com/wzhe06/Reco-papers</a></li>
+</ul>
+<p><a href="#/l/rec-ch4-l2">下一课：DeepFM 等深度模型</a></p>

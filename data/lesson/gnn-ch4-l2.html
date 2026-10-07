@@ -1,0 +1,106 @@
+<h2 id="h-gat-注意力">GAT 注意力<a class="anchor" href="#h-gat-注意力" aria-label="本节链接">#</a></h2>
+<p>GCN 给邻居分配的权重是<strong>预先算死</strong>的：<code>1/sqrt(d_v · d_u)</code>，只由图的度数结构决定，与节点特征、与当前任务毫无关系。GraphSAGE 的均值/池化聚合器虽然更灵活，但对不同邻居依然&quot;一视同仁&quot;。一个自然的疑问是：<strong>能不能让模型自己决定该多听哪个邻居的意见？</strong></p>
+<p>这就是图注意力网络（Graph Attention Network，GAT）的回答。它把 Transformer 里大名鼎鼎的<strong>注意力机制</strong>搬到图上，给每条边学出一个&quot;重要性权重&quot;——重要且相似的邻居被放大，无关或异质的邻居被抑制。更重要的是，这个权重是<strong>内容相关、逐边不同</strong>的，模型能根据节点特征动态地&quot;看人下菜碟&quot;。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-直觉给每条边一个音量旋钮">1. 直觉：给每条边一个&quot;音量旋钮&quot;<a class="anchor" href="#h-1-直觉给每条边一个音量旋钮" aria-label="本节链接">#</a></h4>
+<p>想象节点 <code>i</code> 要听取它所有邻居的意见。有的邻居和它同属一个社区、特征相近，意见更可信；有的邻居是&quot;噪音&quot;，甚至是连接两个社区的桥梁节点，意见要打折。GAT 的做法是给每条边 <code>(i, j)</code> 装一个音量旋钮 <code>α_ij</code>，最终 <code>i</code> 的新表示是所有邻居表示的<strong>加权求和</strong>：</p>
+<pre><code>h_i&#39; = σ( Σ_{j ∈ N(i)} α_ij · W h_j )</code></pre>
+<p>其中 <code>α_ij ≥ 0</code> 且 <code>Σ_j α_ij = 1</code>（对每个节点归一化成一个概率分布）。旋钮开多大，由注意力机制算出来，而不是靠人工或固定公式。</p>
+<p><figure><img class="md-img" src="content/courses/graph-neural-networks/assets/chapter-4-figure-02.svg" alt="GAT 注意力计算流程示意：左侧节点 i 与其三个邻居，先经共享权重 W 做线性变换，再成对计算注意力得分 e_ij（LeakyReLU(a^T[Wh_i‖Wh_j])），经 softmax 归一化得到 α_ij，最后按 α_ij 加权求和并过 σ 得到 h_i&#39;，边上的粗细表示注意力权重的大小" loading="lazy" decoding="async"><figcaption>GAT 注意力计算流程示意：左侧节点 i 与其三个邻居，先经共享权重 W 做线性变换，再成对计算注意力得分 e_ij（LeakyReLU(a^T[Wh_i‖Wh_j])），经 softmax 归一化得到 α_ij，最后按 α_ij 加权求和并过 σ 得到 h_i&#39;，边上的粗细表示注意力权重的大小</figcaption></figure>
+</p>
+<h4 id="h-2-逐步推导注意力系数">2. 逐步推导注意力系数<a class="anchor" href="#h-2-逐步推导注意力系数" aria-label="本节链接">#</a></h4>
+<p>设节点 <code>i</code> 的输入特征为 <code>h_i</code>（维度 <code>F</code>）。GAT 的注意力计算分四步：</p>
+<p><strong>第一步：共享线性变换。</strong> 所有节点先过同一个权重矩阵 <code>W</code>，把特征映射到维度 <code>F&#39;</code>：</p>
+<pre><code>h_i&#39; = W · h_i          (W ∈ R^(F&#39; × F))</code></pre>
+<p><strong>第二步：成对计算注意力得分。</strong> 对每条边 <code>(i, j)</code>，把两端的变换后特征拼起来，再与一个可学习向量 <code>a</code>（维度 <code>2F&#39;</code>）做内积，经过 LeakyReLU：</p>
+<pre><code>e_ij = LeakyReLU( a^T · [ W h_i ‖ W h_j ] )</code></pre>
+<p><code>‖</code> 表示拼接，<code>a</code> 是注意力机制的&quot;打分器&quot;参数。这个得分的含义是&quot;节点 <code>j</code> 对节点 <code>i</code> 有多重要&quot;。</p>
+<p><strong>第三步：softmax 归一化。</strong> 为了让权重可比、可解释，对每个节点 <code>i</code>，把它的所有邻居得分归一化成概率：</p>
+<pre><code>α_ij = softmax_j( e_ij ) = exp( e_ij ) / Σ_{k ∈ N(i)} exp( e_ik )</code></pre>
+<p>注意归一化只针对 <code>i</code> 的邻居做（图结构在这里起到了&quot;mask&quot;的作用），这与 Transformer 里对全序列做 softmax 不同。</p>
+<p><strong>第四步：加权聚合。</strong> 用 <code>α_ij</code> 作为权重对邻居求和，过非线性激活：</p>
+<pre><code>h_i&#39;&#39; = σ( Σ_{j ∈ N(i)} α_ij · W h_j )</code></pre>
+<h4 id="h-3-多头注意力多套旋钮并行">3. 多头注意力：多套旋钮并行<a class="anchor" href="#h-3-多头注意力多套旋钮并行" aria-label="本节链接">#</a></h4>
+<p>单个注意力头可能学得不够稳（一次 softmax 容易&quot;押注&quot;某几个邻居）。GAT 借鉴 Transformer 的<strong>多头（multi-head）</strong>做法：并行跑 <code>K</code> 套独立的 <code>(W^k, a^k)</code>，各自算出权重再聚合：</p>
+<pre><code>h_i&#39;&#39; = ‖_{k=1..K} σ( Σ_{j} α_ij^k · W^k h_j )     （中间层：拼接）</code></pre>
+<p>最后一层（预测层）通常把多头的输出<strong>取平均</strong>而不是拼接，保证输出维度不变。多头让不同&quot;头&quot;可以关注不同类型的邻居关系（一个头关注同主题，一个头关注高被引），整体更鲁棒。</p>
+<h4 id="h-4-为什么注意力有效知其所以然">4. 为什么注意力&quot;有效&quot;：知其所以然<a class="anchor" href="#h-4-为什么注意力有效知其所以然" aria-label="本节链接">#</a></h4>
+<p>这里不能只背公式，要理解它到底解决了什么：</p>
+<ul>
+<li><strong>内容相关、逐边自适应</strong>：GCN 的 <code>1/sqrt(d_v d_u)</code> 只跟度数有关，两个邻居只要度数相同就分到同样的权重，哪怕一个和中心节点毫无共同点。GAT 的 <code>α_ij</code> 由<strong>两端特征共同决定</strong>，能把&quot;特征不相关&quot;的邻居权重压到接近 0，起到软性过滤噪音的作用。</li>
+<li><strong>方向感知（非对称）</strong>：<code>α_ij ≠ α_ji</code> 通常是成立的，因为打分器里的 <code>W h_i</code> 和 <code>W h_j</code> 位置不同。这让&quot;谁向谁传递信息&quot;有了方向性，比 GCN 对称的权重更细腻。</li>
+<li><strong>不需要预知全局结构</strong>：GCN 需要预先算好整张图的归一化拉普拉斯；GAT 只需要每个节点的<strong>局部邻居</strong>（用于 softmax 的 mask），权重完全由参数和特征即时算出。这使得 GAT 具备一定的归纳能力，也能较自然地用于新图。</li>
+<li><strong>可解释性</strong>：<code>α_ij</code> 就是一条边的重要性分数。训练后可以把注意力可视化，看模型认为哪些边是&quot;关键连接&quot;，这对理解模型行为很有价值。</li>
+</ul>
+<h4 id="h-5-一个已知局限与-gatv2-的修正">5. 一个已知局限与 GATv2 的修正<a class="anchor" href="#h-5-一个已知局限与-gatv2-的修正" aria-label="本节链接">#</a></h4>
+<p>原版 GAT 有个被后续研究指出的问题——<strong>静态注意力（static attention）</strong>：因为 <code>a^T[Wh_i‖Wh_j]</code> 可以整理成 <code>a_1^T(Wh_i) + a_2^T(Wh_j)</code>，当打分函数线性可分时，最终&quot;谁最受关注&quot;可能退化为只由&quot;某个全局的键（key）节点&quot;决定，而与查询节点 <code>i</code> 无关，表达能力受限。GATv2 的修正很简单：<strong>先拼接再做一次非线性变换，再打分</strong>，把 <code>a</code> 从向量换成一个小网络，使注意力真正随查询节点 <code>i</code> 动态变化。工程上若遇到注意力&quot;学不动&quot;、所有节点关注同一个邻居的情况，可考虑换用 GATv2。</p>
+<h3 id="h-二可运行示例">二、可运行示例<a class="anchor" href="#h-二可运行示例" aria-label="本节链接">#</a></h3>
+<p><strong>示例：用 PyG 的 <code>GATConv</code> 在 Cora 上做节点分类</strong></p>
+<pre data-lang="python"><code class="language-python">import torch
+import torch.nn.functional as F
+from torch_geometric.nn import GATConv
+from torch_geometric.datasets import Planetoid
+
+dataset = Planetoid(root=&#39;./data/Cora&#39;, name=&#39;Cora&#39;)
+data = dataset[0]
+
+# 定义两层 GAT：第一层 8 个头（concat），第二层 1 个头（用于分类）
+class GAT(torch.nn.Module):
+    def __init__(self, in_ch, hidden_ch, out_ch):
+        super().__init__()
+        # heads=8：输出维度 = hidden_ch * 8（多头拼接）
+        self.conv1 = GATConv(in_ch, hidden_ch, heads=8, dropout=0.6)
+        # 第二层常用 1 个头 + 平均，输出维度 = hidden_ch（可加 concat=False）
+        self.conv2 = GATConv(hidden_ch * 8, out_ch, heads=1,
+                             concat=False, dropout=0.6)
+
+    def forward(self, x, edge_index):
+        x = self.conv1(x, edge_index)
+        x = F.elu(x)                    # GAT 论文里用的是 ELU
+        x = F.dropout(x, p=0.6, training=self.training)
+        x = self.conv2(x, edge_index)
+        return F.log_softmax(x, dim=1)
+
+model = GAT(dataset.num_features, 8, dataset.num_classes)
+optimizer = torch.optim.Adam(model.parameters(), lr=0.005, weight_decay=5e-4)
+
+def train():
+    model.train()
+    optimizer.zero_grad()
+    out = model(data.x, data.edge_index)
+    loss = F.nll_loss(out[data.train_mask], data.y[data.train_mask])
+    loss.backward()
+    optimizer.step()
+    return loss.item()
+
+def evaluate():
+    model.eval()
+    out = model(data.x, data.edge_index)
+    pred = out.argmax(dim=1)
+    return [(int((pred[m] == data.y[m]).sum()) / int(m.sum()))
+            for m in [data.train_mask, data.val_mask, data.test_mask]]
+
+for epoch in range(200):
+    loss = train()
+    if epoch % 20 == 0:
+        tr, va, te = evaluate()
+        print(f&#39;Epoch {epoch:03d} | Loss {loss:.4f} | &#39;
+              f&#39;Train {tr:.4f} | Val {va:.4f} | Test {te:.4f}&#39;)</code></pre>
+<p>测试集准确率通常能到 0.80 上下，与同规模的 GCN/GraphSAGE 相当；注意力模型的优势在<strong>需要区分邻居重要性</strong>、或图里有大量异质邻居时会更明显。</p>
+<p><strong>观察注意力权重</strong>：把 <code>GATConv</code> 换成 <code>GATConv(..., edge_dim=None)</code> 的普通版本后，可以访问内部 <code>alpha_</code> 属性查看每条边的注意力分数，验证&quot;同类邻居权重更高&quot;的直觉。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>逐步推导</strong>：给定 <code>W h_i</code>、<code>W h_j</code> 和向量 <code>a</code>，写出 <code>e_ij</code>、<code>α_ij</code>、<code>h_i&#39;&#39;</code> 的完整计算过程，并指出 softmax 是在哪个集合上做的。</li>
+<li><strong>对比 GCN</strong>：GCN 的邻居权重是 <code>1/sqrt(d_v d_u)</code>，GAT 的权重是 <code>α_ij</code>。从&quot;是否依赖特征&quot;&quot;是否对称&quot;&quot;是否需要预知全局结构&quot;三个维度，列出两者差异。</li>
+<li><strong>多头的作用</strong>：把 <code>heads</code> 从 8 改成 1，重跑实验，观察准确率和训练稳定性的变化，并解释多头注意力的意义。</li>
+<li><strong>归一化范围</strong>：如果 softmax 改成对<strong>整张图所有节点</strong>做（而非仅邻居），注意力会发生什么变化？这样做的优缺点各是什么？</li>
+<li><strong>探究 GATv2</strong>：查阅 GATv2 论文，用自己的话解释&quot;静态注意力&quot;问题，并说明它是如何通过改变打分函数的次序来修正的。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>GAT 原论文：Veličković 等. &quot;Graph Attention Networks&quot; (ICLR 2018)：<a href="https://arxiv.org/abs/1710.10903" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1710.10903</a></li>
+<li>GATv2 论文：Brody, Alon, Yahav. &quot;How Attentive are Graph Attention Networks?&quot; (2021)：<a href="https://arxiv.org/abs/2105.14491" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2105.14491</a></li>
+<li>PyG 官方文档 · GATConv：<a href="https://pytorch-geometric.readthedocs.io/en/latest/generated/torch_geometric.nn.conv.GATConv.html" target="_blank" rel="noopener noreferrer">https://pytorch-geometric.readthedocs.io/en/latest/generated/torch_geometric.nn.conv.GATConv.html</a></li>
+<li>PyG 官方文档 · GATv2Conv：<a href="https://pytorch-geometric.readthedocs.io/en/latest/generated/torch_geometric.nn.conv.GATv2Conv.html" target="_blank" rel="noopener noreferrer">https://pytorch-geometric.readthedocs.io/en/latest/generated/torch_geometric.nn.conv.GATv2Conv.html</a></li>
+</ul>
+<p><a href="#/l/gnn-ch4-l3">下一课：两者对比</a></p>

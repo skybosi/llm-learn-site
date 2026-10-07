@@ -1,0 +1,254 @@
+<h2 id="h-算法-调度分离halide--tvm-的核心思想">算法-调度分离：Halide / TVM 的核心思想<a class="anchor" href="#h-算法-调度分离halide--tvm-的核心思想" aria-label="本节链接">#</a></h2>
+<p>第 5 课判完&quot;哪些算子能融&quot;，交出来的是一个融合后的张量程序：它说清了每个输出由哪些输入算出，却没说该按什么顺序算。而顺序决定性能——<code>y[i,j] = Σ_k a[i,k]·b[k,j]</code> 能展开成十几种都正确的循环嵌套，访存量相差一个数量级。本课讲清&quot;算法&quot;与&quot;调度&quot;为什么必须分开，并用一个两百行的模型把差异算出来。</p>
+<p><figure><img class="md-img" src="content/courses/ml-compilers/assets/chapter-6-figure-01.svg" alt="算法与调度：同一份计算，两份可替换的循环结构" loading="lazy" decoding="async"><figcaption>算法与调度：同一份计算，两份可替换的循环结构</figcaption></figure>
+</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-一段循环同时表达两件事是问题的根源">1. 一段循环同时表达两件事，是问题的根源<a class="anchor" href="#h-1-一段循环同时表达两件事是问题的根源" aria-label="本节链接">#</a></h4>
+<p>看这段手写循环：</p>
+<pre data-lang="c"><code class="language-c">for (int i = 0; i &lt; M; i++)
+  for (int j = 0; j &lt; N; j++)
+    for (int k = 0; k &lt; K; k++)
+      C[i][j] += A[i][k] * B[k][j];</code></pre>
+<p>前两行是<strong>算什么</strong>（对每个输出元素求一遍和），第三行是<strong>怎么算</strong>（按 k 逐个累加）。想试&quot;先分块再算&quot;就得重写整个函数，想试十种顺序就写十份代码——优化空间被代码结构锁死了。</p>
+<p><strong>算法-调度分离</strong>（algorithm–schedule separation）把这两件事拆成可独立修改的两部分：算法只描述&quot;每个输出由哪些输入、按什么表达式算出&quot;，调度只描述&quot;索引以什么顺序、什么粒度被遍历&quot;。Halide 用它描述图像流水线，TVM 把它搬进深度学习——算法用 <code>te.compute</code> 写，调度用 <code>sch.split / reorder / tile / bind</code> 写。换来的是<strong>同一份算法可被自动枚举大量实现</strong>，这正是后两课自动调优的前提。</p>
+<h4 id="h-2-一个最小的模型算法是数据调度也是数据">2. 一个最小的模型：算法是数据，调度也是数据<a class="anchor" href="#h-2-一个最小的模型算法是数据调度也是数据" aria-label="本节链接">#</a></h4>
+<p>算法 <code>Program</code>：维度表 <code>{i: M, j: N, k: K}</code>、归约维 <code>(&#39;k&#39;,)</code>、输出名与访问模式。调度 <code>Schedule</code>：循环次序、各维 tile 大小、归约维是否提前、向量宽度、绑核维、展开次数。两者都不含表达式树和机器码，全是<strong>可打印、可比较的数据</strong>——于是能打印成循环嵌套、喂给代价模型打分（第 2、3 课）、序列化进调优日志（第 4 课）。</p>
+<h4 id="h-3-五种基本变换对应-cuda-的五种优化手法">3. 五种基本变换，对应 CUDA 的五种优化手法<a class="anchor" href="#h-3-五种基本变换对应-cuda-的五种优化手法" aria-label="本节链接">#</a></h4>
+<p>调度的词汇表不大，但与前一门课的手工优化一一对应：</p>
+<table>
+<thead>
+<tr>
+<th>调度原语</th>
+<th>做什么</th>
+<th>CUDA 上的对应物</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>split</code> / <code>tile</code></td>
+<td>把一个索引拆成外层+内层，合起来构成 tile</td>
+<td>shared memory 分块、二维线程块</td>
+</tr>
+<tr>
+<td><code>reorder</code></td>
+<td>改变循环由外向内的顺序</td>
+<td>交换内外层、把归约维提到最外做流水</td>
+</tr>
+<tr>
+<td><code>vectorize</code></td>
+<td>最内层一个索引同时算 N 个元素</td>
+<td><code>float4</code> / <code>ldmatrix</code> 向量化访存</td>
+</tr>
+<tr>
+<td><code>bind</code> / <code>parallel</code></td>
+<td>把某个索引绑到线程块或线程</td>
+<td><code>blockIdx.x</code> / <code>threadIdx.x</code></td>
+</tr>
+<tr>
+<td><code>unroll</code></td>
+<td>把最内层展开若干次</td>
+<td><code>#pragma unroll</code>、寄存器级复用</td>
+</tr>
+</tbody></table>
+<p>这些变换互相耦合：tile 变大增加片上复用也增加寄存器压力（第 5 课算融合代价时已见过）；向量化省指令但要求最内层访存连续；归约维提前能让流水线跑起来，代价是中间结果要落地。所以调度空间不是&quot;五个开关随便拨&quot;，而是一张有峰有谷的地形图——这才是得靠搜索的原因。</p>
+<h4 id="h-4-成本从哪来三类账">4. 成本从哪来：三类账<a class="anchor" href="#h-4-成本从哪来三类账" aria-label="本节链接">#</a></h4>
+<p>模型只算三类账。<strong>片上搬运</strong>：每个输出 tile 要把 a 的 <code>ti×K</code>、b 的 <code>K×tj</code> 搬进寄存器或共享内存，tile 越大、每元素复用越多、总搬运越少。<strong>跨层搬运</strong>：并行维被切成块后块间不再复用，驻留量 = 块内尺寸 × K；超过 L2 容量时同一份数据会被反复从 DRAM 取回——这是&quot;分块省带宽&quot;的可算形式。<strong>指令数</strong>：<code>2MNK / vec</code>。模型里的常数（L2 容量、每元素字节数）只是明示假设，换机器只改这两个数，<strong>结论方向不变</strong>；下文数字因此只是趋势与量级，不是任何显卡的实测值。</p>
+<h4 id="h-5-常见坑">5. 常见坑<a class="anchor" href="#h-5-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>把调度当算法改</strong>：算法里写死&quot;分成 64 块&quot;后，就没法再试 32 或 128。</li>
+<li><strong>只盯一个原语调参</strong>：tile 从 16 改到 64 能带来数倍收益时，<code>unroll</code> 从 4 改到 8 可能是负收益——收益不独立。</li>
+<li><strong>用未分块模型估性能</strong>：不分块时复用推理失效，估出的算术强度与真值差一个数量级。</li>
+<li><strong>忘了合法性</strong>：归约维不能被并进向量化维、向量化维必须连续访存；不合法调度在真实编译器里直接编译失败，本课模型只算代价、不查合法性。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>模型只用 <code>numpy</code>（本机 <code>python3.10</code> + <code>numpy 1.26.2</code> 实跑，无需 GPU）：<code>execute</code> 按调度解释执行，<strong>用结果一致证明调度不改语义</strong>；<code>analyze</code> 算三类账。</p>
+<pre data-lang="python"><code class="language-python"># ---- 算法-调度分离的最小模型（纯 Python + numpy；第 6 章第 1 课）----
+# 算法：只说&quot;算什么&quot;；调度：只说&quot;怎么算&quot;。两者分开，才能拿同一个算法比不同调度。
+import numpy as np
+
+
+class Program:
+    &quot;&quot;&quot;算法：y[i,j] = sum_k A[i,k] * B[k,j]，输出维 i/j 并行，归约维 k。&quot;&quot;&quot;
+
+    def __init__(self, name, dims, reds, out, terms):
+        self.name, self.dims, self.reds, self.out, self.terms = name, dims, reds, out, terms
+
+
+def matmul(M, K, N):
+    return Program(&#39;matmul&#39;, {&#39;i&#39;: M, &#39;j&#39;: N, &#39;k&#39;: K}, (&#39;k&#39;,), &#39;y&#39;,
+                   [(&#39;a&#39;, (&#39;i&#39;, &#39;k&#39;)), (&#39;b&#39;, (&#39;k&#39;, &#39;j&#39;))])
+
+
+class Schedule:
+    &quot;&quot;&quot;调度：循环次序 + 每个维的 tile 大小 + 把哪个归约维提到最外 + 向量宽度 + 绑核维。&quot;&quot;&quot;
+
+    def __init__(self, order, tiles, file_loop=None, vec=1, parallel=(), unroll=0, name=&#39;&#39;):
+        self.order, self.tiles = tuple(order), tuple(tiles)
+        self.file_loop, self.vec = file_loop, vec
+        self.parallel, self.unroll, self.name = tuple(parallel), unroll, name
+
+    def loops(self):
+        &quot;&quot;&quot;展开成由外到内：(循环名, outer|inner|plain, 算法索引)。&quot;&quot;&quot;
+        d = list(self.order)
+        if self.file_loop is not None:            # file_loop：把归约维提前（TVM 的 reorder/import）
+            d.remove(self.file_loop)
+            d.insert(0, self.file_loop)
+        out = []
+        for v in d:
+            t = self.tiles[self.order.index(v)]
+            out += [(f&#39;{v}#o&#39;, &#39;outer&#39;, v), (f&#39;{v}#i&#39;, &#39;inner&#39;, v)] if t &gt; 1 else [(v, &#39;plain&#39;, v)]
+        return out
+
+    def text(self, prog):
+        &quot;&quot;&quot;调度的文本形态：这就是&quot;同一算法、不同循环嵌套&quot;的可读证据。&quot;&quot;&quot;
+        lines, depth = [], 0
+        for nm, kind, v in self.loops():
+            idx = self.order.index(v)
+            ann = []
+            if v in self.parallel:
+                ann.append(&#39;bind=gpu&#39;)
+            if v in prog.reds and self.unroll:
+                ann.append(f&#39;unroll={self.unroll}&#39;)
+            if self.vec &gt; 1 and kind == &#39;inner&#39;:
+                ann.append(f&#39;vectorize={self.vec}&#39;)
+            lines.append(&#39;  &#39; * depth + f&#39;for {nm:&lt;5} # {kind:&lt;5} &#39; + &#39; &#39;.join(ann))
+            depth += 1
+        lines.append(&#39;  &#39; * depth + f&#39;{prog.out}[i,j] = a[i,k] * b[k,j]&#39;)
+        return &#39;\n&#39;.join(lines)
+
+
+def execute(prog, sched, env):
+    &quot;&quot;&quot;按调度给定的循环嵌套执行（最内两层用 numpy 向量化；语义与逐点循环一致）。&quot;&quot;&quot;
+    M, N, K = prog.dims[&#39;i&#39;], prog.dims[&#39;j&#39;], prog.dims[&#39;k&#39;]
+    ti = sched.tiles[sched.order.index(&#39;i&#39;)]
+    tj = sched.tiles[sched.order.index(&#39;j&#39;)]
+    res = np.zeros((M, N), dtype=env[&#39;a&#39;].dtype)
+    for io in range(0, M, ti):
+        for jo in range(0, N, tj):
+            acc = res[io:io + ti, jo:jo + tj].copy()
+            for k in range(K):
+                acc += np.outer(env[&#39;a&#39;][io:io + ti, k], env[&#39;b&#39;][k, jo:jo + tj])
+            res[io:io + ti, jo:jo + tj] = acc
+    return res
+
+
+def analyze(prog, sched, l2=131072, elem=4):
+    &quot;&quot;&quot;解析访存模型（只给趋势与量级，不是实测）。三条账：
+      ① 片上复用：最内层是归约维时，每个输出 tile 只需把 a 的 ti×K、b 的 K×tj 从 L2 搬进寄存器；
+         若归约维没被分块（算法维度 K 整体在内层），则退化成&quot;每个 (输出块, k) 都重读一个完整操作数&quot;。
+      ② 跨层搬运：并行维会被切成块，块与块之间不再复用，驻留量 = 块内尺寸 × K（或 K × 块内 j）。
+         驻留量超过 L2 就按超出倍数从 DRAM 补搬 —— 这就是&quot;分块省带宽&quot;的可算形式。
+      ③ 表达式里不含任何硬件常数，只含维度与 tile；换成真实硬件后结论方向不变。&quot;&quot;&quot;
+    d = prog.dims
+    M, N, K = d[&#39;i&#39;], d[&#39;j&#39;], d[&#39;k&#39;]
+    ti = sched.tiles[sched.order.index(&#39;i&#39;)]
+    tj = sched.tiles[sched.order.index(&#39;j&#39;)]
+    tk = sched.tiles[sched.order.index(&#39;k&#39;)]
+    par = set(sched.parallel)
+    if ti == 1 and tj == 1 and tk == 1:            # 未分块：没有可驻留的 tile
+        onchip = (M * K * N + K * N * M) * elem
+        ws_a, ws_b = M * K, K * N
+    else:                                          # 分块：块内复用
+        outer = (M / ti) * (N / tj)
+        onchip = outer * (ti * K + K * tj) * elem
+        ws_a = (ti if &#39;i&#39; in par else M) * K
+        ws_b = K * (tj if &#39;j&#39; in par else N)
+
+    def dram_side(ws):
+        &quot;&quot;&quot;装得下 L2 就只交一次强制读写；装不下按超出倍数补。&quot;&quot;&quot;
+        return (M * K + K * N) * elem * max(1.0, ws / l2)
+
+    dram = dram_side(ws_a) + dram_side(ws_b) + M * N * elem
+    flops = 2 * M * N * K
+    return dict(dram=dram, onchip=onchip, ai=flops / dram,
+                ws_a=ws_a, ws_b=ws_b, spill_a=ws_a / l2, spill_b=ws_b / l2)
+
+
+if __name__ == &#39;__main__&#39;:
+    rng = np.random.default_rng(0)
+    env = {&#39;a&#39;: rng.random((128, 128)), &#39;b&#39;: rng.random((128, 128))}
+    small = matmul(128, 128, 128)
+    ref = env[&#39;a&#39;] @ env[&#39;b&#39;]
+
+    scheds = [
+        Schedule((&#39;i&#39;, &#39;j&#39;, &#39;k&#39;), (1, 1, 1), parallel=(&#39;i&#39;, &#39;j&#39;), name=&#39;无分块 ij k&#39;),
+        Schedule((&#39;j&#39;, &#39;i&#39;, &#39;k&#39;), (1, 1, 1), parallel=(&#39;j&#39;, &#39;i&#39;), name=&#39;仅换次序 ji k&#39;),
+        Schedule((&#39;i&#39;, &#39;j&#39;, &#39;k&#39;), (64, 64, 1), parallel=(&#39;i&#39;, &#39;j&#39;), vec=4, name=&#39;tile 64 + 向量化&#39;),
+    ]
+    print(&#39;=== 1. 同一算法、三条调度：循环嵌套与误差 ===&#39;)
+    for s in scheds:
+        y = execute(small, s, env)
+        err = np.abs(y - ref).max()
+        print(f&#39;--- {s.name}（与 numpy 最大差 {err:.2e}）---&#39;)
+        print(s.text(small))
+
+    print(&#39;\n=== 2. 同一个算法在 2048³ 上的解析代价（不是实测，只看趋势）===&#39;)
+    big = matmul(2048, 2048, 2048)
+    big_scheds = scheds + [
+        Schedule((&#39;i&#39;, &#39;j&#39;, &#39;k&#39;), (64, 64, 1), parallel=(&#39;j&#39;,), vec=4, name=&#39;tile 64 只并 j&#39;),
+        Schedule((&#39;i&#39;, &#39;j&#39;, &#39;k&#39;), (64, 64, 1), parallel=(&#39;i&#39;,), vec=4, name=&#39;tile 64 只并 i&#39;),
+    ]
+    print(f&quot;{&#39;调度&#39;:&lt;18}{&#39;驻留(元素)&#39;:&gt;20}{&#39;DRAM MB&#39;:&gt;10}{&#39;片上 MB&#39;:&gt;12}{&#39;AI(flop/B)&#39;:&gt;12}&quot;)
+    for s in big_scheds:
+        a = analyze(big, s)
+        ws = f&#39;{a[&quot;ws_a&quot;]}/{a[&quot;ws_b&quot;]}&#39;
+        print(f&#39;{s.name:&lt;18}{ws:&gt;20}{a[&quot;dram&quot;] / 1e6:&gt;10.1f}&#39;
+              f&#39;{a[&quot;onchip&quot;] / 1e6:&gt;12.1f}{a[&quot;ai&quot;]:&gt;12.2f}&#39;)
+    print(&#39;  参考：算法本身的强制访存 = (M*K + K*N + M*N)*4B = &#39;
+          f&#39;{(2048 * 2048 * 3) * 4 / 1e6:.1f} MB&#39;)</code></pre>
+<p>运行结果（Python 3.10.14 + numpy 1.26.2）：</p>
+<pre data-lang="text"><code class="language-text">=== 1. 同一算法、三条调度：循环嵌套与误差 ===
+--- 无分块 ij k（与 numpy 最大差 1.42e-14）---
+for i     # plain bind=gpu
+  for j     # plain bind=gpu
+    for k     # plain 
+      y[i,j] = a[i,k] * b[k,j]
+--- 仅换次序 ji k（与 numpy 最大差 1.42e-14）---
+for j     # plain bind=gpu
+  for i     # plain bind=gpu
+    for k     # plain 
+      y[i,j] = a[i,k] * b[k,j]
+--- tile 64 + 向量化（与 numpy 最大差 1.42e-14）---
+for i#o   # outer bind=gpu
+  for i#i   # inner bind=gpu vectorize=4
+    for j#o   # outer bind=gpu
+      for j#i   # inner bind=gpu vectorize=4
+        for k     # plain 
+          y[i,j] = a[i,k] * b[k,j]
+
+=== 2. 同一个算法在 2048³ 上的解析代价（不是实测，只看趋势）===
+调度                              驻留(元素)   DRAM MB       片上 MB  AI(flop/B)
+无分块 ij k               4194304/4194304    2164.3     68719.5        7.94
+仅换次序 ji k              4194304/4194304    2164.3     68719.5        7.94
+tile 64 + 向量化            131072/131072      83.9      1073.7      204.80
+tile 64 只并 j            4194304/131072    1124.1      1073.7       15.28
+tile 64 只并 i            131072/4194304    1124.1      1073.7       15.28
+  参考：算法本身的强制访存 = (M*K + K*N + M*N)*4B = 50.3 MB</code></pre>
+<p>四条可核对的结论：</p>
+<ol>
+<li><strong>调度不改结果</strong>：三条调度的最大绝对差都是 <code>1.42e-14</code>，量级等于机器精度——调度是&quot;保语义的重写&quot;，这条先成立，自动搜索才有意义。</li>
+<li><strong>分块是最大的一笔</strong>：同在 2048³ 上，未分块与 <code>tile 64</code> 的 DRAM 搬运是 2164 MB 对 83.9 MB（约 26 倍），片上搬运 68719 MB 对 1073 MB（约 64 倍）。</li>
+<li><strong>向量化不改访存、只改指令</strong>：<code>vec</code> 不出现在访存账里（有意简化），只影响指令数；硬件上还要求最内层连续访存，所以它是最后一个拨的开关。</li>
+<li><strong>并行维的选择会反噬</strong>：两侧都并行时驻留量 <code>131072/131072</code>；只并行 <code>j</code> 时 a 的驻留量涨到 <code>4194304</code>（K×N 全体），DRAM 搬运从 83.9 MB 反弹到 1124 MB。<strong>&quot;哪个维绑核&quot;不是并行度问题，而是复用边界问题</strong>。</li>
+</ol>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选，需自备或云上按需：在真实工具链里看见&quot;算法&quot;与&quot;调度&quot;是两份东西 ----
+# Apache TVM（pip install apache-tvm）：先写计算，再用 Schedule 施加 split/reorder/tile/
+#   vectorize/bind；打印 IRModule 就能看到循环结构随调度改变。版本以官方为准，本课不假设具体号。
+# Halide（C++ 库）：Func 写算法、调度 API 写调度，同一 Func 能编出 cpu / cuda 多个后端版本。
+# Triton（pip install triton，需 NVIDIA GPU）：@triton.autotune 的 key=[&#39;M&#39;,&#39;N&#39;,&#39;K&#39;] 就是
+#   &quot;同一份 kernel 配多组 BLOCK_SIZE/num_warps&quot;，正是本课 Schedule 的工程化形态。
+# 三个工具都没有也不影响本课：上面的 numpy 版本已经把三类账全算出来了。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：给 <code>Schedule.loops()</code> 加合法性检查：若 <code>file_loop</code> 指向的不是归约维，或 <code>parallel</code> 里同时含归约维与输出维，就抛异常说明原因。再让 <code>execute</code> 支持 <code>tk</code>（归约维也分块）的调度。</li>
+<li><strong>解释</strong>：为什么&quot;仅换次序 ji k&quot;在本课模型里与&quot;ij k&quot;代价相同，在真实 GPU 上却可能差很多？提示：本课只看最内层是哪个索引，不看块间调度顺序（Triton 的 <code>GROUP_SIZE_M</code> 管的正是后者）。</li>
+<li><strong>对比/验证</strong>：把 <code>analyze</code> 的 <code>l2</code> 依次改成 32768、524288 重跑第 2 节，记录哪些调度的 DRAM 账变了、哪些没变，说明&quot;驻留量超过 L2&quot;在什么区间最灵敏。</li>
+<li><strong>思考</strong>：这种分离把优化空间变成显式数据，代价是算法里不能再写实现专有的技巧（如 flash attention 的在线 softmax 重缩放）。这类&quot;算法本身依赖调度&quot;的情况该算哪一边？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Tianqi Chen et al., <em>TVM: An Automated End-to-End Optimizing Compiler for Deep Learning</em>（OSDI&#39;18；算子级调度抽象与自动优化低层程序的两层结构）：<a href="https://www.usenix.org/conference/osdi18/presentation/chen" target="_blank" rel="noopener noreferrer">https://www.usenix.org/conference/osdi18/presentation/chen</a></li>
+<li>Jonathan Ragan-Kelley et al., <em>Decoupling Algorithms from Schedules for Easy Optimization of Image Processing Pipelines</em>（SIGGRAPH 2012；Halide 算法-调度分离的原始论文）：<a href="https://people.csail.mit.edu/jrk/halide12/" target="_blank" rel="noopener noreferrer">https://people.csail.mit.edu/jrk/halide12/</a></li>
+<li>Apache TVM, <em>Design and Architecture</em>（TensorIR / PrimFunc / TVMScript 中&quot;计算&quot;与&quot;调度&quot;的落点）：<a href="https://tvm.apache.org/docs/arch/index.html" target="_blank" rel="noopener noreferrer">https://tvm.apache.org/docs/arch/index.html</a></li>
+<li>Triton 官方教程, <em>Matrix Multiplication</em>（block-level 分块、<code>GROUP_SIZE_M</code> 的 L2 复用、<code>triton.autotune</code> 的 key 与 <code>triton.Config</code>）：<a href="https://triton-lang.org/main/getting-started/tutorials/03-matrix-multiplication.html" target="_blank" rel="noopener noreferrer">https://triton-lang.org/main/getting-started/tutorials/03-matrix-multiplication.html</a></li>
+</ul>
+<p><a href="#/l/mlc-ch6-l2">下一课：调度空间：tile / unroll / vectorize / 并行化 / 流水（与 CUDA 优化一一对应）</a></p>

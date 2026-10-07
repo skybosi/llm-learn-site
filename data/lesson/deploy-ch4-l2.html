@@ -1,0 +1,110 @@
+<h2 id="h-docker-与容器化">Docker 与容器化<a class="anchor" href="#h-docker-与容器化" aria-label="本节链接">#</a></h2>
+<p>把模型服务&quot;跑在裸机上&quot;只适合演示。一旦要交付、要上 Kubernetes、要给别人一键拉起，就必须<strong>容器化</strong>。这一课讲 Docker 的核心概念、GPU 容器怎么配、怎么基于 vLLM 官方镜像做二次封装，以及用 Compose 把服务、端口、健康检查、资源限制写成可复现的配置文件。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-镜像容器与分层">1. 镜像、容器与分层<a class="anchor" href="#h-1-镜像容器与分层" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>镜像（image）</strong>：一个只读的、自包含的&quot;文件系统快照 + 启动配置&quot;，由 Dockerfile 描述如何构建；</li>
+<li><strong>容器（container）</strong>：镜像的一个运行实例，拥有独立的进程、网络、文件系统视图，但共享宿主机内核；</li>
+<li><strong>分层（layer）</strong>：Dockerfile 每条指令（<code>FROM</code>/<code>RUN</code>/<code>COPY</code>）都会产生一层，构建时逐层缓存。<strong>把变化频繁的步骤放在 Dockerfile 后面</strong>，能最大化利用缓存、加快重复构建。</li>
+</ul>
+<p>对推理服务来说，镜像里最重要的几样东西：CUDA 运行时、Python 环境、推理引擎（vLLM）、以及启动命令。<strong>模型权重通常不打进镜像</strong>（动辄几十 GB，会让镜像膨胀且无法复用），而是通过 <code>-v</code> 挂载宿主机目录或云盘/网络存储进入容器。</p>
+<h4 id="h-2-gpu-怎么进容器">2. GPU 怎么进容器<a class="anchor" href="#h-2-gpu-怎么进容器" aria-label="本节链接">#</a></h4>
+<p>容器默认看不到 GPU。要让 CUDA 在容器内可用，宿主机需要装 <strong>NVIDIA Container Toolkit</strong>（提供 <code>nvidia-container-runtime</code>），然后 <code>docker run --gpus all</code> 把 GPU 设备暴露进去。没有这一步，容器里 <code>nvidia-smi</code> 会直接报错。这也是很多&quot;镜像能起但找不到 GPU&quot;问题的根因。</p>
+<h4 id="h-3-为什么用官方镜像起步">3. 为什么用官方镜像起步<a class="anchor" href="#h-3-为什么用官方镜像起步" aria-label="本节链接">#</a></h4>
+<p>vLLM 官方维护了 <code>vllm/vllm-openai</code> 镜像，内置了匹配版本的 CUDA、PyTorch、vLLM 和 OpenAI 兼容服务入口，开箱即用。<strong>不要从 <code>python:3.11</code> 裸镜像手搓 CUDA 环境</strong>——版本矩阵（CUDA × PyTorch × 驱动）极容易踩坑。正确的姿势是在官方镜像基础上做轻量扩展：加健康检查、加自定义启动脚本、约定自己的模型挂载路径。</p>
+<h4 id="h-4-容器化推理的关键配置">4. 容器化推理的关键配置<a class="anchor" href="#h-4-容器化推理的关键配置" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong><code>--shm-size</code></strong>：共享内存。PyTorch 数据加载和部分通信依赖 <code>/dev/shm</code>，默认只有 64MB，训练/推理常因它 OOM，建议给到 <code>8g</code> 以上；</li>
+<li><strong><code>-p 8000:8000</code></strong>：端口映射，宿主机端口 → 容器端口；</li>
+<li><strong><code>--ipc=host</code></strong>：共享宿主机 IPC，多进程（张量并行）时几乎必须；</li>
+<li><strong>健康检查（healthcheck）</strong>：用 <code>curl /health</code> 或 <code>/v1/models</code> 周期性探测，容器&quot;起得来&quot;不等于&quot;服务就绪&quot;；</li>
+<li><strong>资源限制</strong>：<code>--gpus</code> 限 GPU，<code>--memory</code>/<code>--cpus</code> 限 CPU 和内存，防止单个容器拖垮宿主机。</li>
+</ul>
+<p><figure><img class="md-img" src="content/courses/llm-deployment-practice/assets/chapter-4-figure-02.svg" alt="Docker 容器化推理架构图：左侧&quot;宿主机&quot;大方块，内含 NVIDIA Container Toolkit（用橙点标注）和多张 GPU 小方块；右侧一个容器，内部画 CUDA 运行时、Python 环境、vLLM 引擎三层，容器下方用卷（volume）箭头连到外部&quot;模型权重目录 /models&quot;，上方标端口映射 -p 8000:8000；底部一行字&quot;模型权重挂载进容器，不打进镜像&quot;" loading="lazy" decoding="async"><figcaption>Docker 容器化推理架构图：左侧&quot;宿主机&quot;大方块，内含 NVIDIA Container Toolkit（用橙点标注）和多张 GPU 小方块；右侧一个容器，内部画 CUDA 运行时、Python 环境、vLLM 引擎三层，容器下方用卷（volume）箭头连到外部&quot;模型权重目录 /models&quot;，上方标端口映射 -p 8000:8000；底部一行字&quot;模型权重挂载进容器，不打进镜像&quot;</figcaption></figure>
+</p>
+<h3 id="h-二可运行示例">二、可运行示例<a class="anchor" href="#h-二可运行示例" aria-label="本节链接">#</a></h3>
+<h4 id="h-示例-1直接跑官方镜像">示例 1：直接跑官方镜像<a class="anchor" href="#h-示例-1直接跑官方镜像" aria-label="本节链接">#</a></h4>
+<pre data-lang="bash"><code class="language-bash"># 拉取官方镜像并启动（模型权重挂载到 /models）
+docker run --rm \
+  --gpus all \
+  --shm-size 8g \
+  --ipc=host \
+  -p 8000:8000 \
+  -v /data/models:/models \
+  vllm/vllm-openai:latest \
+  --model /models/Llama-3.1-8B-Instruct \
+  --served-model-name llama-8b</code></pre>
+<h4 id="h-示例-2写一个自定义-dockerfile">示例 2：写一个自定义 Dockerfile<a class="anchor" href="#h-示例-2写一个自定义-dockerfile" aria-label="本节链接">#</a></h4>
+<pre data-lang="dockerfile"><code class="language-dockerfile"># 基于官方镜像做二次封装
+FROM vllm/vllm-openai:latest
+
+# 安装额外依赖（例如业务侧需要的健康检查/监控工具）
+RUN pip install --no-cache-dir httpx
+
+# 放一个自定义启动脚本
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+# 覆盖入口：先做初始化，再拉起 vLLM
+ENTRYPOINT [&quot;/entrypoint.sh&quot;]</code></pre>
+<p>配套的 <code>entrypoint.sh</code>：</p>
+<pre data-lang="bash"><code class="language-bash">#!/bin/bash
+set -e
+# 启动前探测 GPU 与模型目录，失败立即退出，便于排障
+nvidia-smi
+ls /models || { echo &quot;模型目录 /models 不存在&quot;; exit 1; }
+# 把剩余参数原样传给 vLLM 服务入口
+exec vllm serve &quot;$@&quot;</code></pre>
+<pre data-lang="bash"><code class="language-bash"># 构建镜像
+docker build -t my-llm-serve:0.1 .</code></pre>
+<h4 id="h-示例-3用-docker-compose-编排服务">示例 3：用 Docker Compose 编排服务<a class="anchor" href="#h-示例-3用-docker-compose-编排服务" aria-label="本节链接">#</a></h4>
+<pre data-lang="yaml"><code class="language-yaml"># docker-compose.yml
+services:
+  vllm:
+    image: my-llm-serve:0.1
+    command: &gt;
+      --model /models/Llama-3.1-8B-Instruct
+      --served-model-name llama-8b
+      --max-model-len 8192
+    ports:
+      - &quot;8000:8000&quot;
+    volumes:
+      - /data/models:/models:ro        # 只读挂载权重，防止误改
+    environment:
+      - HF_HUB_OFFLINE=1               # 离线模式，不访问外网
+    shm_size: &quot;8g&quot;
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]      # 申请 1 张 GPU
+    healthcheck:
+      test: [&quot;CMD&quot;, &quot;curl&quot;, &quot;-f&quot;, &quot;http://localhost:8000/health&quot;]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s               # 模型加载慢，给足预热时间</code></pre>
+<pre data-lang="bash"><code class="language-bash"># 一键拉起
+docker compose up -d
+# 查看健康状态
+docker compose ps
+# 看日志
+docker compose logs -f vllm</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>在示例 3 里把 <code>count: 1</code> 改成 <code>count: 2</code>，体会多卡如何通过 Compose 的 <code>devices</code> 声明，并思考它与 vLLM 的 <code>--tensor-parallel-size 2</code> 要如何配合。</li>
+<li>故意不写 <code>shm_size</code>，跑一个长上下文请求观察是否出现共享内存不足；再补上 <code>shm_size: 8g</code> 重试。</li>
+<li>把 <code>healthcheck</code> 的 <code>start_period</code> 调小到 10 秒，观察 Compose 如何因为&quot;模型还没加载完&quot;就判定不健康，说明预热时间的作用。</li>
+<li>思考：为什么模型权重&quot;不打进镜像&quot;？把它挂载成 <code>:ro</code>（只读）能带来哪些安全和运维上的好处？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Docker · 入门与镜像概念：<a href="https://docs.docker.com/get-started/" target="_blank" rel="noopener noreferrer">https://docs.docker.com/get-started/</a></li>
+<li>Docker · Dockerfile 参考：<a href="https://docs.docker.com/reference/dockerfile/" target="_blank" rel="noopener noreferrer">https://docs.docker.com/reference/dockerfile/</a></li>
+<li>vLLM · 使用 Docker 部署：<a href="https://docs.vllm.ai/en/latest/serving/deploying_with_docker.html" target="_blank" rel="noopener noreferrer">https://docs.vllm.ai/en/latest/serving/deploying_with_docker.html</a></li>
+<li>NVIDIA Container Toolkit 文档：<a href="https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/</a></li>
+</ul>
+<p><a href="#/l/deploy-ch4-l3">下一课：监控与日志</a></p>

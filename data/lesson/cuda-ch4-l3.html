@@ -1,0 +1,222 @@
+<h2 id="h-tma-与-hopper-起的异步数据搬运">TMA 与 Hopper 起的异步数据搬运<a class="anchor" href="#h-tma-与-hopper-起的异步数据搬运" aria-label="本节链接">#</a></h2>
+<p>上一课的 cp.async 已经让搬运不经过寄存器，但&quot;谁去搬&quot;这件事没变：每个线程仍要自己算 global 与 shared 地址、发自己的那条指令。搬一个 16 KiB 的 tile，256 个线程要发 1024 条指令，全部占用发射槽（issue slot）——<strong>这些指令不搬数据，只是在指挥搬运</strong>。Hopper（compute capability 9.0）引入的 <strong>TMA</strong>（Tensor Memory Accelerator，张量内存加速器）把整块多维搬运压缩成&quot;一个线程发一条描述符&quot;的动作。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-描述符搬运tma-的模型">1. 描述符搬运：TMA 的模型<a class="anchor" href="#h-1-描述符搬运tma-的模型" aria-label="本节链接">#</a></h4>
+<p>官方 Hopper Tuning Guide 对 TMA 的定位很明确：它在 Ampere 异步拷贝基础上提供更完整的异步拷贝引擎，能<strong>在 global 与 shared memory 之间双向搬运 1D 到 5D 张量</strong>，也能在同一 cluster 内不同 SM 的 shared memory 之间搬运。有四个直接后果：</p>
+<ol>
+<li><strong>搬运不用寄存器</strong>：数据不再借道线程的寄存器文件。</li>
+<li><strong>搬运不用 SM 指令</strong>：单个线程就能发起大批量搬运，整个 block 可以继续干别的活，只在真正要消费数据时才等。</li>
+<li><strong>让 warp specialization（线程束特化）变得自然</strong>：一部分 warp 专管数据搬运，另一部分只算片上的数据（第 5 课展开）。</li>
+<li><strong>shared → global 方向可带规约</strong>：写回时支持按元素做 add/min/max，以及多数数据类型上的按位与/或。</li>
+</ol>
+<p>和第 2 课的指令账对比：同样 16 KiB 的 tile、256 线程，同步路径 8 条指令/线程、cp.async 4 条，而 TMA 是<strong>整块 1 条</strong>——逐元素地址计算被外包给了专用硬件。</p>
+<h4 id="h-2-描述符tensormap与硬约束">2. 描述符（TensorMap）与硬约束<a class="anchor" href="#h-2-描述符tensormap与硬约束" aria-label="本节链接">#</a></h4>
+<p>TMA 的搬运任务不是循环语句，而是一个<strong>描述符</strong>：用 <code>cuTensorMapEncodeTiled</code> 把张量的形状、步长、要搬的盒子（box）以及布局变换一次性编码好。主要参数包括 rank、<code>globalAddress</code>、<code>globalDim</code>、<code>globalStrides</code>、<code>boxDim</code>、<code>elementStrides</code>、interleave、swizzle、fill mode。</p>
+<p>几条约束直接影响能不能用：</p>
+<table>
+<thead>
+<tr>
+<th>约束</th>
+<th>内容</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>对齐</td>
+<td>global 地址与 stride 按 16 字节对齐；shared memory 目标也要求 16 字节对齐。<code>cuda::memcpy_async</code> 只有在两边 16 字节对齐且大小是 16 的倍数时才走 TMA，否则<strong>回退成同步拷贝</strong></td>
+</tr>
+<tr>
+<td>box 尺寸</td>
+<td>每个维度的 box 以元素计不能超过 256（以官方 <code>cuTensorMapEncodeTiled</code> 文档为准）</td>
+</tr>
+<tr>
+<td>swizzle 上限</td>
+<td>32B/64B/128B swizzle 分别要求 box 内层维度不超过 32/64/128 字节</td>
+</tr>
+<tr>
+<td>完成信号</td>
+<td>用 mbarrier（异步 barrier）：发起前声明期望的事务字节数（<code>barrier_expect_tx</code>），搬运完成时硬件累减，归零即完成；1D bulk 拷贝也可走 bulk async-group</td>
+</tr>
+</tbody></table>
+<p>跑在更低层时用 <code>cuda::ptx::cp_async_bulk</code>（PTX 的 <code>cp.async.bulk.tensor</code>）；它<strong>总是</strong>走 TMA，条件不满足就是未定义行为——这正是&quot;先自检几何&quot;必须写进代码的原因。</p>
+<p><figure><img class="md-img" src="content/courses/gpu-cuda-kernels/assets/chapter-4-figure-03.svg" alt="TMA 搬运模型：描述符 + 单线程发起 + mbarrier 完成信号" loading="lazy" decoding="async"><figcaption>TMA 搬运模型：描述符 + 单线程发起 + mbarrier 完成信号</figcaption></figure>
+</p>
+<h4 id="h-3-swizzletma-顺手把-bank-conflict-也解决了">3. swizzle：TMA 顺手把 bank conflict 也解决了<a class="anchor" href="#h-3-swizzletma-顺手把-bank-conflict-也解决了" aria-label="本节链接">#</a></h4>
+<p>TMA 写 shared memory 时可以让列坐标按固定模式打乱，目的写在官方文档里：<strong>避免 shared memory bank conflict</strong>。以 128 字节 swizzle 为例（CUTLASS 记作 <code>Swizzle&lt;3,4,3&gt;</code>，具体以官方实现为准）：一个 128 字节的行被切成 8 个 16 字节块，第 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">c</span></span></span></span> 块的数据实际写到第 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal">c</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⊕</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord text"><span class="mord">row</span></span><span class="mspace" style="margin-right:0.0556em;"></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin"><span class="mord"><span class="mord mathrm">mod</span></span></span><span class="mspace" style="margin-right:0.0556em;"></span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">8</span><span class="mclose">)</span></span></span></span> 块的位置。</p>
+<p>为什么有用？下一节的代码把 32 个 bank 的映射算了出来：同一列、跨 32 行的一次 warp 访问，不 swizzle 时 32 个线程全落在同一个 bank，是 <strong>32-way conflict、要 32 拍</strong>；128B swizzle 后落到 8 个不同 bank，降到 <strong>4-way</strong>；只在一个 8 行组内访问时是 <strong>1-way（无冲突）</strong>。也就是说，TMA 顺手做掉了一部分本来要手写的 padding/转置技巧。</p>
+<p><strong>注意 swizzle 改变了 shared memory 的物理布局</strong>：读的时候必须用同一套模式（CUTLASS 用布局类型把这件事变成编译期检查），否则拿到的是错位数据。</p>
+<h4 id="h-4-multicastcluster-内一次搬运多份落地">4. multicast：cluster 内一次搬运，多份落地<a class="anchor" href="#h-4-multicastcluster-内一次搬运多份落地" aria-label="本节链接">#</a></h4>
+<p>Hopper 还引入了 <strong>thread block cluster</strong>（线程块簇）这一层：cluster 内的 block 可以互相读写对方的 shared memory（分布式共享内存）。TMA 在这里有一个额外能力——<strong>multicast</strong>：一次搬运把同一块 global 数据同时送进 cluster 内多个 block 的 shared memory。</p>
+<p>收益直接：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">C</span></span></span></span> 个 CTA 都要同一个 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">A</span></span></span></span> tile 时，没有 multicast 要从 L2 搬 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">C</span></span></span></span> 份，有 multicast 只搬 1 份，<strong>L2 → SM 流量降到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1/</span><span class="mord mathnormal" style="margin-right:0.0715em;">C</span></span></span></span></strong>（数字见下节代码）。cluster 的 portable 上限是 8，H100 上可选非 portable 的 16（需显式打开 <code>cudaFuncAttributeNonPortableClusterSizeAllowed</code>），更大 cluster 可能降低同时驻留的 block 数。</p>
+<h4 id="h-5-与-cpasync-的选择">5. 与 cp.async 的选择<a class="anchor" href="#h-5-与-cpasync-的选择" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>同步 LDG/STS</th>
+<th>cp.async（LDGSTS）</th>
+<th>TMA</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>谁发指令</td>
+<td>每个线程</td>
+<td>每个线程（4/8/16 字节）</td>
+<td>单线程发整块描述符</td>
+</tr>
+<tr>
+<td>占寄存器</td>
+<td>是</td>
+<td>否</td>
+<td>否</td>
+</tr>
+<tr>
+<td>维度</td>
+<td>任意</td>
+<td>逐元素（高维需手工算地址）</td>
+<td>1D–5D，硬件算地址</td>
+</tr>
+<tr>
+<td>对齐要求</td>
+<td>宽松</td>
+<td>4/8/16 字节，128B 最佳</td>
+<td>16 字节对齐（含 stride）</td>
+</tr>
+<tr>
+<td>完成机制</td>
+<td><code>__syncthreads()</code></td>
+<td>commit/wait group</td>
+<td>mbarrier + expect_tx</td>
+</tr>
+<tr>
+<td>额外能力</td>
+<td>—</td>
+<td>L1 bypass（16B）</td>
+<td>swizzle、multicast、写回规约</td>
+</tr>
+<tr>
+<td>适用</td>
+<td>小/不规则</td>
+<td>中小块、逐元素</td>
+<td>大块、规则多维（GEMM/Attention）</td>
+</tr>
+</tbody></table>
+<p>结论不是&quot;TMA 取代一切&quot;：<strong>搬运越规则、块越大、维度越高，TMA 优势越明显</strong>；零散的不规则访存仍要靠 cache 与 cp.async 兜底。</p>
+<h4 id="h-6-常见坑">6. 常见坑<a class="anchor" href="#h-6-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>忘记 expect_tx</strong>：mbarrier 的事务计数没声明，等不到归零，直接死锁。</li>
+<li><strong>忘记代理栅栏</strong>：用普通（generic proxy）方式写完 shared memory 再让 TMA（async proxy）去读，中间要有 <code>fence.proxy.async</code>，否则读到旧值。</li>
+<li><strong>对齐/stride 不满足</strong>：<code>cuTensorMapEncodeTiled</code> 会失败，或上层 <code>cuda::memcpy_async</code> 静默回退同步拷贝（性能掉了但结果对，最难发现）。</li>
+<li><strong>swizzle 只做了一半</strong>：写用 128B、读按线性布局，数据错位。</li>
+<li><strong>box 超限</strong>：单维超过 256 个元素、内层超过 swizzle 宽度，描述符建不出来。</li>
+<li><strong>以为 TMA 能提升复用</strong>：它只让搬运更省指令、更好重叠；复用仍来自第 1 课的 tiling。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>三段纯 Python：几何与对齐自检（把描述符的约束变成可跑的断言）、swizzle 的 bank conflict 计算、multicast 的 L2 流量账。</p>
+<pre data-lang="python"><code class="language-python"># ===== 本课示例：TMA 几何自检 + swizzle 消冲突 + multicast 流量账 =====
+import numpy as np
+
+# ---------- 1. TMA 几何与对齐自检 ----------
+def check_tma(rows, cols, itemsize, box_rows, box_cols, swizzle_bytes=128, name=&#39;&#39;):
+    stride_b = cols * itemsize
+    inner_b = box_cols * itemsize
+    ok_addr = stride_b % 16 == 0
+    ok_box = box_cols &lt;= 256 and box_rows &lt;= 256
+    ok_sw = inner_b &lt;= swizzle_bytes
+    tiles = -(-rows // box_rows) * -(-cols // box_cols)
+    print(f&quot;{name}: {rows}x{cols} {itemsize*8}bit, box {box_rows}x{box_cols}, swizzle {swizzle_bytes}B&quot;)
+    print(f&quot;  行 stride = {stride_b} B ({&#39;16B 对齐 ✓&#39; if ok_addr else &#39;16B 未对齐 ✗&#39;})；&quot;
+          f&quot;box 内层 {inner_b} B {&#39;≤ swizzle ✓&#39; if ok_sw else &#39;&gt; swizzle ✗&#39;}；&quot;
+          f&quot;box 维度 {&#39;≤256 ✓&#39; if ok_box else &#39;&gt;256 ✗&#39;}&quot;)
+    print(f&quot;  tile 数 = {tiles}，每 tile {box_rows*box_cols*itemsize} B，&quot;
+          f&quot;每 tile 1 次 TMA 事务 → 共 {tiles} 次（cp.async 需 {box_rows*box_cols*itemsize//16} 条指令）&quot;)
+
+check_tma(8192, 8192, 2, 128, 64, 128, &#39;A 的 128x64 tile&#39;)
+check_tma(8192, 8192, 2, 128, 72, 128, &#39;box 内层超 swizzle&#39;)
+check_tma(8192, 8191, 2, 128, 64, 128, &#39;行宽奇数（stride 未对齐）&#39;)
+
+# ---------- 2. swizzle 如何消除 bank conflict ----------
+R, C, ITEM = 32, 64, 2                 # 32 行 x 64 个 fp16 = 128 B/行
+assert C * ITEM == 128
+def bank(r, c, swizzle):
+    if swizzle:                        # 128B swizzle：16B 块下标 ^ (行号 % 8)
+        off = r * C + ((c // 8) ^ (r % 8)) * 8 + (c % 8)
+    else:
+        off = r * C + c
+    return (off * ITEM // 4) % 32
+
+def conflict(rows, c, swizzle):
+    banks = [bank(r, c, swizzle) for r in rows]
+    counts = np.bincount(banks, minlength=32)
+    return int(counts.max()), len(set(banks))
+
+print(f&quot;\n同一列、跨 {len(range(0,32))} 行的 warp 访问（列 c=24）&quot;)
+for sw in (False, True):
+    deg, used = conflict(range(32), 24, sw)
+    print(f&quot;  {&#39;128B swizzle&#39; if sw else &#39;不 swizzle&#39;:&lt;12} bank 冲突 = {deg}-way，&quot;
+          f&quot;用到 {used} 个不同 bank，耗时 {deg} 拍&quot;)
+for r0 in (0, 8, 16, 24):
+    deg, used = conflict(range(r0, r0 + 8), 24, True)
+    print(f&quot;  128B swizzle，8 行组 r=[{r0},{r0+7}] → {deg}-way（{used} 个 bank）&quot;)
+
+# ---------- 3. cluster multicast 省下的 L2 流量 ----------
+tile_b = 128 * 64 * 2
+print(f&quot;\n一个 128x64 fp16 tile = {tile_b} B；cluster 内 C 个 CTA 共享同一块 A tile：&quot;)
+for Cl in (1, 2, 4, 8):
+    print(f&quot;  C={Cl}: 无 multicast {Cl*tile_b:&gt;6} B，有 multicast {tile_b:&gt;6} B，&quot;
+          f&quot;L2→SM 流量降到 1/{Cl}&quot;)</code></pre>
+<p>实跑输出（<code>python3</code> + numpy）：</p>
+<pre data-lang="text"><code class="language-text">A 的 128x64 tile: 8192x8192 16bit, box 128x64, swizzle 128B
+  行 stride = 16384 B (16B 对齐 ✓)；box 内层 128 B ≤ swizzle ✓；box 维度 ≤256 ✓
+  tile 数 = 8192，每 tile 16384 B，每 tile 1 次 TMA 事务 → 共 8192 次（cp.async 需 1024 条指令）
+box 内层超 swizzle: 8192x8192 16bit, box 128x72, swizzle 128B
+  行 stride = 16384 B (16B 对齐 ✓)；box 内层 144 B &gt; swizzle ✗；box 维度 ≤256 ✓
+  tile 数 = 7296，每 tile 18432 B，每 tile 1 次 TMA 事务 → 共 7296 次（cp.async 需 1152 条指令）
+行宽奇数（stride 未对齐）: 8192x8191 16bit, box 128x64, swizzle 128B
+  行 stride = 16382 B (16B 未对齐 ✗)；box 内层 128 B ≤ swizzle ✓；box 维度 ≤256 ✓
+  tile 数 = 8192，每 tile 16384 B，每 tile 1 次 TMA 事务 → 共 8192 次（cp.async 需 1024 条指令）
+
+同一列、跨 32 行的 warp 访问（列 c=24）
+  不 swizzle    bank 冲突 = 32-way，用到 1 个不同 bank，耗时 32 拍
+  128B swizzle bank 冲突 = 4-way，用到 8 个不同 bank，耗时 4 拍
+  128B swizzle，8 行组 r=[0,7] → 1-way（8 个 bank）
+  128B swizzle，8 行组 r=[8,15] → 1-way（8 个 bank）
+  128B swizzle，8 行组 r=[16,23] → 1-way（8 个 bank）
+  128B swizzle，8 行组 r=[24,31] → 1-way（8 个 bank）
+
+一个 128x64 fp16 tile = 16384 B；cluster 内 C 个 CTA 共享同一块 A tile：
+  C=1: 无 multicast  16384 B，有 multicast  16384 B，L2→SM 流量降到 1/1
+  C=2: 无 multicast  32768 B，有 multicast  16384 B，L2→SM 流量降到 1/2
+  C=4: 无 multicast  65536 B，有 multicast  16384 B，L2→SM 流量降到 1/4
+  C=8: 无 multicast 131072 B，有 multicast  16384 B，L2→SM 流量降到 1/8</code></pre>
+<p>第一段的三行是给真实工程的<strong>前置自检</strong>：内层超 swizzle、stride 未对齐这两类问题在描述符创建阶段就该拦下来，不要等 kernel 跑出错误结果再回头查。</p>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选：需要 GPU（Hopper 或更新）。从描述符到一次 bulk 搬运的最小骨架 ----
+# #include &lt;cuda.h&gt;、&lt;cuda/barrier&gt;、&lt;cuda/ptx&gt;；编译： nvcc -O3 -arch=sm_90 -o tma tma.cu -lcuda
+#   1) 主机侧：cuTensorMapEncodeTiled(...) 建好 CUtensorMap，按 __grid_constant__ 传给 kernel
+#   2) 设备侧：__shared__ alignas(16) T smem[...];  __shared__ barrier bar;  init(&amp;bar, blockDim.x);
+#      if (is_elected()) {                      // 只让一个线程发
+#          cuda::device::memcpy_async_tx(smem, gptr, cuda::aligned_size_t&lt;16&gt;(bytes), bar);
+#          cuda::device::barrier_expect_tx(cuda::device::barrier_native_handle(bar), bytes);
+#      }
+#      bar.arrive_and_wait();                   // 事务计数归零即数据到齐
+#   3) 量它有没有省下来：
+#   ncu --metrics gpu__time_duration.sum,sm__inst_executed.sum,\
+#         dram__bytes_read.sum,lts__t_bytes.sum ./tma
+# 判读：sm__inst_executed.sum 应显著低于 cp.async 版（省的是&quot;指挥搬运&quot;的指令）；
+#      lts__t_bytes.sum 在开启 multicast 后应随 cluster 增大而下降。
+# 没有 GPU 不影响本课：对齐/swizzle/multicast 三笔账上面已经算完。
+# 指标名与 API 细节以官方文档与 ncu --query-metrics 输出为准。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：给 <code>check_tma</code> 增加&quot;元素类型为 int8、box 内层 256 字节&quot;的用例，判断 128B swizzle 是否可用；再给出两种修法（换 swizzle 模式、拆 box），并说明各自的代价。</li>
+<li><strong>解释</strong>：为什么 TMA 需要 mbarrier + <code>expect_tx</code> 这套&quot;事务计数&quot;机制，而 cp.async 只需要 commit/wait group？（提示：一次 TMA 搬运的字节数是硬件按描述符展开的，发起线程并不知道会分成多少个内部事务。）</li>
+<li><strong>对比/验证</strong>：把 swizzle 的 XOR 改成 <code>row % 4</code>、<code>row % 16</code> 各算一次跨 32 行访问的 bank 冲突，解释为什么 128B swizzle 选的是 <code>% 8</code>。</li>
+<li><strong>思考</strong>：multicast 把 L2 → SM 流量降到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1/</span><span class="mord mathnormal" style="margin-right:0.0715em;">C</span></span></span></span>，但 cluster 变大会降低可驻留 block 数。你会用什么量来判断某个 GEMM 配置是否该开 cluster？写出判断式。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>NVIDIA, <em>NVIDIA Hopper Tuning Guide</em> §1.4.1.2「Tensor Memory Accelerator」与 §1.4.1.3「Thread Block Clusters」（TMA 的 1D–5D 双向搬运、不经寄存器/不用 SM 指令、写回规约、cluster 与 multicast、portable 上限 8）：<a href="https://docs.nvidia.com/cuda/hopper-tuning-guide/" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/hopper-tuning-guide/</a></li>
+<li>NVIDIA, <em>CUDA Programming Guide</em> §4.12「Asynchronous Data Copies」（bulk-asynchronous TMA 的源/目标与完成机制表、<code>cuda::memcpy_async</code> 与 <code>cp_async_bulk</code> 的差异、multicast 与 swizzle 说明）：<a href="https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/async-copies.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/async-copies.html</a></li>
+<li>NVIDIA, <em>CUDA Driver API</em> — Tensor Memory 组（<code>cuTensorMapEncodeTiled</code> 的参数、对齐与 swizzle 约束）：<a href="https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__TENSOR__MEMORY.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__TENSOR__MEMORY.html</a></li>
+<li>NVIDIA, <em>Parallel Thread Execution ISA</em>（<code>cp.async.bulk.tensor</code>、<code>tensormap</code> 与 <code>fence.proxy.async</code> 的精确语义）：<a href="https://docs.nvidia.com/cuda/parallel-thread-execution/" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/parallel-thread-execution/</a></li>
+</ul>
+<p><a href="#/l/cuda-ch4-l4">下一课：寄存器压力与 occupancy 的工程权衡</a></p>

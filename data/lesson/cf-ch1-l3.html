@@ -1,0 +1,146 @@
+<h2 id="h-工具链实践ir-打印汇编查看调试一个-pass">工具链实践：IR 打印、汇编查看、调试一个 pass<a class="anchor" href="#h-工具链实践ir-打印汇编查看调试一个-pass" aria-label="本节链接">#</a></h2>
+<p>前两课建立了&quot;四层形态&quot;的心智模型。这一课把它变成<strong>可操作的能力</strong>：拿到一个文件，你能打印出它每一层的表示、能对比优化前后的差异、能定位&quot;是哪个 pass 改坏了我的代码&quot;。</p>
+<blockquote>
+<p>环境说明：本课命令以 LLVM 工具链为例。<strong>没有安装 LLVM 也能学完</strong>——例 2、例 3 用我们自带的 Python 迷你编译器完成同样的观察动作；装 LLVM 的步骤见例 4 的注释（macOS <code>brew install llvm</code>、Ubuntu <code>apt install llvm clang</code>、Windows 建议 WSL）。</p>
+</blockquote>
+<p><figure><img class="md-img" src="content/courses/compiler-foundations/assets/chapter-1-figure-03.svg" alt="LLVM 工具链：IR 在流水线中的位置" loading="lazy" decoding="async"><figcaption>LLVM 工具链：IR 在流水线中的位置</figcaption></figure>
+</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-一次编译里中间产物到底有哪些">1. 一次编译里，中间产物到底有哪些<a class="anchor" href="#h-1-一次编译里中间产物到底有哪些" aria-label="本节链接">#</a></h4>
+<pre><code>源码.c ──clang -S -emit-llvm──▶ 源码.ll（LLVM IR，人类可读）
+       ──opt -passes=... ─────▶ 优化后的 IR（.ll 或 .bc 字节码）
+       ──llc ─────────────────▶ 源码.s（目标汇编）
+       ──as / ld ─────────────▶ 可执行文件
+       └─ lli 直接解释执行 IR（跳过汇编与链接，便于验证语义）</code></pre>
+<table>
+<thead>
+<tr>
+<th>工具</th>
+<th>作用</th>
+<th>本课用它做什么</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>clang -S -emit-llvm</code></td>
+<td>前端 → LLVM IR（文本）</td>
+<td>看&quot;源码→IR&quot;这一步</td>
+</tr>
+<tr>
+<td><code>clang -S</code></td>
+<td>一路到汇编</td>
+<td>看&quot;IR→汇编&quot;这一步</td>
+</tr>
+<tr>
+<td><code>opt -passes=&lt;…&gt;</code></td>
+<td>只跑指定优化 pass</td>
+<td><strong>逐个开关</strong>，看每个 pass 的效果</td>
+</tr>
+<tr>
+<td><code>llc</code></td>
+<td>IR → 汇编</td>
+<td>观察后端指令选择</td>
+</tr>
+<tr>
+<td><code>lli</code></td>
+<td>直接执行 IR</td>
+<td>验证&quot;优化没改语义&quot;</td>
+</tr>
+<tr>
+<td><code>objdump</code>（Linux）/ <code>otool -tvV</code>（macOS）</td>
+<td>反汇编可执行文件</td>
+<td>对照最终机器码</td>
+</tr>
+</tbody></table>
+<h4 id="h-2-为什么要逐个-pass看而不是只看--o2">2. 为什么要&quot;逐个 pass&quot;看，而不是只看 -O2<a class="anchor" href="#h-2-为什么要逐个-pass看而不是只看--o2" aria-label="本节链接">#</a></h4>
+<p><code>-O2</code> 是一个<strong>包含几十个 pass 的管线</strong>。当优化后行为出错，直接面对 <code>-O2</code> 是无从下手的；而有三个可以立刻用上的方法：</p>
+<ol>
+<li><strong>对照法</strong>：<code>-O0</code> 与 <code>-O2</code> 的 IR 差异，就是&quot;被优化掉/改写了什么&quot;的清单。</li>
+<li><strong>逐 pass 打印</strong>：<code>opt -print-after-all</code> 会把<strong>每个 pass 之后</strong>的 IR 全部打印出来，定位&quot;从哪一步开始变坏&quot;。</li>
+<li><strong>二分法</strong>：把 pass 管线拆成两半，先跑前半——如果坏在前半，就继续二分前半。这是编译器调试的通用手法。</li>
+</ol>
+<h4 id="h-3-验证优化没改语义的基本功">3. 验证&quot;优化没改语义&quot;的基本功<a class="anchor" href="#h-3-验证优化没改语义的基本功" aria-label="本节链接">#</a></h4>
+<p>优化的定义是&quot;换成<strong>语义等价</strong>但更快的程序&quot;。因此每次优化的验收都应该是<strong>行为等价</strong>，而不是&quot;看起来更快&quot;：</p>
+<ul>
+<li>用 <code>lli</code> 或编译后执行，对<strong>同一组输入</strong>比较输出；</li>
+<li>边界输入必测（0、负数、极大值、空输入）；</li>
+<li>浮点要明确<strong>容差</strong>（<code>-ffast-math</code> 之类的松弛是另一回事，别混进等价性判断）。</li>
+</ul>
+<p>这条纪律在后面的 GPU/编译器课程里会反复出现：<strong>先证明正确，再谈快</strong>。</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<pre data-lang="python"><code class="language-python"># ---- 例 1：一个给&quot;迷你编译器&quot;用的 IR 观察器 ----
+# 目标：在自己的 pass 上做&quot;前后对比&quot;，与 LLVM 的 -print-after-all 是同一种动作
+
+def show(ir, title):
+    print(f&#39;--- {title} ---&#39;)
+    for ins in ir: print(&#39;   &#39;, ins)
+
+before = [(&#39;t1&#39;, &#39;+&#39;, (&#39;name&#39;,&#39;min&#39;), (&#39;name&#39;,&#39;max&#39;)),
+          (&#39;t2&#39;, &#39;/&#39;, (&#39;name&#39;,&#39;t1&#39;),  (&#39;const&#39;,2)),
+          (&#39;avg&#39;, &#39;=&#39;, (&#39;name&#39;,&#39;t2&#39;), None)]
+show(before, &#39;优化前&#39;)
+
+def constfold(ir):
+    &quot;&quot;&quot;一个真正的优化 pass：把&quot;两个操作数都是常量&quot;的运算直接算掉&quot;&quot;&quot;
+    env = {}          # 临时名 → 常量值
+    out = []
+    for dst, op, a, b in ir:
+        def val(x):
+            k, v = x
+            return env.get(v, v) if k == &#39;name&#39; else v
+        if a[0] == &#39;const&#39; and b and b[0] == &#39;const&#39; and op in &#39;+-*/&#39;:
+            r = eval(f&#39;{a[1]} {op} {b[1]}&#39;)   # 演示用；真实编译器用常量求值器
+            env[dst] = r
+            out.append((dst, &#39;const&#39;, r, None))
+        else:
+            out.append((dst, op, a, b))
+    return out
+
+show(constfold(before), &#39;常量折叠后&#39;)
+print(&#39;→ 与 LLVM `opt -passes=constprop` 的动作同类：能算的提前算掉。&#39;)</code></pre>
+<pre data-lang="python"><code class="language-python"># ---- 例 2：把&quot;逐个 pass&quot;的思路落到自己的编译器上（可复现、无依赖）----
+PASSES = [(&#39;常量折叠&#39;, constfold)]
+
+def run_pipeline(ir, passes=PASSES):
+    &quot;&quot;&quot;每跑一个 pass 就打印一次 —— 相当于 opt -print-after-all 的教学版&quot;&quot;&quot;
+    cur = ir
+    for name, fn in passes:
+        cur = fn(cur)
+        print(f&#39;== after {name} ==&#39;)
+        for ins in cur: print(&#39;   &#39;, ins)
+    return cur
+
+final = run_pipeline(before)
+print(&#39;最终 IR 行数:&#39;, len(final))</code></pre>
+<pre data-lang="bash"><code class="language-bash"># ---- 例 3：一个可复用的观察脚本（存成 observe.sh）----
+#!/usr/bin/env bash
+set -euo pipefail
+SRC=&quot;${1:?用法: ./observe.sh demo.c}&quot;
+BASE=&quot;${SRC%.*}&quot;
+clang -O0 -S -emit-llvm &quot;$SRC&quot; -o &quot;$BASE.O0.ll&quot;
+clang -O2 -S -emit-llvm &quot;$SRC&quot; -o &quot;$BASE.O2.ll&quot;
+echo &quot;== IR 行数：O0 vs O2 ==&quot;
+wc -l &quot;$BASE.O0.ll&quot; &quot;$BASE.O2.ll&quot;
+echo &quot;== 只看指令（去掉注释与空行）后的差异摘要 ==&quot;
+diff &lt;(grep -cE &#39;^\s+[a-z]&#39; &quot;$BASE.O0.ll&quot;) &lt;(grep -cE &#39;^\s+[a-z]&#39; &quot;$BASE.O2.ll&quot;) || true
+echo &quot;== 逐 pass 打印（只看前 80 行，避免刷屏）==&quot;
+opt -O2 -print-after-all -S &quot;$BASE.O0.ll&quot; -o /dev/null 2&gt;&amp;1 | head -80</code></pre>
+<pre data-lang="bash"><code class="language-bash"># ---- 例 4：安装 LLVM（按平台）----
+# macOS:  brew install llvm   （可执行文件在 $(brew --prefix llvm)/bin）
+# Ubuntu: sudo apt update &amp;&amp; sudo apt install -y llvm clang
+# Windows: 建议用 WSL 后按 Ubuntu 安装；或用 https://releases.llvm.org/ 的预编译包
+# 验证：clang --version &amp;&amp; opt --version &amp;&amp; lli --version</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>动手</strong>：写一个 C 函数 <code>int f(int a, int b) { int s = a + b; return s * s; }</code>，分别导出 <code>-O0</code> 与 <code>-O2</code> 的 IR，列出 O2 至少三处改动并解释每一处的目的。</li>
+<li><strong>调试</strong>：用 <code>opt -print-after-all</code> 找到&quot;把 <code>alloca</code> 变成 SSA 寄存器&quot;的那个 pass，并说明它为什么必须早于大多数算术优化。</li>
+<li><strong>验证</strong>：给例 1 的 <code>constfold</code> 补一个&quot;死代码消除&quot;pass（删除结果从未被使用的指令），并用两组输入验证改造前后程序输出一致。</li>
+<li><strong>思考</strong>：为什么&quot;优化后更快&quot;不能作为正确性证据？举一个&quot;优化破坏了语义但基准测试更快&quot;的例子（提示：浮点重结合、整数溢出）。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>LLVM 官方文档：<code>opt</code> 的 <code>-print-after-all</code>、pass 管线与 IR 工具链：<a href="https://llvm.org/docs/CommandGuide/opt.html" target="_blank" rel="noopener noreferrer">https://llvm.org/docs/CommandGuide/opt.html</a></li>
+<li>LLVM 官方 IR 参考手册（阅读 IR 的语法基础）：<a href="https://llvm.org/docs/LangRef.html" target="_blank" rel="noopener noreferrer">https://llvm.org/docs/LangRef.html</a></li>
+<li>LLVM Kaleidoscope 教程（从零写前端 + pass 的完整流程）：<a href="https://llvm.org/docs/tutorial/" target="_blank" rel="noopener noreferrer">https://llvm.org/docs/tutorial/</a></li>
+<li>Aho et al., <em>Compilers: Principles, Techniques, and Tools</em>（龙书）第 8 章「代码生成」、第 9 章「机器无关优化」</li>
+</ul>
+<p><a href="#/learn/../chapter-2/lesson-01">下一章：词法与语法分析</a></p>

@@ -1,0 +1,170 @@
+<h2 id="h-训练配置">训练配置<a class="anchor" href="#h-训练配置" aria-label="本节链接">#</a></h2>
+<p>数据准备好了，接下来是把&quot;旋钮&quot;调对：学习率、批次大小、预热、调度、显存优化、评估与早停。这些超参数直接决定训练能不能收敛、会不会过拟合、会不会把显存撑爆。本课逐一讲清。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-关键超参数">1. 关键超参数<a class="anchor" href="#h-1-关键超参数" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>超参数</th>
+<th>含义</th>
+<th>微调常见取值</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>learning_rate</code></td>
+<td>每一步参数更新的步长</td>
+<td>1e-5 ~ 5e-5（全参数微调）</td>
+</tr>
+<tr>
+<td><code>per_device_train_batch_size</code></td>
+<td>单卡单步的样本数</td>
+<td>1 ~ 8（受显存限制）</td>
+</tr>
+<tr>
+<td><code>gradient_accumulation_steps</code></td>
+<td>梯度累积步数</td>
+<td>4 ~ 32（等效扩大 batch）</td>
+</tr>
+<tr>
+<td><code>num_train_epochs</code></td>
+<td>遍历数据集的轮数</td>
+<td>1 ~ 3（数据小可稍多）</td>
+</tr>
+<tr>
+<td><code>warmup_ratio</code></td>
+<td>预热阶段占比</td>
+<td>0.03 ~ 0.1</td>
+</tr>
+<tr>
+<td><code>lr_scheduler_type</code></td>
+<td>学习率调度曲线</td>
+<td>cosine / linear</td>
+</tr>
+<tr>
+<td><code>weight_decay</code></td>
+<td>权重衰减（正则）</td>
+<td>0.01 ~ 0.1</td>
+</tr>
+<tr>
+<td><code>max_seq_length</code></td>
+<td>序列最大长度</td>
+<td>1024 ~ 8192（看显存）</td>
+</tr>
+</tbody></table>
+<p>其中<strong>学习率</strong>是最敏感的旋钮。太小收敛慢、欠拟合；太大训练不稳定、甚至发散并加重灾难性遗忘。</p>
+<h4 id="h-2-等效-batch-size-与梯度累积">2. 等效 batch size 与梯度累积<a class="anchor" href="#h-2-等效-batch-size-与梯度累积" aria-label="本节链接">#</a></h4>
+<p><strong>等效 batch size = per_device_train_batch_size × 梯度累积步数 × 卡数</strong>。它决定每轮参数更新用了多少样本，进而影响训练稳定性。显存不够时，不直接加大单步 batch，而是用<strong>梯度累积</strong>：多个小步只累积梯度、不更新权重，攒够一定步数再统一更新一次。</p>
+<p><figure><img class="md-img" src="content/courses/llm-fine-tuning/assets/chapter-2-figure-04.svg" alt="梯度累积：多个小步合起来做一次权重更新" loading="lazy" decoding="async"><figcaption>梯度累积：多个小步合起来做一次权重更新</figcaption></figure>
+</p>
+<h4 id="h-3-学习率调度预热--衰减">3. 学习率调度：预热 + 衰减<a class="anchor" href="#h-3-学习率调度预热--衰减" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>Warmup</strong>：训练初期把学习率从接近 0 线性/线性地爬升到目标值，避免一上来步子太大。</li>
+<li><strong>衰减</strong>：中后期按余弦或线性降到接近 0，帮助模型稳稳落入极小值。</li>
+</ul>
+<p>典型曲线是&quot;先爬升 → 平台 → 余弦下降&quot;。Hugging Face 的 <code>lr_scheduler_type=&quot;cosine&quot;</code> 配合 <code>warmup_ratio</code> 就能复现。</p>
+<p><figure><img class="md-img" src="content/courses/llm-fine-tuning/assets/chapter-2-figure-05.svg" alt="学习率调度曲线：预热 → 平台 → 余弦衰减" loading="lazy" decoding="async"><figcaption>学习率调度曲线：预热 → 平台 → 余弦衰减</figcaption></figure>
+</p>
+<h4 id="h-4-显存优化三板斧">4. 显存优化三板斧<a class="anchor" href="#h-4-显存优化三板斧" aria-label="本节链接">#</a></h4>
+<p>全参数微调最怕显存不够，常用手段：</p>
+<ul>
+<li><strong>混合精度（mixed precision）</strong>：用 bf16/fp16 存权重和算前向，用 fp32 存优化器状态和关键累积，既省显存又加速。现代 GPU 优先 <strong>bf16</strong>（动态范围大，不易溢出）。</li>
+<li><strong>梯度检查点（gradient checkpointing）</strong>：前向时<strong>不保存所有中间激活</strong>，反向时按需重新计算，用&quot;时间换显存&quot;。省显存但训练变慢。</li>
+<li><strong>梯度累积</strong>：如前所述，用小 batch + 累积模拟大 batch。</li>
+</ul>
+<p>三者常组合使用。此外还有 8-bit 优化器（如 bitsandbytes 的 AdamW8bit）进一步压优化器状态。</p>
+<h4 id="h-5-评估早停与检查点">5. 评估、早停与检查点<a class="anchor" href="#h-5-评估早停与检查点" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>评估</strong>：每个 epoch（或每若干步）在验证集上算 loss / 指标（如准确率、Rouge、或人工抽检），监控是否过拟合。</li>
+<li><strong>早停（early stopping）</strong>：验证 loss 连续若干个评估周期不再下降就提前停，防止过拟合、省算力。</li>
+<li><strong>检查点（checkpoint）</strong>：定期保存模型和优化器状态，既能中途恢复，也能事后回滚到验证集上最优的那一版。注意 <code>save_strategy</code> 与 <code>evaluation_strategy</code> 的配合，以及是否要 <code>load_best_model_at_end</code>。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面给出一个完整的 <code>TrainingArguments</code> 配置 + <code>Trainer</code> 训练骨架，覆盖上面讲的旋钮。</p>
+<pre data-lang="python"><code class="language-python">from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    Trainer,
+    TrainingArguments,
+)
+from datasets import Dataset
+
+model_name = &quot;Qwen/Qwen2.5-0.5B&quot;
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+model = AutoModelForCausalLM.from_pretrained(model_name)
+
+# 打开梯度检查点（省显存），需先对模型启用
+model.gradient_checkpointing_enable()
+
+# （省略数据准备，沿用上一课的分词结果，这里用占位 Dataset 示意）
+raw = [
+    {&quot;instruction&quot;: &quot;翻译成英文&quot;, &quot;input&quot;: &quot;今天天气很好。&quot;, &quot;output&quot;: &quot;The weather is nice today.&quot;},
+    {&quot;instruction&quot;: &quot;翻译成英文&quot;, &quot;input&quot;: &quot;我喜欢学习编程。&quot;, &quot;output&quot;: &quot;I like learning to program.&quot;},
+]
+
+def tokenize_fn(example):
+    messages = [
+        {&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: example[&quot;instruction&quot;] + &quot;\n&quot; + example[&quot;input&quot;]},
+        {&quot;role&quot;: &quot;assistant&quot;, &quot;content&quot;: example[&quot;output&quot;]},
+    ]
+    prompt = tokenizer.apply_chat_template(messages[:-1], tokenize=False, add_generation_prompt=True)
+    full = tokenizer.apply_chat_template(messages, tokenize=False)
+    p_ids = tokenizer(prompt, add_special_tokens=False)[&quot;input_ids&quot;]
+    f_ids = tokenizer(full, add_special_tokens=False)[&quot;input_ids&quot;]
+    return {&quot;input_ids&quot;: f_ids, &quot;labels&quot;: [-100]*len(p_ids) + f_ids[len(p_ids):]}
+
+train_dataset = Dataset.from_list(raw).map(tokenize_fn)
+# 验证集通常单独划分，这里为演示复用一小份
+eval_dataset = train_dataset
+
+# 训练配置：显存优化 + 学习率调度 + 评估早停
+training_args = TrainingArguments(
+    output_dir=&quot;./ft-config-output&quot;,
+    # —— 批次与累积 ——
+    per_device_train_batch_size=1,
+    gradient_accumulation_steps=8,      # 等效 batch = 1 × 8 = 8
+    # —— 学习率 ——
+    learning_rate=2e-5,
+    num_train_epochs=3,
+    warmup_ratio=0.1,
+    lr_scheduler_type=&quot;cosine&quot;,
+    weight_decay=0.01,
+    # —— 显存优化 ——
+    bf16=True,                          # 混合精度（无 bf16 支持的卡可改 fp16=True）
+    gradient_checkpointing=True,
+    # —— 日志/保存/评估 ——
+    logging_steps=5,
+    save_strategy=&quot;epoch&quot;,
+    evaluation_strategy=&quot;epoch&quot;,
+    load_best_model_at_end=True,        # 训练结束后加载验证集上最优的检查点
+    metric_for_best_model=&quot;eval_loss&quot;,
+    report_to=&quot;none&quot;,
+)
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_dataset,
+    eval_dataset=eval_dataset,
+    tokenizer=tokenizer,
+)
+
+trainer.train()
+print(&quot;\n训练结束，已加载验证集上最优的检查点。&quot;)
+print(&quot;提示：若 bf16 报错，说明当前硬件不支持，可改为 fp16=True 或去掉该行。&quot;)</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>填空</strong>：等效 batch size = ____ × ____ × ____；显存不够时用 ____ 技术模拟大 batch。</li>
+<li><strong>概念辨析</strong>：说明 <code>warmup_ratio</code> 和 <code>lr_scheduler_type</code> 各自的作用；为什么&quot;先预热再余弦衰减&quot;是常用组合？</li>
+<li><strong>动手实验</strong>：把上面代码的 <code>per_device_train_batch_size</code> 改成 2、<code>gradient_accumulation_steps</code> 改成 4，等效 batch 变了吗？如果再把 <code>learning_rate</code> 改成 1e-4，观察训练曲线（loss）的变化趋势。</li>
+<li><strong>思考题</strong>：梯度检查点为什么能省显存却会拖慢训练？&quot;时间换显存&quot;的原理是什么？结合反向传播需要中间激活这一点说明。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Hugging Face TrainingArguments 文档：<a href="https://huggingface.co/docs/transformers/main_classes/trainer" target="_blank" rel="noopener noreferrer">https://huggingface.co/docs/transformers/main_classes/trainer</a></li>
+<li>Hugging Face 混合精度训练文档：<a href="https://huggingface.co/docs/transformers/perf_train_gpu_one" target="_blank" rel="noopener noreferrer">https://huggingface.co/docs/transformers/perf_train_gpu_one</a></li>
+<li>bitsandbytes 优化器文档：<a href="https://huggingface.co/docs/bitsandbytes/index" target="_blank" rel="noopener noreferrer">https://huggingface.co/docs/bitsandbytes/index</a></li>
+<li>混合精度训练论文（Mixed Precision Training）：<a href="https://arxiv.org/abs/1710.03740" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1710.03740</a></li>
+</ul>
+<p><a href="#/l/ft-ch3-l1">下一课：低秩适配原理</a></p>

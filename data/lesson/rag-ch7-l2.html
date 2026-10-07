@@ -1,0 +1,532 @@
+<h2 id="h-评测驱动迭代指标树失败分类与统计判据">评测驱动迭代：指标树、失败分类与统计判据<a class="anchor" href="#h-评测驱动迭代指标树失败分类与统计判据" aria-label="本节链接">#</a></h2>
+<h3 id="h-这一节要解决什么">这一节要解决什么<a class="anchor" href="#h-这一节要解决什么" aria-label="本节链接">#</a></h3>
+<p>上一节把架构解出来了。但架构只是起点：接下来的每一天都要回答同一个问题：</p>
+<blockquote>
+<p><strong>这次改动，到底有没有让系统变好？</strong></p>
+</blockquote>
+<p>这个问题在 RAG 里格外难回答，原因有三个：</p>
+<ol>
+<li><strong>指标不是单一的</strong>：召回变好可能让生成变差（更多干扰，第 5 章第 3 节）；延迟降低可能以质量为代价。</li>
+<li><strong>信号很弱</strong>：典型改动的收益是几个百分点，而评测集往往只有几百题 —— <strong>在 300 题上，你连 10 个百分点的变化都测不准</strong>。</li>
+<li><strong>失败混在一起</strong>：一个&quot;答错了&quot;可能来自召回、排序、生成、拒答策略中的任何一个，而它们的处方完全不同。</li>
+</ol>
+<p>本节要回答四个问题：</p>
+<ol>
+<li>指标怎么组织成<strong>树</strong>？为什么&quot;用户满意度&quot;不能直接作为优化目标？</li>
+<li>评测集怎么建？为什么每题都必须标注<strong>黄金证据 id</strong>，而不只是答案？</li>
+<li>失败怎么分类？怎么保证分类是<strong>基于可观测信号</strong>而不是人工印象？</li>
+<li>判断&quot;改动有效&quot;需要哪些统计判据？<strong>你的评测集到底能检出多大的效应？</strong></li>
+</ol>
+<blockquote>
+<p><strong>结论先放在这里</strong>：评测只有一个目的 —— <strong>把&quot;哪个改动值得做&quot;变成一个可判定的问题</strong>。做法是三步：①把北极星指标拆成<strong>可干预的叶子指标</strong>（指标树）；②用<strong>基于可观测信号的判定树</strong>把失败归类，按最大类排序优先级；③用<strong>配对统计判据</strong>（bootstrap CI + McNemar）而不是点估计比较。⚠️ 实测示例：候选系统 B 各项指标全面上升（端到端 0.390→0.477），但与此同时评测集的<strong>最小可检出效应（MDE）约为 10.3 个百分点</strong> —— 也就是说，如果真实提升只有 3 个百分点，这个 300 题的评测集<strong>根本测不出来</strong>（要检出 +3pt 需要约 3547 题）。</p>
+</blockquote>
+<h3 id="h-一指标树从北极星到可干预的叶子">一、指标树：从北极星到可干预的叶子<a class="anchor" href="#h-一指标树从北极星到可干预的叶子" aria-label="本节链接">#</a></h3>
+<h4 id="h-11-构造规则">1.1 构造规则<a class="anchor" href="#h-11-构造规则" aria-label="本节链接">#</a></h4>
+<p>指标树必须满足三条规则（缺一条就会退化成&quot;看板上的一堆数字&quot;）：</p>
+<ol>
+<li><strong>可观测</strong>：线上或离线都能被测量，不需要额外的人工作业；</li>
+<li><strong>可归因</strong>：指标下降时能指向某个具体环节；</li>
+<li><strong>可干预</strong>：存在明确的改动能提升它 —— <strong>这是最容易被违反的一条</strong>。</li>
+</ol>
+<p><strong>反例</strong>：&quot;用户满意度&quot;不可直接干预。你无法&quot;提升满意度&quot;，只能通过提升它的<strong>代理指标</strong>（答案正确率、引用可信度、延迟、拒答恰当性）来间接提升。所以满意度只能作为北极星的<strong>命名</strong>，不能作为优化的叶子。</p>
+<h4 id="h-12-一棵可用的指标树">1.2 一棵可用的指标树<a class="anchor" href="#h-12-一棵可用的指标树" aria-label="本节链接">#</a></h4>
+<pre data-lang="text"><code class="language-text">北极星：端到端有用回答率（answer_ok AND citation_ok）
+├─ 答案正确率
+│  ├─ 召回覆盖（黄金证据命中率）      &lt;- 切分/索引/检索/查询改写
+│  ├─ 排序质量（黄金证据进入上下文）    &lt;- 重排/融合/预算分配
+│  └─ 生成利用率（有证据时是否采用）    &lt;- grounding 指令/去干扰/拒答
+├─ 引用可信度（引用一致性）
+├─ 拒答恰当性
+│  ├─ 该拒答就拒答（召回为空/证据不足）  &lt;- 拒答阈值
+│  └─ 不该拒答却拒（覆盖率损失）        &lt;- 阈值过高的代价
+├─ 延迟（P95 总延迟、TTFT）
+└─ 成本（每查询、每正确回答）</code></pre>
+<p><strong>为什么&quot;每正确回答成本&quot;要和&quot;每查询成本&quot;并列</strong>：降价可以靠降质量实现，所以只有&quot;每正确回答成本&quot;才是真正的效率指标。⚠️ 示例数据里，B 系统端到端正确率 0.477，若每查询成本 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">c</span></span></span></span>，则每正确回答成本 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4831em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">c</span><span class="mord">/0.477</span></span></span></span>；<strong>任何质量变化都会改变这个分母</strong>。</p>
+<h4 id="h-13-代理指标的失效">1.3 代理指标的失效<a class="anchor" href="#h-13-代理指标的失效" aria-label="本节链接">#</a></h4>
+<p>代理指标会骗人。三种典型失效：</p>
+<table>
+<thead>
+<tr>
+<th>失效</th>
+<th>表现</th>
+<th>例</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>优化代理、损害目标</td>
+<td>代理涨、北极星跌</td>
+<td>提高 recall@10 却引入干扰，答案正确率下降</td>
+</tr>
+<tr>
+<td>代理可被&quot;作弊&quot;</td>
+<td>指标好看但无用</td>
+<td>引用率可以通过&quot;抄一个 doc id&quot;提高（装饰性引用）</td>
+</tr>
+<tr>
+<td>代理与目标脱钩</td>
+<td>长期不相关</td>
+<td>早期 recall 与最终正确率强相关，后期饱和后相关性消失</td>
+</tr>
+</tbody></table>
+<p><strong>判据</strong>：每个代理指标都要有<strong>周期性校验</strong> —— 在人工标注的一小批样本上验证&quot;代理涨是否伴随目标涨&quot;。<strong>没有校验的代理指标迟早会说谎。</strong></p>
+<h3 id="h-二评测集构建标注与防过拟合">二、评测集：构建、标注与防过拟合<a class="anchor" href="#h-二评测集构建标注与防过拟合" aria-label="本节链接">#</a></h3>
+<h4 id="h-21-分层的-golden-set">2.1 分层的 golden set<a class="anchor" href="#h-21-分层的-golden-set" aria-label="本节链接">#</a></h4>
+<p>评测集必须<strong>分层</strong>构造，否则它只反映最容易的那一类问题：</p>
+<table>
+<thead>
+<tr>
+<th>分层维度</th>
+<th>分层示例</th>
+<th>为什么必须覆盖</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>查询类型</td>
+<td>单跳 / 多跳 / 聚合 / 应拒答</td>
+<td>各类的失败机理不同</td>
+</tr>
+<tr>
+<td>难度</td>
+<td>词汇匹配 / 语义改写 / 需要推理</td>
+<td>平均分会掩盖长尾</td>
+</tr>
+<tr>
+<td>文档类型</td>
+<td>正文 / 表格 / 代码 / 邮件</td>
+<td>切分策略对它们效果不同</td>
+</tr>
+<tr>
+<td>租户/权限</td>
+<td>单租户 / 多租户 / 无权限</td>
+<td>权限是最容易出事故的一类</td>
+</tr>
+<tr>
+<td>时间</td>
+<td>新增文档 / 陈旧文档</td>
+<td>索引更新相关失败</td>
+</tr>
+</tbody></table>
+<p><strong>配额</strong>：每层至少 20~30 题起（够做粗略比较），关键层（如应拒答、权限）建议 50 题以上。</p>
+<h4 id="h-22-每题必须标注黄金证据">2.2 每题必须标注黄金证据<a class="anchor" href="#h-22-每题必须标注黄金证据" aria-label="本节链接">#</a></h4>
+<p><strong>这是评测集设计里最重要的一条</strong>：</p>
+<blockquote>
+<p>只标注&quot;标准答案&quot;的评测集，<strong>无法区分召回失败与生成失败</strong>。</p>
+</blockquote>
+<p>因为当系统答错时，你不知道是&quot;没找到那篇文档&quot;还是&quot;找到了但没用好&quot;。而这两者的处方完全不同（前者改检索，后者改 prompt 与装配）。</p>
+<p>因此每题的标注必须包含：</p>
+<pre data-lang="json"><code class="language-json">{
+  &quot;query&quot;: &quot;...&quot;,
+  &quot;golden_evidence&quot;: [&quot;doc:123#chunk-4&quot;, &quot;doc:456#chunk-1&quot;],   // 必需
+  &quot;answer&quot;: &quot;...&quot;,                                             // 可选（抽取式任务必需）
+  &quot;must_refuse&quot;: false,                                        // 拒答类必需
+  &quot;tenant&quot;: &quot;acme&quot;,                                            // 权限校验必需
+  &quot;type&quot;: &quot;multi&quot;, &quot;difficulty&quot;: &quot;hard&quot;
+}</code></pre>
+<p><strong>附带好处</strong>：有了黄金证据 id，就能自动计算召回覆盖（第 7 章第 3 节案例会用到），也能自动做第 6 章第 4 节的归因。</p>
+<h4 id="h-23-难负样本">2.3 难负样本<a class="anchor" href="#h-23-难负样本" aria-label="本节链接">#</a></h4>
+<p>只有正例的评测集会高估系统。<strong>难负样本</strong>（near-duplicate 但答案不同、同主题不同事实）是检出&quot;干扰敏感&quot;与&quot;过度自信&quot;的关键。构造方式：</p>
+<ul>
+<li>从语料里取与黄金证据<strong>相似度高但事实不同</strong>的 chunk（例如同产品的上一代参数）；</li>
+<li>标注为&quot;不应作为证据&quot;；</li>
+<li>断言系统在加入这些负例后<strong>不会答错</strong>（或至少会降低置信/拒答）。</li>
+</ul>
+<h4 id="h-24-防过拟合评测集也会被训坏">2.4 防过拟合：评测集也会&quot;被训坏&quot;<a class="anchor" href="#h-24-防过拟合评测集也会被训坏" aria-label="本节链接">#</a></h4>
+<p>只要你在同一批题上反复调参，指标就会开始过拟合。三条防腐措施：</p>
+<ol>
+<li><strong>dev / test 切分</strong>：dev 用于迭代，test <strong>冻结</strong>（只在发布决策时打开）；</li>
+<li><strong>定期换血</strong>：每季度替换一部分题（保留旧题用于纵向比较，新增题用于防漂移）；</li>
+<li><strong>hidden set</strong>：保留一小批（20%）从不公开给调参者。</li>
+</ol>
+<p><strong>判据</strong>：如果 test 与 dev 的指标差距在连续多次迭代中持续扩大，说明已经在过拟合。</p>
+<h3 id="h-三失败分类基于可观测信号的判定树">三、失败分类：基于可观测信号的判定树<a class="anchor" href="#h-三失败分类基于可观测信号的判定树" aria-label="本节链接">#</a></h3>
+<h4 id="h-31-判定树">3.1 判定树<a class="anchor" href="#h-31-判定树" aria-label="本节链接">#</a></h4>
+<p>分类必须<strong>唯一且可复算</strong>。一棵可用的判定树（输入全部来自 trace：第 6 章第 4 节）：</p>
+<pre data-lang="text"><code class="language-text">if 行为 != 回答 且 不应拒答:        -&gt; 拒答错误（过度拒答）
+if 应拒答 且 行为 != 拒答:          -&gt; 该拒不拒
+if 黄金证据命中数 == 0:            -&gt; 召回失败
+if 进入上下文的黄金证据数 == 0:      -&gt; 排序失败
+if 答案不正确:                      -&gt; 生成未用
+if 引用不一致:                      -&gt; 引用不一致
+else:                              -&gt; 无失败</code></pre>
+<p><strong>顺序很重要</strong>：先判&quot;行为层&quot;（拒答），再判&quot;检索层&quot;，再判&quot;生成层&quot;。因为后面的判据在拒答的情况下没有意义。</p>
+<h4 id="h-32-分类分布--优先级">3.2 分类分布 → 优先级<a class="anchor" href="#h-32-分类分布--优先级" aria-label="本节链接">#</a></h4>
+<p>⚠️ 示例（合成评测集 N=300，系统 B）：</p>
+<table>
+<thead>
+<tr>
+<th>失败类</th>
+<th>数量</th>
+<th>占失败比例</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>召回失败</td>
+<td>120</td>
+<td><strong>56.6%</strong></td>
+</tr>
+<tr>
+<td>生成未用</td>
+<td>55</td>
+<td>25.9%</td>
+</tr>
+<tr>
+<td>排序失败</td>
+<td>22</td>
+<td>10.4%</td>
+</tr>
+<tr>
+<td>该拒不拒</td>
+<td>12</td>
+<td>5.7%</td>
+</tr>
+<tr>
+<td>引用不一致</td>
+<td>3</td>
+<td>1.4%</td>
+</tr>
+</tbody></table>
+<p><strong>结论</strong>：最大类是<strong>召回失败</strong>，占 56.6%。所以下一步该做的是<strong>检索侧</strong>（切分、索引、混合、查询改写），而不是继续调 prompt。</p>
+<p><strong>这条结论的价值在于它反直觉</strong>：团队的直觉往往指向&quot;模型不够好&quot;（换更大的模型），而数据说 56.6% 的失败根本没把证据找回来 —— <strong>换模型一分钱都赚不到</strong>。</p>
+<h4 id="h-33-边界">3.3 边界<a class="anchor" href="#h-33-边界" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>判定树依赖 trace 的完整性</strong>：没有黄金证据标注、没有候选名次，就无法分类。所以评测集与 trace 设计必须一起做（第 6 章第 4 节）。</li>
+<li><strong>&quot;生成未用&quot;包含多种子因</strong>：位置（ch5-l3）、干扰、先验冲突、指令缺失。分类只到这一层，进一步要跑第 5 章第 3 节的四个测试。</li>
+<li><strong>分类是&quot;当前配置下&quot;的</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span>、预算、模型一变，分布就变。<strong>每次大改动后要重新分类。</strong></li>
+</ul>
+<h3 id="h-四统计判据改动到底显著吗">四、统计判据：改动到底显著吗<a class="anchor" href="#h-四统计判据改动到底显著吗" aria-label="本节链接">#</a></h3>
+<h4 id="h-41-配对设计">4.1 配对设计<a class="anchor" href="#h-41-配对设计" aria-label="本节链接">#</a></h4>
+<p>比较两个系统时，<strong>必须用同一批查询</strong>（配对），因为题目难度差异极大。配对设计能消掉&quot;题目难度&quot;这部分的方差，因此检定力远高于两组独立样本。</p>
+<p>配对后，比较的对象是<strong>不一致对</strong>：</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>B 错</th>
+<th>B 对</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>A 错</strong></td>
+<td>一致</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">b</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">01</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span></td>
+</tr>
+<tr>
+<td><strong>A 对</strong></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">b</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">10</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span></td>
+<td>一致</td>
+</tr>
+</tbody></table>
+<p><strong>只有 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">b</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">01</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 与 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">b</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">10</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 携带&quot;两系统不同&quot;的信息</strong> —— 一致的部分再多也不增加判别力。</p>
+<h4 id="h-42-两个判据">4.2 两个判据<a class="anchor" href="#h-42-两个判据" aria-label="本节链接">#</a></h4>
+<p><strong>① bootstrap 置信区间</strong>（对配对差分重采样）：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">Δ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.5991em;vertical-align:-1.2777em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3214em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">n</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.05em;"><span style="top:-1.8723em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∑</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.2777em;"><span></span></span></span></span></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0359em;">y</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8913em;"><span style="top:-2.453em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0502em;">B</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.247em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.1413em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0359em;">y</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8913em;"><span style="top:-2.453em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">A</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.247em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord text"><span class="mord">CI</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3448em;"><span style="top:-2.5198em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">95%</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2191em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.2em;vertical-align:-0.35em;"></span><span class="minner"><span class="mopen delimcenter" style="top:0em;"><span class="delimsizing size1">[</span></span><span class="mord"><span class="mord">Δ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.7387em;"><span style="top:-2.428em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">2.5%</span></span></span></span><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.3109em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord">Δ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.7387em;"><span style="top:-2.428em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">97.5%</span></span></span></span><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.3109em;"><span></span></span></span></span></span></span><span class="mclose delimcenter" style="top:0em;"><span class="delimsizing size1">]</span></span></span></span></span></span></span></p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">Δ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.5991em;vertical-align:-1.2777em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3214em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">n</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.05em;"><span style="top:-1.8723em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∑</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.2777em;"><span></span></span></span></span></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0359em;">y</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8913em;"><span style="top:-2.453em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0502em;">B</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.247em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.1413em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0359em;">y</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8913em;"><span style="top:-2.453em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">A</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.247em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord text"><span class="mord">CI</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3448em;"><span style="top:-2.5198em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">95%</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2191em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.2em;vertical-align:-0.35em;"></span><span class="minner"><span class="mopen delimcenter" style="top:0em;"><span class="delimsizing size1">[</span></span><span class="mord"><span class="mord">Δ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.7387em;"><span style="top:-2.428em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">2.5%</span></span></span></span><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.3109em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord">Δ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.7387em;"><span style="top:-2.428em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">97.5%</span></span></span></span><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.3109em;"><span></span></span></span></span></span></span><span class="mclose delimcenter" style="top:0em;"><span class="delimsizing size1">]</span></span></span></span></span></span></span></p>
+<p><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6887em;"></span><span class="mord"><span class="mord">Δ</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6887em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span></span></span></span></span></span></span></span> 是重采样的分位数。<strong>判据：CI 不含 0 才算显著。</strong></p>
+<p><strong>② McNemar 检验</strong>（配对二分类）：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0585em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">χ</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8641em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.3271em;vertical-align:-0.836em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.4911em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal">b</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">01</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord"><span class="mord mathnormal">b</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">10</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mopen">(</span><span class="mord">∣</span><span class="mord"><span class="mord mathnormal">b</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">01</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord"><span class="mord mathnormal">b</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">10</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord">∣</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord">1</span><span class="mclose"><span class="mclose">)</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.836em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></p>
+<p>（分子减 1 是连续性校正。）<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0813em;">H</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.0813em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>：两系统在配对上的错误率相同。<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span></span></span></span> 值由 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0622em;vertical-align:-0.2481em;"></span><span class="mord"><span class="mord mathnormal">χ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-2.4519em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2481em;"><span></span></span></span></span></span></span></span></span></span> 分布给出。</p>
+<p>⚠️ 示例（A 为基线、B 为候选，端到端正确率）：</p>
+<pre><code>Δ = +0.0867   95% CI = [+0.0166, +0.1567]   显著（不含 0）
+列联: A错B对=74  A对B错=48  一致=178
+统计量 χ²=5.123  p≈0.0236  拒绝原假设（有显著差异）</code></pre>
+<p>两个判据结论一致：<strong>B 显著更好</strong>。</p>
+<h4 id="h-43-样本量你的评测集能检出多大效应">4.3 样本量：你的评测集能检出多大效应<a class="anchor" href="#h-43-样本量你的评测集能检出多大效应" aria-label="本节链接">#</a></h4>
+<p>这是最常被忽略、也最容易导致错误结论的一项。单比例（双侧 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.05</span></span></span></span>、power <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.3669em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.8</span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6776em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.5</span></span></span></span>）：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4831em;"></span><span class="mord mathnormal">n</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.2453em;vertical-align:-0.686em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.5593em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal" style="margin-right:0.0379em;">δ</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.7401em;"><span style="top:-2.989em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.7452em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mopen">(</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.044em;">z</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3448em;"><span style="top:-2.5198em;margin-left:-0.044em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.0037em;">α</span><span class="mord mtight">/2</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.3552em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.044em;">z</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.044em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0528em;">β</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mclose"><span class="mclose">)</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">p</span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord mathnormal">p</span><span class="mclose">)</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></p>
+<p>⚠️ 示例：</p>
+<table>
+<thead>
+<tr>
+<th>要检出的提升 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0379em;">δ</span></span></span></span></th>
+<th>所需题量（独立）</th>
+<th>配对（不一致率 15%）</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>+1%</td>
+<td>19,623</td>
+<td>—</td>
+</tr>
+<tr>
+<td>+3%</td>
+<td>2,181</td>
+<td>1,309</td>
+</tr>
+<tr>
+<td>+5%</td>
+<td>785</td>
+<td>471</td>
+</tr>
+<tr>
+<td>+10%</td>
+<td>197</td>
+<td>—</td>
+</tr>
+</tbody></table>
+<p><strong>反过来说，给定题量就能算出&quot;最小可检出效应&quot;（MDE）</strong>：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord">MDE</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.1052em;vertical-align:-0.3552em;"></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.044em;">z</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3448em;"><span style="top:-2.5198em;margin-left:-0.044em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.0037em;">α</span><span class="mord mtight">/2</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.3552em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:2.44em;vertical-align:-0.8953em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.044em;">z</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.044em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0528em;">β</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mord sqrt"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.5447em;"><span class="svg-align" style="top:-4.4em;"><span class="pstrut" style="height:4.4em;"></span><span class="mord" style="padding-left:1em;"><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.1076em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">n</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">disc</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span><span style="top:-3.5047em;"><span class="pstrut" style="height:4.4em;"></span><span class="hide-tail" style="min-width:1.02em;height:2.48em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="2.48em" viewBox="0 0 400000 2592" preserveAspectRatio="xMinYMin slice"><path d="M424,2478
+c-1.3,-0.7,-38.5,-172,-111.5,-514c-73,-342,-109.8,-513.3,-110.5,-514
+c0,-2,-10.7,14.3,-32,49c-4.7,7.3,-9.8,15.7,-15.5,25c-5.7,9.3,-9.8,16,-12.5,20
+s-5,7,-5,7c-4,-3.3,-8.3,-7.7,-13,-13s-13,-13,-13,-13s76,-122,76,-122s77,-121,77,-121
+s209,968,209,968c0,-2,84.7,-361.7,254,-1079c169.3,-717.3,254.7,-1077.7,256,-1081
+l0 -0c4,-6.7,10,-10,18,-10 H400000
+v40H1014.6
+s-87.3,378.7,-272.6,1166c-185.3,787.3,-279.3,1182.3,-282,1185
+c-2,6,-10,9,-24,9
+c-8,0,-12,-0.7,-12,-2z M1001 80
+h400000v40h-400000z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.8953em;"><span></span></span></span></span></span></span></span></span></span></p>
+<p>⚠️ 示例：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">300</span></span></span></span>、实测不一致率 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">disc</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">122/300</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.407</span></span></span></span>：</p>
+<pre><code>MDE ≈ 0.103，即约 10.3 个百分点
+-&gt; 本评测集无法可靠检出小于 ~10pt 的提升；
+   想检出 +3pt 需要约 3547 题。</code></pre>
+<p><strong>这条数字是本节最有用的一个</strong>。它解释了大量真实场景里的困惑：</p>
+<blockquote>
+<p>&quot;我改了一处，指标涨了 2%，要不要上？&quot;
+——在 300 题上，<strong>你看到的 2% 完全在噪声范围内</strong>，涨或跌都不构成证据。</p>
+</blockquote>
+<h4 id="h-44-显著性之外效应量与多重比较">4.4 显著性之外：效应量与多重比较<a class="anchor" href="#h-44-显著性之外效应量与多重比较" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>统计显著 ≠ 实际重要</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span></span></span></span> 很大时，+0.5% 也能显著，但它不值得上线成本。<strong>同时报告效应量与 CI 宽度。</strong></li>
+<li><strong>多重比较</strong>：如果你一次比较了 8 个指标，其中 1 个&quot;显著&quot;很可能是偶然（家族错误率上升）。做法：预先指定<strong>主指标</strong>（primary），其余作为探索性指标；或对 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span></span></span></span> 值做 Bonferroni 校正（阈值 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mord">/</span><span class="mord mathnormal">m</span></span></span></span>）。</li>
+<li><strong>不要反复看、看到显著就停</strong>（peeking）：会显著抬高假阳率。要么固定样本量，要么用序贯检验。</li>
+</ul>
+<p><figure><img class="md-img" src="content/courses/rag-systems/assets/chapter-7-figure-02.svg" alt="评测集能检出多大效应" loading="lazy" decoding="async"><figcaption>评测集能检出多大效应</figcaption></figure>
+</p>
+<h3 id="h-五离线-在线差距与上线门禁">五、离线-在线差距与上线门禁<a class="anchor" href="#h-五离线-在线差距与上线门禁" aria-label="本节链接">#</a></h3>
+<h4 id="h-51-离线涨线上不涨的五个原因">5.1 离线涨、线上不涨的五个原因<a class="anchor" href="#h-51-离线涨线上不涨的五个原因" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>原因</th>
+<th>机理</th>
+<th>检查方法</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>分布漂移</td>
+<td>评测集题目与真实查询分布不同</td>
+<td>对比线上 query 类型分布 vs 评测集分层</td>
+</tr>
+<tr>
+<td>评测集泄漏</td>
+<td>调参时反复看 test，或评测集与训练语料重叠</td>
+<td>检查 test 的访问记录与语料重叠</td>
+</tr>
+<tr>
+<td>缓存影响</td>
+<td>线上大量请求走缓存，改动只影响 miss 的部分</td>
+<td>看命中率与改动生效比例</td>
+</tr>
+<tr>
+<td>延迟/拒答权衡</td>
+<td>质量涨但延迟超预算，触发降级或用户放弃</td>
+<td>联合看质量与延迟分位数</td>
+</tr>
+<tr>
+<td>用户行为变化</td>
+<td>用户看到更好的回答后，问更难的问题</td>
+<td>看查询难度分布随时间的变化</td>
+</tr>
+</tbody></table>
+<p><strong>判据</strong>：每次离线涨、线上不涨，必须从这五个原因里<strong>指认一个</strong>并给出证据。指认不出来，就说明观测能力不够（回到第 6 章第 4 节）。</p>
+<h4 id="h-52-上线门禁regression-gate">5.2 上线门禁（regression gate）<a class="anchor" href="#h-52-上线门禁regression-gate" aria-label="本节链接">#</a></h4>
+<p>一个改动必须<strong>同时</strong>满足四个条件才允许上线：</p>
+<pre data-lang="text"><code class="language-text">① 主指标不降（例如召回覆盖不低于基线 -1pt，或用 CI 下界判定）
+② 目标指标上升且显著（CI 下界 &gt; 0）
+③ 延迟与成本不超预算（P95、每查询成本）
+④ 没有新增失败类型（失败分类分布里不出现新的类，且最大类没有变大）</code></pre>
+<p>⚠️ 示例判定：</p>
+<pre><code>{&#39;primary_not_worse&#39;: True, &#39;target_up&#39;: True, &#39;cost_latency_ok&#39;: True,
+ &#39;no_new_failure&#39;: True}
+-&gt; 通过（要求主指标不降、目标指标升、成本延迟不超、无新增失败类型，且 CI 下界 &gt; 0）</code></pre>
+<p><strong>为什么必须四条一起</strong>：只满足 ② 是危险的 —— 一个改动可以提高平均正确率、同时新增一整类失败（例如&quot;引用不一致&quot;从 1% 涨到 20%）。<strong>门禁的作用是防止&quot;用平均分掩盖新问题&quot;。</strong></p>
+<h3 id="h-代码">代码<a class="anchor" href="#h-代码" aria-label="本节链接">#</a></h3>
+<pre data-lang="python"><code class="language-python"># -*- coding: utf-8 -*-
+&quot;&quot;&quot;⚠️ 合成数据：指标树 / 失败分类（判定树）/ bootstrap CI / McNemar / 样本量估算。
+   所有数字为构造数据，用于演示判据；真实结论必须用自己的评测集重算。&quot;&quot;&quot;
+import math, numpy as np
+from collections import Counter
+
+rng = np.random.default_rng(11)
+N, K, CTX = 300, 10, 5
+Q = []
+for i in range(N):
+    t = [&quot;single&quot;, &quot;multi&quot;, &quot;refuse&quot;][i % 3]
+    n_gold = 3 if t == &quot;multi&quot; else 1
+    Q.append(dict(qid=i, type=t, golden=set(range(i * 5, i * 5 + n_gold))))
+
+def recall_at_k(p_recall, q, k=K):
+    &quot;&quot;&quot;模拟检索：p_recall 是单条黄金证据被正确打高分的概率。&quot;&quot;&quot;
+    rng2 = np.random.default_rng(q[&quot;qid&quot;] * 1000003 + int(p_recall * 1000))  # 稳定种子
+    pool = list(range(6000))
+    scores = rng2.normal(0, 1, len(pool))
+    for g in q[&quot;golden&quot;]:
+        if rng2.random() &lt; p_recall:
+            scores[g] += 3.0
+    order = np.argsort(-scores)[:k]
+    return [int(x) for x in order], len(q[&quot;golden&quot;]), len(set(order) &amp; q[&quot;golden&quot;])
+
+def run_system(p_recall, p_gen, p_refuse_ok):
+    rows = []
+    for q in Q:
+        order, n_gold, hit = recall_at_k(p_recall, q)
+        in_ctx = len(set(order[:CTX]) &amp; q[&quot;golden&quot;])
+        if q[&quot;type&quot;] == &quot;refuse&quot;:
+            behaviour = &quot;refuse&quot; if rng.random() &lt; p_refuse_ok else &quot;answer&quot;
+            ans_ok, cite_ok = (behaviour == &quot;refuse&quot;), True
+        else:
+            enough = in_ctx &gt;= (1 if q[&quot;type&quot;] == &quot;single&quot; else 2)
+            ans_ok = bool(enough and rng.random() &lt; p_gen)
+            behaviour, cite_ok = &quot;answer&quot;, bool(enough and rng.random() &lt; 0.90)
+        rows.append(dict(qid=q[&quot;qid&quot;], type=q[&quot;type&quot;], n_gold=n_gold, hit=hit,
+                         in_ctx=in_ctx, ans_ok=ans_ok, behaviour=behaviour, cite_ok=cite_ok))
+    return rows
+
+A = run_system(0.74, 0.90, 0.70)      # 基线
+B = run_system(0.86, 0.90, 0.85)      # 候选（召回与拒答策略更好）
+
+def metrics(rows, name):
+    e2e = np.mean([1.0 if (r[&quot;ans_ok&quot;] and r[&quot;cite_ok&quot;]) else 0.0 for r in rows])
+    return dict(name=name, end_to_end=e2e,
+                answer=np.mean([r[&quot;ans_ok&quot;] for r in rows]),
+                recall=np.mean([r[&quot;hit&quot;] / r[&quot;n_gold&quot;] for r in rows]),
+                citation=np.mean([r[&quot;cite_ok&quot;] for r in rows]),
+                refuse_ok=np.mean([r[&quot;behaviour&quot;] == &quot;refuse&quot; for r in rows if r[&quot;type&quot;] == &quot;refuse&quot;]))
+
+mA, mB = metrics(A, &quot;A&quot;), metrics(B, &quot;B&quot;)
+print(&quot;== 指标树（⚠️ 合成评测集，N=300）==&quot;)
+print(f&quot;{&#39;指标&#39;:&lt;16} {&#39;A(基线)&#39;:&gt;9} {&#39;B(候选)&#39;:&gt;9} {&#39;Δ&#39;:&gt;9}&quot;)
+for k, label in [(&quot;end_to_end&quot;, &quot;北极星:端到端&quot;), (&quot;answer&quot;, &quot;答案正确&quot;), (&quot;recall&quot;, &quot;召回覆盖&quot;),
+                 (&quot;citation&quot;, &quot;引用一致&quot;), (&quot;refuse_ok&quot;, &quot;该拒答就拒答&quot;)]:
+    print(f&quot;{label:&lt;16} {mA[k]:&gt;9.3f} {mB[k]:&gt;9.3f} {mB[k]-mA[k]:&gt;+9.3f}&quot;)
+
+def classify(r):
+    &quot;&quot;&quot;基于可观测信号的判定树（输入来自 trace）。&quot;&quot;&quot;
+    if r[&quot;behaviour&quot;] == &quot;refuse&quot; and r[&quot;type&quot;] != &quot;refuse&quot;: return &quot;拒答错误&quot;
+    if r[&quot;type&quot;] == &quot;refuse&quot; and r[&quot;behaviour&quot;] != &quot;refuse&quot;: return &quot;该拒不拒&quot;
+    if r[&quot;hit&quot;] == 0:                                       return &quot;召回失败&quot;
+    if r[&quot;in_ctx&quot;] == 0:                                    return &quot;排序失败&quot;
+    if not r[&quot;ans_ok&quot;]:                                     return &quot;生成未用&quot;
+    if not r[&quot;cite_ok&quot;]:                                    return &quot;引用不一致&quot;
+    return &quot;无失败&quot;
+
+print(&quot;\n== 失败分类分布（B 系统）==&quot;)
+cnt = Counter(classify(r) for r in B)
+tot = sum(v for k, v in cnt.items() if k != &quot;无失败&quot;)
+for k, v in cnt.most_common():
+    print(f&quot;  {k:&lt;12} {v:&gt;4}  占失败 {(v/tot if k != &#39;无失败&#39; and tot else 0):&gt;6.1%}&quot;)
+
+# ---- bootstrap CI（配对差分）----
+a_e2e = [1.0 if r[&quot;ans_ok&quot;] and r[&quot;cite_ok&quot;] else 0.0 for r in A]
+b_e2e = [1.0 if r[&quot;ans_ok&quot;] and r[&quot;cite_ok&quot;] else 0.0 for r in B]
+d = np.array(b_e2e) - np.array(a_e2e)
+rb = np.random.default_rng(0)
+boot = d[rb.integers(0, len(d), (10000, len(d)))].mean(axis=1)
+lo, hi = float(np.percentile(boot, 2.5)), float(np.percentile(boot, 97.5))
+print(f&quot;\n== bootstrap 95% CI（端到端正确率的配对差分 B-A）==&quot;)
+print(f&quot;  Δ = {d.mean():+.4f}   95% CI = [{lo:+.4f}, {hi:+.4f}]   &quot;
+      f&quot;{&#39;显著（不含 0）&#39; if lo &gt; 0 or hi &lt; 0 else &#39;不显著（含 0）&#39;}&quot;)
+
+# ---- McNemar ----
+b01 = sum(1 for x, y in zip(a_e2e, b_e2e) if x == 0 and y == 1)
+b10 = sum(1 for x, y in zip(a_e2e, b_e2e) if x == 1 and y == 0)
+stat = (abs(b01 - b10) - 1) ** 2 / (b01 + b10) if (b01 + b10) else 0.0
+p_val = math.erfc(math.sqrt(stat / 2))          # χ²(1) 的正态近似
+print(f&quot;\n== McNemar（配对二分类）==&quot;)
+print(f&quot;  列联: A错B对={b01}  A对B错={b10}  一致={len(d)-b01-b10}&quot;)
+print(f&quot;  统计量 χ²={stat:.3f}  p≈{p_val:.5f}  &quot;
+      f&quot;{&#39;拒绝原假设&#39; if p_val &lt; 0.05 else &#39;不能拒绝原假设&#39;}&quot;)
+
+# ---- 样本量与 MDE ----
+def n_for_effect(delta, p=0.5):
+    za, zb = 1.959964, 0.841621
+    return math.ceil(((za + zb) ** 2) * p * (1 - p) / (delta ** 2))
+print(&quot;\n== 样本量估算（单比例、α=0.05、power=0.8）==&quot;)
+for delta in (0.01, 0.03, 0.05, 0.10):
+    print(f&quot;  检出 +{delta:.0%} -&gt; 约 {n_for_effect(delta):&gt;6} 题&quot;)
+p_disc = (b01 + b10) / len(Q)
+mde = (1.959964 + 0.841621) * math.sqrt(p_disc / len(Q))
+print(f&quot;\n== 本评测集的最小可检出效应（配对）==&quot;)
+print(f&quot;  不一致对比例 = {b01+b10}/{len(Q)} = {p_disc:.3f}&quot;)
+print(f&quot;  N={len(Q)} 时 MDE ≈ {mde:.3f}（约 {mde*100:.1f} 个百分点）&quot;)
+print(f&quot;  想检出 +3pt 需要约 {math.ceil(((1.959964+0.841621)**2)*p_disc/(0.03**2))} 题&quot;)
+
+print(&quot;\n== 上线门禁 ==&quot;)
+gate = dict(primary_not_worse=(mB[&quot;recall&quot;] &gt;= mA[&quot;recall&quot;] - 0.01),
+            target_up=(mB[&quot;end_to_end&quot;] &gt; mA[&quot;end_to_end&quot;]),
+            cost_latency_ok=True, no_new_failure=True)
+print(f&quot;  {gate}&quot;)
+print(f&quot;  -&gt; {&#39;通过&#39; if all(gate.values()) and lo &gt; 0 else &#39;不通过&#39;}&quot;)</code></pre>
+<pre data-lang="text"><code class="language-text">== 指标树（⚠️ 合成评测集，N=300）==
+指标                   A(基线)     B(候选)         Δ
+北极星:端到端              0.390     0.477    +0.087
+答案正确                 0.397     0.487    +0.090
+召回覆盖                 0.359     0.446    +0.087
+引用一致                 0.503     0.543    +0.040
+该拒答就拒答               0.680     0.880    +0.200
+
+== 失败分类分布（B 系统）==
+  召回失败          120  占失败  56.6%
+  生成未用           55  占失败  25.9%
+  排序失败           22  占失败  10.4%
+  该拒不拒           12  占失败   5.7%
+  引用不一致           3  占失败   1.4%
+
+== bootstrap 95% CI（端到端正确率的配对差分 B-A）==
+  Δ = +0.0867   95% CI = [+0.0166, +0.1567]   显著（不含 0）
+
+== McNemar（配对二分类）==
+  列联: A错B对=74  A对B错=48  一致=178
+  统计量 χ²=5.123  p≈0.02361  拒绝原假设
+
+== 样本量估算（单比例、α=0.05、power=0.8）==
+  检出 +1% -&gt; 约  19623 题
+  检出 +3% -&gt; 约   2181 题
+  检出 +5% -&gt; 约    785 题
+  检出 +10% -&gt; 约    197 题
+
+== 本评测集的最小可检出效应（配对）==
+  不一致对比例 = 122/300 = 0.407
+  N=300 时 MDE ≈ 0.103（约 10.3 个百分点）
+  想检出 +3pt 需要约 3547 题
+
+== 上线门禁 ==
+  {&#39;primary_not_worse&#39;: True, &#39;target_up&#39;: True, &#39;cost_latency_ok&#39;: True, &#39;no_new_failure&#39;: True}
+  -&gt; 通过</code></pre>
+<p><strong>关键设计决策</strong>：把 <code>classify()</code> 写成<strong>只依赖 trace 字段的纯函数</strong>，而不是&quot;人看日志打标签&quot;。这是本节的中心选择：人工标签有两个致命问题 —— 不可复算（换个人结论不同）与不可规模化（评测集一大就做不动）。而判定树的顺序（先行为、再检索、再生成）保证了分类的唯一性与可解释性。<strong>代价是它只能分到较粗的粒度</strong>（&quot;生成未用&quot;内部还有位置/干扰/先验三种子因），需要第 5 章第 3 节那套反事实测试再往下钻。</p>
+<h3 id="h-练习">练习<a class="anchor" href="#h-练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><p><strong>为你的系统画指标树</strong>。要求：每个叶子满足&quot;可观测/可归因/可干预&quot;三条；对每个叶子写出&quot;哪个改动能提升它&quot;；找出树里<strong>不满足第三条</strong>的叶子（如果有，说明它是伪指标，需要继续拆）。</p>
+</li>
+<li><p><strong>重算你的 MDE</strong>。用你评测集的题量与实测不一致率，计算 MDE。然后回答：(a) 你最近一次&quot;提升了 2%&quot;的改动，是否在这个 MDE 之内？(b) 要把 MDE 压到 3pt，需要多少题？按你的标注成本算总价。</p>
+</li>
+<li><p><strong>配对 vs 独立</strong>。用同一批模拟数据，分别按配对（同一批题）与独立（两组不同题）做检验，比较检定力。回答：在什么条件下配对带来的增益最大（提示：题目难度方差越大，配对收益越大）。</p>
+</li>
+<li><p><strong>多重比较的代价</strong>。假设你一次比较 10 个指标，每个用 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.05</span></span></span></span>。计算家族错误率；然后给出 Bonferroni 校正后的阈值，并说明&quot;预先指定主指标&quot;为什么是更好的做法。</p>
+</li>
+<li><p><strong>构造&quot;平均分掩盖新问题&quot;的场景</strong>。设计一组数据，使候选系统端到端正确率提升 3pt，但新增了一类失败（例如引用不一致从 1% 涨到 15%）。说明门禁的四条件如何拦住它，以及为什么第 ④ 条不可省略。</p>
+</li>
+<li><p><strong>评测集过拟合的检测</strong>。设计一个实验：连续 20 次在同一 test 上选择&quot;最好&quot;的配置，画出 test 指标与 hidden set 指标的差距随迭代次数的变化。回答：差距在多少次后开始显著？你会怎么设置防腐规则？</p>
+</li>
+<li><p><strong>拒答类的指标设计</strong>。拒答有两类错误方向相反（该拒不拒 vs 不该拒答却拒）。设计一个<strong>单一</strong>可优化指标（提示：用代价加权的错误率），并说明权重怎么从业务里估。然后给出它的可干预叶子。</p>
+</li>
+<li><p><strong>从失败分类到路线图</strong>。假设你的失败分布是：召回失败 30%、排序失败 35%、生成未用 25%、引用不一致 10%。按&quot;预期收益/成本&quot;排序给出接下来三件该做的事，每件写明预期能消除多少百分点、依据是什么（提示：排序失败的处方是重排，成本可从第 5 章第 4 节的 MC 表估）。</p>
+</li>
+</ol>
+<h3 id="h-小结">小结<a class="anchor" href="#h-小结" aria-label="本节链接">#</a></h3>
+<ul>
+<li><strong>指标树三原则</strong>：可观测、可归因、<strong>可干预</strong>。&quot;用户满意度&quot;不可干预，只能作为北极星的命名，必须拆成答案正确率、引用可信度、拒答恰当性、延迟、每正确回答成本。</li>
+<li><strong>代理指标会失效</strong>（优化代理损害目标、可被作弊、后期脱钩），必须有周期性的人工标注校验。</li>
+<li><strong>每题必须标注黄金证据 id</strong>，否则无法区分召回失败与生成失败 —— 这是评测集设计里最重要的一条。附带好处：可自动算召回覆盖、可做第 6 章的归因。</li>
+<li><strong>难负样本</strong>（相似但事实不同）是检出&quot;干扰敏感&quot;的关键；<strong>防过拟合</strong>靠 dev/test 切分 + 定期换血 + hidden set。</li>
+<li><strong>失败分类必须是基于可观测信号的判定树</strong>（先行为、再检索、再生成），输入全部来自 trace。⚠️ 示例分布：召回失败 <strong>56.6%</strong>、生成未用 25.9%、排序失败 10.4%、该拒不拒 5.7%、引用不一致 1.4% → 优先级指向<strong>检索侧</strong>，而不是换模型。</li>
+<li><strong>必须配对比较</strong>（同一批题），因为只有不一致对携带信息。判据用 <strong>bootstrap CI</strong>（不含 0）与 <strong>McNemar</strong>（连续性校正）。⚠️ 示例：Δ=+0.0867、CI [+0.0166, +0.1567]、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0085em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">χ</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span>=5.123、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6776em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.0236</span></span></span></span> → 显著。</li>
+<li><strong>样本量决定你能检出多大效应</strong>：⚠️ <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">300</span></span></span></span> 时 <strong>MDE ≈ 10.3pt</strong>，即小于 10 个百分点的变化在噪声内；要检出 +3pt 需要约 <strong>3547</strong> 题（单比例口径 2181 题）。<strong>&quot;涨了 2% 要不要上&quot;在 300 题上不是证据问题，是样本量问题。</strong></li>
+<li><strong>显著 ≠ 重要</strong>：同时报告效应量与 CI 宽度；预先指定主指标，避免多重比较与 peeking。</li>
+<li><strong>上线门禁四处同时满足</strong>：主指标不降、目标指标升且 CI 下界 &gt; 0、延迟成本不超、<strong>无新增失败类型</strong>。第四条防止&quot;用平均分掩盖新问题&quot;。</li>
+<li><strong>离线涨线上不涨</strong>必须从五个原因（分布漂移、评测集泄漏、缓存、延迟/拒答权衡、用户行为变化）中指认一个并给证据。</li>
+<li><strong>一句话</strong>：<strong>评测不是算一个分数，而是回答&quot;哪个改动值得做、改动是否真的有效&quot;。前者靠失败分类，后者靠配对统计；而两者都受同一个约束限制：你的评测集能检出多大的效应。</strong></li>
+</ul>
+<blockquote>
+<p>下一节：指标树和门禁都有了。下一节把它们用在真正的代码上 —— 一个可运行的最小 RAG 系统、一份评测脚本和一组决策记录。</p>
+</blockquote>

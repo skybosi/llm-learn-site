@@ -1,0 +1,141 @@
+<h2 id="h-可学习位置编码">可学习位置编码<a class="anchor" href="#h-可学习位置编码" aria-label="本节链接">#</a></h2>
+<p>正弦位置编码是固定的、零参数的，但它不一定是最优的——它只是论文作者选的一个&quot;合理先验&quot;。另一种思路彻底放开手脚：<strong>把每个位置当成一个可训练参数，让模型自己学</strong>。这就是可学习位置编码（learned positional embedding），BERT、GPT 等模型普遍采用它。这一课我们用 <code>nn.Embedding</code> 把它实现出来，和正弦编码做一次正面比较，并顺带看一看它的两个&quot;升级方向&quot;：相对位置编码和旋转位置编码（RoPE）。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-把位置当成一张查表">1. 把&quot;位置&quot;当成一张查表<a class="anchor" href="#h-1-把位置当成一张查表" aria-label="本节链接">#</a></h4>
+<p>可学习位置编码的本质极其简单：准备一个形状为 <code>(max_len, d_model)</code> 的参数矩阵，第 <code>pos</code> 行就是位置 <code>pos</code> 的编码向量。forward 时，根据序列长度取前 <code>seq_len</code> 行，逐元素加到 token embedding 上。</p>
+<p>在 PyTorch 里，这个矩阵正好就是 <code>nn.Embedding(max_len, d_model)</code>：<code>nn.Embedding</code> 内部就是一张可训练的权重表，输入位置序号就取出对应行。它和词嵌入共享同一种机制，只不过索引从&quot;词 id&quot;换成了&quot;位置 id&quot;。</p>
+<pre><code>带位置的输入 = token_embedding(token_ids) + pos_embedding(0, 1, ..., seq_len-1)</code></pre>
+<h4 id="h-2-和正弦编码的正面比较">2. 和正弦编码的正面比较<a class="anchor" href="#h-2-和正弦编码的正面比较" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>正弦位置编码</th>
+<th>可学习位置编码</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>参数</td>
+<td>0（纯公式）</td>
+<td><code>max_len × d_model</code></td>
+</tr>
+<tr>
+<td>是否训练</td>
+<td>否</td>
+<td>是，随任务端到端学习</td>
+</tr>
+<tr>
+<td>外推能力</td>
+<td>可外推到任意长度（公式可续算）</td>
+<td>受 <code>max_len</code> 上限限制，超长会报错</td>
+</tr>
+<tr>
+<td>相对位置</td>
+<td>天然带&quot;距离&quot;信号</td>
+<td>需靠数据学出，不保证</td>
+</tr>
+<tr>
+<td>适配性</td>
+<td>通用、与任务无关</td>
+<td>能贴合具体数据分布</td>
+</tr>
+<tr>
+<td>代表模型</td>
+<td>原始 Transformer</td>
+<td>BERT、GPT、ViT 等</td>
+</tr>
+</tbody></table>
+<p>核心取舍是：<strong>正弦编码&quot;免费&quot;提供了外推能力和相对位置先验，但它是任务无关的固定形式；可学习编码更灵活、能拟合训练分布，但把位置信息完全交给数据，并且被 <code>max_len</code> 卡死</strong>。实践中，如果序列长度固定且数据充足（如 BERT 的 512 上限），可学习编码往往表现略好；如果要求处理任意长序列，正弦编码或其变体更稳妥。</p>
+<h4 id="h-3-为什么加法而不是拼接">3. 为什么&quot;加法&quot;而不是&quot;拼接&quot;<a class="anchor" href="#h-3-为什么加法而不是拼接" aria-label="本节链接">#</a></h4>
+<p>和上一课练习里埋下的问题呼应：位置信息通常用<strong>加法</strong>注入，而不是把位置向量拼接在词向量后面。原因有三：</p>
+<ol>
+<li><strong>维度稳定</strong>：加法不改变 <code>d_model</code>，后续所有层的维度都不用动；拼接会让输入维度翻倍，第一层线性层参数随之翻倍。</li>
+<li><strong>信息混合由网络完成</strong>：加法的结果是&quot;词义 + 位置&quot;的叠加，网络靠训练学会从中分离两者；拼接则把两者硬分开，反而不利于后续交互。</li>
+<li><strong>惯例与兼容</strong>：加法让位置编码成为可插拔模块，换编码方案时不用改下游结构。</li>
+</ol>
+<h4 id="h-4-两个升级方向了解即可">4. 两个升级方向（了解即可）<a class="anchor" href="#h-4-两个升级方向了解即可" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>相对位置编码</strong>：不再给每个绝对位置一个向量，而是直接在注意力分数里加一个&quot;只依赖相对距离 i−j&quot;的偏置项。它天然适合长度外推，代表性工作是 Transformer-XL 与 T5 的相对位置偏置。</li>
+<li><strong>旋转位置编码（RoPE）</strong>：把位置信息以&quot;旋转矩阵&quot;作用在 Query/Key 上，位置差 k 恰好对应旋转角 kθ。它既保留了正弦编码的&quot;相对位置可线性表示&quot;，又避免显式相加，是如今 LLM（如 LLaMA）的主流选择。可以把它理解成&quot;正弦编码思想 + 可学习式的融合升级&quot;。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>先实现一个标准的可学习位置编码，并演示它如何与词嵌入相加。</p>
+<pre data-lang="python"><code class="language-python">import torch
+import torch.nn as nn
+
+class LearnedPositionalEncoding(nn.Module):
+    def __init__(self, max_len, d_model):
+        super().__init__()
+        # 一张 (max_len, d_model) 的可训练表，第 pos 行是位置 pos 的编码
+        self.pos_embedding = nn.Embedding(max_len, d_model)
+
+    def forward(self, x):
+        # x: (seq_len, batch, d_model)，与 torch.nn.Transformer 的默认形状一致
+        seq_len = x.shape[0]
+        positions = torch.arange(seq_len, device=x.device)   # 0, 1, ..., seq_len-1
+        pos = self.pos_embedding(positions)                  # (seq_len, d_model)
+        return x + pos.unsqueeze(1)                          # 广播加到每个 batch 上
+
+d_model = 16
+token_emb = nn.Embedding(100, d_model)      # 词表 100 的词嵌入
+pos_enc = LearnedPositionalEncoding(max_len=128, d_model=d_model)
+
+# 一条长度为 10 的序列，batch=2
+ids = torch.randint(0, 100, (10, 2))
+x = token_emb(ids)                           # (10, 2, 16)
+y = pos_enc(x)                               # (10, 2, 16)
+print(&quot;输出形状:&quot;, y.shape)                  # torch.Size([10, 2, 16])
+print(&quot;位置编码是否可训练:&quot;, pos_enc.pos_embedding.weight.requires_grad)  # True
+print(&quot;参数量:&quot;, pos_enc.pos_embedding.weight.numel())  # 128 * 16 = 2048</code></pre>
+<p>接着把上一课的正弦编码也拿过来，和&quot;初始化后尚未训练&quot;的可学习编码放在一起对比热力图。你会发现：可学习编码初始是随机噪声，训练后才会呈现出某种结构。</p>
+<pre data-lang="python"><code class="language-python">import math
+import matplotlib.pyplot as plt
+
+def sinusoidal_pe(max_len, d_model):
+    pe = torch.zeros(max_len, d_model)
+    pos = torch.arange(max_len).unsqueeze(1).float()
+    div = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+    pe[:, 0::2] = torch.sin(pos * div)
+    pe[:, 1::2] = torch.cos(pos * div)
+    return pe
+
+sin_pe = sinusoidal_pe(64, d_model)
+lrn_pe = pos_enc.pos_embedding.weight[:64].detach()   # 未训练，仍是随机初始化
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+axes[0].imshow(sin_pe.numpy(), aspect=&quot;auto&quot;, cmap=&quot;viridis&quot;)
+axes[0].set_title(&quot;正弦位置编码（固定、有结构）&quot;)
+axes[1].imshow(lrn_pe.numpy(), aspect=&quot;auto&quot;, cmap=&quot;viridis&quot;)
+axes[1].set_title(&quot;可学习位置编码（随机初始化）&quot;)
+for ax in axes:
+    ax.set_xlabel(&quot;维度&quot;)
+    ax.set_ylabel(&quot;位置 pos&quot;)
+plt.tight_layout()
+plt.show()</code></pre>
+<p><figure><img class="md-img" src="content/courses/attention-transformer/assets/chapter-4-figure-03.svg" alt="正弦位置编码与可学习位置编码的对比热力图：前者有规律条纹，后者是随机初始化" loading="lazy" decoding="async"><figcaption>正弦位置编码与可学习位置编码的对比热力图：前者有规律条纹，后者是随机初始化</figcaption></figure>
+</p>
+<p>最后演示一个&quot;外推&quot;上的差别：把序列加长到超过 <code>max_len</code>，可学习编码会直接报错，而正弦编码仍能继续算。</p>
+<pre data-lang="python"><code class="language-python"># 可学习编码：序列长度超过 max_len=128 时会越界
+try:
+    x_long = token_emb(torch.randint(0, 100, (200, 2)))
+    pos_enc(x_long)
+except Exception as e:
+    print(&quot;可学习编码超长报错:&quot;, type(e).__name__)   # IndexError
+
+# 正弦编码：任何长度都能算
+print(&quot;正弦编码在长度 200 时仍可计算:&quot;, sinusoidal_pe(200, d_model).shape)  # (200, 16)</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>用上一课的思路，训练一个小模型，分别在<strong>正弦</strong>和<strong>可学习</strong>两种位置编码下跑同一个任务，比较收敛速度与最终效果，谈谈你观察到的差异可能来自哪里。</li>
+<li>把 <code>max_len</code> 设成 32，然后输入长度 40 的序列，确认 <code>nn.Embedding</code> 会抛 <code>IndexError</code>。思考：在真实产品里，超过位置上限通常有哪些处理办法（截断、滑窗、相对位置……）？</li>
+<li>查阅 RoPE（RoFormer）论文，写一段不超过 10 行的伪代码，说明它如何把绝对位置差 <code>k</code> 编码成 Query/Key 的旋转角。</li>
+<li>思考：可学习位置编码是&quot;每个位置一个独立向量&quot;，那么相邻位置的编码在训练后会不会变得相近？训练充分后画一次热力图验证你的猜测。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>论文《Attention Is All You Need》3.5 节（两种位置编码对比）：<a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1706.03762</a></li>
+<li>BERT 论文（使用可学习位置嵌入）：<a href="https://arxiv.org/abs/1810.04805" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1810.04805</a></li>
+<li>PyTorch 官方文档 · Embedding：<a href="https://pytorch.org/docs/stable/generated/torch.nn.Embedding.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/docs/stable/generated/torch.nn.Embedding.html</a></li>
+<li>RoFormer 论文（旋转位置编码 RoPE）：<a href="https://arxiv.org/abs/2104.09864" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2104.09864</a></li>
+</ul>
+<p><a href="#/l/attn-ch5-l1">下一课：掩码注意力</a></p>

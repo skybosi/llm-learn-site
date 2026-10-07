@@ -1,0 +1,78 @@
+<h2 id="h-int4int8-量化">INT4/INT8 量化<a class="anchor" href="#h-int4int8-量化" aria-label="本节链接">#</a></h2>
+<p>前面几章反复提到&quot;量化&quot;能省显存、提速 decode，这一章正式展开。量化（quantization）的本质是：<strong>用更少的比特去近似表示原本的浮点权重</strong>，从而让模型变小、跑得更快。学完本课，你应当能写出对称量化的公式，算清 INT8/INT4 各自省多少，并说出量化误差从哪来。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-为什么要量化">1. 为什么要量化<a class="anchor" href="#h-1-为什么要量化" aria-label="本节链接">#</a></h4>
+<p>模型默认用 FP16（甚至 FP32）存权重。一个 7B 模型 FP16 要 14GB，INT8 只需 7GB，INT4 只需 3.5GB。更关键的是，decode 阶段是<strong>访存密集</strong>的（第 1 章）：权重字节数减半，每 token 读权重的时间几乎减半，<strong>TPOT 也就近似减半</strong>。所以量化同时带来两大收益：</p>
+<ul>
+<li><strong>省显存</strong>：同样的卡能放下更大的模型，或服务更多请求；</li>
+<li><strong>提速</strong>：访存减少 → decode 每 token 更快。</li>
+</ul>
+<h4 id="h-2-量化的基本公式">2. 量化的基本公式<a class="anchor" href="#h-2-量化的基本公式" aria-label="本节链接">#</a></h4>
+<p>最常用的<strong>对称线性量化</strong>，把一个浮点区间线性映射到整数区间：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7167em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal">x</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0359em;">q</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.836em;vertical-align:-0.686em;"></span><span class="mord text"><span class="mord">round</span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="minner"><span class="mopen delimcenter" style="top:0em;"><span class="delimsizing size2">(</span></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.1076em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">s</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">x</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mclose delimcenter" style="top:0em;"><span class="delimsizing size2">)</span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">x</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7306em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal">x</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0359em;">q</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span></span></span></span></span></p>
+<p>其中 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span></span></span></span> 是<strong>缩放因子（scale）</strong>，通常取 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mop">max</span><span class="mopen">(</span><span class="mord">∣</span><span class="mord mathnormal">x</span><span class="mord">∣</span><span class="mclose">)</span><span class="mord">/</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0359em;">q</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">ma</span><span class="mord mathnormal mtight">x</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0359em;">q</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">ma</span><span class="mord mathnormal mtight">x</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 是该整型能表示的最大值（INT8 是 127，INT4 是 7）。反量化就是乘回 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span></span></span></span>。所谓&quot;量化 + 反量化&quot;，就是来回做这个乘除与取整。</p>
+<h4 id="h-3-量化误差的来源">3. 量化误差的来源<a class="anchor" href="#h-3-量化误差的来源" aria-label="本节链接">#</a></h4>
+<p>取整会丢信息，这就是量化误差。误差的大小取决于：</p>
+<ul>
+<li><strong>比特数</strong>：比特越少，可表示的值越少，误差越大（INT4 比 INT8 更&quot;糙&quot;）；</li>
+<li><strong>缩放粒度</strong>：整层共用一个 scale（per-tensor）误差较大；每个输出通道各用一个 scale（<strong>per-channel</strong>）误差明显更小，是权重量化的标配；</li>
+<li><strong>是否感知激活分布</strong>：只看权重的极值（如 AWQ 之前的天真做法）不如&quot;结合激活的重要性&quot;（第 2 课的 AWQ）来得准。</li>
+</ul>
+<h4 id="h-4-权重-vs-激活ptq-vs-qat">4. 权重 vs 激活、PTQ vs QAT<a class="anchor" href="#h-4-权重-vs-激活ptq-vs-qat" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>权重量化</strong>：只量化权重，激活仍用浮点。最常用、最稳妥。</li>
+<li><strong>激活量化</strong>：连激活也量化，能进一步提速（可用整数运算核），但误差更大、实现更难。</li>
+<li><strong>PTQ（训练后量化）</strong>：不重新训练，只用少量校准数据找 scale。主流做法。</li>
+<li><strong>QAT（量化感知训练）</strong>：训练时就模拟量化，精度保持最好，但成本高，LLM 上少见。</li>
+</ul>
+<h3 id="h-二可运行示例">二、可运行示例<a class="anchor" href="#h-二可运行示例" aria-label="本节链接">#</a></h3>
+<p>下面的 Python 实现对称量化与反量化，并直观展示不同比特数带来的误差。</p>
+<pre data-lang="python"><code class="language-python"># -*- coding: utf-8 -*-
+# 对称线性量化与反量化：INT8 vs INT4 的误差对比
+import numpy as np
+
+def quantize(w, bits):
+    &quot;&quot;&quot;对称量化：scale = max(|w|)/q_max，返回 (量化整数, scale)。&quot;&quot;&quot;
+    q_max = 2 ** (bits - 1) - 1          # INT8-&gt;127, INT4-&gt;7
+    s = np.max(np.abs(w)) / q_max
+    wq = np.round(w / s).astype(np.int32)
+    wq = np.clip(wq, -q_max, q_max)      # 截断到可表示范围
+    return wq, s
+
+def dequantize(wq, s):
+    &quot;&quot;&quot;反量化：乘回 scale。&quot;&quot;&quot;
+    return wq.astype(np.float32) * s
+
+# 用一段模拟的权重（正态分布 + 少量离群大值）
+rng = np.random.default_rng(42)
+w = rng.normal(0, 1, size=1000).astype(np.float32)
+w[::50] *= 8   # 人为制造离群值，观察它如何&quot;绑架&quot; scale
+
+for bits in [8, 4, 2]:
+    wq, s = quantize(w, bits)
+    w_rec = dequantize(wq, s)
+    mse = np.mean((w - w_rec) ** 2)
+    # 量化后字节占用（每值 bits/8 字节）
+    bytes_per_val = bits / 8
+    print(f&quot;INT{bits}：scale={s:.4f} | MSE={mse:.5f} | 每值 {bytes_per_val} 字节&quot;)
+
+# 对照 FP16 的字节占用与省下的显存
+print(f&quot;\n7B 模型权重：FP16=14.0 GB | INT8={7*10**9/1024**3:.1f} GB | &quot;
+      f&quot;INT4={7*10**9*0.5/1024**3:.2f} GB&quot;)</code></pre>
+<p>运行后你会看到两个现象：<strong>比特越少 MSE 越大</strong>（4-bit 明显比 8-bit 糙）；离群大值会把 scale 拉大，导致普通权重被&quot;挤&quot;到很粗的格子，误差变大——这正是第 2 课 AWQ 要解决的&quot;离群值问题&quot;。</p>
+<p><figure><img class="md-img" src="content/courses/llm-inference-optimization/assets/chapter-4-figure-01.svg" alt="FP16 到 INT8/INT4 量化示意图：左侧画一条 FP16 权重的数轴，上面散布许多小点（权重值），标&quot;FP16：每个值 2 字节&quot;；中间画 INT8 的 256 个等距刻度格，数轴被映射进去，点被落到最近刻度，标&quot;INT8：1 字节，误差小&quot;；右侧画 INT4 的 16 个稀疏刻度格，点更稀疏、偏差更大，标&quot;INT4：0.5 字节，误差较大&quot;；用箭头从左到右表示&quot;除以 scale → 取整 → 乘回 scale&quot;，并在数轴一端用红色圆圈标出&quot;离群值把 scale 拉大&quot;；底部一句话&quot;比特越少越省，但误差越大&quot;" loading="lazy" decoding="async"><figcaption>FP16 到 INT8/INT4 量化示意图：左侧画一条 FP16 权重的数轴，上面散布许多小点（权重值），标&quot;FP16：每个值 2 字节&quot;；中间画 INT8 的 256 个等距刻度格，数轴被映射进去，点被落到最近刻度，标&quot;INT8：1 字节，误差小&quot;；右侧画 INT4 的 16 个稀疏刻度格，点更稀疏、偏差更大，标&quot;INT4：0.5 字节，误差较大&quot;；用箭头从左到右表示&quot;除以 scale → 取整 → 乘回 scale&quot;，并在数轴一端用红色圆圈标出&quot;离群值把 scale 拉大&quot;；底部一句话&quot;比特越少越省，但误差越大&quot;</figcaption></figure>
+</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>去掉离群值</strong>：把 <code>w[::50] *= 8</code> 删掉，重跑，观察 4-bit 的 MSE 是否大幅下降，说明离群值对量化的破坏。</li>
+<li><strong>改粒度</strong>：把整层一个 scale 改成&quot;每 128 个数一组各算一个 scale&quot;（per-group），重算 MSE，体会粒度变细对精度的改善。</li>
+<li><strong>算省显存</strong>：用代码验证：一个 13B 模型 FP16 约 26GB，量化到 INT8、INT4 各是多少 GB？量化到 2-bit 呢？</li>
+<li><strong>思考</strong>：为什么权重容易量化，激活更难量化？结合&quot;激活的分布随输入动态变化&quot;来谈。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Hugging Face：量化概念与 PTQ/QAT 介绍：<a href="https://huggingface.co/docs/transformers/quantization/overview" target="_blank" rel="noopener noreferrer">https://huggingface.co/docs/transformers/quantization/overview</a></li>
+<li>NVIDIA：LLM 量化技术概述：<a href="https://developer.nvidia.com/blog/quantization-for-large-language-models/" target="_blank" rel="noopener noreferrer">https://developer.nvidia.com/blog/quantization-for-large-language-models/</a></li>
+<li>《A Survey of Quantization Methods for Efficient Neural Network Inference》：<a href="https://arxiv.org/abs/2103.13630" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2103.13630</a></li>
+</ul>
+<p><a href="#/l/inf-ch4-l2">下一课：GPTQ/AWQ/GGUF</a></p>

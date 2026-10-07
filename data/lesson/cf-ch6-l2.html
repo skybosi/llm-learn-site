@@ -1,0 +1,298 @@
+<h2 id="h-寄存器分配图着色溢出与重写">寄存器分配：图着色、溢出与重写<a class="anchor" href="#h-寄存器分配图着色溢出与重写" aria-label="本节链接">#</a></h2>
+<p>第 4 课强调过：IR 的临时名&quot;要多少有多少&quot;。到了目标机上这种奢侈立刻破产——AArch64 只有 31 个通用寄存器，一部分还被调用约定与栈指针占着。把几百个虚拟值塞进几十个物理寄存器，塞不下的怎么办？这就是<strong>寄存器分配</strong>（register allocation）：表面是安排寄存器，本质是两道题——一个 NP-完全的图着色，一个&quot;塞不下时如何改程序&quot;。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-这一步在做什么">1. 这一步在做什么<a class="anchor" href="#h-1-这一步在做什么" aria-label="本节链接">#</a></h4>
+<p>LLVM 的目标无关代码生成文档把这一步定义为：<strong>把 SSA 形式下&quot;无限虚拟寄存器文件&quot;的代码，转换成目标机具体寄存器文件上的代码；这个阶段引入溢出代码（spill code），并消除程序里所有虚拟寄存器引用</strong>。前半句是约束，后半句是验收标准。</p>
+<h4 id="h-2-活跃范围与干扰图">2. 活跃范围与干扰图<a class="anchor" href="#h-2-活跃范围与干扰图" aria-label="本节链接">#</a></h4>
+<p><strong>活跃范围</strong>（live range）是一个值&quot;从被定义到最后一次被使用&quot;的区间。两个值的活跃范围有重叠就不能共用寄存器——这条关系写成图就是<strong>干扰图</strong>（interference graph）：节点是值，边表示&quot;不能同色&quot;。</p>
+<p>构造规则只有一句（Chaitin 的写法）：<strong>对每条指令，它定义的值 <code>d</code> 与&quot;该指令之后仍然活着的每个值&quot;之间连一条边</strong>——直线代码里任意两个重叠的活跃范围，重叠区间内必有一个定义点，边就在那里被加上。图 1 是本课示例第一轮的干扰图（把示例跑一遍即可逐边核对）。</p>
+<p><figure><img class="md-img" src="content/courses/compiler-foundations/assets/chapter-6-figure-02.svg" alt="干扰图：a、b、c、d 四点全连，K=3 时必须溢出" loading="lazy" decoding="async"><figcaption>干扰图：a、b、c、d 四点全连，K=3 时必须溢出</figcaption></figure>
+</p>
+<p>分配于是变成&quot;给图着色，颜色 = 寄存器&quot;；判定&quot;K 个颜色够不够&quot;在 K ≥ 3 时是 NP-完全的。Chaitin 等人把它引入编译器，不是因为它容易，而是因为它有好的启发式。</p>
+<h4 id="h-3-simplify--selectchaitin-式启发式">3. simplify / select：Chaitin 式启发式<a class="anchor" href="#h-3-simplify--selectchaitin-式启发式" aria-label="本节链接">#</a></h4>
+<p>Chaitin 的算法靠一个栈完成：<strong>simplify</strong> 反复找出&quot;度数 &lt; K&quot;的节点，从图上摘掉并压栈（邻居少于 K 个，等邻居都定色后总能挑到一个颜色）；<strong>select</strong> 反向弹栈，给每个节点挑一个邻居没用过的颜色。</p>
+<p>图摘到某一刻一定会卡住（剩余节点度数都 ≥ K），此时必须挑一个节点当<strong>溢出候选</strong>（spill candidate），压栈并标记&quot;可能溢出&quot;。挑谁按&quot;溢出代价最小&quot;：代价近似为 <code>(使用次数 + 定义次数) / 度数</code>。</p>
+<h4 id="h-4-乐观着色与溢出重写">4. 乐观着色与溢出重写<a class="anchor" href="#h-4-乐观着色与溢出重写" aria-label="本节链接">#</a></h4>
+<p>卡住就直接判溢出太悲观：图摘到后面会变小，高风险节点可能刚好能落位。<strong>乐观着色</strong>（optimistic coloring，Briggs 等人的改进）把候选也压栈，只有弹栈时<strong>真的找不到颜色</strong>才算实际溢出——本课代码实现的正是这一版。</p>
+<p>真的溢出意味着这个值必须走内存：在栈帧上开一个槽（spill slot），使用处之前插 <code>ld</code>（装进短命临时名）、定义处之后插 <code>st</code>，这就是 Chaitin 的 <strong>spill everywhere</strong>。<strong>重写之后必须重建干扰图、重新分配</strong>（程序变了、活跃范围就变了，可能迭代多轮）；本课代码还做了一个改良——定义来自 load 的值可以从内存<strong>重算</strong>（rematerialization），于是删掉那条 load、改在使用处重装，省掉一次没必要的 store。</p>
+<h4 id="h-5-复写合并让-copy-消失">5. 复写合并：让 copy 消失<a class="anchor" href="#h-5-复写合并让-copy-消失" aria-label="本节链接">#</a></h4>
+<p>IR 里有大量 <code>r = mov t3</code> 这样的复制。让它的两端<strong>同色</strong>（共用寄存器），那条 copy 就变成&quot;自己搬自己&quot;，可以直接删掉：建图时<strong>不给复写对连边</strong>，着色时优先让它们同色。这不是白拿的——合并可能造出度数更高的节点反而不可着色，所以实践里用<strong>保守合并</strong>（如 Briggs 测试、George 测试）。</p>
+<h4 id="h-6-溢出代价把寄存器留给热点">6. 溢出代价：把寄存器留给热点<a class="anchor" href="#h-6-溢出代价把寄存器留给热点" aria-label="本节链接">#</a></h4>
+<p>溢出选择对性能影响很大：一条&quot;多一次访存&quot;的指令放进循环体，代价被放大成千上万倍，所以经典启发式按循环深度加权（深度 <code>d</code> 的权常见取 <code>10^d</code>）。本课代码用同一份程序跑了两遍：权重全为 1 时溢出 <code>d</code>，把 <code>d</code> 标成循环体内（权重 10）后改溢 <code>c</code>——&quot;热点值优先留在寄存器里&quot;就是这个意思。</p>
+<h4 id="h-7-工程现实与常见坑">7. 工程现实与常见坑<a class="anchor" href="#h-7-工程现实与常见坑" aria-label="本节链接">#</a></h4>
+<p>真实的分配器要在编译时间与代码质量之间取舍：</p>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>思路</th>
+<th>适用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>图着色（Chaitin / Briggs）</td>
+<td>全局看冲突，能合并与拆分</td>
+<td>追求代码质量的 AOT</td>
+</tr>
+<tr>
+<td>线性扫描（Poletto &amp; Sarkar）</td>
+<td>按顺序扫一遍活跃范围</td>
+<td>JIT、编译速度优先</td>
+</tr>
+<tr>
+<td>LLVM 的 greedy allocator</td>
+<td>逐个活跃范围贪心、必要时拆分</td>
+<td>LLVM 默认（另有 basic / fast / PBQP）</td>
+</tr>
+</tbody></table>
+<ul>
+<li><strong>把分配当纯图着色</strong>：固定寄存器与调用约定是硬约束，必须一起进模型；只看冲突数、不看代价也不行，循环体内的活跃范围要优先保住。</li>
+<li><strong>忘了重写后重新分配</strong>：溢出改变了活跃范围，图不作废就会得到错误的着色。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面这段纯 Python（无第三方依赖）把&quot;活跃变量分析 → 干扰图 → simplify/select → 溢出重写 → 再分配&quot;跑通。示例是能<strong>手工核对</strong>的直线代码：8 条指令、8 个值、9 条边，K = 3。</p>
+<pre data-lang="python"><code class="language-python"># ---- 寄存器分配：Chaitin 式图着色（simplify / select）+ 溢出重写 ----
+# 纯 Python，无第三方依赖。示例是一段直线代码，活跃变量分析与干扰图都能手算核对。
+
+K = 3                          # 可用的物理寄存器数
+REGS = [&#39;x1&#39;, &#39;x2&#39;, &#39;x3&#39;]
+
+# ---------- 1. 待分配的线性程序（寄存器数不限的 IR） ----------
+#   指令 = (格式串, 定义, 使用列表, 权重, 是否 copy)；格式串里 {d} 是定义，{u0}{u1} 是操作数
+def I(fmt, d, uses, w=1, cp=False):
+    return {&#39;fmt&#39;: fmt, &#39;def&#39;: d, &#39;uses&#39;: list(uses), &#39;w&#39;: w, &#39;cp&#39;: cp}
+
+def T(ins):
+    return ins[&#39;fmt&#39;].format(d=ins[&#39;def&#39;] or &#39;-&#39;,
+                             **{f&#39;u{k}&#39;: v for k, v in enumerate(ins[&#39;uses&#39;])})
+
+def program():
+    return [
+        I(&#39;ld   {d}, [x_a]&#39;,          &#39;a&#39;,  []),
+        I(&#39;ld   {d}, [x_b]&#39;,          &#39;b&#39;,  []),
+        I(&#39;ld   {d}, [x_c]&#39;,          &#39;c&#39;,  []),
+        I(&#39;ld   {d}, [x_d]&#39;,          &#39;d&#39;,  []),
+        I(&#39;{d} = {u0} + {u1}&#39;,        &#39;t1&#39;, [&#39;a&#39;, &#39;b&#39;]),
+        I(&#39;{d} = {u0} + {u1}&#39;,        &#39;t2&#39;, [&#39;c&#39;, &#39;d&#39;]),
+        I(&#39;{d} = {u0} + {u1}&#39;,        &#39;t3&#39;, [&#39;t1&#39;, &#39;t2&#39;]),
+        I(&#39;{d} = mov {u0}&#39;,           &#39;r&#39;,  [&#39;t3&#39;], cp=True),   # copy：可与 t3 共用寄存器
+    ]
+
+# ---------- 2. 活跃变量分析（直线代码：live_out[i] = live_in[i+1]） ----------
+def liveness(prog):
+    li = [set()] * len(prog)
+    for i in range(len(prog) - 1, -1, -1):
+        out = li[i + 1] if i + 1 &lt; len(prog) else set()
+        li[i] = set(prog[i][&#39;uses&#39;]) | (out - {prog[i][&#39;def&#39;]})
+    return li
+
+def live_out(prog, li, i):
+    return li[i + 1] if i + 1 &lt; len(prog) else set()
+
+# ---------- 3. 干扰图：定义 d 与&quot;该点之后仍然活着&quot;的每个值互斥 ----------
+#    copy 指令的定义-使用对不连边（它们允许共用一个寄存器 = 复写合并）
+def build_ig(prog):
+    nodes = set()
+    for ins in prog:
+        if ins[&#39;def&#39;]: nodes.add(ins[&#39;def&#39;])
+        nodes.update(ins[&#39;uses&#39;])
+    adj = {v: set() for v in nodes}
+    li = liveness(prog)
+    for i, ins in enumerate(prog):
+        d = ins[&#39;def&#39;]
+        if not d: continue
+        for v in live_out(prog, li, i):
+            if v == d: continue
+            if ins[&#39;cp&#39;] and v in ins[&#39;uses&#39;]: continue       # 复写对：不互斥
+            adj[d].add(v); adj[v].add(d)
+    return adj, li
+
+# ---------- 4. simplify / select（乐观着色：spill 候选也压栈，真没色了才算溢出） ----------
+def allocate(adj, K, spill_cost, partner_map=None):
+    work = {v: set(adj[v]) for v in adj}
+    stack = []
+    while work:
+        low = [v for v in work if len(work[v] &amp; work.keys()) &lt; K]
+        if low:                                     # 度数 &lt; K：一定能着色
+            v = min(low, key=lambda x: (len(work[x] &amp; work.keys()), x))
+            stack.append((v, False))
+        else:                                       # 度数 &gt;= K：先当&quot;潜在溢出&quot;
+            v = max(work, key=lambda x: (len(work[x] &amp; work.keys()), -spill_cost.get(x, 0), x))
+            stack.append((v, True))
+        for s in work.values(): s.discard(v)
+        del work[v]
+    color, spilled = {}, []
+    for v, potential in reversed(stack):
+        used = {color[n] for n in adj[v] if n in color}
+        partner = (partner_map or {}).get(v)
+        free = [c for c in range(K) if c not in used]
+        if partner in color and color[partner] not in used:
+            color[v] = color[partner]                # 复写合并：跟 copy 伙伴同色
+        elif free:
+            color[v] = free[0]
+        else:
+            spilled.append(v)
+    return color, spilled, stack
+
+# ---------- 5. 溢出重写 ----------
+#   定义来自 load 的值：删掉那条 load，改用在使用处重装（rematerialization）
+#   其余值：溢写到栈——定义后立即 store，每个使用前 load 成短命临时名
+def rewrite(prog, spills):
+    out, slots, addr, removable = [], {}, {}, set()
+    for ins in prog:
+        if ins[&#39;def&#39;] in spills and not ins[&#39;uses&#39;] and &#39;ld &#39; in ins[&#39;fmt&#39;]:
+            removable.add(ins[&#39;def&#39;])
+            addr[ins[&#39;def&#39;]] = ins[&#39;fmt&#39;].split(&#39;[&#39;)[1].split(&#39;]&#39;)[0]
+    for i, ins in enumerate(prog):
+        if ins[&#39;def&#39;] in removable: continue          # 该 load 被删掉
+        uses = list(ins[&#39;uses&#39;])
+        for k, v in enumerate(uses):
+            if v not in spills: continue
+            tmp = f&#39;{v}${i}&#39;
+            if v in removable:
+                out.append(I(&#39;ld   {d}, [&#39; + addr[v] + &#39;]&#39;, tmp, []))
+            else:
+                slots.setdefault(v, f&#39;[spill_{v}]&#39;)
+                out.append(I(&#39;ld   {d}, &#39; + slots[v], tmp, []))
+            uses[k] = tmp
+        out.append(I(ins[&#39;fmt&#39;], ins[&#39;def&#39;], uses, ins[&#39;w&#39;], ins[&#39;cp&#39;]))
+        if ins[&#39;def&#39;] in spills and ins[&#39;def&#39;] not in removable:
+            slots.setdefault(ins[&#39;def&#39;], f&#39;[spill_{ins[&quot;def&quot;]}]&#39;)
+            out.append(I(&#39;st   {u0}, &#39; + slots[ins[&#39;def&#39;]], None, [ins[&#39;def&#39;]]))
+    return out
+
+def show(prog, li=None, indent=&#39;  &#39;):
+    for i, ins in enumerate(prog):
+        extra = &#39;&#39;
+        if li is not None:
+            extra = &#39;   live_out={&#39; + &#39;,&#39;.join(sorted(live_out(prog, li, i))) + &#39;}&#39;
+        print(f&#39;{indent}{i:&gt;2}: {T(ins):&lt;22} def={str(ins[&quot;def&quot;]):&lt;5} use={ins[&quot;uses&quot;]}{extra}&#39;)
+
+def spill_cost(prog, weights=None):
+    c = {}
+    for ins in prog:
+        w = (weights or {}).get(ins[&#39;def&#39;], ins[&#39;w&#39;])
+        for v in ([ins[&#39;def&#39;]] if ins[&#39;def&#39;] else []) + ins[&#39;uses&#39;]:
+            c[v] = c.get(v, 0) + w
+    return c
+
+if __name__ == &#39;__main__&#39;:
+    base = program()
+    print(&#39;=== 待分配的程序（K = %d 个寄存器：%s） ===&#39; % (K, &#39; &#39;.join(REGS)))
+    show(base)
+
+    prog, round_no = base, 0
+    while round_no &lt; 5:
+        round_no += 1
+        adj, _ = build_ig(prog)
+        li = liveness(prog)
+        print(f&#39;\n=== 第 {round_no} 轮：{len(prog)} 条指令，{len(adj)} 个值，&#39;
+              f&#39;{sum(len(s) for s in adj.values()) // 2} 条干扰边 ===&#39;)
+        show(prog, li)
+        print(&#39;  干扰边：&#39;, &#39; &#39;.join(sorted({&#39;-&#39;.join(sorted((u, v))) for u in adj for v in adj[u]})))
+        cost = spill_cost(prog)
+        partner = {i[&#39;def&#39;]: i[&#39;uses&#39;][0] for i in prog if i[&#39;cp&#39;] and i[&#39;uses&#39;]}
+        color, spilled, stack = allocate(adj, K, cost, partner)
+        print(&#39;  simplify 栈：&#39;, &#39; &#39;.join(f&#39;{v}{&quot;?&quot; if p else &quot;&quot;}&#39; for v, p in stack), &#39;（? = 潜在溢出）&#39;)
+        print(&#39;  select 着色：&#39;, &#39; &#39;.join(f&#39;{v}={REGS[c]}&#39; for v, c in sorted(color.items())))
+        print(&#39;  实际溢出：&#39;, spilled if spilled else &#39;无&#39;)
+        if not spilled:
+            copies = [p for p in prog if p[&#39;cp&#39;] and color.get(p[&#39;def&#39;]) == color.get(p[&#39;uses&#39;][0])]
+            print(f&#39;\n  分配完成：{len(prog)} 条指令（原始 {len(base)} 条），溢出 {round_no - 1} 个值&#39;)
+            show(prog)
+            print(f&#39;  copy 与源同色、可直接删除：{len(copies)} 条&#39;
+                  f&#39;{&quot;（&quot; + &quot;, &quot;.join(T(p) for p in copies) + &quot;）&quot; if copies else &quot;&quot;}&#39;)
+            break
+        prog = rewrite(prog, set(spilled))
+        print(f&#39;  溢出重写后（{len(prog)} 条指令）：&#39;)
+        show(prog)
+
+    print(&#39;\n=== 对照：溢出代价启发式的影响（同样 K=3，只改权重） ===&#39;)
+    for label, w in ((&#39;所有值权重 = 1&#39;, {}), (&#39;d 在循环体内（权重 10）&#39;, {&#39;d&#39;: 10})):
+        adj, _ = build_ig(base)
+        cost = spill_cost(base, w)
+        _, spilled, _ = allocate(adj, K, cost)
+        print(f&#39;  {label:&lt;22} 代价表 {dict(sorted(cost.items()))} → 溢出 {spilled}&#39;)</code></pre>
+<p>运行结果（本机 Python 3.14 实跑，输出原样粘贴）：</p>
+<pre><code>=== 待分配的程序（K = 3 个寄存器：x1 x2 x3） ===
+   0: ld   a, [x_a]          def=a     use=[]
+   1: ld   b, [x_b]          def=b     use=[]
+   2: ld   c, [x_c]          def=c     use=[]
+   3: ld   d, [x_d]          def=d     use=[]
+   4: t1 = a + b             def=t1    use=[&#39;a&#39;, &#39;b&#39;]
+   5: t2 = c + d             def=t2    use=[&#39;c&#39;, &#39;d&#39;]
+   6: t3 = t1 + t2           def=t3    use=[&#39;t1&#39;, &#39;t2&#39;]
+   7: r = mov t3             def=r     use=[&#39;t3&#39;]
+
+=== 第 1 轮：8 条指令，8 个值，9 条干扰边 ===
+   0: ld   a, [x_a]          def=a     use=[]   live_out={a}
+   1: ld   b, [x_b]          def=b     use=[]   live_out={a,b}
+   2: ld   c, [x_c]          def=c     use=[]   live_out={a,b,c}
+   3: ld   d, [x_d]          def=d     use=[]   live_out={a,b,c,d}
+   4: t1 = a + b             def=t1    use=[&#39;a&#39;, &#39;b&#39;]   live_out={c,d,t1}
+   5: t2 = c + d             def=t2    use=[&#39;c&#39;, &#39;d&#39;]   live_out={t1,t2}
+   6: t3 = t1 + t2           def=t3    use=[&#39;t1&#39;, &#39;t2&#39;]   live_out={t3}
+   7: r = mov t3             def=r     use=[&#39;t3&#39;]   live_out={}
+  干扰边： a-b a-c a-d b-c b-d c-d c-t1 d-t1 t1-t2
+  simplify 栈： r t3 t2 t1 d? a b c （? = 潜在溢出）
+  select 着色： a=x3 b=x2 c=x1 r=x1 t1=x2 t2=x1 t3=x1
+  实际溢出： [&#39;d&#39;]
+  溢出重写后（8 条指令）：
+   0: ld   a, [x_a]          def=a     use=[]
+   1: ld   b, [x_b]          def=b     use=[]
+   2: ld   c, [x_c]          def=c     use=[]
+   3: t1 = a + b             def=t1    use=[&#39;a&#39;, &#39;b&#39;]
+   4: ld   d$5, [x_d]        def=d$5   use=[]
+   5: t2 = c + d$5           def=t2    use=[&#39;c&#39;, &#39;d$5&#39;]
+   6: t3 = t1 + t2           def=t3    use=[&#39;t1&#39;, &#39;t2&#39;]
+   7: r = mov t3             def=r     use=[&#39;t3&#39;]
+
+=== 第 2 轮：8 条指令，8 个值，7 条干扰边 ===
+   0: ld   a, [x_a]          def=a     use=[]   live_out={a}
+   1: ld   b, [x_b]          def=b     use=[]   live_out={a,b}
+   2: ld   c, [x_c]          def=c     use=[]   live_out={a,b,c}
+   3: t1 = a + b             def=t1    use=[&#39;a&#39;, &#39;b&#39;]   live_out={c,t1}
+   4: ld   d$5, [x_d]        def=d$5   use=[]   live_out={c,d$5,t1}
+   5: t2 = c + d$5           def=t2    use=[&#39;c&#39;, &#39;d$5&#39;]   live_out={t1,t2}
+   6: t3 = t1 + t2           def=t3    use=[&#39;t1&#39;, &#39;t2&#39;]   live_out={t3}
+   7: r = mov t3             def=r     use=[&#39;t3&#39;]   live_out={}
+  干扰边： a-b a-c b-c c-d$5 c-t1 d$5-t1 t1-t2
+  simplify 栈： r t3 t2 a b c d$5 t1 （? = 潜在溢出）
+  select 着色： a=x2 b=x1 c=x3 d$5=x2 r=x1 t1=x1 t2=x2 t3=x1
+  实际溢出： 无
+
+  分配完成：8 条指令（原始 8 条），溢出 1 个值
+   0: ld   a, [x_a]          def=a     use=[]
+   1: ld   b, [x_b]          def=b     use=[]
+   2: ld   c, [x_c]          def=c     use=[]
+   3: t1 = a + b             def=t1    use=[&#39;a&#39;, &#39;b&#39;]
+   4: ld   d$5, [x_d]        def=d$5   use=[]
+   5: t2 = c + d$5           def=t2    use=[&#39;c&#39;, &#39;d$5&#39;]
+   6: t3 = t1 + t2           def=t3    use=[&#39;t1&#39;, &#39;t2&#39;]
+   7: r = mov t3             def=r     use=[&#39;t3&#39;]
+  copy 与源同色、可直接删除：1 条（r = mov t3）
+
+=== 对照：溢出代价启发式的影响（同样 K=3，只改权重） ===
+  所有值权重 = 1              代价表 {&#39;a&#39;: 2, &#39;b&#39;: 2, &#39;c&#39;: 2, &#39;d&#39;: 2, &#39;r&#39;: 1, &#39;t1&#39;: 2, &#39;t2&#39;: 2, &#39;t3&#39;: 2} → 溢出 [&#39;d&#39;]
+  d 在循环体内（权重 10）         代价表 {&#39;a&#39;: 2, &#39;b&#39;: 2, &#39;c&#39;: 2, &#39;d&#39;: 11, &#39;r&#39;: 1, &#39;t1&#39;: 2, &#39;t2&#39;: 2, &#39;t3&#39;: 2} → 溢出 [&#39;c&#39;]</code></pre>
+<p>三件值得盯住的事：</p>
+<ol>
+<li><strong>第 1 轮就撞上 K=3 的硬墙</strong>：<code>a</code>、<code>b</code>、<code>c</code>、<code>d</code> 在指令 3 处同时活着、两两相连（<code>a-b a-c a-d b-c b-d c-d</code>），凑成 4-团——3 种颜色染不了 4 个两两冲突的节点，必然溢出。</li>
+<li><strong>溢出重写没有让程序变长</strong>：<code>d</code> 的定义是一条 load，&quot;删掉 load、在使用处重装&quot;之后仍是 8 条；经典 spill everywhere 会多出一条 <code>st d, [spill_d]</code>。</li>
+<li><strong>第 2 轮干扰边从 9 条降到 7 条</strong>，着色一次成功；<code>t3</code> 与 <code>r</code> 同为 <code>x1</code>，那条 <code>r = mov t3</code> 可直接删。对照实验再看启发式：<code>d</code> 的权重调成 10 后代价从 2 变 11，分配器就改溢 <code>c</code>——&quot;保谁&quot;由启发式决定。</li>
+</ol>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：把 <code>K</code> 改成 4 再跑一遍，验证&quot;4 色够染 4-团&quot;。</li>
+<li><strong>解释</strong>：为什么&quot;定义点与 live-out 连边&quot;这一条规则就够？举一个漏边导致同色的例子。</li>
+<li><strong>对比/验证</strong>：把 <code>rewrite()</code> 改成经典 spill everywhere（load 型定义也插 <code>st</code>），比较两版的指令数与第 2 轮干扰边数。</li>
+<li><strong>思考</strong>：先调度再分配，与&quot;先分配再在约束下调度&quot;各有什么代价？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Chaitin, <em>Register Allocation &amp; Spilling via Graph Coloring</em>, SIGPLAN 1982（干扰图、simplify/select 与溢出启发式的原始论文）：<a href="https://dl.acm.org/doi/10.1145/872726.806984" target="_blank" rel="noopener noreferrer">https://dl.acm.org/doi/10.1145/872726.806984</a></li>
+<li>Briggs, Cooper, Torczon, <em>Improvements to Graph Coloring Register Allocation</em>, ACM TOPLAS 16(3), 1994（乐观着色与保守合并）：<a href="https://dl.acm.org/doi/10.1145/177492.177575" target="_blank" rel="noopener noreferrer">https://dl.acm.org/doi/10.1145/177492.177575</a></li>
+<li>LLVM Project Blog, <em>Greedy Register Allocation in LLVM 3.0</em>（LLVM 默认分配器与活跃范围拆分）：<a href="https://blog.llvm.org/2011/09/greedy-register-allocation-in-llvm-30.html" target="_blank" rel="noopener noreferrer">https://blog.llvm.org/2011/09/greedy-register-allocation-in-llvm-30.html</a></li>
+<li>LLVM 官方文档《The LLVM Target-Independent Code Generator》「Register Allocation」一节（虚拟寄存器 → 物理寄存器、引入溢出代码）：<a href="https://llvm.org/docs/CodeGenerator.html" target="_blank" rel="noopener noreferrer">https://llvm.org/docs/CodeGenerator.html</a></li>
+</ul>
+<p><a href="#/l/cf-ch6-l3">下一课：指令调度与流水线：延迟隐藏（与 GPU occupancy 同理）</a></p>

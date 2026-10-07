@@ -1,0 +1,132 @@
+<h2 id="h-训练与推理差异">训练与推理差异<a class="anchor" href="#h-训练与推理差异" aria-label="本节链接">#</a></h2>
+<p>同一个 Transformer，训练时和推理时的&quot;跑法&quot;几乎完全不同。训练时它像个开了挂的学生：老师把正确答案（右移一位的真实目标）直接塞给它，它一次性、并行地算出整条序列每个位置的预测；推理时它却只能白手起家：从起始符开始，一个字一个字地吐，吐完还要把新字接回输入再来一遍。理解这两套流程——<strong>teacher forcing</strong> 与<strong>自回归生成</strong>——以及它们背后的效率差异（为什么训练快、推理慢，以及 KV cache 如何补救），是真正会用 Transformer 的分水岭。这一课就把这两条路径拆开讲透。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-训练teacher-forcing一次算完一整句">1. 训练：teacher forcing，一次算完一整句<a class="anchor" href="#h-1-训练teacher-forcing一次算完一整句" aria-label="本节链接">#</a></h4>
+<p>假设要训练一个&quot;把 <code>abc</code> 翻译成 <code>xyz</code>&quot;的模型。目标序列是 <code>[x, y, z, &lt;eos&gt;]</code>。训练时，解码器的输入<strong>不是模型自己生成的猜测，而是&quot;右移一位的真实答案&quot;</strong>：</p>
+<pre><code>解码器输入: [&lt;bos&gt;, x, y, z]      ← 真实的、整体右移一位
+预测目标:   [   x,   y, z, &lt;eos&gt;] ← 每个位置预测下一个真实词</code></pre>
+<p>这一步叫 <strong>teacher forcing（教师强制）</strong>——让&quot;老师&quot;（真实标签）牵着走，而不是让模型的错误预测滚雪球。它的巨大好处是：<strong>整条序列的所有位置可以一次性并行计算</strong>。因为因果掩码已经保证了位置 <code>t</code> 只能看见 <code>1..t</code>，而 <code>1..t</code> 这些 token 又都是已知的真实值，所以一个 forward 就能得到每个位置的 logits，一次反向传播就能更新所有位置的梯度。这就是训练能并行的根本原因。</p>
+<h4 id="h-2-推理自回归一个-token-一个-token-地吐">2. 推理：自回归，一个 token 一个 token 地吐<a class="anchor" href="#h-2-推理自回归一个-token-一个-token-地吐" aria-label="本节链接">#</a></h4>
+<p>推理时没有&quot;老师&quot;了，只有模型自己。流程变成循环：</p>
+<pre><code>已生成 = [&lt;bos&gt;]
+重复直到遇到 &lt;eos&gt; 或达到最大长度：
+    用&quot;已生成&quot;序列做解码器输入
+    取最后一个位置的输出，算出下一个 token 的概率
+    采样/贪心地选出下一个 token，追加到&quot;已生成&quot;末尾</code></pre>
+<p>每一步都要做一次完整的前向，且<strong>只能基于已生成的前缀</strong>。所以推理天然是串行的：生成长度 <code>L</code> 的句子，就要跑 <code>L</code> 次前向。这也解释了为什么训练时一大段话几秒就&quot;学&quot;完，而推理时同样长度要一个字一个字地&quot;等&quot;。</p>
+<h4 id="h-3-训练快推理慢的根源与-kv-cache">3. 训练快、推理慢的根源与 KV cache<a class="anchor" href="#h-3-训练快推理慢的根源与-kv-cache" aria-label="本节链接">#</a></h4>
+<p>训练并行、推理串行，速度差距来自两点：一是并行度（一次算全部 vs 一次算一步），二是<strong>重复计算</strong>。</p>
+<p>在自回归推理里，第 <code>t</code> 步和第 <code>t+1</code> 步的输入只差一个 token，但朴素实现会把整个前缀的 Key、Value 重新算一遍。前缀越来越长，浪费越来越严重。<strong>KV cache</strong> 的思路是：把已经算过的 Key、Value 缓存起来，下一步只算新 token 的 K、V，然后拼接：</p>
+<pre><code>第 1 步: 计算 K_1, V_1，缓存
+第 2 步: 只算 K_2, V_2，拼接成 [K_1 K_2]、[V_1 V_2]
+第 t 步: 只算 K_t, V_t，拼接成 [K_1 ... K_t]、[V_1 ... V_t]</code></pre>
+<p>这样每一步的注意力只需要&quot;新 Query 与全量 Key 点积&quot;，省掉了对历史前缀的重复投影。KV cache 是让 LLM 推理提速的核心工程手段之一。代价是显存：要缓存所有层、所有头的历史 K/V。</p>
+<h4 id="h-4-一张图看懂两条路径">4. 一张图看懂两条路径<a class="anchor" href="#h-4-一张图看懂两条路径" aria-label="本节链接">#</a></h4>
+<p><figure><img class="md-img" src="content/courses/attention-transformer/assets/chapter-5-figure-03.svg" alt="训练与推理的对比：训练用 teacher forcing 并行算整句，推理自回归逐 token 生成并复用 KV cache" loading="lazy" decoding="async"><figcaption>训练与推理的对比：训练用 teacher forcing 并行算整句，推理自回归逐 token 生成并复用 KV cache</figcaption></figure>
+</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>训练</th>
+<th>推理</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>解码器输入</td>
+<td>真实目标右移一位</td>
+<td>已生成的前缀</td>
+</tr>
+<tr>
+<td>计算方式</td>
+<td>一次前向算完整句</td>
+<td>每个 token 一次前向</td>
+</tr>
+<tr>
+<td>并行度</td>
+<td>高（全位置并行）</td>
+<td>低（串行）</td>
+</tr>
+<tr>
+<td>依赖真实标签</td>
+<td>是（teacher forcing）</td>
+<td>否</td>
+</tr>
+<tr>
+<td>加速手段</td>
+<td>并行训练</td>
+<td>KV cache、批处理、投机解码</td>
+</tr>
+</tbody></table>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>用一个极简的&quot;下一个词预测&quot;模型，分别演示训练（teacher forcing）与推理（自回归）两条路径。模型本身故意造得很小，只为把流程看清楚。</p>
+<pre data-lang="python"><code class="language-python">import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# 极简模型：输入 token id 序列，输出词表 logits（真实 Transformer 见第 6 章）
+class TinyNextWord(nn.Module):
+    def __init__(self, vocab, d_model):
+        super().__init__()
+        self.emb = nn.Embedding(vocab, d_model)
+        self.proj = nn.Linear(d_model, vocab)
+    def forward(self, ids):
+        return self.proj(self.emb(ids))   # (T, vocab)
+
+torch.manual_seed(0)
+VOCAB, BOS, EOS = 10, 0, 9
+model = TinyNextWord(VOCAB, d_model=8)
+
+# —— 训练：teacher forcing，一次前向得到整句所有位置的 logits ——
+target = torch.tensor([1, 2, 3, 4, EOS])                 # 目标序列
+decoder_input = torch.cat([torch.tensor([BOS]), target[:-1]])  # 右移一位，头部补 BOS
+
+logits = model(decoder_input)                            # (5, vocab)
+loss = F.cross_entropy(logits, target)                   # 每个位置预测下一个真实词
+print(&quot;teacher forcing: 一次前向得到 5 个位置的 logits, loss =&quot;, round(loss.item(), 4))
+
+# —— 推理：自回归，逐个生成，每次只看已生成的前缀 ——
+model.eval()
+generated = [BOS]
+with torch.no_grad():
+    for _ in range(6):
+        logits = model(torch.tensor([generated[-1]]))    # 只看最后一个 token
+        nxt = logits.argmax(dim=-1).item()
+        generated.append(nxt)
+        if nxt == EOS:
+            break
+print(&quot;自回归生成:&quot;, generated)</code></pre>
+<p>注意两处对比：训练版一个 <code>model(decoder_input)</code> 就覆盖了 5 个位置；推理版在循环里 <code>model</code> 被反复调用，每次只推进一个 token。</p>
+<p>再看 KV cache 的核心思想（示意代码，重在&quot;只算新 token、旧的部分复用&quot;）：</p>
+<pre data-lang="python"><code class="language-python">d = 8
+W_k = nn.Linear(d, d)
+W_v = nn.Linear(d, d)
+
+# 用一次随机序列模拟&quot;已生成的前缀&quot;，逐步演示缓存
+prefix = torch.randn(3, d)                 # 已生成 3 个 token 的表示
+past_k = W_k(prefix)                       # 第 1 次：算全部 3 个 K 并缓存
+past_v = W_v(prefix)
+
+new_token = torch.randn(1, d)              # 第 4 个 token 到来
+k_new, v_new = W_k(new_token), W_v(new_token)
+
+# 关键：不重算 prefix 的 K/V，只把新 token 的拼上去
+k_full = torch.cat([past_k, k_new], dim=0) # (4, d)
+v_full = torch.cat([past_v, v_new], dim=0)
+print(&quot;缓存后拼接的 K 形状:&quot;, k_full.shape)  # (4, 8)，前缀部分零重算</code></pre>
+<p>真实实现里，缓存发生在每一层、每一个注意力头，且会随着推理逐步增长；这里只是把&quot;复用历史、只算增量&quot;的思想落地成代码。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>把上面自回归循环里的 <code>argmax</code> 改成按概率采样（<code>torch.multinomial</code>），连续生成 20 个 token，观察输出与贪心结果的差异，思考&quot;温度采样&quot;的意义。</li>
+<li>为什么 teacher forcing 训练时，模型可能在推理阶段表现骤降（&quot;exposure bias&quot;）？结合&quot;训练看真实、推理看自己&quot;解释，并列出至少一种缓解手段（如 scheduled sampling）。</li>
+<li>推导 KV cache 的显存占用：设层数 <code>L</code>、头数 <code>H</code>、维度 <code>d_model</code>、已生成长度 <code>t</code>、batch <code>B</code>，写出缓存 Key 和 Value 各自占多少元素（忽略 batch 维度可先取 <code>B=1</code>）。</li>
+<li>思考：交叉注意力的 K/V 来自编码器，编码器只需算一次，因此交叉注意力天然就&quot;自带缓存&quot;。为什么自注意力却需要显式的 KV cache？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>论文《Attention Is All You Need》3.1 节（Decoder 结构）：<a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1706.03762</a></li>
+<li>The Illustrated Transformer（Jay Alammar）· 解码器与生成流程：<a href="https://jalammar.github.io/illustrated-transformer/" target="_blank" rel="noopener noreferrer">https://jalammar.github.io/illustrated-transformer/</a></li>
+<li>The Annotated Transformer（Harvard NLP）· 训练与生成循环：<a href="https://nlp.seas.harvard.edu/annotated-transformer/" target="_blank" rel="noopener noreferrer">https://nlp.seas.harvard.edu/annotated-transformer/</a></li>
+<li>PyTorch 官方文档 · Transformer（含训练/推理讨论）：<a href="https://pytorch.org/docs/stable/generated/torch.nn.Transformer.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/docs/stable/generated/torch.nn.Transformer.html</a></li>
+</ul>
+<p><a href="#/l/attn-ch6-l1">下一课：用 PyTorch 实现 Transformer</a></p>

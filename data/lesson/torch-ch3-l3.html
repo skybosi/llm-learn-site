@@ -1,0 +1,97 @@
+<h2 id="h-参数管理">参数管理<a class="anchor" href="#h-参数管理" aria-label="本节链接">#</a></h2>
+<p>模型定义好了，接下来要面对&quot;参数&quot;这一整套生命周期：它们是什么、如何初始化、如何交给优化器、如何冻结一部分、如何保存与加载。这些是真正把模型从&quot;能定义&quot;推进到&quot;能训练、能复用&quot;的关键。本课把这些操作串成一条线。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-nnparameter被登记的张量">1. nn.Parameter：被&quot;登记&quot;的张量<a class="anchor" href="#h-1-nnparameter被登记的张量" aria-label="本节链接">#</a></h4>
+<p>模型里可学习的量（权重、偏置）都是 <strong><code>nn.Parameter</code></strong>，它本质是一个特殊的 <code>Tensor</code>，但有两点不同：</p>
+<ul>
+<li>创建时默认 <code>requires_grad=True</code>；</li>
+<li>被赋值给某个 <code>nn.Module</code> 的属性后，会被<strong>自动登记</strong>进该模块的参数集合。</li>
+</ul>
+<p>所以 <code>nn.Linear</code> 内部做的，就是把 <code>weight</code>、<code>bias</code> 两个 <code>nn.Parameter</code> 登记起来，<code>model.parameters()</code> 才能把它们一网打尽。反过来，如果你随便用一个普通 <code>torch.tensor</code> 存参数，它不会被优化器&quot;看见&quot;。图 3-3 画出参数从登记到被优化器消费的路径。</p>
+<p><figure><img class="md-img" src="content/courses/pytorch-fundamentals/assets/chapter-3-figure-03.svg" alt="参数从登记到被优化器消费的路径" loading="lazy" decoding="async"><figcaption>参数从登记到被优化器消费的路径</figcaption></figure>
+</p>
+<h4 id="h-2-参数初始化">2. 参数初始化<a class="anchor" href="#h-2-参数初始化" aria-label="本节链接">#</a></h4>
+<p><code>nn.Linear</code> 等内置层有默认初始化（如 <code>Linear</code> 用 kaiming uniform 初始化权重、均匀分布初始化偏置）。但很多场景需要自定义，常见做法是遍历参数、用 <code>nn.init</code> 里的函数<strong>原地</strong>修改：</p>
+<ul>
+<li><code>nn.init.xavier_uniform_(p)</code>、<code>nn.init.kaiming_normal_(p)</code>、<code>nn.init.zeros_(p)</code> 等。</li>
+</ul>
+<p>注意这些函数带 <code>_</code> 后缀，是原地修改传入的 <code>nn.Parameter</code>，不需要返回值。</p>
+<h4 id="h-3-冻结与局部更新">3. 冻结与局部更新<a class="anchor" href="#h-3-冻结与局部更新" aria-label="本节链接">#</a></h4>
+<p>迁移学习里常要&quot;冻结&quot;预训练部分、只训练新加的头。冻结 = 把参数的 <code>requires_grad</code> 设为 <code>False</code>：</p>
+<ul>
+<li>单个参数：<code>param.requires_grad = False</code>；</li>
+<li>传优化器时只传要更新的参数：<code>optimizer = torch.optim.SGD(filter(lambda p: p.requires_grad, model.parameters()), lr=...)</code>。</li>
+</ul>
+<p>被冻结的参数不再计算梯度、不被更新，既省显存又加快反向。</p>
+<h4 id="h-4-优化器参数更新的执行者">4. 优化器：参数更新的执行者<a class="anchor" href="#h-4-优化器参数更新的执行者" aria-label="本节链接">#</a></h4>
+<p>优化器不关心模型结构，只关心&quot;给我哪些参数 + 学习率&quot;。<code>torch.optim.SGD(model.parameters(), lr=0.01)</code> 拿到参数列表后，在训练循环里配合 <code>loss.backward()</code> 与 <code>optimizer.step()</code> 完成一次更新。上一章讲的&quot;梯度清零&quot;在这里对应 <code>optimizer.zero_grad()</code>。</p>
+<h4 id="h-5-state_dict保存与加载">5. state_dict：保存与加载<a class="anchor" href="#h-5-state_dict保存与加载" aria-label="本节链接">#</a></h4>
+<p><code>model.state_dict()</code> 返回&quot;参数名 → 张量&quot;的有序字典，<code>torch.save(model.state_dict(), path)</code> 保存，<code>model.load_state_dict(torch.load(path))</code> 加载。推荐保存 <code>state_dict</code> 而不是整个模型对象——它更小、更灵活、跨代码版本更稳。</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<pre data-lang="python"><code class="language-python">import torch
+import torch.nn as nn
+import torch.nn.init as init
+
+# ---- 1. 参数的类型与登记 ----
+class Net(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc = nn.Linear(4, 2)
+        self.extra = nn.Parameter(torch.zeros(3))   # 自定义参数也会被登记
+
+net = Net()
+for name, p in net.named_parameters():
+    is_param = isinstance(p, nn.Parameter)
+    print(f&quot;{name:12s} 形状={str(p.shape):12s} requires_grad={p.requires_grad}&quot;)
+
+# ---- 2. 自定义初始化 ----
+def init_weights(m):
+    if isinstance(m, nn.Linear):
+        init.xavier_uniform_(m.weight)   # 原地修改权重
+        init.zeros_(m.bias)              # 偏置置零
+
+net.apply(init_weights)                  # 递归应用到所有子模块
+print(&quot;\n初始化后 fc.bias =&quot;, net.fc.bias)
+
+# ---- 3. 冻结部分参数 ----
+net.fc.weight.requires_grad = False      # 冻结权重，只留 bias 可训练
+trainable = [p for p in net.parameters() if p.requires_grad]
+print(&quot;\n可训练参数数量:&quot;, len(trainable))
+
+# ---- 4. 优化器只更新可训练参数 ----
+optimizer = torch.optim.SGD(
+    filter(lambda p: p.requires_grad, net.parameters()), lr=0.01
+)
+print(&quot;优化器管理的参数组数量:&quot;, len(optimizer.param_groups[0][&#39;params&#39;]))
+
+# ---- 5. 一次迷你训练步 ----
+x = torch.randn(2, 4)
+target = torch.randn(2, 2)
+optimizer.zero_grad()                    # 清零上一轮梯度
+loss = ((net(x) - target) ** 2).sum()    # MSE 损失
+loss.backward()                          # 反向求梯度
+optimizer.step()                         # 用梯度更新参数
+print(&quot;\n一次更新后 fc.bias =&quot;, net.fc.bias)
+
+# ---- 6. 保存与加载 ----
+torch.save(net.state_dict(), &quot;net_state.pt&quot;)
+loaded = Net()
+loaded.load_state_dict(torch.load(&quot;net_state.pt&quot;))
+print(&quot;\n加载后 loaded.fc.weight 等于 net.fc.weight：&quot;,
+      torch.equal(loaded.fc.weight, net.fc.weight))</code></pre>
+<p>运行要点：<code>net.extra</code>（自定义 <code>nn.Parameter</code>）出现在 <code>named_parameters()</code> 里；冻结 <code>fc.weight</code> 后，优化器参数组里不再包含它；保存的 <code>.pt</code> 文件用 <code>load_state_dict</code> 可完整还原。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>定义一个含 <code>nn.Linear(10, 5)</code> 的模块，用 <code>named_parameters()</code> 打印每个参数的名字、形状、<code>requires_grad</code>，并指出哪个是权重、哪个是偏置。</li>
+<li>写一个 <code>init_weights</code>，对 <code>Linear</code> 层用 <code>kaiming_normal_</code> 初始化权重、用 <code>ones_</code> 初始化偏置，通过 <code>apply</code> 应用到模型上，验证结果。</li>
+<li>冻结模型第一层、只训练第二层：把 <code>fc1</code> 的所有参数 <code>requires_grad</code> 设为 <code>False</code>，构建一个只包含可训练参数的 <code>SGD</code> 优化器，打印它实际管理的参数名。</li>
+<li>把上面的模型训练一步后保存 <code>state_dict</code>，新建一个同结构模型加载，用 <code>torch.equal</code> 逐参数核对是否完全一致。思考：为什么推荐保存 <code>state_dict</code> 而不是 <code>torch.save(model)</code> 整个对象？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>PyTorch 官方文档 · torch.nn.Parameter：<a href="https://pytorch.org/docs/stable/generated/torch.nn.parameter.Parameter.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/docs/stable/generated/torch.nn.parameter.Parameter.html</a></li>
+<li>PyTorch 官方文档 · torch.nn.init：<a href="https://pytorch.org/docs/stable/nn.init.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/docs/stable/nn.init.html</a></li>
+<li>PyTorch 官方文档 · Module.state_dict / load_state_dict：<a href="https://pytorch.org/docs/stable/generated/torch.nn.Module.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/docs/stable/generated/torch.nn.Module.html</a></li>
+<li>PyTorch 官方教程 · Optimizing Model Parameters：<a href="https://pytorch.org/tutorials/beginner/basics/optimization_tutorial.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/tutorials/beginner/basics/optimization_tutorial.html</a></li>
+</ul>
+<p><a href="#/l/torch-ch4-l1">下一课：Dataset</a></p>

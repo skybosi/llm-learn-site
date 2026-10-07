@@ -1,0 +1,262 @@
+<h2 id="h-常量折叠代数化简与算子消除">常量折叠、代数化简与算子消除<a class="anchor" href="#h-常量折叠代数化简与算子消除" aria-label="本节链接">#</a></h2>
+<p>第 3 课教会我们&quot;怎么改图&quot;——在 Relay、MLIR、StableHLO 这类图 IR 上写一个 pass。但 pass 不是目的，<strong>改什么才划算</strong>才是。真实模型里有一类节点从编译那一刻起就注定可以删掉：权重形状推导出的常量、<code>x + 0</code>、<code>x * 1</code>、以及被折叠结果孤立出来的死子图。它们不改变任何数值，却占着执行计划和显存。这一课把这三类改写拆开讲清，并给出一个能逐条核对的 40 行 pass 管线。</p>
+<p><figure><img class="md-img" src="content/courses/ml-compilers/assets/chapter-4-figure-01.svg" alt="图优化的 pass 管线：折叠 → 化简 → 属性改写 → 死节点消除" loading="lazy" decoding="async"><figcaption>图优化的 pass 管线：折叠 → 化简 → 属性改写 → 死节点消除</figcaption></figure>
+</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-常量折叠--在图-ir-上做一遍常量传播">1. 常量折叠 = 在图 IR 上做一遍常量传播<a class="anchor" href="#h-1-常量折叠--在图-ir-上做一遍常量传播" aria-label="本节链接">#</a></h4>
+<p><strong>常量折叠</strong>（constant folding）指&quot;当某个节点的全部输入在编译期已知，就直接算出结果、把节点换成常量&quot;。TVM Relay 把它实现为一个独立 pass（常量折叠 pass，官方文档的 pass 基础设施一节描述了这类 pass 如何注册与串联）；MLIR 侧则是 <code>arith</code> 等 dialect 的 canonicalizer/folder 机制。</p>
+<p>关键在于它不是&quot;扫一遍就能完&quot;，而是<strong>要迭代到不动点</strong>：<code>five = 2+3</code> 折成 <code>5</code> 之后，<code>c = five*five</code> 才第一次具备可折叠条件。真实编译器把这件事交给&quot;重写到不动点&quot;的驱动逻辑，本课的程序用一个 <code>while</code> 显式写出来——实测在 12 节点图上只需要 <strong>2 轮</strong>。</p>
+<h4 id="h-2-代数化简哪些恒等式在浮点下也成立">2. 代数化简：哪些恒等式在浮点下也成立<a class="anchor" href="#h-2-代数化简哪些恒等式在浮点下也成立" aria-label="本节链接">#</a></h4>
+<p><strong>代数化简</strong>（algebraic simplification）是一组模式改写：<code>x+0→x</code>、<code>x*1→x</code>、<code>x-0→x</code>、<code>x/1→x</code>、<code>÷常数→×倒数</code>。它们成立的前提各不相同：</p>
+<table>
+<thead>
+<tr>
+<th>改写</th>
+<th>整数下</th>
+<th>浮点下</th>
+<th>备注</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>x+0 → x</code></td>
+<td>成立</td>
+<td>成立</td>
+<td>但 <code>-0.0 + 0.0 = +0.0</code>，strict 语义要保号</td>
+</tr>
+<tr>
+<td><code>x*1 → x</code></td>
+<td>成立</td>
+<td>成立</td>
+<td>NaN/Inf 也成立</td>
+</tr>
+<tr>
+<td><code>x*0 → 0</code></td>
+<td>成立</td>
+<td><strong>条件成立</strong></td>
+<td>NaN/Inf 上应为 NaN，见第 4 课</td>
+</tr>
+<tr>
+<td><code>(x+y)-y → x</code></td>
+<td>成立</td>
+<td><strong>不成立</strong></td>
+<td>消去律在有限精度下失效</td>
+</tr>
+<tr>
+<td><code>÷c → ×(1/c)</code></td>
+<td>仅整除时</td>
+<td><strong>不成立</strong>（位不一致）</td>
+<td>只有在数值契约允许时才做</td>
+</tr>
+</tbody></table>
+<p>真实的简化不是&quot;能换就换&quot;，而是<strong>每条规则带着自己的前置条件</strong>：<code>÷c→×(1/c)</code> 要求 <code>c≠0</code> 且契约允许非位一致；<code>x*0→0</code> 要求能证明 <code>x</code> 有限。TVM Relay 有一个专门的化简 pass（SimplifyExpr），它的规则集就是这种&quot;带守卫的改写&quot;的集合。</p>
+<h4 id="h-3-算子消除常量折叠的副产品">3. 算子消除：常量折叠的副产品<a class="anchor" href="#h-3-算子消除常量折叠的副产品" aria-label="本节链接">#</a></h4>
+<p>折叠会生产<strong>孤儿子图</strong>：<code>c</code> 被折成常量后，<code>two</code>、<code>three</code>、<code>five</code> 不再有读者。这一步叫<strong>死节点消除</strong>（dead node elimination），也叫 DCE。做法是从每个输出反向求活跃集合——与第 3 课数据流分析里的&quot;活跃变量&quot;是同一件事，只是作用在整张图上。</p>
+<p>DCE 的价值常被低估：折叠本身并不减少节点数（本课实测 12→12），<strong>真正把节点数降下来的是紧接着的 DCE</strong>（12→8）。顺序错了会白干：先 DCE 再折叠，孤儿要等下一轮才被清掉。</p>
+<h4 id="h-4-pass-的次序与不动点">4. pass 的次序与不动点<a class="anchor" href="#h-4-pass-的次序与不动点" aria-label="本节链接">#</a></h4>
+<p>四个 pass 的排列顺序有硬道理：</p>
+<ol>
+<li><strong>先折叠、再化简</strong>：化简 <code>x+0</code> 需要知道 <code>0</code> 是常量；如果常量还在图里以&quot;未折叠的节点&quot;形式存在，化简判定就要多写一套&quot;这个节点其实是常量&quot;的逻辑。</li>
+<li><strong>化简后要再折叠一次</strong>：<code>÷c</code> 换成 <code>×0.04</code> 之后，如果 <code>x</code> 也是常量，这一层新出现的乘法又能折。</li>
+<li><strong>DCE 放最后</strong>：它清的是前三个 pass 制造的垃圾。</li>
+</ol>
+<h4 id="h-5-常见坑">5. 常见坑<a class="anchor" href="#h-5-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>折叠用了宿主精度</strong>：在 float64 里算 <code>float32</code> 表达式再降回去，结果可能差 1 个 ULP。折叠必须在目标 dtype 上做（第 4 课有实测）。</li>
+<li><strong>拿&quot;等价&quot;当&quot;位一致&quot;</strong>：<code>÷25 → ×0.04</code> 在多数硬件上不保证位一致；是否允许取决于数值契约。</li>
+<li><strong>漏掉常量语义的边界</strong>：<code>/0</code>、<code>x*0</code>、<code>-0.0</code> 三处是折叠器最常翻车的地方。</li>
+<li><strong>忘记 <code>identity</code> 节点的代价</strong>：化简产生的&quot;直接复用&quot;节点如果不做别名消除，执行时仍可能退化成一次拷贝。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面这段纯 Python（无第三方依赖）实现四步 pass 管线：<strong>常量折叠 → 代数化简 → 常量除法改写 → 死节点消除</strong>。图用第 3 课的节点表表示，<code>identity</code> 表示&quot;直接复用输入&quot;。每步都打印改了哪条规则，最后做优化前后逐元素对拍。</p>
+<pre data-lang="python"><code class="language-python"># ---- 第 1 课示例：常量折叠 + 代数化简 + 死节点消除（纯 Python，无第三方依赖）----
+# 图表示沿用第 3 课的节点表：节点 = (op, [输入名], attrs, 输出名)，表顺序即拓扑序
+
+def graph_before():
+    N = lambda op, deps, nm, **at: (op, deps, at | {&#39;name&#39;: nm}, nm)
+    return [
+        N(&#39;const&#39;, [], &#39;two&#39;,   value=2.0),
+        N(&#39;const&#39;, [], &#39;three&#39;, value=3.0),
+        N(&#39;const&#39;, [], &#39;zero&#39;,  value=0.0),
+        N(&#39;const&#39;, [], &#39;one&#39;,   value=1.0),
+        N(&#39;add&#39;,  [&#39;two&#39;, &#39;three&#39;], &#39;five&#39;),     # 2+3 → 5（常量折叠）
+        N(&#39;mul&#39;,  [&#39;five&#39;, &#39;five&#39;], &#39;c&#39;),        # 5*5 → 25（同一 pass 里要再触发一轮）
+        N(&#39;mul&#39;,  [&#39;x&#39;, &#39;w&#39;], &#39;t1&#39;),             # 真实计算从这里开始
+        N(&#39;add&#39;,  [&#39;t1&#39;, &#39;zero&#39;], &#39;t2&#39;),         # +0 → 恒等（代数化简）
+        N(&#39;mul&#39;,  [&#39;t2&#39;, &#39;one&#39;], &#39;t3&#39;),          # ×1 → 恒等
+        N(&#39;div&#39;,  [&#39;t3&#39;, &#39;c&#39;], &#39;y1&#39;),            # ÷25：折叠后常量在分母上，可换成 ×0.04
+        N(&#39;relu&#39;, [&#39;t1&#39;], &#39;t4&#39;),
+        N(&#39;mul&#39;,  [&#39;t4&#39;, &#39;zero&#39;], &#39;y2&#39;),         # ×0：本课不做（第 4 课讲它何时不合法）
+    ]
+
+EXTERNAL = {&#39;x&#39;: [1.0, 2.0, 3.0], &#39;w&#39;: [2.0, 0.0, -1.0]}
+
+def binop(op, a, b):
+    f = {&#39;add&#39;: lambda u, v: u + v, &#39;sub&#39;: lambda u, v: u - v,
+         &#39;mul&#39;: lambda u, v: u * v, &#39;div&#39;: lambda u, v: u / v}[op]
+    if isinstance(a, list) and isinstance(b, list): return [f(u, v) for u, v in zip(a, b)]
+    if isinstance(a, list): return [f(u, b) for u in a]
+    if isinstance(b, list): return [f(a, v) for v in b]
+    return f(a, b)
+
+def run(nodes, inputs):
+    &quot;&quot;&quot;解释执行：外部输入 + const 节点提供初值，identity 直接复用输入。&quot;&quot;&quot;
+    env = dict(inputs)
+    for op, deps, at, nm in nodes:
+        if op == &#39;const&#39;:      env[nm] = at[&#39;value&#39;]
+        elif op == &#39;identity&#39;: env[nm] = env[deps[0]]
+        elif op in (&#39;add&#39;, &#39;sub&#39;, &#39;mul&#39;, &#39;div&#39;): env[nm] = binop(op, env[deps[0]], env[deps[1]])
+        elif op == &#39;relu&#39;:     env[nm] = [max(u, 0.0) for u in env[deps[0]]]
+        else: raise ValueError(op)
+    return env
+
+# ---------------- pass 1：常量折叠（一个常量会解锁下游，必须迭代到不动点）----------------
+def fold(nodes, const):
+    cur, log, rounds = list(nodes), [], 0
+    while True:
+        rounds += 1; changed = False; nxt = []
+        for op, deps, at, nm in cur:
+            if op == &#39;const&#39;:
+                const[nm] = at[&#39;value&#39;]; nxt.append((op, deps, at, nm)); continue
+            # 只折叠&quot;输入全是标量常量&quot;的算术节点；含张量的常量运算留给后端常量算
+            if op in (&#39;add&#39;, &#39;sub&#39;, &#39;mul&#39;, &#39;div&#39;) and all(d in const for d in deps):
+                a, b = const[deps[0]], const[deps[1]]
+                if op == &#39;div&#39; and b == 0:                      # 先挡住非法折叠
+                    log.append((nm, f&#39;{a!r} div {b!r} → 分母为 0，不折叠&#39;))
+                    nxt.append((op, deps, at, nm)); continue
+                v = binop(op, a, b)
+                log.append((nm, f&#39;{a!r} {op} {b!r} = {v!r}&#39;))
+                const[nm] = v; changed = True
+                nxt.append((&#39;const&#39;, [], {&#39;value&#39;: v, &#39;name&#39;: nm, &#39;from&#39;: nm}, nm)); continue
+            nxt.append((op, deps, at, nm))
+        cur = nxt
+        if not changed: break
+    return cur, log, rounds
+
+# ---------------- pass 2：代数化简（只留浮点下成立的恒等式）----------------
+IDENT = {(&#39;add&#39;, &#39;zero&#39;), (&#39;sub&#39;, &#39;zero&#39;), (&#39;mul&#39;, &#39;one&#39;), (&#39;div&#39;, &#39;one&#39;)}
+def simplify(nodes, const):
+    cur, log = [], []
+    for op, deps, at, nm in nodes:
+        hit = None
+        if len(deps) == 2 and op in (&#39;add&#39;, &#39;sub&#39;, &#39;mul&#39;, &#39;div&#39;):
+            for d in deps:
+                if (op, d) in IDENT and d in const:
+                    hit = deps[1] if deps[0] == d else deps[0]; break
+        if hit:
+            log.append((nm, f&#39;{op}({deps[0]}, {deps[1]}) → 直接复用 {hit}&#39;))
+            cur.append((&#39;identity&#39;, [hit], {&#39;name&#39;: nm}, nm))
+        else:
+            cur.append((op, deps, at, nm))
+    return cur, log
+
+# ---------------- pass 3：常量除法改写（÷常数 → ×倒数，判定在后端）----------------
+def div_to_mul(nodes, const):
+    cur, log = [], []
+    for op, deps, at, nm in nodes:
+        if op == &#39;div&#39; and deps[1] in const and const[deps[1]] not in (0, 0.0):
+            r = 1.0 / const[deps[1]]
+            log.append((nm, f&#39;÷{const[deps[1]]} → ×{r!r}&#39;))
+            cur.append((&#39;const&#39;, [], {&#39;value&#39;: r, &#39;name&#39;: &#39;_recip_&#39; + nm}, &#39;_recip_&#39; + nm))
+            cur.append((&#39;mul&#39;, [deps[0], &#39;_recip_&#39; + nm], {&#39;name&#39;: nm}, nm))
+            continue
+        cur.append((op, deps, at, nm))
+    return cur, log
+
+# ---------------- pass 4：死节点消除（从输出反向求活跃集合）----------------
+def dce(nodes, outputs):
+    byname = {nm: deps for op, deps, at, nm in nodes}
+    live = set(outputs)
+    for nm in [n for _, _, _, n in nodes][::-1]:
+        if nm in live: live.update(byname[nm])
+    kept = [t for t in nodes if t[3] in live]
+    return kept, [t[3] for t in nodes if t[3] not in live]
+
+def show(nodes):
+    return &#39; → &#39;.join(f&#39;{nm}:{op}({&quot;,&quot;.join(deps)})&#39; for op, deps, at, nm in nodes)
+
+if __name__ == &#39;__main__&#39;:
+    g0 = graph_before()
+    print(&#39;=== 原始图（12 个节点，前 4 个是 const）===&#39;)
+    print(&#39; &#39;, show(g0))
+
+    const = {}
+    g1, log1, rounds = fold(g0, const)
+    print(f&#39;\n=== pass 1 常量折叠：迭代 {rounds} 轮达到不动点 ===&#39;)
+    for nm, msg in log1: print(f&#39;  {nm:&lt;6} {msg}&#39;)
+
+    g2, log2 = simplify(g1, const)
+    print(&#39;\n=== pass 2 代数化简（先折叠后化简：常量在 map 里看得见）===&#39;)
+    for nm, msg in log2: print(f&#39;  {nm:&lt;6} +0 / ×1 命中：{msg}&#39;)
+
+    g3, log3 = div_to_mul(g2, const)
+    print(&#39;\n=== pass 3 常量除法改写（÷常数 换 ×倒数；第 2 课的布局改写同属这一类属性改写）===&#39;)
+    for nm, msg in log3: print(f&#39;  {nm:&lt;6} {msg}&#39;)
+
+    g4, gone = dce(g3, [&#39;y1&#39;, &#39;y2&#39;])
+    print(f&#39;\n=== pass 4 死节点消除：已无读者 {gone}（{len(gone)} 个）===&#39;)
+    print(f&#39;\n节点数：{len(g0)} → {len(g1)} → {len(g2)} → {len(g3)} → {len(g4)}&#39;)
+
+    rb, ra = run(g0, EXTERNAL), run(g4, EXTERNAL)
+    print(&#39;\n=== 优化前后逐元素对拍（必须完全一致）===&#39;)
+    print(f&#39;  y1: 前 {rb[&quot;y1&quot;]}  后 {ra[&quot;y1&quot;]}  {&quot;一致&quot; if rb[&quot;y1&quot;] == ra[&quot;y1&quot;] else &quot;不一致 ← bug&quot;}&#39;)
+    print(f&#39;  y2: 前 {rb[&quot;y2&quot;]}  后 {ra[&quot;y2&quot;]}  {&quot;一致&quot; if rb[&quot;y2&quot;] == ra[&quot;y2&quot;] else &quot;不一致 ← bug&quot;}&#39;)
+    print(f&#39;  折叠出的常量：&#39; + &#39;, &#39;.join(f&#39;{k}={v!r}&#39; for k, v in const.items() if k in (&#39;five&#39;, &#39;c&#39;)))
+
+    print(&#39;\n=== 为什么&quot;等价变换&quot;不总是等价：浮点不是实数域 ===&#39;)
+    x, z = 1.0, 1e16
+    print(f&#39;  (x+z)-z = {(x + z) - z!r}  而 x = {x!r}  → &quot;(x+z)-z → x&quot; 这条改写在这里不成立&#39;)
+    y = 1e16
+    print(f&#39;  (x+y)-y = {(x + y) - y!r}  而 x = {x!r}  → 同样的改写，换一组数就不成立&#39;)
+    print(f&#39;  nan*0.0 = {float(&quot;nan&quot;) * 0.0}   inf*0.0 = {float(&quot;inf&quot;) * 0.0}&#39;
+          f&#39;   → &quot;x*0→0&quot; 的前提是 x 有限&#39;)
+    print(&#39;  本课演示的都是&quot;能折叠&quot;的情形；判定标准与反例清单在第 4 课。&#39;)</code></pre>
+<p>实际运行结果（Python 3.14，无第三方依赖）：</p>
+<pre data-lang="text"><code class="language-text">=== 原始图（12 个节点，前 4 个是 const）===
+  two:const() → three:const() → zero:const() → one:const() → five:add(two,three) → c:mul(five,five) → t1:mul(x,w) → t2:add(t1,zero) → t3:mul(t2,one) → y1:div(t3,c) → t4:relu(t1) → y2:mul(t4,zero)
+
+=== pass 1 常量折叠：迭代 2 轮达到不动点 ===
+  five   2.0 add 3.0 = 5.0
+  c      5.0 mul 5.0 = 25.0
+
+=== pass 2 代数化简（先折叠后化简：常量在 map 里看得见）===
+  t2     +0 / ×1 命中：add(t1, zero) → 直接复用 t1
+  t3     +0 / ×1 命中：mul(t2, one) → 直接复用 t2
+
+=== pass 3 常量除法改写（÷常数 换 ×倒数；第 2 课的布局改写同属这一类属性改写）===
+  y1     ÷25.0 → ×0.04
+
+=== pass 4 死节点消除：已无读者 [&#39;two&#39;, &#39;three&#39;, &#39;one&#39;, &#39;five&#39;, &#39;c&#39;]（5 个）===
+
+节点数：12 → 12 → 12 → 13 → 8
+
+=== 优化前后逐元素对拍（必须完全一致）===
+  y1: 前 [0.08, 0.0, -0.12]  后 [0.08, 0.0, -0.12]  一致
+  y2: 前 [0.0, 0.0, 0.0]  后 [0.0, 0.0, 0.0]  一致
+  折叠出的常量：five=5.0, c=25.0
+
+=== 为什么&quot;等价变换&quot;不总是等价：浮点不是实数域 ===
+  (x+z)-z = 0.0  而 x = 1.0  → &quot;(x+z)-z → x&quot; 这条改写在这里不成立
+  (x+y)-y = 0.0  而 x = 1.0  → 同样的改写，换一组数就不成立
+  nan*0.0 = nan   inf*0.0 = nan   → &quot;x*0→0&quot; 的前提是 x 有限
+  本课演示的都是&quot;能折叠&quot;的情形；判定标准与反例清单在第 4 课。</code></pre>
+<p>四处可核对的结论：<strong>折叠必须迭代</strong>（第 1 轮折出 <code>five</code>，第 2 轮才折出 <code>c</code>，第 3 轮确认不再变化）；<strong>折叠本身不减节点</strong>（12→12），把节点数降下来的是 DCE（12→8，删掉 5 个孤儿）；<strong>化简依赖折叠结果</strong>（<code>zero</code>/<code>one</code> 先作为常量节点存在，<code>+0</code>/<code>×1</code> 才判得出来）；<strong>改写前后逐元素一致</strong>（<code>y1</code>、<code>y2</code> 完全相同），这就是&quot;正确性验收&quot;的最小形式——真实编译器要跑的是整个测试集。</p>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选：在真实编译器里观察同一组 pass（需 pip 安装 tvm，非必需）----
+# python3 -c &quot;import tvm; print(tvm.__version__)&quot;        # 版本以官方为准，本课不假设具体号
+# 在 TVM 里，relay.transform.FoldConstant / SimplifyExpr / DeadCodeElimination
+# 就是本课四个 pass 的工业对应物，它们可以单独调用，也可以拼进 Sequential 顺序执行。
+# 没有 TVM 不影响本课：上面的纯 Python 版本已经把&quot;折叠→化简→属性改写→DCE&quot;跑通了。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：给 <code>fold</code> 加一条&quot;广播折叠&quot;——当输入是&quot;标量常量 + 常量列表&quot;时也折叠（例如 <code>t = x_const_list + 0.0</code>）。提示：先想清楚结果该是列表还是标量，以及这一步为什么在真实编译器里常交给后端常量算。</li>
+<li><strong>解释</strong>：为什么 pass 3 把 <code>_recip_y1</code> 常量节点插在 <code>mul</code> <strong>之前</strong>是必须的？如果插在后面，<code>run</code> 会报什么错，这暴露了图 IR 的哪条不变式？</li>
+<li><strong>对比/验证</strong>：把 <code>simplify</code> 的规则集扩展到 <code>x-0→x</code> 和 <code>x/1→x</code>，重跑程序并对照节点数变化；再故意加一条 <code>x*0→0</code>，用 <code>x = [float(&#39;nan&#39;), 1.0]</code> 做输入，观察逐元素对拍是否失效。</li>
+<li><strong>思考</strong>：本课的 DCE 从 <code>[&#39;y1&#39;,&#39;y2&#39;]</code> 出发。如果模型有多个输出（例如训练时还要输出 loss），DCE 的根集合该取什么？取漏一个会发生什么——是编译错误，还是更难发现的运行时错误？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Tianqi Chen et al., <em>TVM: An Automated End-to-End Optimizing Compiler for Deep Learning</em>（OSDI&#39;18；图级优化三件事：算子融合、常量折叠、静态内存规划）：<a href="https://www.usenix.org/conference/osdi18/presentation/chen" target="_blank" rel="noopener noreferrer">https://www.usenix.org/conference/osdi18/presentation/chen</a></li>
+<li>Apache TVM, <em>Relay Pass Infrastructure</em>（pass 管理器与 <code>FoldConstant</code> / <code>SimplifyExpr</code> / <code>DeadCodeElimination</code> 等 Relay 变换的官方说明）：<a href="https://tvm.apache.org/docs/dev/pass_infra.html" target="_blank" rel="noopener noreferrer">https://tvm.apache.org/docs/dev/pass_infra.html</a></li>
+<li>MLIR 官方文档（<code>arith</code> / <code>tensor</code> dialect 的 canonicalization 与 fold 机制：常量折叠与代数改写在现代多层 IR 上的落点）：<a href="https://mlir.llvm.org/" target="_blank" rel="noopener noreferrer">https://mlir.llvm.org/</a></li>
+<li>Lianmin Zheng et al., <em>The Deep Learning Compiler: A Comprehensive Survey</em>（第 5 节把图级优化归为&quot;节点级/图级/算子级&quot;三层的分类框架）：<a href="https://arxiv.org/abs/2002.03794" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2002.03794</a></li>
+</ul>
+<p><a href="#/l/mlc-ch4-l2">下一课：布局与内存格式变换：为什么 layout 能决定性能</a></p>

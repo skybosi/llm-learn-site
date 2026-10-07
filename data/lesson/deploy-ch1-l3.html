@@ -1,0 +1,161 @@
+<h2 id="h-技术选型决策树">技术选型决策树<a class="anchor" href="#h-技术选型决策树" aria-label="本节链接">#</a></h2>
+<p>前两课解决了&quot;要什么&quot;，这一课解决&quot;选什么&quot;。LLM 部署的技术栈现在非常多——vLLM、TensorRT-LLM、SGLang、llama.cpp、TGI，量化有 GPTQ/AWQ/FP8/GGUF，硬件从 L4 到 H100。<strong>选型没有万能答案，只有&quot;在约束下最划算&quot;的答案</strong>。本课给你一棵决策树，把需求输入进去，输出一套&quot;引擎 + 量化 + 硬件&quot;的组合。学完本课，你应当能解释每个分支的判断依据，并为一组真实需求给出可辩护的选型。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-主流推理引擎速览">1. 主流推理引擎速览<a class="anchor" href="#h-1-主流推理引擎速览" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>引擎</th>
+<th>强项</th>
+<th>适用场景</th>
+<th>备注</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>vLLM</strong></td>
+<td>PagedAttention、continuous batching、OpenAI 兼容、生态好、上手快</td>
+<td>在线服务、通用首选</td>
+<td>社区活跃，文档全</td>
+</tr>
+<tr>
+<td><strong>SGLang</strong></td>
+<td>RadixAttention（前缀缓存）、结构化输出、长序列 prefill 快</td>
+<td>RAG、多轮、Agent、长上下文</td>
+<td>与 vLLM 定位接近，增长快</td>
+</tr>
+<tr>
+<td><strong>TensorRT-LLM</strong></td>
+<td>NVIDIA 官方、算子深度优化、低延迟高吞吐</td>
+<td>追求极致性能、NVIDIA 全家桶</td>
+<td>编译/部署流程较重</td>
+</tr>
+<tr>
+<td><strong>llama.cpp / Ollama</strong></td>
+<td>GGUF 量化、纯 CPU/端侧、零依赖</td>
+<td>端侧、边缘、CPU 推理、本地小模型</td>
+<td>吞吐不及 GPU 引擎</td>
+</tr>
+<tr>
+<td><strong>TGI（HF Text Generation Inference）</strong></td>
+<td>Hugging Face 出品、与 HF 生态集成</td>
+<td>HF Hub 模型快速上线</td>
+<td>功能与 vLLM 重叠</td>
+</tr>
+</tbody></table>
+<h4 id="h-2-量化方案怎么选">2. 量化方案怎么选<a class="anchor" href="#h-2-量化方案怎么选" aria-label="本节链接">#</a></h4>
+<p>上一门课学过原理，这里给<strong>选型结论</strong>：</p>
+<ul>
+<li><strong>AWQ / GPTQ</strong>：4-bit 权重量化，显存约为 FP16 的 1/4，精度损失小，GPU 推理主流；</li>
+<li><strong>FP8</strong>：8-bit，需 H100/Ada 等支持 FP8 的硬件，吞吐高、精度几乎无损；</li>
+<li><strong>GGUF（Q4_K_M 等）</strong>：llama.cpp 生态，支持 CPU + 混合 GPU，端侧/边缘首选；</li>
+<li><strong>bitsandbytes</strong>：8-bit/4-bit，主要用于加载显存不够时的权宜之计，生产吞吐一般。</li>
+</ul>
+<p>经验：<strong>GPU 在线服务优先 AWQ（4-bit 或 8-bit）；有 FP8 硬件优先 FP8；端侧只能 GGUF</strong>。</p>
+<h4 id="h-3-硬件怎么选">3. 硬件怎么选<a class="anchor" href="#h-3-硬件怎么选" aria-label="本节链接">#</a></h4>
+<p>按&quot;模型参数 × 精度&quot;估算权重大小（FP16 约 2 字节/参数，INT4 约 0.5 字节/参数 + 开销），再对照卡显存：</p>
+<table>
+<thead>
+<tr>
+<th>GPU</th>
+<th>显存</th>
+<th>适合（FP16）</th>
+<th>适合（INT4/AWQ）</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>L4</td>
+<td>24GB</td>
+<td>≤ 7B</td>
+<td>≤ 13B</td>
+</tr>
+<tr>
+<td>A10</td>
+<td>24GB</td>
+<td>≤ 7B</td>
+<td>≤ 13B</td>
+</tr>
+<tr>
+<td>A100</td>
+<td>40/80GB</td>
+<td>≤ 30B / ≤ 70B</td>
+<td>≤ 70B / 更大</td>
+</tr>
+<tr>
+<td>H100</td>
+<td>80GB</td>
+<td>≤ 70B</td>
+<td>70B+ 或需 FP8 提速</td>
+</tr>
+</tbody></table>
+<p>注意：显存还要留出 <strong>KV Cache 和激活</strong>，所以&quot;权重大小 ≤ 显存&quot;只是必要条件，不是充分条件。</p>
+<h4 id="h-4-决策树主线">4. 决策树主线<a class="anchor" href="#h-4-决策树主线" aria-label="本节链接">#</a></h4>
+<p>把选择流程写成一条主线（下面示例会代码化）：</p>
+<ol>
+<li><strong>先定位场景</strong>：端侧？→ llama.cpp + GGUF；在线/离线 GPU？→ 继续；</li>
+<li><strong>看延迟敏感</strong>：在线延迟敏感 → vLLM / SGLang / TensorRT-LLM；离线批处理 → vLLM 打满吞吐即可；</li>
+<li><strong>看特殊需求</strong>：RAG/长前缀 → SGLang（前缀缓存）；极致性能 + NVIDIA 栈 → TensorRT-LLM；快速上线 → vLLM；</li>
+<li><strong>定量化</strong>：有 FP8 硬件 → FP8；否则 GPU 上 AWQ（4-bit）平衡精度与显存；</li>
+<li><strong>定硬件</strong>：按&quot;权重 + KV Cache&quot;估显存，选刚好装下、再留 20–30% 余量的卡；单卡装不下 → 下一章的多卡张量并行。</li>
+</ol>
+<p><figure><img class="md-img" src="content/courses/llm-deployment-practice/assets/chapter-1-figure-03.svg" alt="技术选型决策树：从根节点&quot;端侧还是 GPU&quot;分叉，逐级问延迟敏感度、特殊需求、硬件是否支持 FP8，最终叶子节点标注推荐组合（如 vLLM+AWQ+A100、SGLang+FP8+H100、llama.cpp+GGUF+端侧）" loading="lazy" decoding="async"><figcaption>技术选型决策树：从根节点&quot;端侧还是 GPU&quot;分叉，逐级问延迟敏感度、特殊需求、硬件是否支持 FP8，最终叶子节点标注推荐组合（如 vLLM+AWQ+A100、SGLang+FP8+H100、llama.cpp+GGUF+端侧）</figcaption></figure>
+</p>
+<h3 id="h-二可运行示例">二、可运行示例<a class="anchor" href="#h-二可运行示例" aria-label="本节链接">#</a></h3>
+<p>下面的脚本把决策树实现为函数：输入场景特征，输出推荐引擎、量化与硬件。</p>
+<pre data-lang="python"><code class="language-python"># -*- coding: utf-8 -*-
+# 技术选型决策树：需求特征 -&gt; 推荐(引擎, 量化, 硬件)
+
+def select_engine(edge: bool, latency_sensitive: bool, long_prefix: bool,
+                  nvidia_stack: bool) -&gt; str:
+    if edge:
+        return &quot;llama.cpp&quot;
+    if latency_sensitive and long_prefix:
+        return &quot;SGLang（前缀缓存优先）&quot;
+    if latency_sensitive and nvidia_stack:
+        return &quot;TensorRT-LLM&quot;
+    return &quot;vLLM&quot;
+
+def select_quant(fp8_hw: bool, edge: bool) -&gt; str:
+    if edge:
+        return &quot;GGUF Q4_K_M&quot;
+    return &quot;FP8&quot; if fp8_hw else &quot;AWQ 4-bit&quot;
+
+def select_gpu(params_b: float, quant: str, kv_overhead_ratio: float = 0.3) -&gt; str:
+    # 权重字节估算：FP16≈2B/参, INT4≈0.5B/参, FP8≈1B/参
+    bytes_per_param = {&quot;GGUF Q4_K_M&quot;: 0.55, &quot;AWQ 4-bit&quot;: 0.55,
+                       &quot;FP8&quot;: 1.05, &quot;FP16&quot;: 2.0}[quant]
+    weight_gb = params_b * bytes_per_param
+    need_gb = weight_gb * (1 + kv_overhead_ratio)  # 留 KV Cache/激活余量
+    # 常见卡显存，按从小到大选第一张够用的
+    for gpu, mem in [(&quot;L4&quot;, 24), (&quot;A10&quot;, 24), (&quot;A100-40G&quot;, 40),
+                     (&quot;A100-80G&quot;, 80), (&quot;H100-80G&quot;, 80)]:
+        if need_gb &lt;= mem * 0.85:   # 再留 15% 碎片余量
+            return f&quot;{gpu}（需显存约 {need_gb:.0f}GB）&quot;
+    return &quot;单卡装不下 -&gt; 下一章多卡张量并行&quot;
+
+cases = [
+    (&quot;手机离线翻译(0.5B)&quot;,  dict(edge=True,  latency_sensitive=True,  long_prefix=False, nvidia_stack=False, fp8_hw=False, params_b=0.5)),
+    (&quot;客服机器人(7B)&quot;,      dict(edge=False, latency_sensitive=True,  long_prefix=False, nvidia_stack=False, fp8_hw=False, params_b=7.0)),
+    (&quot;RAG 文档问答(8B)&quot;,    dict(edge=False, latency_sensitive=True,  long_prefix=True,  nvidia_stack=False, fp8_hw=True,  params_b=8.0)),
+    (&quot;离线批量生成(70B)&quot;,   dict(edge=False, latency_sensitive=False, long_prefix=False, nvidia_stack=False, fp8_hw=False, params_b=70.0)),
+]
+for name, f in cases:
+    eng = select_engine(f[&quot;edge&quot;], f[&quot;latency_sensitive&quot;], f[&quot;long_prefix&quot;], f[&quot;nvidia_stack&quot;])
+    q = select_quant(f[&quot;fp8_hw&quot;], f[&quot;edge&quot;])
+    gpu = select_gpu(f[&quot;params_b&quot;], q)
+    print(f&quot;{name} -&gt; 引擎：{eng} ｜ 量化：{q} ｜ 硬件：{gpu}&quot;)</code></pre>
+<p>运行后你会看到四个需求各自得到一套有依据的组合，尤其注意 70B 用 AWQ 4-bit（权重约 38GB）在 A100-80G 上&quot;单卡刚能装、但很紧&quot;，实战里通常直接上双卡——这正是下一章的起点。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>补分支</strong>：给决策树增加&quot;是否需要 OpenAI 兼容 API&quot;这一问，说明它对 vLLM 与 TensorRT-LLM 选择的影响。</li>
+<li><strong>精度敏感场景</strong>：如果一个医疗/法律场景对量化精度极敏感（拒绝 4-bit 损失），把 <code>select_quant</code> 改成&quot;优先 FP8，无 FP8 硬件时用 FP16&quot;，重跑 70B 案例，观察硬件选择如何变化。</li>
+<li><strong>查成本</strong>：为&quot;客服机器人(7B)&quot;案例，分别用 A10 与 A100-40G 估算月成本（假设单价 1.2 与 3.0 美元/小时），说明&quot;刚好够用&quot;的卡为何往往更划算。</li>
+<li><strong>验证决策树</strong>：写一个你设想的新需求（含端侧/延迟/长前缀/FP8 四类特征），走一遍决策树，并口头解释每一步为什么这么选。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>vLLM 文档 · 支持的模型与量化方式：<a href="https://docs.vllm.ai/en/latest/features/quantization/" target="_blank" rel="noopener noreferrer">https://docs.vllm.ai/en/latest/features/quantization/</a></li>
+<li>SGLang 项目与 RadixAttention：<a href="https://github.com/sgl-project/sglang" target="_blank" rel="noopener noreferrer">https://github.com/sgl-project/sglang</a></li>
+<li>NVIDIA · TensorRT-LLM 文档：<a href="https://docs.nvidia.com/tensorrt-llm/" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/tensorrt-llm/</a></li>
+<li>Hugging Face · 量化方法总览：<a href="https://huggingface.co/docs/transformers/main/en/quantization/overview" target="_blank" rel="noopener noreferrer">https://huggingface.co/docs/transformers/main/en/quantization/overview</a></li>
+</ul>
+<p><a href="#/l/deploy-ch2-l1">下一课：环境准备与量化</a></p>

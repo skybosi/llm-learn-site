@@ -1,0 +1,100 @@
+<h2 id="h-transformer-用于时序">Transformer 用于时序<a class="anchor" href="#h-transformer-用于时序" aria-label="本节链接">#</a></h2>
+<p>上一章结尾我们留下一个问题：seq2seq 的固定长度瓶颈，让解码器每步只能看同一个历史摘要。Transformer 用<strong>自注意力（self-attention）</strong>彻底解决了它——序列里任意两个时间步之间都可以直接&quot;互相看&quot;，不需要像 RNN 那样一步一步传递信息。这一章我们把 Transformer 从自然语言处理搬到时间序列上，先讲清楚它为什么适合、又在哪里卡壳，为下一课 Informer 铺路。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-自注意力任意两两时间步直接相连">1. 自注意力：任意两两时间步直接相连<a class="anchor" href="#h-1-自注意力任意两两时间步直接相连" aria-label="本节链接">#</a></h4>
+<p>回想注意力：用 Query 去比对一串 Key，得到权重，再对 Value 加权求和。<strong>自注意力</strong>的特殊之处在于，Query、Key、Value 都来自<strong>同一条序列</strong>——每个时间步既当查询者，又当被查询者。于是序列里第 i 步和第 j 步之间有了<strong>一条直接的信息通路</strong>，不管它们相隔多远。</p>
+<p>这对时间序列意味着什么？长程依赖不再需要&quot;一步接一步&quot;地传递。第 100 步想参考第 3 步，直接算一次注意力打分即可，路径长度是 O(1)；而 RNN 要传 97 步，TCN 要靠足够大的感受野。这就是 Transformer 捕捉长程依赖的根本优势：<strong>把&quot;距离&quot;从路径长度问题变成了打分权重问题</strong>。</p>
+<h4 id="h-2-三个矩阵qkv-从何而来">2. 三个矩阵：Q、K、V 从何而来<a class="anchor" href="#h-2-三个矩阵qkv-从何而来" aria-label="本节链接">#</a></h4>
+<p>对每个时间步的输入向量 <code>x_i</code>，用三个可学习矩阵分别投影成：</p>
+<pre><code>q_i = W_Q x_i,   k_i = W_K x_i,   v_i = W_V x_i</code></pre>
+<p>然后第 i 步的输出是对所有 Value 的加权和：</p>
+<pre><code>out_i = Σ_j  softmax(q_i · k_j / √d) · v_j</code></pre>
+<p><code>q_i</code> 与 <code>k_j</code> 的点积衡量&quot;第 i 步想找的信息，和第 j 步提供的信息有多匹配&quot;，<code>√d</code> 缩放防止维度大时点积过大导致 softmax 饱和。这一套我们在注意力机制课程里已经完整推导过，这里直接拿来用。</p>
+<h4 id="h-3-位置编码自注意力天生不知先后">3. 位置编码：自注意力天生&quot;不知先后&quot;<a class="anchor" href="#h-3-位置编码自注意力天生不知先后" aria-label="本节链接">#</a></h4>
+<p>自注意力有一个致命盲区：<strong>它完全看不出输入的顺序</strong>。把序列任意打乱，自注意力算出的结果一模一样（只是位置换了）。但时间序列的顺序是核心信息——&quot;昨天在前、今天在后&quot;必须被编码进去。</p>
+<p>解法是<strong>位置编码（positional encoding）</strong>：在输入向量上加一个只由位置决定、不参与训练的信号。最经典的是正弦余弦编码，第 pos 个位置、第 2i 个维度：</p>
+<pre><code>PE(pos, 2i)   = sin(pos / 10000^(2i/d))
+PE(pos, 2i+1) = cos(pos / 10000^(2i/d))</code></pre>
+<p>不同频率的正弦波叠加，让每个位置拥有独一无二的&quot;指纹&quot;，且相邻位置编码相近、相对位置关系可被网络学到。也可以直接用可学习的嵌入（learned embedding），让网络自己学一套位置表示。</p>
+<h4 id="h-4-多头注意力--残差--前馈transformer-的完整单元">4. 多头注意力 + 残差 + 前馈：Transformer 的完整单元<a class="anchor" href="#h-4-多头注意力--残差--前馈transformer-的完整单元" aria-label="本节链接">#</a></h4>
+<p>实用中，自注意力不是只算一次，而是<strong>多头（multi-head）</strong>：把 Q、K、V 切分成 h 份，各自独立做注意力，再拼接投影。不同头可以关注不同模式——一个头看趋势、一个头看周期性、一个头看突变点。之后接<strong>残差连接 + LayerNorm</strong>稳定训练，再接一个<strong>逐位置的前馈网络（FFN）</strong>增加非线性容量。这三件套叠 N 层，就构成 Transformer 编码器。</p>
+<h4 id="h-5-用在时序上的两处调整">5. 用在时序上的两处调整<a class="anchor" href="#h-5-用在时序上的两处调整" aria-label="本节链接">#</a></h4>
+<p>把 Transformer 搬到时序，需要做两个关键调整：</p>
+<ul>
+<li><strong>因果掩码</strong>：做预测时，第 t 步不能看到第 t+1 步，所以注意力打分矩阵要对&quot;未来位置&quot;置 <code>-∞</code>，softmax 后权重为 0——这和 TCN 的因果卷积是同一约束的两种实现；</li>
+<li><strong>输入形状</strong>：NLP 里输入是词 token 序列，时序里输入是滑动窗口的每一步（可以带多个特征），把&quot;时间步&quot;当作&quot;token&quot;即可。</li>
+</ul>
+<p>一切看起来很美好，直到遇到<strong>长序列</strong>——这恰恰是时间序列的常态，也是下一课的主题。</p>
+<p><figure><img class="md-img" src="content/courses/time-series/assets/chapter-5-figure-01.svg" alt="自注意力让任意两个时间步直接相连，位置编码补充顺序信息" loading="lazy" decoding="async"><figcaption>自注意力让任意两个时间步直接相连，位置编码补充顺序信息</figcaption></figure>
+</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面用 PyTorch 手写一个单头自注意力 + 正弦位置编码，作用在一条时间序列的窗口上，直观看出&quot;每个时间步如何加权参考其它时间步&quot;。</p>
+<pre data-lang="python"><code class="language-python">import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+torch.manual_seed(0)
+
+# 1) 正弦位置编码：给每个位置一个固定的&quot;顺序指纹&quot;
+def sinusoidal_pe(seq_len, d):
+    pe = torch.zeros(seq_len, d)
+    pos = torch.arange(seq_len).float().unsqueeze(1)   # (L, 1)
+    i = torch.arange(d // 2).float().unsqueeze(0)      # (1, d/2)
+    angle = pos / (10000 ** (2 * i / d))
+    pe[:, 0::2] = torch.sin(angle)
+    pe[:, 1::2] = torch.cos(angle)
+    return pe                                          # (L, d)
+
+# 2) 单头自注意力
+class SelfAttention(nn.Module):
+    def __init__(self, d):
+        super().__init__()
+        self.Wq = nn.Linear(d, d, bias=False)
+        self.Wk = nn.Linear(d, d, bias=False)
+        self.Wv = nn.Linear(d, d, bias=False)
+
+    def forward(self, x, causal=True):
+        # x: (L, d)
+        q, k, v = self.Wq(x), self.Wk(x), self.Wv(x)
+        scores = q @ k.T / (q.size(-1) ** 0.5)         # (L, L) 打分矩阵
+        if causal:
+            # 上三角置 -inf，让每个位置只看得到过去
+            mask = torch.triu(torch.ones_like(scores), diagonal=1).bool()
+            scores = scores.masked_fill(mask, float(&quot;-inf&quot;))
+        attn = F.softmax(scores, dim=-1)               # 每行是&quot;该位置看所有位置&quot;的权重
+        return attn @ v, attn                          # 输出与权重矩阵
+
+# 3) 构造一条 8 步的窗口序列，每步用 4 维特征
+L, d = 8, 4
+x = torch.randn(L, d)
+x = x + sinusoidal_pe(L, d)                            # 加上位置编码
+attn_layer = SelfAttention(d)
+out, attn = attn_layer(x)
+
+print(&quot;打分矩阵（因果掩码后，-inf 已变为 0 权重）:&quot;)
+print((attn &gt; 0).float())                              # 看哪些位置之间有权重
+print(&quot;\n第 4 个时间步对各位置的注意力权重:&quot;)
+print(attn[3].tolist())                                # 下标 0..3 有权重，4..7 为 0</code></pre>
+<p>运行后注意：</p>
+<ul>
+<li>权重矩阵是一个<strong>下三角</strong>（含对角线），说明第 i 步只看得到 <code>0..i</code>，未来位置权重全为 0——因果性成立；</li>
+<li>第 4 个时间步（下标 3）对下标 0、1、2、3 各有一个权重，这些权重<strong>由 q_i 与 k_j 的相似度动态决定</strong>，不是固定的——这就是&quot;数据相关&quot;的注意力。</li>
+</ul>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>把 <code>causal=False</code> 重新运行，观察权重矩阵变成完整方阵。此时第 3 步&quot;看到&quot;了第 7 步的信息，为什么这在预测任务里是作弊？</li>
+<li>打印 <code>sinusoidal_pe(8, 4)</code> 的矩阵，比较相邻两行的数值差异，体会&quot;相邻位置编码相近&quot;的性质。</li>
+<li>把单头改造成多头：把 <code>d=8</code> 切成 <code>h=2</code> 份，各自做注意力再拼接。观察不同头的权重矩阵是否学到不同的&quot;关注模式&quot;。</li>
+<li>思考：一个长度 L=1000 的窗口，自注意力的打分矩阵 <code>scores</code> 有多大？计算量和内存各是多少量级？这预示了 Transformer 用于长时序的什么瓶颈？</li>
+</ol>
+<h3 id="h-为什么这样做理论推导">为什么这样做？——理论推导<a class="anchor" href="#h-为什么这样做理论推导" aria-label="本节链接">#</a></h3>
+<p>自注意力为什么能捕捉长程依赖？关键在<strong>信息通路的路径长度</strong>。设序列有 L 个时间步。RNN 里第 1 步到第 L 步的信息要经过 L-1 个递推步骤，每一步都是一次非线性变换，信息沿途衰减；TCN 里要靠感受野覆盖，层数需 O(log L)，但每层卷积核仍是局部的。自注意力里，第 1 步和第 L 步之间是<strong>直接相连</strong>的——打分矩阵 <code>QK^T</code> 里第 (L,1) 号元素就是它们之间的一条边，一次矩阵乘即可得到，路径长度是 O(1)。</p>
+<p>再看代价。打分矩阵 <code>scores = QK^T</code> 的形状是 <code>L × L</code>，它的计算量是 O(L² d)，softmax 也是 O(L²)。对短序列（NLP 的句子、几十上百 token）这无所谓；但时间序列动辄几千上万个点，L² 会迅速爆炸——L=10000 时矩阵有 1 亿个元素。<strong>用 O(1) 的路径长度换来 O(L²) 的代价</strong>，这就是 Transformer 用于长时序时&quot;甜中带苦&quot;的根源。</p>
+<p><strong>母原理连接</strong>：自注意力是&quot;全连接信息交换 + 数据相关权重&quot;的实例。它放弃了卷积的&quot;局部性先验&quot;和 RNN 的&quot;顺序性先验&quot;，转而假设&quot;任何两个位置都可能有关系，关系强度由数据当场决定&quot;。这个假设让模型表达力极强，代价是失去了局部/顺序的归纳偏置，必须靠位置编码补回顺序、靠海量数据学会局部性。理解这一取舍，就理解了为什么后面会出现 Informer、Autoformer、PatchTST 等一堆&quot;为长时序省成本&quot;的变体。</p>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Vaswani et al. · Attention Is All You Need：<a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1706.03762</a></li>
+<li>Zhou et al. · Informer: Beyond Efficient Transformer for Long Sequence Time-Series Forecasting（下一课的原文）：<a href="https://arxiv.org/abs/2012.07436" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2012.07436</a></li>
+<li>PyTorch 官方文档 · torch.nn.MultiheadAttention：<a href="https://pytorch.org/docs/stable/generated/torch.nn.MultiheadAttention.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/docs/stable/generated/torch.nn.MultiheadAttention.html</a></li>
+</ul>
+<p><a href="#/l/ts-ch5-l2">下一课：Informer 等长时序模型</a></p>

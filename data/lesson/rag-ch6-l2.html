@@ -1,0 +1,485 @@
+<h2 id="h-在线服务的缓存与批处理收益风险与阈值">在线服务的缓存与批处理：收益、风险与阈值<a class="anchor" href="#h-在线服务的缓存与批处理收益风险与阈值" aria-label="本节链接">#</a></h2>
+<h3 id="h-这一节要解决什么">这一节要解决什么<a class="anchor" href="#h-这一节要解决什么" aria-label="本节链接">#</a></h3>
+<p>上一节把索引变成了&quot;可增量、可版本、可回滚&quot;的段式结构。索引会更新了，但线上查询本身还有大量浪费：</p>
+<ul>
+<li>同一个问题被反复问（客服场景里比例很高）；</li>
+<li>相似但不相同的问题被当成新问题处理；</li>
+<li>每个请求都要重新 prefill 一遍<strong>一模一样的系统提示</strong>；</li>
+<li>请求稀疏时 GPU 空转，请求密集时又没有批处理。</li>
+</ul>
+<p>缓存在这里看起来是免费午餐。但这一节要说清楚的是：<strong>缓存有四层，风险谱完全不同</strong>。最安全的（embedding 缓存）和最危险的（语义缓存）相差极大，而语义缓存恰恰是最容易被&quot;加上去&quot;的那一层。</p>
+<p>本节要回答四个问题：</p>
+<ol>
+<li>四层缓存各自的收益与失效条件是什么？</li>
+<li>前缀缓存（prefix caching）能省多少？<strong>它成立的前提是一个硬约束</strong>，违反它收益会瞬间归零。</li>
+<li>语义缓存的两类错误怎么算？<strong>最优阈值是什么，什么时候&quot;不开&quot;才是最优解？</strong></li>
+<li>缓存键怎么写才不会绕过权限？批处理的收益与尾延迟代价怎么权衡？</li>
+</ol>
+<blockquote>
+<p><strong>结论先放在这里</strong>：前缀缓存的收益取决于<strong>最长公共前缀的长度</strong>，所以&quot;稳定内容放前面&quot;是硬约束（⚠️ 示例：稳定前缀布局可复用 68.0% 的 token，把检索片段插到最前面只剩 6.7%，插在中间 51.5%）。语义缓存的命中阈值不是一个&quot;设高一点就安全&quot;的参数：⚠️ 示例中当错答代价是漏命中代价的 100 倍以上时，<strong>语义缓存的最优期望损失已经高于&quot;根本不开缓存&quot;</strong> —— 也就是说，正确决策是不开。而缓存键漏掉 tenant 会造成<strong>跨租户答案泄漏</strong>，这是缓存层最常见的越权路径。</p>
+</blockquote>
+<h3 id="h-一四层缓存风险谱">一、四层缓存：风险谱<a class="anchor" href="#h-一四层缓存风险谱" aria-label="本节链接">#</a></h3>
+<table>
+<thead>
+<tr>
+<th>层</th>
+<th>缓存什么</th>
+<th>典型收益</th>
+<th>失效条件</th>
+<th>安全风险</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>Embedding 缓存</strong></td>
+<td>query → 向量</td>
+<td>高（重复查询多）</td>
+<td>模型版本变更</td>
+<td><strong>几乎无</strong>（只依赖 query 文本 + 模型版本）</td>
+</tr>
+<tr>
+<td><strong>检索结果缓存</strong></td>
+<td>query → top-k chunk id</td>
+<td>中高</td>
+<td>索引更新、权限变化</td>
+<td><strong>中</strong>：必须带租户/权限/索引版本，否则越权或返回已删文档</td>
+</tr>
+<tr>
+<td><strong>重排缓存</strong></td>
+<td>(query, chunk) → 分数</td>
+<td>中</td>
+<td>重排模型/版本</td>
+<td>低（但同样要带版本）</td>
+</tr>
+<tr>
+<td><strong>生成缓存</strong></td>
+<td>前缀 KV / 完整回答</td>
+<td>高</td>
+<td>前缀不稳定、答案时效性</td>
+<td><strong>高</strong>：完整回答缓存会固化错误、跨租户泄漏、时效过期</td>
+</tr>
+</tbody></table>
+<p>三条判据：</p>
+<ol>
+<li><strong>缓存的键必须包含所有&quot;能改变结果&quot;的版本量</strong>。少一个维度 = 一类隐蔽 bug（§4）。</li>
+<li><strong>缓存的收益随层数上升，风险也随层数上升</strong>。工程上应当<strong>从最安全的层开始做</strong>，把生成缓存（尤其语义缓存）留到最后，并且要用数据决定要不要做。</li>
+<li><strong>&quot;质量不变、成本下降&quot;是缓存唯一合法的收益形式</strong>。一旦缓存改变了质量（哪怕只在一小部分请求上），它就必须按&quot;质量-成本前沿&quot;（第 5.4 节）的方式评估，而不是按&quot;省钱&quot;评估。</li>
+</ol>
+<h3 id="h-二前缀缓存机理与硬约束">二、前缀缓存：机理与硬约束<a class="anchor" href="#h-二前缀缓存机理与硬约束" aria-label="本节链接">#</a></h3>
+<h4 id="h-21-机理">2.1 机理<a class="anchor" href="#h-21-机理" aria-label="本节链接">#</a></h4>
+<p>自回归生成时，prompt 的每个 token 都要算 KV。<strong>如果两次请求的 token 前缀逐字相同</strong>，那么这段前缀的 KV 就是相同的，可以直接复用，不必重算。</p>
+<p>省下的是 <strong>prefill</strong>，不是 decode：</p>
+<p><span class="math-fallback math-fallback--block">\text{节省比例} = \frac{n_{\text{reuse}}}{n_{\text{prefill}}}} \quad(\text{仅在 prefill 项上})</span></p>
+<p>其中</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">reuse</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.0525em;vertical-align:-0.3025em;"></span><span class="mord text"><span class="mord">LCP</span></span><span class="mopen">(</span><span class="mord"><span class="mord text"><span class="mord">prompt</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1864em;"><span style="top:-2.4559em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2441em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord text"><span class="mord">prompt</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.207em;"><span style="top:-2.4559em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">t</span><span class="mbin mtight">−</span><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.3025em;"><span></span></span></span></span></span></span><span class="mclose">)</span></span></span></span></span></p>
+<p><strong>这就是硬约束</strong>：可复用的 token 数等于<strong>最长公共前缀长度</strong>。前缀一旦在某处不同，后面的全部作废 —— 哪怕后面的内容完全一样。</p>
+<h4 id="h-22-布局决定收益">2.2 布局决定收益<a class="anchor" href="#h-22-布局决定收益" aria-label="本节链接">#</a></h4>
+<p>典型的 RAG prompt 有四段：系统提示 / 租户与版本头 / 检索证据 / 用户问题。四种摆放方式的可复用比例（⚠️ 合成实验，近似 token 切分，平均 prompt 长度 194 token）：</p>
+<table>
+<thead>
+<tr>
+<th>布局</th>
+<th>平均可复用 token</th>
+<th>可复用比例</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>stable-first</code>：系统 + 租户头 + 证据 + 问题</td>
+<td>132.0</td>
+<td><strong>0.680</strong></td>
+<td>稳定内容在前，公共前缀 = 系统 + 租户头</td>
+</tr>
+<tr>
+<td><code>interleaved</code>：系统 + 证据 + 租户头 + 问题</td>
+<td>100.0</td>
+<td>0.515</td>
+<td>租户头被挤到证据后，只能复用系统提示</td>
+</tr>
+<tr>
+<td><code>docs-first</code>：证据 + 系统 + 租户头 + 问题</td>
+<td>13.0</td>
+<td><strong>0.067</strong></td>
+<td>证据每次不同 → 公共前缀塌到几乎 0</td>
+</tr>
+</tbody></table>
+<p><strong>三个可操作的结论</strong>：</p>
+<ol>
+<li><strong>把最稳定的东西放最前面</strong>：系统提示 → 租户/权限/版本头 → 证据 → 问题。顺序不能反。</li>
+<li><strong>任何&quot;每请求都变&quot;的内容都不能插在前面</strong>：时间戳、request id、用户名、检索结果 —— 插一个就把前缀切断。</li>
+<li><strong>收益可以被预先计算</strong>：只要统计各段长度与变化频率，就能算出期望可复用比例，不必上线后猜。⚠️ 示例中 <code>stable-first</code> 与 <code>docs-first</code> 的差距是 <strong>10 倍</strong>（0.680 vs 0.067），这是纯粹的布局选择，零额外成本。</li>
+</ol>
+<h4 id="h-23-失效条件与边界">2.3 失效条件与边界<a class="anchor" href="#h-23-失效条件与边界" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>情况</th>
+<th>后果</th>
+<th>处置</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>检索片段插在系统提示前</td>
+<td>前缀命中率塌到接近 0</td>
+<td>重排 prompt 结构</td>
+</tr>
+<tr>
+<td>模板版本变更（多一个空格）</td>
+<td>旧缓存全部失效</td>
+<td>把模板版本写进监控指标</td>
+</tr>
+<tr>
+<td>多轮对话每轮拼接方式不同</td>
+<td>前缀断裂</td>
+<td>固定&quot;追加&quot;式拼接（只往后加）</td>
+</tr>
+<tr>
+<td>前缀缓存跨请求但<strong>跨租户</strong>共享</td>
+<td>越权（KV 里含他人内容）</td>
+<td>缓存键必须含租户与权限指纹</td>
+</tr>
+<tr>
+<td>位置编码与缓存实现不匹配</td>
+<td>复用结果错误</td>
+<td>依赖框架保证；不要手工拼 KV</td>
+</tr>
+</tbody></table>
+<p><strong>多轮对话是前缀缓存的最佳场景</strong>，因为&quot;历史 + 新问题&quot;天然是追加式的：只要每轮都把新内容加在尾部，前缀就能不断复用。反过来说，<strong>如果你在每轮重写系统提示或重排历史，就等于主动放弃这块收益。</strong></p>
+<h3 id="h-三语义缓存把要不要开算出来">三、语义缓存：把&quot;要不要开&quot;算出来<a class="anchor" href="#h-三语义缓存把要不要开算出来" aria-label="本节链接">#</a></h3>
+<h4 id="h-31-机制与两类错误">3.1 机制与两类错误<a class="anchor" href="#h-31-机制与两类错误" aria-label="本节链接">#</a></h4>
+<p>语义缓存用&quot;相似度 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5782em;vertical-align:-0.0391em;"></span><span class="mrel">&gt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span></span></span></span>&quot;代替精确匹配：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord">hit</span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0359em;">q</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">⟺</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.6901em;vertical-align:-0.8882em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.4306em;"><span style="top:-2.3479em;margin-left:0em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.0359em;">q</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6828em;"><span style="top:-2.786em;margin-right:0.0714em;"><span class="pstrut" style="height:2.5em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mord mtight"><span class="mord mtight">′</span></span></span></span></span></span></span></span></span><span class="mrel mtight">∈</span><span class="mord text mtight"><span class="mord mtight">cache</span></span></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span><span class="mop">max</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.8882em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">sim</span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0359em;">q</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0359em;">q</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8019em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">′</span></span></span></span></span></span></span></span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&gt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span></span></span></span></span></p>
+<p>它有两类错误，方向相反：</p>
+<ul>
+<li><strong>假命中（FPR）</strong>：不同意图的问题被判为同一意图 → 复用了<strong>错误的答案</strong>。这类错误<strong>很难被发现</strong>（用户拿到了一个通顺但答错的内容），而且会被缓存<strong>固化</strong>（越多人命中，越难纠正）。</li>
+<li><strong>假未命中（FNR）</strong>：同一意图没被认出 → 白付一次完整成本。</li>
+</ul>
+<p>期望损失（每查询，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3175em;"><span style="top:-2.55em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">miss</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> 为归一化单位）：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">E</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6389em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">same</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord">FNR</span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3175em;"><span style="top:-2.55em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">miss</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">same</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord">FPR</span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.9694em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">wrong</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span></span></span></p>
+<p>其中 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">same</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 是&quot;本次查询在缓存里确实有同意图条目&quot;的先验比例。</p>
+<h4 id="h-32-阈值扫描结论与直觉相反">3.2 阈值扫描：结论与直觉相反<a class="anchor" href="#h-32-阈值扫描结论与直觉相反" aria-label="本节链接">#</a></h4>
+<p>⚠️ 合成实验（同意图相似度 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.3669em;"></span><span class="mrel">∼</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord">Beta</span></span><span class="mopen">(</span><span class="mord">9</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">1.6</span><span class="mclose">)</span></span></span></span>、不同意图 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.3669em;"></span><span class="mrel">∼</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord">Beta</span></span><span class="mopen">(</span><span class="mord">6</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">3</span><span class="mclose">)</span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">same</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.35</span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3175em;"><span style="top:-2.55em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">miss</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span>）：</p>
+<table>
+<thead>
+<tr>
+<th><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span></span></span></span></th>
+<th>FNR</th>
+<th>FPR</th>
+<th><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">E</span></span></span></span>（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0361em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">wrong</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mord">/</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3175em;"><span style="top:-2.55em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">miss</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">10</span></span></span></span>）</th>
+<th><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">E</span></span></span></span>（100）</th>
+<th><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">E</span></span></span></span>（1000）</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>0.700</td>
+<td>0.097</td>
+<td>0.449</td>
+<td>2.9523</td>
+<td>29.2167</td>
+<td>291.8613</td>
+</tr>
+<tr>
+<td>0.800</td>
+<td>0.272</td>
+<td>0.203</td>
+<td>1.4162</td>
+<td>13.3034</td>
+<td>132.1754</td>
+</tr>
+<tr>
+<td>0.900</td>
+<td>0.618</td>
+<td>0.038</td>
+<td>0.4639</td>
+<td>2.6930</td>
+<td>24.9844</td>
+</tr>
+<tr>
+<td>0.950</td>
+<td>0.840</td>
+<td>0.005</td>
+<td><strong>0.3293</strong></td>
+<td>0.6485</td>
+<td>3.8396</td>
+</tr>
+<tr>
+<td>0.975</td>
+<td>0.941</td>
+<td>0.001</td>
+<td>0.3342</td>
+<td><strong>0.3793</strong></td>
+<td><strong>0.8297</strong></td>
+</tr>
+</tbody></table>
+<p>最优阈值与&quot;值不值得开&quot;：</p>
+<pre><code>最优 tau*(C_wrong/C_miss=  10) = 0.950  最小期望损失 = 0.3293  | 禁用缓存损失 = 0.3500 -&gt; 值得开
+最优 tau*(C_wrong/C_miss= 100) = 0.975  最小期望损失 = 0.3793  | 禁用缓存损失 = 0.3500 -&gt; 不如不开
+最优 tau*(C_wrong/C_miss=1000) = 0.975  最小期望损失 = 0.8297  | 禁用缓存损失 = 0.3500 -&gt; 不如不开</code></pre>
+<p><strong>这是本节最重要的结论，它有两个层次</strong>：</p>
+<ol>
+<li><strong>最优阈值随两类代价之比移动</strong>：错答代价越高，阈值越高；&quot;设 0.95 就安全&quot;是错的。</li>
+<li><strong>更关键的是：当错答代价足够高时，语义缓存的最优期望损失超过&quot;不开缓存&quot;</strong>。此时正确决策不是&quot;调高阈值&quot;，而是<strong>不做语义缓存</strong>。⚠️ 示例中阈值只差 2.5%（0.100/0.975）时，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0361em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">wrong</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mord">/</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3175em;"><span style="top:-2.55em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">miss</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">100</span></span></span></span> 就已经越过了这条线。</li>
+</ol>
+<p><strong>所以语义缓存的正确用法是</strong>：</p>
+<ul>
+<li>只在<strong>答案本身低风险</strong>（措辞建议、格式转换、公开常识）处启用；</li>
+<li>绝不在<strong>个性化、时间敏感、权限相关</strong>的问答上启用；</li>
+<li>上线前必须测出 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">same</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>、同类/异类相似度分布、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0361em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">wrong</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mord">/</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3175em;"><span style="top:-2.55em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">miss</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>，<strong>算出 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">E</span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6887em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span></span></span></span></span><span class="mclose">)</span></span></span></span> 并与&quot;不开&quot;比较</strong>。</li>
+</ul>
+<h4 id="h-33-边界">3.3 边界<a class="anchor" href="#h-33-边界" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>&quot;多正确答案&quot;问题</strong>：同一个问题的多个答案都能接受时，假命中的危害小；反之（如&quot;我的订单状态&quot;）危害大。</li>
+<li><strong>缓存污染</strong>：一旦一条错误答案进入缓存，它会持续命中。<strong>必须有按 doc_id / 反馈触发的失效索引</strong>（§4.2）。</li>
+<li><strong>分布漂移</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">same</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 与相似度分布会随时间变化（新用户、新话题），因此 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span></span></span></span> 需要<strong>定期重估</strong>，不是一次调好。</li>
+<li><strong>冷启动</strong>：新租户/新语料下缓存命中率低，语义缓存的价值要等流量起来才显现 —— <strong>不要用冷启动期的数据下结论</strong>。</li>
+</ul>
+<p><figure><img class="md-img" src="content/courses/rag-systems/assets/chapter-6-figure-02.svg" alt="语义缓存：最优阈值与「不如不开」" loading="lazy" decoding="async"><figcaption>语义缓存：最优阈值与「不如不开」</figcaption></figure>
+</p>
+<h3 id="h-四缓存键不绕过权限是底线">四、缓存键：不绕过权限是底线<a class="anchor" href="#h-四缓存键不绕过权限是底线" aria-label="本节链接">#</a></h3>
+<h4 id="h-41-键必须包含的维度">4.1 键必须包含的维度<a class="anchor" href="#h-41-键必须包含的维度" aria-label="本节链接">#</a></h4>
+<pre data-lang="text"><code class="language-text">key = hash(tenant | user_or_acl_fingerprint | index_manifest_id |
+           model_version | prompt_template_version | language | time_bucket | query_norm)</code></pre>
+<p>逐个说明为什么不能省：</p>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>省掉的后果</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>tenant</code> / <code>user</code></td>
+<td><strong>跨租户/跨用户答案泄漏</strong>（⚠️ 实测：无租户键时 globex 命中了 acme 的答案）</td>
+</tr>
+<tr>
+<td><code>acl_fingerprint</code></td>
+<td>权限变更后仍返回旧权限下的内容</td>
+</tr>
+<tr>
+<td><code>index_manifest_id</code></td>
+<td>索引已更新/回滚，缓存仍返回旧文档内容</td>
+</tr>
+<tr>
+<td><code>model_version</code></td>
+<td>模型换了，旧答案与新模型风格/能力不一致</td>
+</tr>
+<tr>
+<td><code>prompt_template_version</code></td>
+<td>模板改了（引用格式、拒答规则），缓存答案不遵守新契约</td>
+</tr>
+<tr>
+<td><code>language</code></td>
+<td>多语言场景下语义相似度跨语言误命中</td>
+</tr>
+<tr>
+<td><code>time_bucket</code></td>
+<td>时间敏感问题（价格、政策、库存）返回过期答案</td>
+</tr>
+<tr>
+<td><code>query_norm</code></td>
+<td>不做归一化会让&quot;同一问题不同写法&quot;完全 miss（收益损失）</td>
+</tr>
+</tbody></table>
+<p><strong>注意最后两条方向相反</strong>：<code>time_bucket</code> 是&quot;宁可不命中&quot;，<code>query_norm</code> 是&quot;尽量命中&quot;。<strong>缓存键的设计就是在这两个方向之间按业务选。</strong></p>
+<h4 id="h-42-失效需要反向索引">4.2 失效：需要反向索引<a class="anchor" href="#h-42-失效需要反向索引" aria-label="本节链接">#</a></h4>
+<p>缓存 TTL 不足以应对&quot;某篇文档刚更新&quot;的场景：所有引用了该文档的缓存答案都该失效。做法是维护反向索引：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0044em;vertical-align:-0.31em;"></span><span class="mord text"><span class="mord">doc_id</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">→</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.06em;vertical-align:-0.31em;"></span><span class="mopen">{</span><span class="mord text"><span class="mord">cache_key</span></span><span class="mclose">}</span></span></span></span></span></p>
+<p>文档变更时按 doc_id 批量失效。<strong>没有这个反向索引，&quot;文档更新了但用户还看到旧答案&quot;会持续到 TTL 到期</strong>（可能是几小时）。</p>
+<h4 id="h-43-跨租户泄漏的最小复现">4.3 跨租户泄漏的最小复现<a class="anchor" href="#h-43-跨租户泄漏的最小复现" aria-label="本节链接">#</a></h4>
+<p>⚠️ 合成实验：</p>
+<pre><code>tenant=acme    q=问题A  无租户键命中=False  带租户键命中=False
+tenant=globex  q=问题A  无租户键命中=True   命中内容租户=acme   带租户键命中=False
+tenant=acme    q=问题A  无租户键命中=True   命中内容租户=acme   带租户键命中=True
+跨租户泄漏次数（无租户键）= 1（带租户键 = 0）</code></pre>
+<p><strong>这并不是&quot;巧合命中&quot;，而是缓存键设计缺陷的必然结果</strong>：只要两个租户问同一个问题，先到者的答案就会被后到者拿到。而 RAG 系统里的答案<strong>几乎总是含私有内容</strong>。</p>
+<h4 id="h-44-缓存的三个隐性成本">4.4 缓存的三个隐性成本<a class="anchor" href="#h-44-缓存的三个隐性成本" aria-label="本节链接">#</a></h4>
+<p>缓存的收益容易看到（成本下降、延迟下降），成本却常被漏掉。三项必须在设计时就算清：</p>
+<table>
+<thead>
+<tr>
+<th>隐性成本</th>
+<th>机理</th>
+<th>量化方式</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>命中率下降即负载回流</strong></td>
+<td>缓存失效或未命中时，请求全部回到 GPU；若缓存层本身也参与容量规划，则 GPU 容量必须按&quot;全 miss&quot;配置</td>
+<td>容量按 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">h</span></span></span></span> 的负载设计，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">h</span></span></span></span> 是稳态命中率</td>
+</tr>
+<tr>
+<td><strong>失效的传播成本</strong></td>
+<td>一次文档更新可能触发大量缓存条目失效（反向索引 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">m</span></span></span></span> 条）</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal">m</span><span class="mord">×</span></span></span></span> 单条失效成本；<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">m</span></span></span></span> 大时改用版本号校验</td>
+</tr>
+<tr>
+<td><strong>新鲜度与命中率的权衡</strong></td>
+<td>TTL 越长命中率越高但越陈旧；时间桶越细越新鲜但命中率越低</td>
+<td>用&quot;陈旧答案比例&quot;与&quot;命中率&quot;画二维工作点，按业务选</td>
+</tr>
+</tbody></table>
+<p><strong>判据</strong>：如果一个缓存方案的<strong>容量规划假设了高命中率</strong>，那么它在缓存击穿（重启、清空、变更键维度）时会直接打垮下游。<strong>正确做法是按&quot;缓存全 miss&quot;配置容量，把命中率当作成本与延迟的优化项，而不是可用性假设。</strong></p>
+<h4 id="h-45-边界">4.5 边界<a class="anchor" href="#h-45-边界" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>缓存一致性只能做到&quot;最终一致&quot;</strong>：文档更新到缓存失效之间总有窗口。要把这个窗口写成 SLA（&quot;文档更新后 N 分钟内生效&quot;），而不是假设它为零（ch6-l1 §4.2）。</li>
+</ul>
+<h3 id="h-五批处理与调度">五、批处理与调度<a class="anchor" href="#h-五批处理与调度" aria-label="本节链接">#</a></h3>
+<h4 id="h-51-收益与代价">5.1 收益与代价<a class="anchor" href="#h-51-收益与代价" aria-label="本节链接">#</a></h4>
+<p>批处理把多个请求合成一个 batch 前向，提升吞吐。设单请求服务时间 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span></span></span></span>、批大小 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">b</span></span></span></span>、凑批等待 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0269em;">w</span></span></span></span>：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord cjk_fallback">吞吐</span></span><span class="mopen">(</span><span class="mord mathnormal">b</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.3074em;vertical-align:-0.936em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3714em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0576em;">S</span><span class="mopen">(</span><span class="mord mathnormal">b</span><span class="mclose">)</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">b</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.936em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord cjk_fallback">单请求延迟</span></span><span class="mopen">(</span><span class="mord mathnormal">b</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal" style="margin-right:0.0269em;">w</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span><span class="mopen">(</span><span class="mord mathnormal">b</span><span class="mclose">)</span></span></span></span></span></p>
+<p>其中 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span><span class="mopen">(</span><span class="mord mathnormal">b</span><span class="mclose">)</span></span></span></span> 随 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">b</span></span></span></span> 次线性增长（矩阵乘效率提升），所以吞吐上升而延迟也上升。<strong>存在一个吞吐最优的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord"><span class="mord mathnormal">b</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6887em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span></span></span></span></span></span></span></span> 与一个尾延迟允许的最大 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">b</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mop mtight"><span class="mtight">m</span><span class="mtight">a</span><span class="mtight">x</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span></strong>，工作点必须落在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8304em;vertical-align:-0.136em;"></span><span class="mord mathnormal">b</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≤</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">b</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mop mtight"><span class="mtight">m</span><span class="mtight">a</span><span class="mtight">x</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 内。</p>
+<h4 id="h-52-缓存与批处理的交互">5.2 缓存与批处理的交互<a class="anchor" href="#h-52-缓存与批处理的交互" aria-label="本节链接">#</a></h4>
+<p><strong>命中缓存的请求不占用 GPU</strong>，因此正确顺序是：</p>
+<pre data-lang="text"><code class="language-text">请求 -&gt; 精确缓存 -&gt; [命中] 直接返回（0 GPU）
+              -&gt; [未命中] -&gt; 前缀缓存分流 -&gt; 动态批 -&gt; 生成</code></pre>
+<p>把缓存放在批处理<strong>之前</strong>，等于把 GPU 的负载先减掉一块，再对剩下的做批处理。<strong>反过来（先进批再查缓存）会让缓存命中白白占用批容量。</strong></p>
+<h4 id="h-53-尾延迟的注意事项">5.3 尾延迟的注意事项<a class="anchor" href="#h-53-尾延迟的注意事项" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>长短输出混批会队头阻塞</strong>：短请求被长请求拖住。按预期输出长度分桶。</li>
+<li><strong>批处理对稀疏流量无效</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">λ</span></span></span></span> 很低时凑批等待 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0269em;">w</span></span></span></span> 主导，反而不如单请求。</li>
+<li><strong>缓存命中率下降会同时抬高成本与尾延迟</strong>（负载回流到 GPU），所以<strong>缓存命中率必须与延迟指标一起监控</strong>。</li>
+</ul>
+<h3 id="h-代码">代码<a class="anchor" href="#h-代码" aria-label="本节链接">#</a></h3>
+<pre data-lang="python"><code class="language-python"># -*- coding: utf-8 -*-
+&quot;&quot;&quot;⚠️ 合成数据：前缀缓存命中率（按 prompt 布局）/ 语义缓存阈值-期望损失 / 跨租户泄漏。&quot;&quot;&quot;
+import re, numpy as np
+
+# ============ (a) 前缀缓存：prompt 布局决定可复用比例 ============
+_TOK = re.compile(r&quot;[A-Za-z0-9_=\-\[\].]+|[^\sA-Za-z0-9]&quot;)
+SYS = &quot;你是企业内部助手。回答必须只依据给定资料，并逐句标注来源。&quot; * 3   # 稳定
+TEN = &quot;租户=acme；权限指纹=acl-7f3a；索引版本=man-2026-09-22；&quot; * 2       # 半稳定
+def docs(i):                                   # 每查询不同
+    return &quot; &quot;.join(f&quot;[doc{j}] 这是第{j}段资料，内容编号{i}-{j}。&quot; for j in range(4))
+def query(i): return f&quot;问题{i}：请说明指标变化的原因。&quot;
+
+def build(style, i):
+    d, q = docs(i), query(i)
+    if style == &quot;stable-first&quot;: return SYS + TEN + d + q
+    if style == &quot;docs-first&quot;:   return d + SYS + TEN + q
+    if style == &quot;interleaved&quot;:  return SYS + d + TEN + q
+    raise ValueError(style)
+
+def lcp_tokens(a, b):
+    &quot;&quot;&quot;近似 token 切分：拉丁词整块、CJK 逐字（接近 BPE 粒度）。&quot;&quot;&quot;
+    ta, tb = _TOK.findall(a), _TOK.findall(b)
+    n = 0
+    for x, y in zip(ta, tb):
+        if x != y: break
+        n += 1
+    return n
+
+rng = np.random.default_rng(0); N_REQ = 300
+print(&quot;== (a) ⚠️ 合成：前缀缓存可复用比例（按 prompt 布局）==&quot;)
+print(f&quot;{&#39;布局&#39;:&lt;14} {&#39;平均总tok&#39;:&gt;9} {&#39;最大前缀tok&#39;:&gt;11} {&#39;平均可复用tok&#39;:&gt;13} {&#39;可复用比例&#39;:&gt;10}&quot;)
+for style in (&quot;stable-first&quot;, &quot;docs-first&quot;, &quot;interleaved&quot;):
+    prompts = [build(style, i) for i in range(N_REQ)]
+    lens = [len(_TOK.findall(p)) for p in prompts]
+    lcps = [lcp_tokens(prompts[i], prompts[i-1]) for i in range(1, N_REQ)]
+    avg_lcp = float(np.mean(lcps))
+    print(f&quot;{style:&lt;14} {np.mean(lens):&gt;9.1f} {max(lcps):&gt;11} {avg_lcp:&gt;13.1f} &quot;
+          f&quot;{avg_lcp/float(np.mean(lens)):&gt;10.3f}&quot;)
+
+# ============ (b) 语义缓存：阈值 -&gt; 期望损失 ============
+print(&quot;\n== (b) ⚠️ 合成：语义缓存的阈值扫描（两类代价不对称）==&quot;)
+rng = np.random.default_rng(1); M = 200000
+same = rng.beta(9, 1.6, M)          # 同意图相似度（偏高）
+diff = rng.beta(6, 3.0, M)          # 不同意图相似度（有重叠区 -&gt; 风险来源）
+P_SAME = 0.35
+
+def rates(tau):
+    return float((same &lt;= tau).mean()), float((diff &gt; tau).mean())   # FNR, FPR
+
+print(f&quot;{&#39;tau&#39;:&gt;5} {&#39;FNR&#39;:&gt;7} {&#39;FPR&#39;:&gt;7} &quot; +
+      &quot; &quot;.join(f&quot;{&#39;E(r=&#39;+str(r)+&#39;)&#39;:&gt;10}&quot; for r in (10, 100, 1000)))
+best = {r: (None, 1e9) for r in (10, 100, 1000)}
+for tau in np.arange(0.5, 0.99, 0.025):
+    fnr, fpr = rates(tau); row = []
+    for r in (10, 100, 1000):
+        E = P_SAME * fnr * 1.0 + (1 - P_SAME) * fpr * r     # C_miss=1, C_wrong=r
+        row.append(E)
+        if E &lt; best[r][1]: best[r] = (float(tau), E)
+    print(f&quot;{tau:&gt;5.3f} {fnr:&gt;7.3f} {fpr:&gt;7.3f} &quot; + &quot; &quot;.join(f&quot;{e:&gt;10.4f}&quot; for e in row))
+NO_CACHE = P_SAME * 1.0            # 禁用语义缓存：同意图也全部 miss
+for r in (10, 100, 1000):
+    verdict = &quot;值得开&quot; if best[r][1] &lt; NO_CACHE else &quot;不如不开&quot;
+    print(f&quot;  最优 tau*(C_wrong/C_miss={r:&gt;4}) = {best[r][0]:.3f}  最小期望损失 = {best[r][1]:.4f}&quot;
+          f&quot;   | 禁用缓存损失 = {NO_CACHE:.4f} -&gt; {verdict}&quot;)
+
+# ============ (c) 跨租户缓存泄漏 ============
+print(&quot;\n== (c) ⚠️ 合成：缓存键漏掉 tenant 的后果 ==&quot;)
+cache_bad, cache_good = {}, {}
+def key_bad(q): return f&quot;{q}&quot;                        # 缺 tenant/权限/版本
+def key_good(q, tenant, acl, man): return f&quot;{tenant}|{acl}|{man}|{q}&quot;
+events = [(&quot;acme&quot;, &quot;acl-1&quot;, &quot;问题A&quot;, &quot;ACME 内部答案：预算=100万&quot;),
+          (&quot;globex&quot;, &quot;acl-2&quot;, &quot;问题A&quot;, &quot;GLOBEX 内部答案：预算=8万&quot;),
+          (&quot;acme&quot;, &quot;acl-1&quot;, &quot;问题A&quot;, &quot;ACME 内部答案：预算=100万&quot;)]
+leak = 0
+for tenant, acl, q, ans in events:
+    kb, kg = key_bad(q), key_good(q, tenant, acl, &quot;man-v1&quot;)
+    hit_bad, hit_good = kb in cache_bad, kg in cache_good
+    if hit_bad: leak += (cache_bad[kb][0] != tenant)
+    print(f&quot;  tenant={tenant:&lt;7} q={q:&lt;6} 无租户键命中={hit_bad} &quot;
+          f&quot;命中内容租户={cache_bad.get(kb,(&#39;-&#39;,&#39;&#39;))[0]:&lt;7} 带租户键命中={hit_good}&quot;)
+    cache_bad.setdefault(kb, (tenant, ans)); cache_good.setdefault(kg, (tenant, ans))
+print(f&quot;跨租户泄漏次数（无租户键）= {leak}（带租户键 = 0）&quot;)</code></pre>
+<pre data-lang="text"><code class="language-text">== (a) ⚠️ 合成：前缀缓存可复用比例（按 prompt 布局）==
+布局                平均总tok     最大前缀tok      平均可复用tok      可复用比例
+stable-first       194.0         132         132.0      0.680
+docs-first         194.0          13          13.0      0.067
+interleaved        194.0         100         100.0      0.515
+
+== (b) ⚠️ 合成：语义缓存的阈值扫描（两类代价不对称）==
+  tau     FNR     FPR    E(r=10)   E(r=100)  E(r=1000)
+0.500   0.006   0.856     5.5681    55.6614   556.5940
+0.600   0.028   0.686     4.4697    44.6086   445.9975
+0.700   0.097   0.449     2.9523    29.2167   291.8613
+0.800   0.272   0.203     1.4162    13.3034   132.1754
+0.900   0.618   0.038     0.4639     2.6930    24.9844
+0.950   0.840   0.005     0.3293     0.6485     3.8396
+0.975   0.941   0.001     0.3342     0.3793     0.8297
+  最优 tau*(C_wrong/C_miss=  10) = 0.950  最小期望损失 = 0.3293   | 禁用缓存损失 = 0.3500 -&gt; 值得开
+  最优 tau*(C_wrong/C_miss= 100) = 0.975  最小期望损失 = 0.3793   | 禁用缓存损失 = 0.3500 -&gt; 不如不开
+  最优 tau*(C_wrong/C_miss=1000) = 0.975  最小期望损失 = 0.8297   | 禁用缓存损失 = 0.3500 -&gt; 不如不开
+
+== (c) ⚠️ 合成：缓存键漏掉 tenant 的后果 ==
+  tenant=acme    q=问题A  无租户键命中=False  命中内容租户=-       带租户键命中=False
+  tenant=globex  q=问题A  无租户键命中=True   命中内容租户=acme    带租户键命中=False
+  tenant=acme    q=问题A  无租户键命中=True   命中内容租户=acme    带租户键命中=True
+跨租户泄漏次数（无租户键）= 1（带租户键 = 0）</code></pre>
+<p><strong>关键设计决策</strong>：语义缓存部分没有去&quot;调一个更好的阈值&quot;，而是<strong>把&quot;开不开&quot;也变成一个可比较的数量</strong>（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">E</span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6887em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span></span></span></span></span><span class="mclose">)</span></span></span></span> vs 不开缓存的损失）。这是这份代码最重要的选择：工程上大量&quot;缓存效果不好&quot;的问题，本质不是参数没调好，而是<strong>这类缓存在这个业务上就不该开</strong>；只有把&quot;不开&quot;作为基线放进同一个期望损失里，这个结论才会显式出现。</p>
+<h3 id="h-练习">练习<a class="anchor" href="#h-练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><p><strong>算你自己 prompt 的可复用比例</strong>。把你们真实的 prompt 模板按段拆开（系统/租户/证据/问题），统计各段 token 数（用真实分词器），计算四种布局下的期望可复用比例。回答：(a) 现有布局浪费了多少 prefill？(b) 换成最优布局需要改哪些代码？(c) 折算成每查询成本是多少？</p>
+</li>
+<li><p><strong>多轮对话的前缀复用</strong>。设第 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6151em;"></span><span class="mord mathnormal">t</span></span></span></span> 轮 prompt = 历史（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6984em;vertical-align:-0.0833em;"></span><span class="mord mathnormal">t</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> 轮的拼接）+ 新问题。证明：如果每轮只往后追加，则第 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6151em;"></span><span class="mord mathnormal">t</span></span></span></span> 轮的可复用前缀 = 第 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6984em;vertical-align:-0.0833em;"></span><span class="mord mathnormal">t</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> 轮的整个 prompt。然后说明：&quot;每轮重新生成摘要替代历史&quot;会如何破坏这个性质，以及代价是多少 token 的重算。</p>
+</li>
+<li><p><strong>语义缓存的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">same</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 估计</strong>。设计一个从线上日志估计 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">same</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 的方法（提示：用人工标注的小样本 + 相似度分布做校准）。说明为什么 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">same</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 会随租户/话题变化，以及你会怎么分桶估计。</p>
+</li>
+<li><p><strong>推导 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6887em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6887em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span></span></span></span></span></span></span></span> 的一阶条件</strong>。对 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">E</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">FNR</span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">p</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">FPR</span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mclose">)</span></span></span></span>，写出 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathrm">d</span><span class="mord mathnormal" style="margin-right:0.0576em;">E</span><span class="mord">/</span><span class="mord mathrm">d</span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0</span></span></span></span> 的条件，并说明它如何用两个相似度分布的密度函数表示（提示：设两类分布的密度为 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.1076em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.1076em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>，则 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8251em;"></span><span class="mord"><span class="mord text"><span class="mord">FPR</span></span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8251em;"><span style="top:-3.1362em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">′</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">−</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.1076em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mclose">)</span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8251em;"></span><span class="mord"><span class="mord text"><span class="mord">FNR</span></span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8251em;"><span style="top:-3.1362em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">′</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.1076em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mclose">)</span></span></span></span>，得到似然比阈值 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.53em;vertical-align:-0.52em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.01em;"><span style="top:-2.655em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.1076em;">f</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3173em;"><span style="top:-2.357em;margin-left:-0.1076em;margin-right:0.0714em;"><span class="pstrut" style="height:2.5em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.143em;"><span></span></span></span></span></span></span><span class="mopen mtight">(</span><span class="mord mathnormal mtight" style="margin-right:0.1132em;">τ</span><span class="mclose mtight">)</span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.485em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.1076em;">f</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3173em;"><span style="top:-2.357em;margin-left:-0.1076em;margin-right:0.0714em;"><span class="pstrut" style="height:2.5em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.143em;"><span></span></span></span></span></span></span><span class="mopen mtight">(</span><span class="mord mathnormal mtight" style="margin-right:0.1132em;">τ</span><span class="mclose mtight">)</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.52em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.4911em;vertical-align:-0.4811em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.01em;"><span style="top:-2.655em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">p</span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.485em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mopen mtight">(</span><span class="mord mtight">1</span><span class="mbin mtight">−</span><span class="mord mathnormal mtight">p</span><span class="mclose mtight">)</span><span class="mord mathnormal mtight" style="margin-right:0.0278em;">r</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.4811em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span>）。解释这个式子的含义：它正是<strong>贝叶斯最优决策阈值</strong>。</p>
+</li>
+<li><p><strong>缓存键的完备性测试</strong>。为你的缓存层设计一组单元测试：对每一个键维度，构造两个&quot;只在该维度不同&quot;的请求，断言它们<strong>不共享</strong>缓存条目。列出至少 7 个维度的测试用例，并说明哪一个维度最容易被漏掉。</p>
+</li>
+<li><p><strong>反向失效索引的成本</strong>。设缓存条目 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">C</span></span></span></span> 条、每篇文档平均被 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">m</span></span></span></span> 条缓存引用。推导维护 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord text"><span class="mord">doc</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">→</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.0044em;vertical-align:-0.31em;"></span><span class="mord text"><span class="mord">cache_key</span></span></span></span></span> 反向索引的存储与写入成本。回答：当 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">m</span></span></span></span> 很大时（热门文档），有没有更省的做法（提示：存 doc 版本号，在缓存读取时校验版本，而不是主动失效）？</p>
+</li>
+<li><p><strong>批处理工作点</strong>。给定 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span><span class="mopen">(</span><span class="mord mathnormal">b</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">8</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord">2</span><span class="mord mathnormal">b</span></span></span></span> ms、凑批等待 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0269em;">w</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">15</span></span></span></span> ms、尾延迟上限 200 ms。求 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">b</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mop mtight"><span class="mtight">m</span><span class="mtight">a</span><span class="mtight">x</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>；再假设 60% 请求命中缓存不占用 GPU，重算到达 GPU 的有效 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">λ</span></span></span></span>，并给出推荐批大小与预期吞吐。</p>
+</li>
+<li><p><strong>&quot;缓存改变质量&quot;的评估</strong>。假设语义缓存让 3% 的请求返回了&quot;接近但不完全正确&quot;的答案。用第 5.4 节的 Pareto 框架，把&quot;语义缓存开/关&quot;作为两个配置，说明如何用端到端质量与每查询成本判断它是否被支配。需要什么数据？如果只有离线指标，能否得出结论？</p>
+</li>
+</ol>
+<h3 id="h-小结">小结<a class="anchor" href="#h-小结" aria-label="本节链接">#</a></h3>
+<ul>
+<li><strong>四层缓存的风险谱</strong>：embedding（几乎无风险）&lt; 重排 &lt; 检索结果 &lt; 生成/语义（高风险）。<strong>工程上从最安全的一层开始做。</strong></li>
+<li><strong>前缀缓存的硬约束</strong>：可复用 token 数 = <strong>最长公共前缀长度</strong>；省的是 prefill，不是 decode。⚠️ 布局决定 10 倍差距：<code>stable-first</code> 0.680、<code>interleaved</code> 0.515、<code>docs-first</code> 0.067。</li>
+<li><strong>布局规则</strong>：系统提示 → 租户/权限/版本头 → 证据 → 问题。<strong>任何每请求都变的内容插在前面，都会把前缀切断。</strong> 多轮对话要保持&quot;只往后追加&quot;。</li>
+<li><strong>语义缓存的两类错误方向相反</strong>：假命中（错误答案、难发现、会被固化）与假未命中（白付成本）。期望损失 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">E</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8778em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">FNR</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">p</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">FPR</span></span></span></span></span>；<strong>最优阈值由似然比 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.4133em;vertical-align:-0.4811em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.9322em;"><span style="top:-2.655em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.1076em;">f</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3173em;"><span style="top:-2.357em;margin-left:-0.1076em;margin-right:0.0714em;"><span class="pstrut" style="height:2.5em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.143em;"><span></span></span></span></span></span></span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.4461em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.1076em;">f</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3173em;"><span style="top:-2.357em;margin-left:-0.1076em;margin-right:0.0714em;"><span class="pstrut" style="height:2.5em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.143em;"><span></span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.4811em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.4911em;vertical-align:-0.4811em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.01em;"><span style="top:-2.655em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">p</span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.485em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mopen mtight">(</span><span class="mord mtight">1</span><span class="mbin mtight">−</span><span class="mord mathnormal mtight">p</span><span class="mclose mtight">)</span><span class="mord mathnormal mtight" style="margin-right:0.0278em;">r</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.4811em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span> 决定</strong>，即贝叶斯最优决策。</li>
+<li><strong>最关键的一条</strong>：最优阈值随两类代价之比移动，而<strong>当错答代价足够高时，&quot;不开语义缓存&quot;才是最优决策</strong>。⚠️ 示例：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">10</span></span></span></span> 时值得开（0.3293 &lt; 0.3500），<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">100</span></span></span></span> 与 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1000</span></span></span></span> 时都&quot;不如不开&quot;（0.3793、0.8297 &gt; 0.3500）。<strong>上线前必须把&quot;不开&quot;作为基线算进去。</strong></li>
+<li><strong>缓存键必须包含</strong>：tenant/user、权限指纹、索引 manifest 版本、模型版本、prompt 模板版本、语言、时间桶、归一化查询。⚠️ 实测：缺 tenant 时 globex 命中了 acme 的答案（泄漏 1 次；带租户键 0 次）。</li>
+<li><strong>失效需要反向索引</strong> <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord text"><span class="mord">doc</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">→</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.06em;vertical-align:-0.31em;"></span><span class="mopen">{</span><span class="mord text"><span class="mord">cache_key</span></span><span class="mclose">}</span></span></span></span>；否则&quot;文档更新了但用户看到旧答案&quot;会持续到 TTL 到期。替代方案是把 doc 版本写进键、读取时校验。</li>
+<li><strong>批处理的正确顺序</strong>：先查缓存（命中不占 GPU）再做动态批；长短输出分桶避免队头阻塞；稀疏流量下批处理反而更差。</li>
+<li><strong>三个隐性成本</strong>：命中率下降导致负载回流（<strong>容量必须按&quot;全 miss&quot;配置</strong>）、失效传播成本（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord text"><span class="mord">doc</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">→</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">m</span></span></span></span> 条缓存条目）、新鲜度与命中率的权衡（TTL 与时间桶）。</li>
+<li><strong>缓存只提供最终一致</strong>：更新到失效之间存在窗口，必须写成 SLA，而不是假设为零。</li>
+<li><strong>缓存不是可用性组件</strong>：它是优化组件。容量必须按「全 miss」设计，命中率下降只应表现为成本与延迟上升，而不是服务不可用。</li>
+<li><strong>一句话</strong>：<strong>缓存唯一合法的收益形式是&quot;质量不变、成本下降&quot;。前缀缓存靠布局（免费），语义缓存靠概率（有风险），而权限必须靠键（不可妥协）。</strong></li>
+</ul>
+<blockquote>
+<p>下一节：缓存能省钱，但缓存也是绕过权限最方便的一条路。下一节把多租户与文档级 ACL 讲透：为什么&quot;先取 top-k 再过滤&quot;必然漏、高选择性前置过滤为什么也会掉召回，以及怎么用可证伪的 canary 测试证明&quot;不漏&quot;。</p>
+</blockquote>

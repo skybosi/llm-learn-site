@@ -1,0 +1,85 @@
+<h2 id="h-关键点检测">关键点检测<a class="anchor" href="#h-关键点检测" aria-label="本节链接">#</a></h2>
+<p>实例分割给每个物体画了轮廓，但很多任务关心的是<strong>物体上的特定点</strong>：人体关节（肩、肘、腕、髋、膝、踝）、人脸五官（眼角、鼻尖、嘴角）、手的骨节点。<strong>关键点检测（Keypoint Detection）</strong> 就是定位这些有语义的点的坐标，它在姿态估计、动作识别、人脸对齐、手势交互里是基础能力。</p>
+<p>这一课讲清一个核心问题：<strong>关键点该用&quot;直接回归坐标&quot;还是&quot;预测热图&quot;来表示？</strong> 答案是后者，而&quot;为什么&quot;里藏着关键点检测的全部设计哲学。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-任务定义与表示之争">1. 任务定义与表示之争<a class="anchor" href="#h-1-任务定义与表示之争" aria-label="本节链接">#</a></h4>
+<p>人体姿态估计的目标是：给定一张含人的图，输出一组关节点的坐标，如 <code>[(x_左肩, y_左肩), (x_左肘, y_左肘), ...]</code>。最直觉的做法是<strong>直接回归坐标</strong>：网络最后接几个全连接，输出一串 (x, y) 数值。</p>
+<p>但直接回归有一个根本问题：<strong>坐标是一个&quot;孤立的低维值&quot;，几乎没有空间结构可供卷积网络学习</strong>。网络很难从&quot;一个数值&quot;反推&quot;这个点应该出现在肩膀这个局部纹理附近&quot;。更要命的是，真实图片里同一个关节位置往往<strong>多模态</strong>（被遮挡、有歧义时，一个位置可能有多个合理答案），而回归一个点只能输出一个平均值。</p>
+<p>于是主流方法改用<strong>热图（heatmap）表示</strong>：不为每个关键点输出一个 (x, y)，而是输出<strong>一张与输入同尺寸的&quot;概率图&quot;</strong>，图上每个像素的值表示&quot;该关键点位于此像素的概率&quot;，真值用一个以标注点为中心的<strong>高斯峰</strong>来构造。网络的学习目标从&quot;背出一个坐标&quot;变成了&quot;画出一座高斯山&quot;——这是一个<strong>逐像素的、有空间结构的监督信号</strong>，卷积网络天生擅长。</p>
+<p><figure><img class="md-img" src="content/courses/cv-advanced/assets/chapter-3-figure-03.svg" alt="关键点的热图表示：真值是一个以标注点为中心的高斯峰，网络逐像素预测概率" loading="lazy" decoding="async"><figcaption>关键点的热图表示：真值是一个以标注点为中心的高斯峰，网络逐像素预测概率</figcaption></figure>
+</p>
+<p>预测时，对热图取<strong>峰值位置</strong>（argmax，或更精细的取期望）就得到坐标。热图还有额外好处：它天然携带<strong>置信度</strong>（峰越高越确定），还能自然地表达<strong>多模态</strong>（出现多个峰 = 多个可能位置），这些是坐标回归给不了的。</p>
+<h4 id="h-2-两条技术路线自顶向下-vs-自底向上">2. 两条技术路线：自顶向下 vs 自底向上<a class="anchor" href="#h-2-两条技术路线自顶向下-vs-自底向上" aria-label="本节链接">#</a></h4>
+<p>关键点检测（尤其是多人姿态估计）分两大流派：</p>
+<ul>
+<li><strong>自顶向下（top-down）</strong>：先用一个<strong>人检测器</strong>框出每个人，再对<strong>每个单人框</strong>单独做关键点检测。优点是单人的姿态估计简单、精度高；缺点是速度随人数线性下降，且严重依赖检测器——人没被框到，姿态就丢了；</li>
+<li><strong>自底向上（bottom-up）</strong>：<strong>先检测图中所有人的所有关键点</strong>（不管属于谁），再通过<strong>关联算法</strong>把这些点分组、拼成一个个完整的人。代表是 OpenPose（用&quot;部件亲和场 PAF&quot;学习点与点之间的连接关系）。优点是人数再多也只做一次前向，速度稳定；缺点是多人密集、遮挡时分组容易错。</li>
+</ul>
+<p><figure><img class="md-img" src="content/courses/cv-advanced/assets/chapter-3-figure-04.svg" alt="自顶向下（先框人再估点）与自底向上（先估点再分组）的对比" loading="lazy" decoding="async"><figcaption>自顶向下（先框人再估点）与自底向上（先估点再分组）的对比</figcaption></figure>
+</p>
+<h4 id="h-3-经典网络演进精度如何一步步做高">3. 经典网络演进：精度如何一步步做高<a class="anchor" href="#h-3-经典网络演进精度如何一步步做高" aria-label="本节链接">#</a></h4>
+<p>关键点网络的主线是&quot;<strong>如何在高分辨率下保持大感受野</strong>&quot;——这其实和分割是同一个矛盾。代表性工作：</p>
+<ul>
+<li><strong>CPM（卷积姿态机）</strong>：用<strong>多阶段</strong>网络逐步精修热图，后一阶段看前一阶段的输出 + 中间特征，让浅层也能间接获得大感受野；</li>
+<li><strong>Stacked Hourglass（堆叠沙漏）</strong>：把编码器-解码器做成一个&quot;沙漏&quot;单元，再<strong>堆叠多个沙漏</strong>，反复&quot;下采样提取语义 → 上采样恢复细节 → 中间监督&quot;，是热图法的经典骨架；</li>
+<li><strong>HRNet</strong>：反其道而行，<strong>全程保持高分辨率</strong>，同时用并行的低分辨率分支交换信息（多分辨率并行 + 反复融合），避免了&quot;先降再升&quot;的信息损失，成为精度标杆。</li>
+</ul>
+<p>这条线的共同教训：<strong>关键点定位对空间精度极其敏感，任何粗暴的下采样都会直接损伤坐标精度</strong>。</p>
+<h4 id="h-4-评价指标从像素到-oks">4. 评价指标：从像素到 OKS<a class="anchor" href="#h-4-评价指标从像素到-oks" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>PCK（Percentage of Correct Keypoints）</strong>：预测点与真值的距离小于某阈值（如头部长度的一定比例）即算正确，统计正确率；</li>
+<li><strong>OKS（Object Keypoint Similarity）</strong>：COCO 用的指标，本质是&quot;关键点版的 IoU&quot;。它把每个关键点的距离误差用<strong>该点的尺度与标注不确定性</strong>加权，再像 mAP 那样对阈值与类别做平均，得到 <code>mAP@OKS</code>。理解 OKS 就是理解&quot;关键点的 mAP&quot;，与第一章的 IoU/mAP 一脉相承。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>第一段<strong>从零生成高斯热图真值</strong>（关键点检测的核心监督信号）；第二段用 torchvision 预训练的 Keypoint R-CNN（自顶向下路线）做一次推理。</p>
+<pre data-lang="python"><code class="language-python">import torch
+import torch.nn.functional as F
+
+# ---------- 1) 从零生成高斯热图真值 ----------
+def make_heatmap(h, w, cx, cy, sigma=3.0):
+    &quot;&quot;&quot;在 (h, w) 图上，以 (cx, cy) 为中心画一个高斯峰作为关键点真值&quot;&quot;&quot;
+    ys = torch.arange(h).float().view(-1, 1)   # (h, 1)
+    xs = torch.arange(w).float().view(1, -1)   # (1, w)
+    dist2 = (ys - cy) ** 2 + (xs - cx) ** 2    # 到中心的平方距离
+    return torch.exp(-dist2 / (2 * sigma ** 2))
+
+h, w = 64, 64
+hm = make_heatmap(h, w, cx=32.0, cy=20.0, sigma=3.0)
+peak = torch.stack(torch.where(hm == hm.max()), dim=1)   # 找到峰值坐标
+print(&quot;热图形状：&quot;, tuple(hm.shape), &quot; 峰值位置：&quot;, peak.tolist())   # 应约等于 (20, 32)
+print(&quot;热图最大值：&quot;, round(hm.max().item(), 4))                     # 应为 1.0
+
+# 一个&quot;多模态&quot;例子：两个峰表示该关键点有两个可能位置
+hm2 = make_heatmap(h, w, 20, 20, 3.0) + make_heatmap(h, w, 48, 44, 3.0)
+print(&quot;双峰热图的最大两个值：&quot;, torch.topk(hm2.flatten(), 2).values.tolist())
+
+# ---------- 2) 预训练 Keypoint R-CNN 推理（自顶向下：先检测人再估点） ----------
+from torchvision.models.detection import keypointrcnn_resnet50_fpn, KeypointRCNN_ResNet50_FPN_Weights
+
+weights = KeypointRCNN_ResNet50_FPN_Weights.DEFAULT
+model = keypointrcnn_resnet50_fpn(weights=weights).eval()
+
+img = torch.rand(3, 480, 640)
+with torch.no_grad():
+    out = model([img])[0]
+print(&quot;检测到的人数：&quot;, len(out[&quot;boxes&quot;]))
+if len(out[&quot;boxes&quot;]):
+    print(&quot;关键点坐标形状：&quot;, tuple(out[&quot;keypoints&quot;][0].shape))      # (17, 3)：17 个 COCO 关键点
+    print(&quot;关键点分数形状：&quot;, tuple(out[&quot;keypoint_scores&quot;][0].shape)) # (17,)</code></pre>
+<p>第 1 段展示了热图法的本质：真值不是 <code>(32, 20)</code> 这个孤立坐标，而是一张以 <code>(32, 20)</code> 为中心的&quot;高斯山&quot;。网络学会&quot;画山&quot;，推理时&quot;找山顶&quot;，坐标自然就出来了，还顺带拿到了置信度。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>修改 <code>make_heatmap</code> 的 <code>sigma</code>，观察高斯峰&quot;变尖/变胖&quot;；说说 <code>sigma</code> 过大或过小分别会导致网络学出怎样的预测行为（过拟合 vs 过于平滑）。</li>
+<li>实现&quot;从热图取坐标&quot;的两种方式：<code>argmax</code> 取峰值，以及&quot;用热图概率做加权期望&quot;，对比两者在热图不对称时的差异。</li>
+<li>解释自顶向下与自底向上各自的&quot;单点故障&quot;在哪里（一个依赖检测器、一个依赖分组），并举例说明哪种场景该选哪种。</li>
+<li>用 torchvision 的 <code>keypointrcnn_resnet50_fpn</code> 对一张真实照片推理，把关键点画回原图（连接相邻关节画骨架），观察遮挡部位的关键点分数是否明显更低。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>COCO 关键点检测评测（OKS/mAP）：<a href="https://cocodataset.org/#keypoints-eval" target="_blank" rel="noopener noreferrer">https://cocodataset.org/#keypoints-eval</a></li>
+<li>OpenPose 原论文（自底向上 + PAF）：<a href="https://arxiv.org/abs/1611.08050" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1611.08050</a></li>
+<li>Stacked Hourglass 原论文：<a href="https://arxiv.org/abs/1603.06937" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1603.06937</a></li>
+<li>HRNet 原论文（高分辨率表示）：<a href="https://arxiv.org/abs/1904.04514" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1904.04514</a></li>
+<li>PyTorch 官方文档 · torchvision 关键点检测模型：<a href="https://pytorch.org/vision/stable/models.html#keypoint-detection" target="_blank" rel="noopener noreferrer">https://pytorch.org/vision/stable/models.html#keypoint-detection</a></li>
+</ul>
+<p><a href="#/l/cv-ch3-l3">下一课：对比与选择</a></p>

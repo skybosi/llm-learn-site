@@ -1,0 +1,79 @@
+<h2 id="h-量化-lora">量化 LoRA<a class="anchor" href="#h-量化-lora" aria-label="本节链接">#</a></h2>
+<p>你已经学完 LoRA：冻结基座、只训练低秩增量矩阵，把可训练参数量砍到原来的千分之一。但 LoRA 只解决了&quot;训练哪些参数&quot;，没解决&quot;基座模型本身太大放不进显存&quot;的问题——一个 7B 模型用 BF16 加载就要 14GB，65B 更是直接爆掉单张 48GB 显卡。<strong>QLoRA</strong> 把两条路合二为一：先把基座<strong>量化到 4-bit</strong>再冻结，然后在上面挂 LoRA 适配器训练。这一课我们讲清它凭什么能让 65B 模型在单卡上微调。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-问题全精度基座太占显存">1. 问题：全精度基座太占显存<a class="anchor" href="#h-1-问题全精度基座太占显存" aria-label="本节链接">#</a></h4>
+<p>LoRA 的经典用法是：基座用 FP16/BF16 加载并冻结，只训练挂在旁边的 LoRA 增量。可训练的 LoRA 参数确实很小，但<strong>被冻结的基座权重仍然完整地占着显存</strong>。显存大头没省下来，LoRA 只省了优化器状态和反向传播图。</p>
+<p>QLoRA 的核心想法很直接：<strong>既然基座是冻结的，我们不需要它保持高精度</strong>。把它量化成 4-bit 存着，前向计算时临时反量化成 16-bit 参与运算，训练完再把量化后的基座和 LoRA 一起恢复成 BF16 部署。这样显存从&quot;16 bit × 参数量&quot;骤降到&quot;约 4 bit × 参数量&quot;，65B 模型从需要 130GB 降到约 48GB 以内。</p>
+<p><figure><img class="md-img" src="content/courses/llm-fine-tuning/assets/chapter-4-figure-01.svg" alt="QLoRA 架构：4-bit 量化基座 + 冻结 + LoRA 适配器" loading="lazy" decoding="async"><figcaption>QLoRA 架构：4-bit 量化基座 + 冻结 + LoRA 适配器</figcaption></figure>
+</p>
+<h4 id="h-2-关键技术一nf4-数据类型">2. 关键技术一：NF4 数据类型<a class="anchor" href="#h-2-关键技术一nf4-数据类型" aria-label="本节链接">#</a></h4>
+<p>普通 4-bit 量化（如 INT4）把浮点范围<strong>均匀</strong>切成 16 个桶，这有一个隐含假设——权重是均匀分布的。但神经网络权重实际近似<strong>正态分布</strong>：绝大多数值挤在 0 附近，少数极大/极小值拉得很开。均匀量化会浪费大量桶去覆盖那些稀有的极端值，而 0 附近密集区域的精度反而不够。</p>
+<p>NF4（Normal Float 4-bit）反其道而行之：它基于<strong>分位数</strong>来摆放 16 个取值点，让这些点密集地落在概率密度高的区间（即 0 附近），稀疏地落在分布两端的尾巴上。等价的说法是：NF4 的值点让&quot;信息论上最优的分桶&quot;近似成立。对服从正态分布的权重，NF4 比 INT4 保留更多有效信息，训练更稳。</p>
+<p><figure><img class="md-img" src="content/courses/llm-fine-tuning/assets/chapter-4-figure-02.svg" alt="NF4 分位数取值点与标准正态分布的关系示意" loading="lazy" decoding="async"><figcaption>NF4 分位数取值点与标准正态分布的关系示意</figcaption></figure>
+</p>
+<h4 id="h-3-关键技术二双重量化">3. 关键技术二：双重量化<a class="anchor" href="#h-3-关键技术二双重量化" aria-label="本节链接">#</a></h4>
+<p>量化后权重会带一组<strong>量化常数</strong>（每块一个 scale/zero-point）。当块分得很细时，这些常数本身也占了可观内存，而且它们仍是 FP32。<strong>双重量化</strong>就是对&quot;量化常数&quot;再做一次量化，把 FP32 的常数压成 FP8，进一步省内存。它是对量化这件事本身的&quot;二次压缩&quot;，能再省下约每参数 0.37 bit。</p>
+<h4 id="h-4-关键技术三分页优化器">4. 关键技术三：分页优化器<a class="anchor" href="#h-4-关键技术三分页优化器" aria-label="本节链接">#</a></h4>
+<p>训练中即使权重省了，优化器的梯度/状态仍可能在长序列、大批量时出现<strong>显存尖峰</strong>，导致 OOM。QLoRA 借用 CPU 内存做&quot;分页&quot;：当 GPU 显存吃紧时，把优化器状态临时换出到 CPU 内存，需要时再换回来，像操作系统虚拟内存一样削平尖峰。这解决了&quot;平时没事、某一步突然爆显存&quot;的经典问题。</p>
+<h4 id="h-5-一句话总结架构">5. 一句话总结架构<a class="anchor" href="#h-5-一句话总结架构" aria-label="本节链接">#</a></h4>
+<p>QLoRA = <strong>4-bit NF4 基座（冻结）+ 双重量化 + 分页优化器 + 所有线性层挂 LoRA</strong>。它把 LoRA 的&quot;少训练参数&quot;和量化的&quot;少占显存&quot;叠加，是当前消费级 GPU 上微调大模型的事实标准。</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面用 bitsandbytes + PEFT 把一个大模型以 4-bit NF4 加载并挂上 LoRA。代码依赖 <code>transformers</code>、<code>peft</code>、<code>bitsandbytes</code>、<code>accelerate</code>，需要一张支持 CUDA 的显卡（或 Colab T4）。</p>
+<pre data-lang="python"><code class="language-python">import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+
+model_id = &quot;meta-llama/Llama-2-7b-hf&quot;  # 示例：换成任意可用基座
+
+# 1) 4-bit NF4 量化配置（QLoRA 的量化三件套）
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,                      # 以 4-bit 加载基座权重
+    bnb_4bit_quant_type=&quot;nf4&quot;,              # 用 NF4 而非 INT4
+    bnb_4bit_use_double_quant=True,         # 开启双重量化，压缩量化常数
+    bnb_4bit_compute_dtype=torch.bfloat16,  # 前向计算时反量化到 BF16
+)
+
+# 2) 量化加载模型，device_map=&quot;auto&quot; 让 accelerate 自动分配层到多卡/CPU
+model = AutoModelForCausalLM.from_pretrained(
+    model_id,
+    quantization_config=bnb_config,
+    device_map=&quot;auto&quot;,
+)
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+
+# 3) 让模型准备好接受 k-bit 训练（冻结基座、处理梯度检查点等）
+model = prepare_model_for_kbit_training(model)
+
+# 4) 在所有注意力投影层上挂 LoRA
+lora_config = LoraConfig(
+    r=16,                                   # 低秩维度，越大表达能力越强但参数越多
+    lora_alpha=32,                          # 缩放系数，常取 r 的 2 倍
+    target_modules=[&quot;q_proj&quot;, &quot;k_proj&quot;, &quot;v_proj&quot;, &quot;o_proj&quot;],
+    lora_dropout=0.05,
+    bias=&quot;none&quot;,
+    task_type=&quot;CAUSAL_LM&quot;,
+)
+model = get_peft_model(model, lora_config)
+
+# 5) 打印可训练参数占比：应只有千分之几
+model.print_trainable_parameters()
+# 输出形如：trainable params: 41,943,040 || all params: 6,779,558,400 || trainable%: 0.6187</code></pre>
+<p>运行后你会看到：模型总参数量约 67 亿，但可训练参数只有约 4000 万，占比约 0.6%。真正参与梯度更新的只有这些 LoRA 增量，而基座以 4-bit 冻结在显存里。接下来只需照常跑 Trainer 或手写训练循环即可，训练步骤和普通 LoRA 完全一致。</p>
+<blockquote>
+<p>提示：用 <code>get_memory_footprint()</code> 或 <code>nvidia-smi</code> 对比&quot;BF16 加载&quot;和&quot;4-bit 加载&quot;的显存占用，会直观地看到 QLoRA 省下的空间。</p>
+</blockquote>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>把 <code>bnb_4bit_use_double_quant</code> 分别设为 <code>True</code>/<code>False</code>，观察显存占用的差别，验证双重量化省下的那一小撮内存。</li>
+<li>修改 <code>r</code>（例如 8 / 16 / 64）和 <code>target_modules</code>（只挂 <code>q_proj</code>、<code>v_proj</code> vs 挂全部四个），对比 <code>print_trainable_parameters()</code> 的输出，理解秩与挂载范围对参数量的影响。</li>
+<li>尝试把 <code>bnb_4bit_quant_type</code> 换成 <code>&quot;fp4&quot;</code>，再换回 <code>&quot;nf4&quot;</code>，查阅 bitsandbytes 文档说明两者差异，并用一句话总结&quot;为什么 NF4 更适合神经网络权重&quot;。</li>
+<li>思考：QLoRA 里&quot;量化&quot;和&quot;LoRA&quot;各自解决了什么独立的问题？如果只做量化不做 LoRA，训练时会发生什么？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>QLoRA 原论文（Dettmers 等，2023）：<a href="https://arxiv.org/abs/2305.14314" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2305.14314</a></li>
+<li>LoRA 原论文（Hu 等，2021）：<a href="https://arxiv.org/abs/2106.09685" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2106.09685</a></li>
+<li>Hugging Face · PEFT 文档（QLoRA 章节）：<a href="https://huggingface.co/docs/peft/developer_guides/quantization" target="_blank" rel="noopener noreferrer">https://huggingface.co/docs/peft/developer_guides/quantization</a></li>
+<li>bitsandbytes 文档（4-bit 量化）：<a href="https://huggingface.co/docs/bitsandbytes/main/en/index" target="_blank" rel="noopener noreferrer">https://huggingface.co/docs/bitsandbytes/main/en/index</a></li>
+</ul>
+<p><a href="#/l/ft-ch4-l2">下一课：PEFT 库</a></p>

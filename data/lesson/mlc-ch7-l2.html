@@ -1,0 +1,198 @@
+<h2 id="h-生成质量与手写-kernel-的差距从哪里来">生成质量：与手写 kernel 的差距从哪里来<a class="anchor" href="#h-生成质量与手写-kernel-的差距从哪里来" aria-label="本节链接">#</a></h2>
+<p>Triton 官方 matmul 教程里有一个很容易被跳过的细节：同一份 kernel、同一组 tile，只把 block 的<strong>发射顺序</strong>从行优先改成分组，前 9 个输出块需要同时留在片上的 block 数就从 90 降到 54，教程注明这在某些硬件上能带来超过 10% 的差别。这说明&quot;生成质量&quot;不是玄学——它由几件可以逐项算清的事情组成：调度决策、形状余数、资源约束。本课把这三项拆开，每一项都给一个能打印出来的数，最后给出&quot;把局部差距折成端到端差距&quot;的算法。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-差距只有三个来源">1. 差距只有三个来源<a class="anchor" href="#h-1-差距只有三个来源" aria-label="本节链接">#</a></h4>
+<p><strong>调度决策</strong>：tile 多大、K 方向分几段、block 之间按什么顺序发射、流水几级、几个 warp。这些是第 6 课搜索空间里的点，也是生成器与手写 kernel 差距的主战场。
+<strong>形状余数</strong>：固定 block 遇到非整除 shape，必须靠掩码或 padding 收口，多发射的 lane 就是纯浪费。
+<strong>资源约束</strong>：累加器、操作数、地址各占多少寄存器，片上缓冲够不够，决定了 occupancy 与&quot;再大一点就变慢&quot;的拐点。</p>
+<p>一个模型在端到端上的差距，是这三项在<strong>各自覆盖的时间段</strong>上的加权结果——所以归因永远先于优化。</p>
+<p><figure><img class="md-img" src="content/courses/ml-compilers/assets/chapter-7-figure-03.svg" alt="生成质量与手写 kernel 的差距只有三个来源：调度决策、形状余数、资源约束" loading="lazy" decoding="async"><figcaption>生成质量与手写 kernel 的差距只有三个来源：调度决策、形状余数、资源约束</figcaption></figure>
+</p>
+<h4 id="h-2-形状余数差一个元素浪费率差两个数量级">2. 形状余数：差一个元素，浪费率差两个数量级<a class="anchor" href="#h-2-形状余数差一个元素浪费率差两个数量级" aria-label="本节链接">#</a></h4>
+<p>代码第 1 节给出实测：<code>BLOCK=128</code> 时，shape 1024 浪费 0%，1000 浪费 2.34%，<strong>1025 浪费 11.02%</strong>；8191 只浪费 0.01%。规律是&quot;发射 lane 数 = ceil(shape/block) × block&quot;，所以浪费率在&quot;刚过一个整数倍&quot;处最难看。这解释了两条工程习惯：一是尽量让 batch/序列长度取到 block 的整数倍，二是把一个点链的逐元素部分与归约部分分别选块，不要让一个块的取整误差污染整网。</p>
+<h4 id="h-3-访问顺序决定工作集90--54">3. 访问顺序决定工作集：90 → 54<a class="anchor" href="#h-3-访问顺序决定工作集90--54" aria-label="本节链接">#</a></h4>
+<p>同一份 GEMM，产出前 9 个输出块时，行优先顺序要触及 9 个 A block 加 81 个 B block（共 90）；按 3 行一组、组内列优先发射，A、B 各 27，共 54。本课代码复现了这两个数，与 Triton 教程一致。放大到 M=N=4096、K=4096、<code>BLOCK_M=BLOCK_N=128</code>、<code>BLOCK_K=64</code>：行优先要 2112 个 block，<code>GROUP_SIZE_M</code> 取 4 或 8 时都是 768——注意 4 与 8 打平不是巧合，块数按 A 与 B 的<strong>对称形状</strong>最小化，组太扁或太长都会让另一侧变差。</p>
+<h4 id="h-4-资源约束累加器先吃掉寄存器">4. 资源约束：累加器先吃掉寄存器<a class="anchor" href="#h-4-资源约束累加器先吃掉寄存器" aria-label="本节链接">#</a></h4>
+<p><code>BLOCK_M×BLOCK_N</code> 的累加器要摊到 <code>num_warps×32</code> 个线程上：128×256 / 256 线程 = 每线程 128 个累加器，而多数架构单线程寄存器上限是 255（以 NVIDIA compute capability 文档为准）。累加器只是下限，再加上操作数与流水缓冲，大 block 会把 occupancy 压下去——这正是&quot;tile 不是越大越好&quot;的定量解释，也是自动调优存在的理由。</p>
+<h4 id="h-5-差距账本与归因">5. 差距账本与归因<a class="anchor" href="#h-5-差距账本与归因" aria-label="本节链接">#</a></h4>
+<p>代码第 4 节把可调项列成账本：tile 尺寸、访问顺序、软件流水、掩码尾部、epilogue 融合、K 方向并行度（split-K / stream-K）、寄存器与 occupancy 权衡，都能在搜索空间里补；只有&quot;为唯一常量形状写死的 persistent kernel / swizzle&quot;通常不在生成器输出里。第 5 节用 Amdahl 折账：局部提速 20%、若只覆盖 25% 的时间，端到端只有约 5%；哪怕点链提速 5 倍，覆盖 25% 时间也只换来 1.26 倍。<strong>先定位时间花在哪一段，再问那一段归谁生成</strong>——这是本课最该记住的顺序。</p>
+<h4 id="h-6-常见坑">6. 常见坑<a class="anchor" href="#h-6-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>拿微基准的加速比当端到端收益</strong>：忽略覆盖比例，结论会大一个数量级（第 5 节）。</li>
+<li><strong>只调 tile 不看发射顺序</strong>：访问顺序几乎不花编译时间，收益却可能超过换块。</li>
+<li><strong>把&quot;用满寄存器&quot;当目标</strong>：寄存器用得越满，occupancy 越低，访存延迟越藏不住。</li>
+<li><strong>对掩码尾部不设防</strong>：大 batch 跑得漂亮、小 batch 或奇数长度掉一半，都是尾部问题。</li>
+<li><strong>忘了 K 方向的并行度</strong>：K 很小、M×N 很大时，网格并行度不足，需要 split-K 再加一次归约。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>纯标准库 Python（本机 <code>python3.10.16</code> 实跑），只需要 <code>math</code>。五段：形状余数表、block 访问顺序的工作集计数（含 Triton 教程的 90/54 复核）、block 尺寸到每线程累加器、差距账本、Amdahl 折账。</p>
+<pre data-lang="python"><code class="language-python"># ---- 第 2 课：生成质量的差距从哪里来（纯标准库，无需 numpy / GPU）----
+import math
+
+# ============ 1. 固定 block 与任意 shape 的尾巴浪费 ============
+def tail(shape, block):
+    useful = shape
+    lanes = math.ceil(shape / block) * block
+    return lanes, lanes - useful, (lanes - useful) / lanes
+
+print(&quot;=== 1. block 取整：同一条生成规则，不同 shape 的浪费率差两个数量级 ===&quot;)
+print(f&quot;  {&#39;shape&#39;:&gt;6} {&#39;BLOCK&#39;:&gt;6} {&#39;发射 lane&#39;:&gt;10} {&#39;空转&#39;:&gt;6} {&#39;浪费率&#39;:&gt;9}&quot;)
+for shape, block in [(1024, 128), (1000, 128), (1025, 128), (4096, 128), (4097, 256), (8191, 128)]:
+    lanes, waste, ratio = tail(shape, block)
+    print(f&quot;  {shape:&gt;6} {block:&gt;6} {lanes:&gt;10} {waste:&gt;6} {ratio:&gt;8.2%}&quot;)
+print(&quot;  对齐的 shape 浪费 0；差 1 个元素就要多发射一整个 block —— 这就是 padding / 掩码的代价&quot;)
+
+# ============ 2. block 访问顺序 → 工作集大小（LRU 缓存模拟）============
+def launch_order(cm, cn, group_m):
+    &quot;&quot;&quot;Triton 官方 matmul 教程的 pid → (pid_m, pid_n) 映射：组内按列优先，组间按行。&quot;&quot;&quot;
+    order = []
+    for pid in range(cm * cn):
+        num_pid_in_group = group_m * cn
+        group_id = pid // num_pid_in_group
+        first_pid_m = group_id * group_m
+        group_size_m = min(cm - first_pid_m, group_m)
+        pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+        pid_n = (pid % num_pid_in_group) // group_size_m
+        order.append((pid_m, pid_n))
+    return order
+
+def working_set(cm, cn, k_tiles, group_m, first_p):
+    &quot;&quot;&quot;产出前 first_p 个输出 block 期间，触及过的 A/B block 去重计数。&quot;&quot;&quot;
+    touched = set()
+    for pid_m, pid_n in launch_order(cm, cn, group_m)[:first_p]:
+        for k in range(k_tiles):
+            touched.add((&quot;A&quot;, pid_m, k))
+            touched.add((&quot;B&quot;, k, pid_n))
+    a_blocks = sum(1 for t in touched if t[0] == &quot;A&quot;)
+    b_blocks = sum(1 for t in touched if t[0] == &quot;B&quot;)
+    return a_blocks, b_blocks
+
+print(&quot;\n=== 2. 同一份计算，只改 block 访问顺序：工作集 90 → 54 ===&quot;)
+cm = cn = 9
+k_tiles = 9
+for group_m, tag in [(1, &quot;行优先（GROUP_SIZE_M=1）&quot;), (3, &quot;分组：3 行一组&quot;)]:
+    a, b = working_set(cm, cn, k_tiles, group_m, first_p=9)
+    print(f&quot;  {cm}x{cn} 个输出 block，K 方向 {k_tiles} 片，产出前 9 个 block：&quot;)
+    print(f&quot;    {tag}：A {a} + B {b} = {a + b} 个 block 需要同时留在片上缓存&quot;)
+print(&quot;  这与 Triton 官方 matmul 教程给出的 90 / 54 一致 —— 差异只来自访问顺序&quot;)
+
+cm = cn = 32
+k_tiles = 64
+print(f&quot;\n  放大到 M=N=4096, K=4096, BLOCK_M=BLOCK_N=128, BLOCK_K=64（{cm}x{cn} 个输出 block，K 方向 {k_tiles} 片）：&quot;)
+for group_m in (1, 4, 8, 16):
+    a, b = working_set(cm, cn, k_tiles, group_m, first_p=cm)
+    print(f&quot;    GROUP_SIZE_M={group_m:&gt;2}：A {a:&gt;4} + B {b:&gt;4} = {a + b:&gt;5} 个 block（产出前 {cm} 个）&quot;)
+
+# ============ 3. block 尺寸 → 每线程累加器 ============
+print(&quot;\n=== 3. block 尺寸直接决定每线程的累加器数量（寄存器压力的第一来源）===&quot;)
+print(f&quot;  {&#39;BLOCK_M&#39;:&gt;7} {&#39;BLOCK_N&#39;:&gt;7} {&#39;warps&#39;:&gt;5} {&#39;线程&#39;:&gt;5} {&#39;acc/线程&#39;:&gt;8} {&#39;片上 acc 总量(MB)&#39;:&gt;18}&quot;)
+for bm, bn, warps in [(128, 256, 8), (128, 128, 4), (64, 128, 4), (64, 64, 4), (32, 32, 4)]:
+    threads = warps * 32
+    acc_per_thread = bm * bn / threads
+    acc_total_mb = bm * bn * 4 / 2**20
+    print(f&quot;  {bm:&gt;7} {bn:&gt;7} {warps:&gt;5} {threads:&gt;5} {acc_per_thread:&gt;8.0f} {acc_total_mb:&gt;18.2f}&quot;)
+print(&quot;  单线程寄存器上限多数架构为 255（以 NVIDIA compute capability 文档为准）；&quot;)
+print(&quot;  acc 只是下限，加上操作数、地址、流水缓冲，大 block 会先把 occupancy 压下去&quot;)
+
+# ============ 4. 差距账本：哪些部分生成器补得上、哪些补不上 ============
+print(&quot;\n=== 4. 差距账本：每一项对应一个可调旋钮 ===&quot;)
+LEDGER = [
+    (&quot;tile 尺寸选择&quot;, &quot;自动调优扫 BLOCK_M/N/K × num_warps × num_stages&quot;, &quot;可补&quot;),
+    (&quot;block 访问顺序&quot;, &quot;分组顺序提升片上/L2 复用（第 2 节）&quot;, &quot;可补&quot;),
+    (&quot;软件流水&quot;, &quot;num_stages：预取下一片，掩盖访存延迟&quot;, &quot;可补&quot;),
+    (&quot;尾部与掩码&quot;, &quot;shape 取整带来的空转（第 1 节）&quot;, &quot;部分可补：改 shape 或专门 ptx 化&quot;),
+    (&quot;epilogue 融合&quot;, &quot;把 bias/激活融进 GEMM 模板，省一次 DRAM 往返&quot;, &quot;可补（模板支持时）&quot;),
+    (&quot;K 方向并行度&quot;, &quot;split-K / stream-K：K 小、M×N 大时切 K&quot;, &quot;可补（需要额外归约）&quot;),
+    (&quot;寄存器/occupancy 权衡&quot;, &quot;num_warps 与 block 大小的联合搜索&quot;, &quot;可补（搜索空间内）&quot;),
+    (&quot;常量形状特化&quot;, &quot;为唯一形状写死的 persistent kernel / swizzle&quot;, &quot;生成器通常不做&quot;),
+]
+for item, knob, cover in LEDGER:
+    print(f&quot;  {item:&lt;18}{knob:&lt;46}{cover}&quot;)
+
+# ============ 5. 用 Amdahl 把&quot;局部差距&quot;折成端到端差距 ============
+def speedup(parts):
+    &quot;&quot;&quot;parts: [(占比, 该部分加速比)]；1/(Σ 占比/加速比)。&quot;&quot;&quot;
+    total = sum(frac / sp for frac, sp in parts)
+    return 1.0 / total
+
+print(&quot;\n=== 5. 局部差距 → 端到端差距（模型估算，占比是假设值）===&quot;)
+for parts, tag in [
+    ([(0.70, 1.00), (0.25, 1.20), (0.05, 1.10)], &quot;点在 matmul（外部库）上的模型&quot;),
+    ([(0.30, 1.00), (0.60, 1.20), (0.10, 1.10)], &quot;点在点链/归约上的模型&quot;),
+    ([(0.70, 1.00), (0.25, 5.00), (0.05, 1.10)], &quot;点链加速 5x 的乐观上界&quot;),
+]:
+    print(f&quot;  {tag}：端到端加速 = {speedup(parts):.3f}x&quot;)
+print(&quot;  结论：局部 20% 的提升，若只覆盖 25% 的时间，端到端只有约 5%；&quot;)
+print(&quot;  所以：生成质量要先看时间花在哪一段，再看那一段归谁生成&quot;)</code></pre>
+<p>实际运行结果：</p>
+<pre data-lang="text"><code class="language-text">=== 1. block 取整：同一条生成规则，不同 shape 的浪费率差两个数量级 ===
+   shape  BLOCK    发射 lane     空转       浪费率
+    1024    128       1024      0    0.00%
+    1000    128       1024     24    2.34%
+    1025    128       1152    127   11.02%
+    4096    128       4096      0    0.00%
+    4097    256       4352    255    5.86%
+    8191    128       8192      1    0.01%
+  对齐的 shape 浪费 0；差 1 个元素就要多发射一整个 block —— 这就是 padding / 掩码的代价
+
+=== 2. 同一份计算，只改 block 访问顺序：工作集 90 → 54 ===
+  9x9 个输出 block，K 方向 9 片，产出前 9 个 block：
+    行优先（GROUP_SIZE_M=1）：A 9 + B 81 = 90 个 block 需要同时留在片上缓存
+  9x9 个输出 block，K 方向 9 片，产出前 9 个 block：
+    分组：3 行一组：A 27 + B 27 = 54 个 block 需要同时留在片上缓存
+  这与 Triton 官方 matmul 教程给出的 90 / 54 一致 —— 差异只来自访问顺序
+
+  放大到 M=N=4096, K=4096, BLOCK_M=BLOCK_N=128, BLOCK_K=64（32x32 个输出 block，K 方向 64 片）：
+    GROUP_SIZE_M= 1：A   64 + B 2048 =  2112 个 block（产出前 32 个）
+    GROUP_SIZE_M= 4：A  256 + B  512 =   768 个 block（产出前 32 个）
+    GROUP_SIZE_M= 8：A  512 + B  256 =   768 个 block（产出前 32 个）
+    GROUP_SIZE_M=16：A 1024 + B  128 =  1152 个 block（产出前 32 个）
+
+=== 3. block 尺寸直接决定每线程的累加器数量（寄存器压力的第一来源）===
+  BLOCK_M BLOCK_N warps    线程   acc/线程      片上 acc 总量(MB)
+      128     256     8   256      128               0.12
+      128     128     4   128      128               0.06
+       64     128     4   128       64               0.03
+       64      64     4   128       32               0.02
+       32      32     4   128        8               0.00
+  单线程寄存器上限多数架构为 255（以 NVIDIA compute capability 文档为准）；
+  acc 只是下限，加上操作数、地址、流水缓冲，大 block 会先把 occupancy 压下去
+
+=== 4. 差距账本：每一项对应一个可调旋钮 ===
+  tile 尺寸选择         自动调优扫 BLOCK_M/N/K × num_warps × num_stages    可补
+  block 访问顺序        分组顺序提升片上/L2 复用（第 2 节）                         可补
+  软件流水              num_stages：预取下一片，掩盖访存延迟                       可补
+  尾部与掩码             shape 取整带来的空转（第 1 节）                          部分可补：改 shape 或专门 ptx 化
+  epilogue 融合       把 bias/激活融进 GEMM 模板，省一次 DRAM 往返               可补（模板支持时）
+  K 方向并行度           split-K / stream-K：K 小、M×N 大时切 K              可补（需要额外归约）
+  寄存器/occupancy 权衡  num_warps 与 block 大小的联合搜索                     可补（搜索空间内）
+  常量形状特化            为唯一形状写死的 persistent kernel / swizzle          生成器通常不做
+
+=== 5. 局部差距 → 端到端差距（模型估算，占比是假设值）===
+  点在 matmul（外部库）上的模型：端到端加速 = 1.048x
+  点在点链/归约上的模型：端到端加速 = 1.122x
+  点链加速 5x 的乐观上界：端到端加速 = 1.257x
+  结论：局部 20% 的提升，若只覆盖 25% 的时间，端到端只有约 5%；
+  所以：生成质量要先看时间花在哪一段，再看那一段归谁生成</code></pre>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选，需自备或云上按需：把上面的模型换成实测 ----
+# 有一块 NVIDIA GPU 时，用 Triton 官方教程的 autotune 版本扫配置：
+#   pip install triton &amp;&amp; python3 -c &quot;import triton; print(triton.__version__)&quot;   # 版本以官方为准
+#   然后跑 triton 教程里的 03-matrix-multiplication，把 @triton.autotune 的 configs 换成
+#   只改 GROUP_SIZE_M 的两组（其余相同），对比两种顺序的耗时
+# 没有 GPU 也能观察同一件事：把 ncu / nsight compute 的 L2 与 smem 相关计数器换成
+#   &quot;本课第 2 节的 block 计数&quot;，两者衡量的是同一个量（工作集大小）。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：把第 2 节的 <code>working_set</code> 扩展成同时支持&quot;按 <code>GROUP_SIZE_M</code> 分组&quot;与&quot;按 N 方向分组（对称写法）&quot;，找出 M=N=4096、<code>BLOCK=128</code>、K 方向 64 片时使总块数最小的分组方式，并解释为什么最优解接近正方形。</li>
+<li><strong>解释</strong>：为什么 <code>shape=1025, BLOCK=128</code> 的浪费率（11.02%）远高于 <code>shape=8191, BLOCK=128</code>（0.01%）？如果把块改成 256，这两个 shape 的浪费率各变成多少？</li>
+<li><strong>对比/验证</strong>：用第 3 节的公式算出 <code>BLOCK_M=BLOCK_N=256, num_warps=8</code> 时每线程的累加器数量，并与 <code>128×128, num_warps=4</code> 比较；解释为什么前者的实测往往更慢，尽管 tile 更大。</li>
+<li><strong>思考</strong>：假设某模型 60% 时间在 extern GEMM（生成器无法改）、40% 在生成的点链。若你要把端到端提高 15%，点链至少要快多少倍？这个数字如果不可能达到，说明决策应该转向哪里？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Triton 官方文档, <em>Matrix Multiplication</em>（block 级 GEMM 写法、分组发射顺序与&quot;9×9 个 block：行优先 90 vs 分组 54&quot;的例子、<code>@triton.autotune</code> 的 BLOCK/num_warps/num_stages 配置集）：<a href="https://triton-lang.org/main/getting-started/tutorials/03-matrix-multiplication.html" target="_blank" rel="noopener noreferrer">https://triton-lang.org/main/getting-started/tutorials/03-matrix-multiplication.html</a></li>
+<li>PyTorch dev-discuss, <em>TorchInductor: a PyTorch-native Compiler with Define-by-Run IR and Symbolic Shapes</em>（融合判定 <code>can_fuse</code>、融合优先级 <code>score_fusion</code>，以及&quot;部分融合会挡住另一些融合，所以顺序重要&quot;）：<a href="https://dev-discuss.pytorch.org/t/torchinductor-a-pytorch-native-compiler-with-define-by-run-ir-and-symbolic-shapes/747" target="_blank" rel="noopener noreferrer">https://dev-discuss.pytorch.org/t/torchinductor-a-pytorch-native-compiler-with-define-by-run-ir-and-symbolic-shapes/747</a></li>
+<li>Lianmin Zheng et al., <em>Ansor: Generating High-Performance Tensor Programs for Deep Learning</em>（OSDI&#39;20；同一计算的搜索空间如何由 tile / 并行 / 流水等原语构成，以及代价模型如何排序候选）：<a href="https://www.usenix.org/conference/osdi20/presentation/zheng" target="_blank" rel="noopener noreferrer">https://www.usenix.org/conference/osdi20/presentation/zheng</a></li>
+<li>NVIDIA, <em>CUDA C++ Best Practices Guide</em>（occupancy、寄存器与并行度的权衡；单线程寄存器上限以 compute capability 表为准）：<a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/contents.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/contents.html</a></li>
+</ul>
+<p><a href="#/l/mlc-ch7-l3">下一课：回退与兜底：生成失败时的正确性保障</a></p>

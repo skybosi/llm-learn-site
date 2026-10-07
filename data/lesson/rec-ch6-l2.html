@@ -1,0 +1,192 @@
+<h2 id="h-完整推荐流程实现">完整推荐流程实现<a class="anchor" href="#h-完整推荐流程实现" aria-label="本节链接">#</a></h2>
+<blockquote>
+<p>规划做完，本课动手把&quot;召回 → 粗排 → 精排 → 重排&quot;整条链路在一个脚本里跑通。我们用前面各章的思路写一个最小可用版本：多路召回（ItemCF + 热门 + 主题向量）、内积粗排、精细打分精排、MMR 多样性重排，最后输出一份推荐列表。</p>
+</blockquote>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-端到端流程的模块划分">1. 端到端流程的模块划分<a class="anchor" href="#h-1-端到端流程的模块划分" aria-label="本节链接">#</a></h4>
+<p>把前面的知识落到代码，一条推荐请求的处理可以清晰切成四个模块：</p>
+<ol>
+<li><strong>召回</strong>：并行跑多路，各自产出候选并打分，合并去重后得到数千候选。</li>
+<li><strong>粗排</strong>：对数千候选做轻量打分（内积），砍到几百。</li>
+<li><strong>精排</strong>：对几百候选做精细打分（融合物品画像、用户兴趣、流行度等），排到几十。</li>
+<li><strong>重排</strong>：对精排结果做多样性打散（MMR），得到最终展示列表。</li>
+</ol>
+<p>每个模块都是前面课程里独立讲过的一块，本课的价值在于把它们<strong>用统一的接口串起来</strong>，并体会到&quot;每一层都在缩小候选、逐步换更重的模型&quot;这个设计。</p>
+<h4 id="h-2-让每一路召回有分数可合并">2. 让每一路召回&quot;有分数、可合并&quot;<a class="anchor" href="#h-2-让每一路召回有分数可合并" aria-label="本节链接">#</a></h4>
+<p>多路召回的合并要求每一路都输出&quot;物品 ID → 分数&quot;的统一结构。本课用三种召回：</p>
+<ul>
+<li><strong>ItemCF 召回</strong>：从交互矩阵算物品-物品相似度，对用户历史物品的相似物品累加分数（个性化）。</li>
+<li><strong>热门召回</strong>：按物品全局点击次数打分（兜底、冷启动）。</li>
+<li><strong>主题向量召回</strong>：把物品主题 one-hot 当作物品向量，把用户主题偏好归一化当作用户向量，内积打分（类比双塔，语义泛化）。</li>
+</ul>
+<p>三者分数先各自 min-max 归一化，再加权求和、按物品 ID 去重，就得到合并后的候选。</p>
+<h4 id="h-3-粗排精排重排如何衔接">3. 粗排、精排、重排如何衔接<a class="anchor" href="#h-3-粗排精排重排如何衔接" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>粗排</strong>：直接用&quot;用户主题偏好向量 · 物品主题向量&quot;的内积，速度快，把合并候选砍到几百。</li>
+<li><strong>精排</strong>：构造一个更重的打分函数 <code>fine_score</code>，融合主题匹配度、物品流行度、以及一个&quot;新鲜度&quot;（发布时间越近分越高），模拟真实精排模型&quot;特征更多、更准&quot;。</li>
+<li><strong>重排</strong>：用 MMR 在&quot;精排分数&quot;和&quot;类目多样性&quot;之间平衡，避免推荐列表被同一主题霸屏。</li>
+</ul>
+<p>每个阶段的函数都只依赖&quot;上一个阶段的输出列表&quot;，接口清晰，便于后续把任意一层替换成真正的深度学习模型或 ANN 引擎。</p>
+<p><figure><img class="md-img" src="content/courses/recommendation-systems/assets/chapter-6-figure-02.svg" alt="完整推荐流程的数据流" loading="lazy" decoding="async"><figcaption>完整推荐流程的数据流</figcaption></figure>
+</p>
+<h3 id="h-二可运行示例">二、可运行示例<a class="anchor" href="#h-二可运行示例" aria-label="本节链接">#</a></h3>
+<h4 id="h-示例-1端到端推荐流程一个脚本跑通全链路">示例 1：端到端推荐流程（一个脚本跑通全链路）<a class="anchor" href="#h-示例-1端到端推荐流程一个脚本跑通全链路" aria-label="本节链接">#</a></h4>
+<pre data-lang="python"><code class="language-python">import numpy as np
+
+# ---------- 0. 数据准备 ----------
+np.random.seed(42)
+n_users, n_items, n_topics = 500, 800, 8
+user_topics = np.array([np.random.choice(n_topics, size=np.random.randint(1, 3), replace=False)
+                        for _ in range(n_users)], dtype=object)
+item_topics = np.random.randint(0, n_topics, size=n_items)
+item_time = np.random.randint(0, 100, size=n_items)      # 发布时间（越大越新）
+
+# 生成交互矩阵 R（用户×物品，1 表示点击），并统计物品流行度
+R = np.zeros((n_users, n_items))
+for u in range(n_users):
+    for i in np.random.choice(n_items, size=np.random.randint(30, 100), replace=False):
+        boost = 0.6 if item_topics[i] in user_topics[u] else 0.0
+        if np.random.rand() &lt; 0.05 + boost:
+            R[u, i] = 1
+item_hot = R.sum(axis=0)                                 # 物品流行度
+
+# ---------- 1. 召回 ----------
+def cosine_sim(A):
+    norm = np.linalg.norm(A, axis=0, keepdims=True) + 1e-9
+    return (A / norm).T @ (A / norm)
+
+def itemcf_recall(u, R, item_sim, top=300):
+    &quot;&quot;&quot;ItemCF：用户历史物品的相似物品累加分数。&quot;&quot;&quot;
+    scores = np.zeros(R.shape[1])
+    for i in np.where(R[u] &gt; 0)[0]:
+        scores += item_sim[i]
+    scores[np.where(R[u] &gt; 0)[0]] = -np.inf
+    idx = np.argsort(-scores)[:top]
+    return idx, scores[idx]
+
+def topic_vec_recall(u, top=300):
+    &quot;&quot;&quot;主题向量召回：用户主题偏好向量 · 物品主题 one-hot。&quot;&quot;&quot;
+    item_vec = np.eye(n_topics)[item_topics]             # (n_items, n_topics)
+    user_vec = np.zeros(n_topics)
+    for t in user_topics[u]:
+        user_vec[t] = 1.0
+    user_vec /= (user_vec.sum() + 1e-9)
+    scores = item_vec @ user_vec
+    idx = np.argsort(-scores)[:top]
+    return idx, scores[idx]
+
+def merge_recall(u, R, item_sim, top=800):
+    &quot;&quot;&quot;合并三路召回：归一化 + 加权 + 去重。&quot;&quot;&quot;
+    def minmax(s):
+        return (s - s.min()) / (s.max() - s.min() + 1e-9)
+    i1, s1 = itemcf_recall(u, R, item_sim)
+    hot_idx = np.argsort(-item_hot)[:300]
+    i2, s2 = hot_idx, item_hot[hot_idx]
+    i3, s3 = topic_vec_recall(u)
+    # 逐路归一化后加权累加，用字典按物品 id 去重
+    merged = {}
+    def add_route(idx, scores, w):
+        m = minmax(scores)
+        for j, v in zip(idx, m):
+            merged[j] = merged.get(j, 0.0) + w * v
+    add_route(i1, s1, 0.5)
+    add_route(i2, s2, 0.2)
+    add_route(i3, s3, 0.3)
+    # 排除已交互过的
+    for seen in np.where(R[u] &gt; 0)[0]:
+        merged.pop(seen, None)
+    top_items = sorted(merged.items(), key=lambda kv: -kv[1])[:top]
+    return np.array([k for k, _ in top_items]), np.array([v for _, v in top_items])
+
+# ---------- 2. 粗排 ----------
+def coarse_rank(u, cand_idx, top=300):
+    &quot;&quot;&quot;粗排：用户主题偏好与物品主题的内积。&quot;&quot;&quot;
+    user_vec = np.zeros(n_topics)
+    for t in user_topics[u]:
+        user_vec[t] = 1.0
+    user_vec /= (user_vec.sum() + 1e-9)
+    item_vec = np.eye(n_topics)[item_topics[cand_idx]]
+    scores = item_vec @ user_vec
+    order = np.argsort(-scores)[:top]
+    return cand_idx[order]
+
+# ---------- 3. 精排 ----------
+def fine_rank(u, cand_idx, top=50):
+    &quot;&quot;&quot;精排：融合主题匹配、流行度、新鲜度的精细打分。&quot;&quot;&quot;
+    user_top = set(user_topics[u].tolist())
+    scores = []
+    for i in cand_idx:
+        match = 1.0 if item_topics[i] in user_top else 0.0
+        hot_n = item_hot[i] / (item_hot.max() + 1e-9)
+        fresh = item_time[i] / 100.0
+        # 模拟精排模型：非线性组合多个特征
+        scores.append(2.0 * match + 0.5 * hot_n + 0.3 * fresh + 0.2 * match * hot_n)
+    scores = np.array(scores)
+    return cand_idx[np.argsort(-scores)[:top]]
+
+# ---------- 4. 重排（MMR 多样性打散） ----------
+def mmr_rerank(u, cand_idx, lam=0.7, k=10):
+    &quot;&quot;&quot;在精排分数与主题多样性之间平衡，输出最终列表。&quot;&quot;&quot;
+    user_top = set(user_topics[u].tolist())
+    rel = np.array([1.0 if item_topics[i] in user_top else 0.2 for i in cand_idx])
+    rel = rel / (rel.max() + 1e-9)
+    selected, remain = [], list(range(len(cand_idx)))
+    for _ in range(min(k, len(cand_idx))):
+        best, best_val = None, -np.inf
+        for p in remain:
+            div = max((1.0 if item_topics[cand_idx[p]] == item_topics[cand_idx[s]] else 0.0)
+                      for s in selected) if selected else 0.0
+            val = lam * rel[p] - (1 - lam) * div
+            if val &gt; best_val:
+                best, best_val = p, val
+        selected.append(best)
+        remain.remove(best)
+    return cand_idx[selected]
+
+# ---------- 5. 组装完整流程 ----------
+item_sim = cosine_sim(R)
+
+def recommend(u, k=10):
+    cand, _ = merge_recall(u, R, item_sim)     # 召回 -&gt; 数千
+    cand = coarse_rank(u, cand)                # 粗排 -&gt; 数百
+    cand = fine_rank(u, cand)                  # 精排 -&gt; 数十
+    return mmr_rerank(u, cand, k=k)            # 重排 -&gt; 最终
+
+# 验证：为 3 个用户跑完整流程，并统计最终列表的命中率（模拟简单评估）
+def hit_rate(u, rec_list, R):
+    &quot;&quot;&quot;命中率：推荐列表里有多少是用户真实交互过的（这里用&#39;主题匹配&#39;近似评估）。&quot;&quot;&quot;
+    return np.mean([1.0 if item_topics[i] in user_topics[u] else 0.0 for i in rec_list])
+
+for u in [0, 10, 100]:
+    rec = recommend(u, k=10)
+    print(f&quot;用户 {u:&gt;3} 主题偏好 {user_topics[u].tolist()} -&gt; 推荐 {rec.tolist()}&quot;)
+    print(f&quot;      推荐主题 {item_topics[rec].tolist()}  主题命中率 {hit_rate(u, rec, R):.1f}&quot;)</code></pre>
+<h4 id="h-示例-2检查各阶段候选量与主题命中率">示例 2：检查各阶段候选量与主题命中率<a class="anchor" href="#h-示例-2检查各阶段候选量与主题命中率" aria-label="本节链接">#</a></h4>
+<p>把中间量级打印出来，直观看到漏斗逐层收紧；同时观察各阶段的主题命中率如何变化——尤其注意粗排若只用粗粒度的信号，命中率可能出现波动，这正说明粗排&quot;既要快、又要和精排目标对齐&quot;的重要性。</p>
+<pre data-lang="python"><code class="language-python">u = 42
+cand, _ = merge_recall(u, R, item_sim)
+print(&quot;召回候选量:&quot;, len(cand))
+cand2 = coarse_rank(u, cand)
+print(&quot;粗排候选量:&quot;, len(cand2))
+cand3 = fine_rank(u, cand2)
+print(&quot;精排候选量:&quot;, len(cand3))
+final = mmr_rerank(u, cand3, k=10)
+print(&quot;最终列表量:&quot;, len(final))
+# 主题命中率逐层变化
+for name, lst in [(&quot;召回&quot;, cand[:200]), (&quot;粗排&quot;, cand2), (&quot;精排&quot;, cand3), (&quot;重排&quot;, final)]:
+    hit = np.mean([1.0 if item_topics[i] in user_topics[u] else 0.0 for i in lst])
+    print(f&quot;{name}阶段主题命中率: {hit:.3f}&quot;)</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>把 <code>merge_recall</code> 里三路召回的权重从 <code>(0.5, 0.2, 0.3)</code> 改成 <code>(0.1, 0.8, 0.1)</code>（几乎只看热门），观察最终列表的主题命中率和多样性如何变化，说明&quot;兜底&quot;与&quot;个性化&quot;的此消彼长。</li>
+<li>给&quot;精排&quot;的 <code>fine_score</code> 增加一个&quot;价格/质量&quot;维度的特征（比如物品质量分 <code>item_quality</code>），并说明增加一个特征后精排为什么能比粗排更准。</li>
+<li>解释示例 1 里&quot;主题向量召回&quot;为什么能召回到&quot;用户没交互过、但主题匹配&quot;的物品，而 ItemCF 召不到。</li>
+<li>思考题：这个 Demo 全程在内存里跑。如果要上线服务化，哪些计算需要离线预计算（如 <code>item_sim</code>、物品向量），哪些必须在线上实时算？为什么？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>王喆《深度学习推荐系统》配套论文清单 Reco-papers：<a href="https://github.com/wzhe06/Reco-papers" target="_blank" rel="noopener noreferrer">https://github.com/wzhe06/Reco-papers</a></li>
+<li>YouTube 推荐论文《Deep Neural Networks for YouTube Recommendations》（召回/排序工程实践）：<a href="https://static.googleusercontent.com/media/research.google.com/zh-CN//pubs/archive/45530.pdf" target="_blank" rel="noopener noreferrer">https://static.googleusercontent.com/media/research.google.com/zh-CN//pubs/archive/45530.pdf</a></li>
+<li>MMR（Maximal Marginal Relevance）论文：<a href="https://www.cs.cmu.edu/~jgc/publication/The_Use_MMR_Diversity_Based_LTMIR_1998.pdf" target="_blank" rel="noopener noreferrer">https://www.cs.cmu.edu/~jgc/publication/The_Use_MMR_Diversity_Based_LTMIR_1998.pdf</a></li>
+</ul>
+<p><a href="#/l/rec-ch6-l3">下一课：结果评估与复盘</a></p>

@@ -1,0 +1,680 @@
+<h2 id="h-项目实现一个能编译小型语言并正确运行全部用例的编译器">项目：实现一个能编译小型语言并正确运行全部用例的编译器<a class="anchor" href="#h-项目实现一个能编译小型语言并正确运行全部用例的编译器" aria-label="本节链接">#</a></h2>
+<p>&quot;每章都能讲清&quot;和&quot;能连起来跑&quot;是两件事。前面的课时分别交付了扫描器、递归下降、符号表、IR、优化和后端知识，但它们从未在同一个程序里共存过。本课把它们装成一台完整的编译器：不到 500 行的单文件实现，支持 <code>let</code>、赋值、<code>if/else</code>、<code>while</code>、函数（含递归）与 <code>print</code>，编译到栈式字节码并在虚拟机上运行——8 个用例全部通过，并且必须在<strong>优化前后输出完全一致</strong>。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-先定验收口径再写代码">1. 先定验收口径，再写代码<a class="anchor" href="#h-1-先定验收口径再写代码" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>用例</th>
+<th>考什么</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1</td>
+<td>算术与优先级</td>
+<td><code>2+3*4</code>、括号、整除与取余</td>
+</tr>
+<tr>
+<td>2</td>
+<td>let 与赋值</td>
+<td>变量声明与重新赋值</td>
+</tr>
+<tr>
+<td>3</td>
+<td>if/else</td>
+<td>走 else 分支</td>
+</tr>
+<tr>
+<td>4</td>
+<td>while 求和 1..10</td>
+<td>循环 + 条件跳转回填</td>
+</tr>
+<tr>
+<td>5</td>
+<td>函数与参数</td>
+<td>调用协议、参数压栈、返回值</td>
+</tr>
+<tr>
+<td>6</td>
+<td>递归 fib(10)</td>
+<td>帧栈、递归调用</td>
+</tr>
+<tr>
+<td>7</td>
+<td>常量折叠生效</td>
+<td>优化改变指令数但不改变输出</td>
+</tr>
+<tr>
+<td>8</td>
+<td>常量条件剪枝</td>
+<td><code>if (1&lt;2)</code> 被编译期判定</td>
+</tr>
+</tbody></table>
+<p>三条硬指标：<strong>功能</strong>（8/8 输出逐行一致）、<strong>一致性</strong>（同一用例&quot;不优化&quot;与&quot;优化后&quot;输出必须完全相同，这是第 5 章正确性要求在项目里的最小形式）、<strong>报错</strong>（未定义变量在编译期拦下并给出名字，除以 0 在运行期报错）。任何一条不满足，项目就不算完成。</p>
+<h4 id="h-2-语言规格与故意不支持的边界">2. 语言规格与&quot;故意不支持&quot;的边界<a class="anchor" href="#h-2-语言规格与故意不支持的边界" aria-label="本节链接">#</a></h4>
+<pre data-lang="text"><code class="language-text">program := { fn | stmt }
+fn      := &#39;fn&#39; NAME &#39;(&#39; [NAME {&#39;,&#39; NAME}] &#39;)&#39; block
+stmt    := &#39;let&#39; NAME &#39;=&#39; expr &#39;;&#39; | NAME &#39;=&#39; expr &#39;;&#39;
+         | &#39;if&#39; &#39;(&#39; expr &#39;)&#39; block [&#39;else&#39; block] | &#39;while&#39; &#39;(&#39; expr &#39;)&#39; block
+         | &#39;return&#39; [expr] &#39;;&#39; | &#39;print&#39; &#39;(&#39; expr &#39;)&#39; &#39;;&#39; | expr &#39;;&#39;
+expr    := cmp ;  cmp := add {(&#39;&lt;&#39;|&#39;&lt;=&#39;|&#39;&gt;&#39;|&#39;&gt;=&#39;|&#39;==&#39;|&#39;!=&#39;) add}
+add     := mul {(&#39;+&#39;|&#39;-&#39;) mul} ;  mul := unary {(&#39;*&#39;|&#39;/&#39;|&#39;%&#39;) unary}
+unary   := &#39;-&#39; unary | primary
+primary := NUMBER | NAME | NAME &#39;(&#39; [expr {&#39;,&#39; expr}] &#39;)&#39; | &#39;(&#39; expr &#39;)&#39;</code></pre>
+<p><strong>明确不支持</strong>：浮点、字符串、数组、闭包、块级作用域（同一函数内同名变量共用一个槽位）、短路求值。边界写出来是为了让&quot;这是 bug 吗&quot;有答案——第 2 章的错误恢复在本项目里退化成&quot;报第一个错就停&quot;。</p>
+<h4 id="h-3-五段流水线每一段都能指回前面某章">3. 五段流水线，每一段都能指回前面某章<a class="anchor" href="#h-3-五段流水线每一段都能指回前面某章" aria-label="本节链接">#</a></h4>
+<p><code>scan</code>（第 2 章：正则手写扫描器，带行号）→ <code>parse</code>（第 2 章：递归下降 + 优先级爬升）→ <code>resolve</code>（第 3 章：名字绑定）→ <code>codegen</code>（第 4 章：IR 思路 + 第 6 章栈式机器模型）→ <code>VM</code>（执行）。两个设计决定值得记住：</p>
+<ul>
+<li><strong>绑定槽位而不是名字</strong>：符号表把每个变量映射成帧内下标，运行时只做 <code>slots[i]</code> 数组访问，没有字典查找。</li>
+<li><strong>编译成字节码而不是边走 AST 边算</strong>：AST 只需走一遍生成代码，之后同一份字节码可以被执行任意多次——这正是&quot;编译&quot;与&quot;解释&quot;的分界。</li>
+</ul>
+<p><figure><img class="md-img" src="content/courses/compiler-foundations/assets/chapter-7-figure-03.svg" alt="五段流水线：scan → parse → resolve → codegen → VM" loading="lazy" decoding="async"><figcaption>五段流水线：scan → parse → resolve → codegen → VM</figcaption></figure>
+</p>
+<h4 id="h-4-指令集">4. 指令集<a class="anchor" href="#h-4-指令集" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>指令</th>
+<th>语义</th>
+<th>指令</th>
+<th>语义</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>CONST k</code></td>
+<td>压入常量</td>
+<td><code>JMP a</code></td>
+<td>跳到 a</td>
+</tr>
+<tr>
+<td><code>LOAD s</code></td>
+<td>压入槽位 s</td>
+<td><code>JZ a</code></td>
+<td>弹出，为 0 则跳 a</td>
+</tr>
+<tr>
+<td><code>STORE s</code></td>
+<td>弹出并写入槽位 s</td>
+<td><code>CALL f n</code></td>
+<td>调 f，n 个参数</td>
+</tr>
+<tr>
+<td><code>ADD..NE</code></td>
+<td>弹出两个、压入结果</td>
+<td><code>RET</code></td>
+<td>弹出返回值并退栈</td>
+</tr>
+<tr>
+<td><code>NEG</code></td>
+<td>取负</td>
+<td><code>PRINT</code></td>
+<td>弹出并打印</td>
+</tr>
+<tr>
+<td><code>HALT</code></td>
+<td>结束主程序</td>
+<td></td>
+<td></td>
+</tr>
+</tbody></table>
+<h4 id="h-5-三个最容易写错的地方都实测踩过">5. 三个最容易写错的地方（都实测踩过）<a class="anchor" href="#h-5-三个最容易写错的地方都实测踩过" aria-label="本节链接">#</a></h4>
+<ol>
+<li><strong><code>let</code> 的求值顺序</strong>：本项目是&quot;先算右值、再分配槽位&quot;（<code>self.gen(node[2])</code> 必须在 <code>self.res.declare(node[1])</code> 之前）。顺序反了在这个语言里影响不大（同名变量复用同一槽位），但一旦引入块级作用域，<code>{ let x = x + 1; }</code> 就会先占住内层 <code>x</code> 的槽位再拿它当右值——经典的自引用 bug。</li>
+<li><strong>跳转回填</strong>：<code>if</code>/<code>while</code> 先发一条 <code>JZ ?</code> 占位，生成完分支再回填目标；<code>while</code> 末尾要 <code>JMP</code> 回到<strong>条件</strong>的位置而不是循环体开头。</li>
+<li><strong>优化不能改变可观察行为</strong>：本项目的常量折叠会把 <code>1/0</code> 从运行期错误提前成编译期错误——这是已知偏离，生产编译器必须保证&quot;永不执行的代码不能导致编译失败&quot;。另外整数除法要向零截断（C 语义），Python 的 <code>//</code> 是向下取整，负数上会不一致，必须自己写 <code>idiv</code>。</li>
+</ol>
+<h4 id="h-6-做完之后还差什么">6. 做完之后还差什么<a class="anchor" href="#h-6-做完之后还差什么" aria-label="本节链接">#</a></h4>
+<p>错误恢复（第 2 章）、完整类型检查与隐式转换（第 3 章）、SSA 与数据流优化（第 4–5 章）、寄存器分配与指令调度（第 6 章——字节码 VM 恰好把这些都绕过去了）、真正的机器码生成（第 6 章）。把 <code>Compiler</code> 的出口从字节码换成 LLVM IR，这个项目就直接对接上了下一门课。</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>单文件、纯 Python、无第三方依赖。<code>CASES</code> 里是 8 个用例（源码 + 期望输出），<code>fold</code> 是优化器，<code>compile_source(src, optimize=...)</code> 是统一入口——同一份源码分别走&quot;不优化/优化&quot;两条路，输出必须一致才算 PASS。</p>
+<pre data-lang="python"><code class="language-python"># ---- 项目：一个能编能跑的迷你编译器（扫描 → 解析 → 解析名字 → 字节码 → 栈式 VM）----
+# 纯 Python，无第三方依赖。语言 &quot;Mini&quot; 支持：let / 赋值 / if-else / while / fn / return / print
+# 算术 + - * / %、比较 &lt; &lt;= &gt; &gt;= == !=、函数调用（含递归）
+import re
+import unicodedata
+
+# ============ 1. 词法 ============
+TOKEN = re.compile(r&#39;&#39;&#39;(?P&lt;space&gt;\s+)|(?P&lt;num&gt;\d+)|(?P&lt;name&gt;[A-Za-z_]\w*)
+|(?P&lt;op&gt;==|!=|&lt;=|&gt;=|[-+*/%&lt;&gt;=(){},;])&#39;&#39;&#39;, re.X)
+KEYWORDS = {&#39;let&#39;, &#39;fn&#39;, &#39;if&#39;, &#39;else&#39;, &#39;while&#39;, &#39;return&#39;, &#39;print&#39;}
+
+
+def scan(src):
+    &quot;&quot;&quot;字符流 → token 流；带行号，供报错定位&quot;&quot;&quot;
+    toks, i, line = [], 0, 1
+    while i &lt; len(src):
+        m = TOKEN.match(src, i)
+        if not m:
+            raise SyntaxError(f&#39;第 {line} 行：非法字符 {src[i]!r}&#39;)
+        i = m.end()
+        kind = m.lastgroup
+        text = m.group()
+        if kind == &#39;space&#39;:
+            line += text.count(&#39;\n&#39;)
+            continue
+        if kind == &#39;name&#39; and text in KEYWORDS:
+            kind = text
+        toks.append((kind, text, line))
+    toks.append((&#39;eof&#39;, &#39;&#39;, line))
+    return toks
+
+
+# ============ 2. 语法（递归下降 + 优先级爬升）============
+class Parser:
+    def __init__(self, toks):
+        self.toks, self.pos = toks, 0
+
+    def peek(self):
+        return self.toks[self.pos]
+
+    def eat(self, kind, text=None):
+        k, t, ln = self.peek()
+        if k != kind or (text is not None and t != text):
+            raise SyntaxError(f&#39;第 {ln} 行：期望 {text or kind}，得到 {t or k!r}&#39;)
+        self.pos += 1
+        return t
+
+    def program(self):
+        fns, stmts = [], []
+        while self.peek()[0] != &#39;eof&#39;:
+            if self.peek()[0] == &#39;fn&#39;:
+                fns.append(self.func())
+            else:
+                stmts.append(self.stmt())
+        return (&#39;program&#39;, fns, (&#39;block&#39;, stmts))
+
+    def func(self):
+        self.eat(&#39;fn&#39;)
+        name = self.eat(&#39;name&#39;)
+        self.eat(&#39;op&#39;, &#39;(&#39;)
+        params = []
+        if self.peek() != (&#39;op&#39;, &#39;)&#39;, self.peek()[2]):
+            params.append(self.eat(&#39;name&#39;))
+            while self.peek()[0] == &#39;op&#39; and self.peek()[1] == &#39;,&#39;:
+                self.eat(&#39;op&#39;, &#39;,&#39;); params.append(self.eat(&#39;name&#39;))
+        self.eat(&#39;op&#39;, &#39;)&#39;)
+        return (&#39;fn&#39;, name, params, self.block())
+
+    def block(self):
+        self.eat(&#39;op&#39;, &#39;{&#39;)
+        stmts = []
+        while not (self.peek()[0] == &#39;op&#39; and self.peek()[1] == &#39;}&#39;):
+            stmts.append(self.stmt())
+        self.eat(&#39;op&#39;, &#39;}&#39;)
+        return (&#39;block&#39;, stmts)
+
+    def stmt(self):
+        k = self.peek()[0]
+        if k == &#39;let&#39;:
+            self.eat(&#39;let&#39;); name = self.eat(&#39;name&#39;)
+            self.eat(&#39;op&#39;, &#39;=&#39;); e = self.expr(); self.eat(&#39;op&#39;, &#39;;&#39;)
+            return (&#39;let&#39;, name, e)
+        if k == &#39;if&#39;:
+            self.eat(&#39;if&#39;); self.eat(&#39;op&#39;, &#39;(&#39;); c = self.expr(); self.eat(&#39;op&#39;, &#39;)&#39;)
+            then = self.block()
+            els = None
+            if self.peek()[0] == &#39;else&#39;:
+                self.eat(&#39;else&#39;); els = self.block()
+            return (&#39;if&#39;, c, then, els)
+        if k == &#39;while&#39;:
+            self.eat(&#39;while&#39;); self.eat(&#39;op&#39;, &#39;(&#39;); c = self.expr(); self.eat(&#39;op&#39;, &#39;)&#39;)
+            return (&#39;while&#39;, c, self.block())
+        if k == &#39;return&#39;:
+            self.eat(&#39;return&#39;)
+            e = None if self.peek()[1] == &#39;;&#39; else self.expr()
+            self.eat(&#39;op&#39;, &#39;;&#39;)
+            return (&#39;return&#39;, e)
+        if k == &#39;print&#39;:
+            self.eat(&#39;print&#39;); self.eat(&#39;op&#39;, &#39;(&#39;); e = self.expr(); self.eat(&#39;op&#39;, &#39;)&#39;)
+            self.eat(&#39;op&#39;, &#39;;&#39;)
+            return (&#39;print&#39;, e)
+        if k == &#39;name&#39; and self.toks[self.pos + 1][1] == &#39;=&#39;:
+            name = self.eat(&#39;name&#39;); self.eat(&#39;op&#39;, &#39;=&#39;)
+            e = self.expr(); self.eat(&#39;op&#39;, &#39;;&#39;)
+            return (&#39;assign&#39;, name, e)
+        e = self.expr(); self.eat(&#39;op&#39;, &#39;;&#39;)
+        return (&#39;expr&#39;, e)
+
+    def expr(self):
+        return self.binop(self.add, (&#39;&lt;&#39;, &#39;&lt;=&#39;, &#39;&gt;&#39;, &#39;&gt;=&#39;, &#39;==&#39;, &#39;!=&#39;))
+
+    def add(self):
+        return self.binop(self.mul, (&#39;+&#39;, &#39;-&#39;))
+
+    def mul(self):
+        return self.binop(self.unary, (&#39;*&#39;, &#39;/&#39;, &#39;%&#39;))
+
+    def binop(self, sub, ops):
+        node = sub()
+        while self.peek()[0] == &#39;op&#39; and self.peek()[1] in ops:
+            op = self.eat(&#39;op&#39;); node = (&#39;bin&#39;, op, node, sub())
+        return node
+
+    def unary(self):
+        if self.peek()[0] == &#39;op&#39; and self.peek()[1] == &#39;-&#39;:
+            self.eat(&#39;op&#39;, &#39;-&#39;)
+            return (&#39;un&#39;, &#39;-&#39;, self.unary())
+        return self.primary()
+
+    def primary(self):
+        k, t, ln = self.peek()
+        if k == &#39;num&#39;:
+            self.eat(&#39;num&#39;); return (&#39;num&#39;, int(t))
+        if k == &#39;name&#39;:
+            self.eat(&#39;name&#39;)
+            if self.peek()[0] == &#39;op&#39; and self.peek()[1] == &#39;(&#39;:
+                self.eat(&#39;op&#39;, &#39;(&#39;)
+                args = []
+                if not (self.peek()[0] == &#39;op&#39; and self.peek()[1] == &#39;)&#39;):
+                    args.append(self.expr())
+                    while self.peek()[1] == &#39;,&#39;:
+                        self.eat(&#39;op&#39;, &#39;,&#39;); args.append(self.expr())
+                self.eat(&#39;op&#39;, &#39;)&#39;)
+                return (&#39;call&#39;, t, args)
+            return (&#39;var&#39;, t)
+        if k == &#39;op&#39; and t == &#39;(&#39;:
+            self.eat(&#39;op&#39;, &#39;(&#39;); e = self.expr(); self.eat(&#39;op&#39;, &#39;)&#39;); return e
+        raise SyntaxError(f&#39;第 {ln} 行：表达式中意外的 {t or k!r}&#39;)
+
+
+# ============ 3. 语义：查名与槽位分配（每个函数一张名字表）============
+class Resolver:
+    &quot;&quot;&quot;把变量名绑到帧槽位；未定义的名字在编译期就报错（而不是运行时崩）&quot;&quot;&quot;
+    def __init__(self):
+        self.funcs = {}      # name -&gt; (params, block)
+        self.slots = {}      # 当前函数的 name -&gt; slot
+        self.nslots = 0
+
+    def declare(self, name):
+        if name not in self.slots:
+            self.slots[name] = self.nslots
+            self.nslots += 1
+        return self.slots[name]
+
+    def lookup(self, name):
+        if name not in self.slots:
+            raise NameError(f&#39;未定义的变量 {name!r}&#39;)
+        return self.slots[name]
+
+    def walk(self, node):
+        k = node[0]
+        if k in (&#39;num&#39;,):
+            return
+        if k == &#39;var&#39;:
+            self.lookup(node[1])
+        elif k == &#39;bin&#39;:
+            self.walk(node[2]); self.walk(node[3])
+        elif k == &#39;un&#39;:
+            self.walk(node[2])
+        elif k == &#39;call&#39;:
+            if node[1] not in self.funcs:
+                raise NameError(f&#39;未定义的函数 {node[1]!r}&#39;)
+            for a in node[2]:
+                self.walk(a)
+        elif k == &#39;let&#39;:
+            self.walk(node[2]); self.declare(node[1])
+        elif k == &#39;assign&#39;:
+            self.lookup(node[1]); self.walk(node[2])
+        elif k == &#39;if&#39;:
+            self.walk(node[1]); self.walk_block(node[2])
+            if node[3]:
+                self.walk_block(node[3])
+        elif k == &#39;while&#39;:
+            self.walk(node[1]); self.walk_block(node[2])
+        elif k == &#39;return&#39;:
+            if node[1]:
+                self.walk(node[1])
+        elif k == &#39;print&#39;:
+            self.walk(node[1])
+        elif k == &#39;expr&#39;:
+            self.walk(node[1])
+        elif k == &#39;block&#39;:
+            self.walk_block(node)
+        else:
+            raise TypeError(f&#39;未知节点 {k}&#39;)
+
+    def walk_block(self, block):
+        for s in block[1]:
+            self.walk(s)
+
+
+# ============ 4. 优化：常量折叠 + 常量条件分支消除（第 5 章的正确性要求）============
+def idiv(a, b):
+    &quot;&quot;&quot;C 语义的整数除法：向零截断&quot;&quot;&quot;
+    if b == 0:
+        raise ZeroDivisionError(&#39;除以 0&#39;)
+    q = abs(a) // abs(b)
+    return q if (a &lt; 0) == (b &lt; 0) else -q
+
+
+def fold(node):
+    k = node[0]
+    if k in (&#39;num&#39;, &#39;var&#39;):
+        return node
+    if k == &#39;program&#39;:
+        return (&#39;program&#39;, [fold(f) for f in node[1]], fold(node[2]))
+    if k == &#39;fn&#39;:
+        return (&#39;fn&#39;, node[1], node[2], fold(node[3]))
+    if k == &#39;bin&#39;:
+        l, r = fold(node[2]), fold(node[3])
+        if l[0] == &#39;num&#39; and r[0] == &#39;num&#39;:
+            a, b, op = l[1], r[1], node[1]
+            v = {&#39;+&#39;: a + b, &#39;-&#39;: a - b, &#39;*&#39;: a * b,
+                 &#39;&lt;&#39;: int(a &lt; b), &#39;&lt;=&#39;: int(a &lt;= b), &#39;&gt;&#39;: int(a &gt; b), &#39;&gt;=&#39;: int(a &gt;= b),
+                 &#39;==&#39;: int(a == b), &#39;!=&#39;: int(a != b)}.get(op)
+            if v is None:
+                v = {&#39;/&#39;: lambda: idiv(a, b), &#39;%&#39;: lambda: a - idiv(a, b) * b}[op]()
+            return (&#39;num&#39;, v)
+        return (&#39;bin&#39;, node[1], l, r)
+    if k == &#39;un&#39;:
+        e = fold(node[2])
+        return (&#39;num&#39;, -e[1]) if e[0] == &#39;num&#39; else (&#39;un&#39;, &#39;-&#39;, e)
+    if k == &#39;call&#39;:
+        return (&#39;call&#39;, node[1], [fold(a) for a in node[2]])
+    if k == &#39;let&#39;:
+        return (&#39;let&#39;, node[1], fold(node[2]))
+    if k == &#39;assign&#39;:
+        return (&#39;assign&#39;, node[1], fold(node[2]))
+    if k == &#39;print&#39;:
+        return (&#39;print&#39;, fold(node[1]))
+    if k == &#39;expr&#39;:
+        return (&#39;expr&#39;, fold(node[1]))
+    if k == &#39;return&#39;:
+        return (&#39;return&#39;, fold(node[1]) if node[1] else None)
+    if k == &#39;block&#39;:
+        return (&#39;block&#39;, [fold(s) for s in node[1]])
+    if k == &#39;if&#39;:
+        c = fold(node[1])
+        if c[0] == &#39;num&#39;:                       # 条件在编译期可判定 → 只留一条分支
+            return fold(node[2] if c[1] != 0 else (node[3] or (&#39;block&#39;, [])))
+        return (&#39;if&#39;, c, fold(node[2]), fold(node[3]) if node[3] else None)
+    if k == &#39;while&#39;:
+        c = fold(node[1])
+        if c[0] == &#39;num&#39; and c[1] == 0:         # while(0) 永远不会被执行
+            return (&#39;block&#39;, [])
+        return (&#39;while&#39;, c, fold(node[2]))
+    raise TypeError(f&#39;未知节点 {k}&#39;)
+
+
+# ============ 5. 字节码生成 ============
+BIN = {&#39;+&#39;: &#39;ADD&#39;, &#39;-&#39;: &#39;SUB&#39;, &#39;*&#39;: &#39;MUL&#39;, &#39;/&#39;: &#39;DIV&#39;, &#39;%&#39;: &#39;MOD&#39;,
+       &#39;&lt;&#39;: &#39;LT&#39;, &#39;&lt;=&#39;: &#39;LE&#39;, &#39;&gt;&#39;: &#39;GT&#39;, &#39;&gt;=&#39;: &#39;GE&#39;, &#39;==&#39;: &#39;EQ&#39;, &#39;!=&#39;: &#39;NE&#39;}
+
+
+class Code:
+    def __init__(self, name, nparams, nslots):
+        self.name, self.nparams, self.nslots, self.code = name, nparams, nslots, []
+
+    def emit(self, *ins):
+        self.code.append(ins)
+        return len(self.code) - 1
+
+
+class Compiler:
+    def __init__(self, program):
+        _, self.fns, self.main_stmts = program
+        self.table = {}
+
+    def compile(self):
+        for f in self.fns:
+            self.table[f[1]] = f                      # 先登记全部函数 → 支持前向调用与递归
+        out = {}
+        for _, name, params, body in self.fns:
+            self.cur = Code(name, len(params), 0)
+            self.res = Resolver()
+            self.res.funcs = self.table
+            for p in params:
+                self.res.declare(p)
+            self.gen(body)
+            if not self.cur.code or self.cur.code[-1][0] != &#39;RET&#39;:
+                self.cur.emit(&#39;CONST&#39;, 0); self.cur.emit(&#39;RET&#39;)  # 没写 return 时返回 0
+            self.cur.nslots = self.res.nslots
+            out[name] = self.cur
+        self.cur = Code(&#39;&lt;main&gt;&#39;, 0, 0)
+        self.res = Resolver()
+        self.res.funcs = self.table
+        self.gen(self.main_stmts)
+        self.cur.emit(&#39;HALT&#39;)
+        self.cur.nslots = self.res.nslots
+        out[&#39;&lt;main&gt;&#39;] = self.cur
+        return out
+
+    def gen(self, node):
+        k = node[0]
+        if k == &#39;num&#39;:
+            self.cur.emit(&#39;CONST&#39;, node[1])
+        elif k == &#39;var&#39;:
+            self.cur.emit(&#39;LOAD&#39;, self.res.lookup(node[1]))
+        elif k == &#39;bin&#39;:
+            self.gen(node[2]); self.gen(node[3]); self.cur.emit(BIN[node[1]])
+        elif k == &#39;un&#39;:
+            self.gen(node[2]); self.cur.emit(&#39;NEG&#39;)
+        elif k == &#39;call&#39;:
+            for a in node[2]:
+                self.gen(a)
+            self.cur.emit(&#39;CALL&#39;, node[1], len(node[2]))
+        elif k == &#39;let&#39;:
+            self.gen(node[2])
+            self.cur.emit(&#39;STORE&#39;, self.res.declare(node[1]))   # 先算值再占槽，顺序不能反
+        elif k == &#39;assign&#39;:
+            self.gen(node[2]); self.cur.emit(&#39;STORE&#39;, self.res.lookup(node[1]))
+        elif k == &#39;print&#39;:
+            self.gen(node[1]); self.cur.emit(&#39;PRINT&#39;)
+        elif k == &#39;expr&#39;:
+            self.gen(node[1])
+        elif k == &#39;return&#39;:
+            if node[1]:
+                self.gen(node[1])
+            else:
+                self.cur.emit(&#39;CONST&#39;, 0)
+            self.cur.emit(&#39;RET&#39;)
+        elif k == &#39;if&#39;:
+            self.gen(node[1])
+            jz = self.cur.emit(&#39;JZ&#39;, None)
+            self.gen(node[2])
+            jmp = self.cur.emit(&#39;JMP&#39;, None)
+            self.cur.code[jz] = (&#39;JZ&#39;, len(self.cur.code))
+            if node[3]:
+                self.gen(node[3])
+            self.cur.code[jmp] = (&#39;JMP&#39;, len(self.cur.code))
+        elif k == &#39;while&#39;:
+            top = len(self.cur.code)
+            self.gen(node[1])
+            jz = self.cur.emit(&#39;JZ&#39;, None)
+            self.gen(node[2])
+            self.cur.emit(&#39;JMP&#39;, top)
+            self.cur.code[jz] = (&#39;JZ&#39;, len(self.cur.code))
+        elif k == &#39;block&#39;:
+            for s in node[1]:
+                self.gen(s)
+        elif k == &#39;fn&#39;:
+            pass                                        # 函数体已在第一遍各自编译
+        else:
+            raise TypeError(f&#39;未知节点 {k}&#39;)
+
+
+# ============ 6. 栈式虚拟机 ============
+class VM:
+    def __init__(self, codes):
+        self.codes = codes
+
+    def run(self):
+        out = []
+        frames = [{&#39;code&#39;: self.codes[&#39;&lt;main&gt;&#39;], &#39;ip&#39;: 0, &#39;slots&#39;: [0] * self.codes[&#39;&lt;main&gt;&#39;].nslots}]
+        stack = []
+        while frames:
+            f = frames[-1]
+            if f[&#39;ip&#39;] &gt;= len(f[&#39;code&#39;].code):
+                stack.append(0); frames.pop(); continue
+            ins = f[&#39;code&#39;].code[f[&#39;ip&#39;]]; f[&#39;ip&#39;] += 1
+            op = ins[0]
+            if op == &#39;CONST&#39;:
+                stack.append(ins[1])
+            elif op == &#39;LOAD&#39;:
+                stack.append(f[&#39;slots&#39;][ins[1]])
+            elif op == &#39;STORE&#39;:
+                f[&#39;slots&#39;][ins[1]] = stack.pop()
+            elif op == &#39;NEG&#39;:
+                stack.append(-stack.pop())
+            elif op in (&#39;ADD&#39;, &#39;SUB&#39;, &#39;MUL&#39;, &#39;DIV&#39;, &#39;MOD&#39;, &#39;LT&#39;, &#39;LE&#39;, &#39;GT&#39;, &#39;GE&#39;, &#39;EQ&#39;, &#39;NE&#39;):
+                b, a = stack.pop(), stack.pop()
+                stack.append({&#39;ADD&#39;: lambda: a + b, &#39;SUB&#39;: lambda: a - b, &#39;MUL&#39;: lambda: a * b,
+                              &#39;DIV&#39;: lambda: idiv(a, b), &#39;MOD&#39;: lambda: a - idiv(a, b) * b,
+                              &#39;LT&#39;: lambda: int(a &lt; b), &#39;LE&#39;: lambda: int(a &lt;= b),
+                              &#39;GT&#39;: lambda: int(a &gt; b), &#39;GE&#39;: lambda: int(a &gt;= b),
+                              &#39;EQ&#39;: lambda: int(a == b), &#39;NE&#39;: lambda: int(a != b)}[op]())
+            elif op == &#39;PRINT&#39;:
+                out.append(str(stack.pop()))
+            elif op == &#39;JMP&#39;:
+                f[&#39;ip&#39;] = ins[1]
+            elif op == &#39;JZ&#39;:
+                if stack.pop() == 0:
+                    f[&#39;ip&#39;] = ins[1]
+            elif op == &#39;CALL&#39;:
+                name, argc = ins[1], ins[2]
+                callee = self.codes[name]
+                args = [stack.pop() for _ in range(argc)][::-1]
+                slots = args + [0] * (callee.nslots - argc)
+                frames.append({&#39;code&#39;: callee, &#39;ip&#39;: 0, &#39;slots&#39;: slots})
+            elif op == &#39;RET&#39;:
+                v = stack.pop(); frames.pop(); stack.append(v)
+            elif op == &#39;HALT&#39;:
+                frames.pop()
+            else:
+                raise RuntimeError(f&#39;未知指令 {op}&#39;)
+        return out
+
+
+# ============ 7. 测试：用例 + 编译/优化双跑对照 ============
+CASES = [
+    (&#39;算术与优先级&#39;, &#39;print(2 + 3 * 4); print((2 + 3) * 4); print(20 / 3); print(20 % 3);&#39;,
+     [&#39;14&#39;, &#39;20&#39;, &#39;6&#39;, &#39;2&#39;]),
+    (&#39;let 与赋值&#39;, &#39;let x = 1; x = x + 41; print(x);&#39;, [&#39;42&#39;]),
+    (&#39;if/else 走 else&#39;, &#39;let x = 3; if (x &gt; 10) { print(1); } else { print(0); }&#39;, [&#39;0&#39;]),
+    (&#39;while 求和 1..10&#39;, &#39;let i = 1; let s = 0; while (i &lt;= 10) { s = s + i; i = i + 1; } print(s);&#39;, [&#39;55&#39;]),
+    (&#39;函数与参数&#39;, &#39;fn add(a, b) { return a + b; } print(add(2, 3)); print(add(add(1, 1), 5));&#39;, [&#39;5&#39;, &#39;7&#39;]),
+    (&#39;递归 fib(10)&#39;, &#39;fn fib(n) { if (n &lt; 2) { return n; } return fib(n - 1) + fib(n - 2); } print(fib(10));&#39;,
+     [&#39;55&#39;]),
+    (&#39;常量折叠生效&#39;, &#39;let x = 2 * 3 + 4; print(x); print((1 + 2) * (3 + 4));&#39;, [&#39;10&#39;, &#39;21&#39;]),
+    (&#39;常量条件剪枝&#39;, &#39;if (1 &lt; 2) { print(7); } else { print(0); } print(5 * 5);&#39;, [&#39;7&#39;, &#39;25&#39;]),
+]
+
+
+def compile_source(src, optimize=False):
+    ast = Parser(scan(src)).program()
+    if optimize:
+        ast = fold(ast)
+    codes = Compiler(ast).compile()
+    ninstr = sum(len(c.code) for c in codes.values())
+    return VM(codes), ninstr, codes
+
+
+def dwidth(s):
+    &quot;&quot;&quot;显示宽度：中日韩全角字符算 2 列，否则对齐会歪&quot;&quot;&quot;
+    return sum(2 if unicodedata.east_asian_width(ch) in &#39;WF&#39; else 1 for ch in s)
+
+
+def pad(s, n):
+    return s + &#39; &#39; * max(0, n - dwidth(s))
+
+
+def main():
+    npass = 0
+    print(pad(&#39;用例&#39;, 18) + pad(&#39;期望&#39;, 16) + pad(&#39;编译后&#39;, 16) + pad(&#39;优化后&#39;, 16)
+          + pad(&#39;指令数(编/优)&#39;, 18) + &#39;结果&#39;)
+    for name, src, want in CASES:
+        row = []
+        for opt in (False, True):
+            try:
+                vm, n, _ = compile_source(src, optimize=opt)
+                row.append((vm.run(), n))
+            except Exception as e:                       # 编译期/运行期错误也要如实标出来
+                row.append(([f&#39;{type(e).__name__}: {e}&#39;], -1))
+        (got_u, n_u), (got_f, n_f) = row
+        ok = got_u == want and got_f == want
+        npass += ok
+        print(pad(name, 18) + pad(&#39;,&#39;.join(want), 16) + pad(&#39;,&#39;.join(got_u), 16)
+              + pad(&#39;,&#39;.join(got_f), 16) + pad(f&#39;{n_u}/{n_f}&#39;, 18) + (&#39;PASS&#39; if ok else &#39;FAIL&#39;))
+    print(f&#39;\n全部用例：{npass}/{len(CASES)} 通过（编译后与优化后都必须与期望一致）&#39;)
+
+    print(&#39;\n--- 生成的字节码（while 求和，优化前）---&#39;)
+    _, n, codes = compile_source(CASES[3][1])
+    for i, ins in enumerate(codes[&#39;&lt;main&gt;&#39;].code):
+        print(f&#39;  {i:&gt;2}: {&quot; &quot;.join(str(x) for x in ins)}&#39;)
+    print(f&#39;  槽位：{codes[&quot;&lt;main&gt;&quot;].nslots} 个，指令 {n} 条&#39;)
+
+    print(&#39;\n--- 两类错误：编译期 vs 运行期 ---&#39;)
+    try:
+        compile_source(&#39;print(y);&#39;)                       # 名字没绑上 → 编译期就拦下
+    except NameError as e:
+        print(f&#39;  编译期 NameError: {e}&#39;)
+    try:
+        vm, _, _ = compile_source(&#39;print(1 / 0);&#39;)        # 优化关闭：留到运行期才报
+        vm.run()
+    except ZeroDivisionError as e:
+        print(f&#39;  运行期 ZeroDivisionError: {e}&#39;)
+    try:
+        compile_source(&#39;print(1 / 0);&#39;, optimize=True)    # 优化开启：折叠时提前暴露
+    except ZeroDivisionError as e:
+        print(f&#39;  优化期 ZeroDivisionError: {e}（折叠把一个运行期错误提前到了编译期，见正文&quot;常见坑&quot;）&#39;)
+
+
+main()</code></pre>
+<p>运行 <code>python3 mini_compiler.py</code> 的真实输出：</p>
+<pre><code>用例              期望            编译后          优化后          指令数(编/优)     结果
+算术与优先级      14,20,6,2       14,20,6,2       14,20,6,2       21/9              PASS
+let 与赋值        42              42              42              9/9               PASS
+if/else 走 else   0               0               0               12/12             PASS
+while 求和 1..10  55              55              55              20/20             PASS
+函数与参数        5,7             5,7             5,7             15/15             PASS
+递归 fib(10)      55              55              55              21/21             PASS
+常量折叠生效      10,21           10,21           10,21           17/7              PASS
+常量条件剪枝      7,25            7,25            7,25            14/5              PASS
+
+全部用例：8/8 通过（编译后与优化后都必须与期望一致）
+
+--- 生成的字节码（while 求和，优化前）---
+   0: CONST 1
+   1: STORE 0
+   2: CONST 0
+   3: STORE 1
+   4: LOAD 0
+   5: CONST 10
+   6: LE
+   7: JZ 17
+   8: LOAD 1
+   9: LOAD 0
+  10: ADD
+  11: STORE 1
+  12: LOAD 0
+  13: CONST 1
+  14: ADD
+  15: STORE 0
+  16: JMP 4
+  17: LOAD 1
+  18: PRINT
+  19: HALT
+  槽位：2 个，指令 20 条
+
+--- 两类错误：编译期 vs 运行期 ---
+  编译期 NameError: 未定义的变量 &#39;y&#39;
+  运行期 ZeroDivisionError: 除以 0
+  优化期 ZeroDivisionError: 除以 0（折叠把一个运行期错误提前到了编译期，见正文&quot;常见坑&quot;）</code></pre>
+<p>三个可核对的结果：<strong>8/8 用例通过</strong>，且每行都有&quot;优化后&quot;一列与&quot;编译后&quot;逐行对比；指令数一列给出了优化收益（用例 1 从 21 条降到 9 条，用例 8 从 14 条降到 5 条）；<code>while</code> 用例的字节码 dump 里可以看到 <code>JZ 17</code> 与 <code>JMP 4</code> 这对回填出来的地址——19 号位置是 <code>HALT</code>，所以回填没有越界。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：给语言加 <code>break;</code>。需要新增 <code>BREAK</code> 指令或在编译期回填跳出地址（后者更简单：维护一个&quot;当前循环的跳出跳转待回填列表&quot;），并用一个 <code>while (1) { if (i &gt; 3) { break; } i = i + 1; }</code> 用例验证。</li>
+<li><strong>解释</strong>：为什么&quot;先算右值、再分配槽位&quot;对一个块级作用域语言会变得更复杂？如果允许 <code>{ let x = 1; } { let x = 2; }</code> 复用同一个槽位，需要在什么时机释放槽位？</li>
+<li><strong>对比/验证</strong>：给优化器再加一条&quot;强度削减&quot;（<code>x * 2</code> → <code>x + x</code>，见第 7 章第 1 课那个 LLVM pass），跑全部用例，确认 8/8 仍然通过、且指令数下降。如果某个用例不再通过，说明这条变换在什么前提下才成立？</li>
+<li><strong>思考</strong>：本项目 8/8 通过能证明编译器&quot;正确&quot;吗？请给出至少两个 8 个用例都覆盖不到的失败模式（提示：整数溢出、负数取余、深递归的栈深度、未定义行为）。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Robert Nystrom, <em>Crafting Interpreters</em> 第 15 章「A Virtual Machine」（栈式 VM 的指令派发与帧结构，clox 的实现基础）：<a href="https://craftinginterpreters.com/a-virtual-machine.html" target="_blank" rel="noopener noreferrer">https://craftinginterpreters.com/a-virtual-machine.html</a></li>
+<li>Robert Nystrom, <em>Crafting Interpreters</em> 第 24 章「Calls and Functions」（调用协议、帧栈与返回值；第 23 章讲 if/while 的跳转回填）：<a href="https://craftinginterpreters.com/calls-and-functions.html" target="_blank" rel="noopener noreferrer">https://craftinginterpreters.com/calls-and-functions.html</a></li>
+<li>Aho, Lam, Sethi, Ullman, <em>Compilers: Principles, Techniques, and Tools</em>（龙书）第 8 章「Code Generation」（目标代码生成与栈式/寄存器机器的代码模型）：<a href="https://suif.stanford.edu/dragonbook/" target="_blank" rel="noopener noreferrer">https://suif.stanford.edu/dragonbook/</a></li>
+<li>Cytron, Ferrante, Rosen, Wegman, Zadeck, <em>Efficiently Computing Static Single Assignment Form and the Control Dependence Graph</em>（TOP LAS 1991；把优化建立在 SSA 上，是第 4 章与本课优化器正确性论证的出处）：<a href="https://dl.acm.org/doi/10.1145/115372.115320" target="_blank" rel="noopener noreferrer">https://dl.acm.org/doi/10.1145/115372.115320</a></li>
+</ul>
+<p><a href="#/l/mlc-ch1-l1">下一门课：框架执行的三个代价：算子边界、内存搬运、动态开销</a></p>
+<p>恭喜你完成《编译原理基础：从源码到机器码》！接下来在《深度学习编译器与算子生成》里，本课的图、pass、优化正确性与后端知识会直接复用。</p>

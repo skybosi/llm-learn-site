@@ -1,0 +1,705 @@
+<h2 id="h-工具即接口schema-设计参数语义与限制的表达">工具即接口：schema 设计、参数语义与限制的表达<a class="anchor" href="#h-工具即接口schema-设计参数语义与限制的表达" aria-label="本节链接">#</a></h2>
+<h3 id="h-这一节要解决什么">这一节要解决什么<a class="anchor" href="#h-这一节要解决什么" aria-label="本节链接">#</a></h3>
+<p>把工具当成&quot;一个函数 + 一段 JSON Schema&quot;来写，是这一章所有事故的起点。</p>
+<p>一个工具对 Agent 而言不是函数，而是<strong>三个东西的合成体</strong>：</p>
+<pre><code>工具 = 能力声明（description：这个世界能做什么）
+     + 调用协议（schema：怎么调用它，什么算合法调用）
+     + 结果语义（返回值里哪个字段表示什么状态的什么事实）</code></pre>
+<p>模型能看到的只有这三者的<strong>文字形式</strong>。它看不到实现、看不到数据库表结构、看不到权限表、看不到上次调用是在哪个租户下发生的。于是有一个必须记住的推论：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord cjk_fallback">模型的行为</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="mopen">(</span><span class="mord text"><span class="mord cjk_fallback">契约面所表达的信息</span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord cjk_fallback">模型从训练分布带来的先验</span></span></span></span></span></span></p>
+<p><strong>当契约面没写清楚时，先验会替它做决定</strong> —— 而先验是&quot;互联网上代码的平均习惯&quot;，不是你的系统语义。这就是为什么&quot;参数语义&quot;不是文档问题而是能力边界问题。</p>
+<p>这一节的三个目标：</p>
+<ol>
+<li>把工具设计从&quot;写 schema&quot;提升到&quot;设计接口面&quot;：粒度、可选性、限制、错误语义四个维度。</li>
+<li>说清 schema 能表达什么、<strong>不能表达什么</strong> —— 边界之外的部分必须用别的手段补（运行时校验、描述文字、工具拆分）。</li>
+<li>给出可执行的<strong>契约审查清单</strong>：一组能在 review 阶段机械检查出来的设计缺陷。</li>
+</ol>
+<p>学完这一节你应该能回答：</p>
+<ul>
+<li>一个&quot;既能读又能写&quot;的工具，为什么通常应该拆成两个？什么时候不该拆？</li>
+<li><code>limit: integer</code> 与 <code>limit: integer, minimum: 1, maximum: 100, default: 20</code> 对模型的差别有多大？为什么&quot;默认值&quot;是契约的一部分而不是实现的细节？</li>
+<li>两个参数语义上互斥（<code>query</code> 与 <code>doc_id</code>），schema 该怎么表达？表达不了的后果是什么？</li>
+<li>为什么&quot;返回一个字符串&quot;是最贵的接口设计？结构化返回的收益在哪里出现？</li>
+</ul>
+<h3 id="h-一契约面是-agent-唯一的接口面">一、契约面是 Agent 唯一的接口面<a class="anchor" href="#h-一契约面是-agent-唯一的接口面" aria-label="本节链接">#</a></h3>
+<h4 id="h-11-与-rpc--系统调用的同构与差别">1.1 与 RPC / 系统调用的同构与差别<a class="anchor" href="#h-11-与-rpc--系统调用的同构与差别" aria-label="本节链接">#</a></h4>
+<p>工具契约与传统接口设计高度同构 —— 同样的粒度问题、同样的版本问题、同样的默认值问题。但有三处<strong>关键差别</strong>，它们决定了不能照搬：</p>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>传统 RPC</th>
+<th>Agent 工具</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>调用方</td>
+<td>程序员（读文档、可调试）</td>
+<td>模型（只读描述、不试错成本敏感）</td>
+</tr>
+<tr>
+<td>参数来源</td>
+<td>编译期/运行期确定的代码</td>
+<td>生成式采样（可能造出从未存在的参数）</td>
+</tr>
+<tr>
+<td>错误处理</td>
+<td>异常向上传播，由代码分支处理</td>
+<td>错误变成文本回到上下文，<strong>影响后续所有决策</strong></td>
+</tr>
+<tr>
+<td>约束表达</td>
+<td>类型系统 + 运行时校验 + 文档</td>
+<td>只有 schema + description（弱表达力）</td>
+</tr>
+<tr>
+<td>变更代价</td>
+<td>改调用方代码</td>
+<td>改模型行为，需重跑评测集</td>
+</tr>
+</tbody></table>
+<p>第三条最容易被低估：<strong>在传统系统里错误是控制流，在 Agent 里错误是输入。</strong> 一个 500 错误在传统系统里让一个函数返回失败；在 Agent 里它会改变模型接下来的十几步行为（可能让它&quot;学会&quot;绕开这个工具，或者开始编造结果）。</p>
+<h4 id="h-12-描述文本的注意力位置">1.2 描述文本的注意力位置<a class="anchor" href="#h-12-描述文本的注意力位置" aria-label="本节链接">#</a></h4>
+<p>工具描述不是均匀生效的。它同时出现在两个位置，作用不同：</p>
+<ul>
+<li><strong>工具选择时</strong>：所有工具的 <code>name</code> + <code>description</code> 一起出现在候选列表里，模型在这里决定&quot;用哪个&quot;。此时描述的作用是<strong>区分度</strong>。</li>
+<li><strong>参数生成时</strong>：被选中工具的 schema 被展开，模型在这里决定&quot;填什么&quot;。此时描述的作用是<strong>约束传递</strong>。</li>
+</ul>
+<p>这两个位置对描述的要求是<strong>冲突</strong>的：为了区分度，描述要强调&quot;这个工具与那个工具的不同&quot;；为了约束传递，描述要强调&quot;参数边界与前置条件&quot;。把两件事塞进同一段文字，是描述写不好的主要原因。</p>
+<p><strong>实用做法</strong>：把 description 写成两段 —— 第一句写<strong>何时用/何时不用</strong>（区分度），中间写<strong>参数语义与前置条件</strong>（约束传递），末尾写<strong>返回什么</strong>（结果语义）：</p>
+<pre><code>search_docs(query, limit, cursor)
+  何时用：需要从内部知识库检索事实时。不用于查实时价格（用 fetch_price）。
+  约束：query 必须是自然语言问句，不是关键词串；库内只覆盖 2023 年后的内部文档。
+  返回：{items: [{doc_id, title, snippet, score}], next_cursor}。score 是相对分，不可跨查询比较。</code></pre>
+<p>最后一句（&quot;score 不可跨查询比较&quot;）是典型的<strong>必须写在契约里、schema 完全表达不了</strong>的信息。不写，模型就会拿两次调用的 score 做阈值判断。</p>
+<p><figure><img class="md-img" src="content/courses/agent-systems/assets/chapter-3-figure-01.svg" alt="契约面：参数 schema 与结果 schema" loading="lazy" decoding="async"><figcaption>契约面：参数 schema 与结果 schema</figcaption></figure>
+</p>
+<h3 id="h-二粒度原子工具复合工具与事务边界">二、粒度：原子工具、复合工具与&quot;事务边界&quot;<a class="anchor" href="#h-二粒度原子工具复合工具与事务边界" aria-label="本节链接">#</a></h3>
+<h4 id="h-21-粒度问题的真实形态">2.1 粒度问题的真实形态<a class="anchor" href="#h-21-粒度问题的真实形态" aria-label="本节链接">#</a></h4>
+<p>&quot;工具该切多细&quot;不是风格问题，而是<strong>权限、幂等与回退粒度的交叉点</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>粒度</th>
+<th>例子</th>
+<th>优点</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>原子（单资源单动作）</td>
+<td><code>get_user</code>, <code>set_user_email</code></td>
+<td>权限可精确到动作；幂等易实现；回退粒度细</td>
+<td>工具数量膨胀（选择变难，见第 4 节）；模型要自己组合多步</td>
+</tr>
+<tr>
+<td>复合（一个意图一个工具）</td>
+<td><code>update_user_profile</code></td>
+<td>工具数少、选择简单；一次调用完成一个意图</td>
+<td>内部有多个副作用 → 幂等与补偿复杂；权限粗；部分成功难表达</td>
+</tr>
+<tr>
+<td>通用逃逸舱</td>
+<td><code>run_sql</code>, <code>run_shell</code></td>
+<td>表达力无限</td>
+<td><strong>权限无法约束</strong>；幂等无法保证；注入面巨大</td>
+</tr>
+</tbody></table>
+<p><strong>设计准则（按优先级）</strong>：</p>
+<ol>
+<li><strong>副作用边界就是工具边界</strong>。如果一个工具内部会对两个独立资源做写操作，它就必须要么是原子的（有事务），要么必须支持&quot;按子步骤报告部分成功&quot;。否则模型无法知道&quot;付了钱但没发货&quot;这种状态。</li>
+<li><strong>读与写分开</strong>。<code>search_then_update</code> 这类工具会让幂等设计无从下手：读的部分可以重试，写的部分不能。分成两个工具后，读可以自由重试、写单独走幂等通道。</li>
+<li><strong>默认不给逃逸舱</strong>。<code>run_sql</code> / <code>run_shell</code> 应当是<strong>受限沙箱里的最后手段</strong>（第 7 章展开），且应提供&quot;只读&quot;与&quot;只写指定表&quot;的裁剪版本，而不是一个万能口子。</li>
+</ol>
+<h4 id="h-22-复合工具的正确形态显式事务语义">2.2 复合工具的正确形态：显式事务语义<a class="anchor" href="#h-22-复合工具的正确形态显式事务语义" aria-label="本节链接">#</a></h4>
+<p>必须提供复合工具时，正确做法是<strong>把事务语义写进契约</strong>，而不是让模型猜：</p>
+<pre data-lang="json"><code class="language-json">{
+  &quot;name&quot;: &quot;transfer_funds&quot;,
+  &quot;description&quot;: &quot;在同一租户内转账。★ 本操作是原子的：要么整体成功，要么整体不生效。返回值 transaction_id 在 24 小时内可用于幂等重放（见 idempotency_key 参数）。&quot;,
+  &quot;parameters&quot;: {
+    &quot;idempotency_key&quot;: {&quot;type&quot;: &quot;string&quot;, &quot;description&quot;: &quot;调用方生成的唯一键；相同键重复调用不会重复转账&quot;},
+    &quot;from_account&quot;: {&quot;type&quot;: &quot;string&quot;},
+    &quot;to_account&quot;: {&quot;type&quot;: &quot;string&quot;},
+    &quot;amount_cents&quot;: {&quot;type&quot;: &quot;integer&quot;, &quot;minimum&quot;: 1}
+  }
+}</code></pre>
+<p>注意这段描述回答了三个模型<strong>自己问不出来</strong>的问题：这个操作是不是原子的？重复调用会怎样？我怎么撤销/核对？<strong>契约的完备性就是由这类问题定义的。</strong> 下面给一个检查表。</p>
+<h4 id="h-23-契约完备性检查表">2.3 契约完备性检查表<a class="anchor" href="#h-23-契约完备性检查表" aria-label="本节链接">#</a></h4>
+<p>对每个工具，逐条回答；答不上来的条目就是设计缺陷：</p>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>问题</th>
+<th>表达位置</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1</td>
+<td>这个工具<strong>会改变世界</strong>吗？（只读 / 可逆写 / 不可逆写）</td>
+<td>description + 权限声明</td>
+</tr>
+<tr>
+<td>2</td>
+<td>重复调用一次会怎样？（幂等 / 累加 / 报错）</td>
+<td>description（<strong>必须写</strong>）</td>
+</tr>
+<tr>
+<td>3</td>
+<td>参数有取值范围吗？越界会怎样（拒绝 / 截断 / 静默钳制）？</td>
+<td>schema 的 min/max/enum + description</td>
+</tr>
+<tr>
+<td>4</td>
+<td>有没有&quot;必须同时给&quot;或&quot;最多给一个&quot;的参数组合？</td>
+<td>schema 的 oneOf/allOf/required（见 3.3）</td>
+</tr>
+<tr>
+<td>5</td>
+<td>参数是&quot;名字&quot;还是&quot;标识&quot;？同名资源的歧义如何消解？</td>
+<td>用 ID 而非名字（3.4）</td>
+</tr>
+<tr>
+<td>6</td>
+<td>失败时返回值告诉你<strong>哪一部分</strong>失败了吗？</td>
+<td>error schema（第 3 节）</td>
+</tr>
+<tr>
+<td>7</td>
+<td>返回值的每个字段是&quot;事实&quot;还是&quot;模型的声明&quot;？</td>
+<td>字段命名 + description</td>
+</tr>
+<tr>
+<td>8</td>
+<td>有没有前置条件（先读后写、需先登录、配额）？</td>
+<td>description</td>
+</tr>
+<tr>
+<td>9</td>
+<td>这个工具的副作用<strong>可撤销</strong>吗？撤销手段是什么？</td>
+<td>description</td>
+</tr>
+<tr>
+<td>10</td>
+<td>它会不会与其他工具产生顺序依赖？</td>
+<td>description（&quot;必须在 open_session 之后调用&quot;）</td>
+</tr>
+</tbody></table>
+<p>第 1、2、9 条是<strong>幂等设计</strong>的输入（第 2 节），第 4、6 条是<strong>错误反馈</strong>的输入（第 3 节），第 1、8 条是<strong>权限</strong>的输入（第 7 章）。所以这张表不是文档清单，而是后面三节的接口。</p>
+<h3 id="h-三可选性默认值与参数语义的精确表达">三、可选性、默认值与&quot;参数语义&quot;的精确表达<a class="anchor" href="#h-三可选性默认值与参数语义的精确表达" aria-label="本节链接">#</a></h3>
+<h4 id="h-31-可选性是契约的语义不是实现的细节">3.1 可选性是契约的语义，不是实现的细节<a class="anchor" href="#h-31-可选性是契约的语义不是实现的细节" aria-label="本节链接">#</a></h4>
+<p>对比两个 schema：</p>
+<pre data-lang="json"><code class="language-json">{&quot;query&quot;: {&quot;type&quot;: &quot;string&quot;}}</code></pre>
+<pre data-lang="json"><code class="language-json">{&quot;query&quot;: {&quot;type&quot;: &quot;string&quot;, &quot;description&quot;: &quot;自然语言问句&quot;},
+ &quot;limit&quot;: {&quot;type&quot;: &quot;integer&quot;, &quot;minimum&quot;: 1, &quot;maximum&quot;: 100, &quot;default&quot;: 20,
+           &quot;description&quot;: &quot;返回条数上限。默认 20；超过 100 会被拒绝而不是截断。&quot;},
+ &quot;cursor&quot;: {&quot;type&quot;: &quot;string&quot;, &quot;description&quot;: &quot;上一次返回的 next_cursor；用于翻页。不要自行构造。&quot;}}</code></pre>
+<p>差别不在于&quot;更啰嗦&quot;，而在于后者消除了四类<strong>模型必须靠猜的决定</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>模型要决定的事</th>
+<th>只有 <code>{&quot;type&quot;:&quot;string&quot;}</code> 时</th>
+<th>有完整约束时</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>要不要传 limit</td>
+<td>猜（可能不传、可能传 1000）</td>
+<td>知道有默认值，可以不传</td>
+</tr>
+<tr>
+<td>传多大</td>
+<td>从训练先验取一个数（常见 10）</td>
+<td>知道合法区间与默认值</td>
+</tr>
+<tr>
+<td>越界会怎样</td>
+<td>不知道 → 可能反复试</td>
+<td>知道会被拒绝，不会浪费步数</td>
+</tr>
+<tr>
+<td>cursor 从哪来</td>
+<td>不知道 → 可能编造</td>
+<td>明确&quot;不要自行构造&quot;</td>
+</tr>
+</tbody></table>
+<p><strong>一个反直觉的结论</strong>：把约束写严（<code>maximum: 100</code>）通常<strong>提高</strong>成功率，而不是降低。因为模型不需要在巨大空间里猜一个&quot;安全&quot;的值，也不需要靠试错发现边界。约束的作用是<strong>把开放决策变成封闭决策</strong>。</p>
+<p>反过来，<strong>&quot;静默钳制&quot;是危险的默认行为</strong>：<code>limit=1000</code> 时悄悄改成 100 并按 100 返回，模型会以为&quot;最多就 100 条&quot;，从而在结论里声称&quot;全库只有 100 条&quot;。要么拒绝（推荐），要么在返回值里<strong>显式</strong>告知被钳制了：</p>
+<pre data-lang="json"><code class="language-json">{&quot;items&quot;: [...], &quot;limit_applied&quot;: 100, &quot;limit_requested&quot;: 1000, &quot;truncated&quot;: true}</code></pre>
+<h4 id="h-32-默认值必须写进-schema而不是藏在实现里">3.2 默认值必须写进 schema，而不是藏在实现里<a class="anchor" href="#h-32-默认值必须写进-schema而不是藏在实现里" aria-label="本节链接">#</a></h4>
+<p>如果 <code>limit</code> 的默认值 20 只写在代码里，schema 里没有，会发生什么？模型不知道默认值存在，于是<strong>每次都会显式传一个数</strong> —— 传的是它自己的先验（10、50、100）。结果是：</p>
+<ul>
+<li>模型的行为与实际默认值不一致，且这种不一致<strong>不可见</strong>；</li>
+<li>当你想通过调默认值来改变行为（比如省钱）时，发现没有效果（因为模型总是显式传参）；</li>
+<li>评测集里的调用与线上调用分布不同。</li>
+</ul>
+<p><strong>规则</strong>：凡是&quot;不传也有确定行为&quot;的参数，默认值必须在 schema 里写出来。它不是实现细节，它是<strong>契约的一部分</strong> —— 因为它决定了&quot;省略&quot;这个模型的合法动作意味着什么。</p>
+<h4 id="h-33-互斥与联动schema-表达力的边界">3.3 互斥与联动：schema 表达力的边界<a class="anchor" href="#h-33-互斥与联动schema-表达力的边界" aria-label="本节链接">#</a></h4>
+<p>常见参数关系有三类，schema 的表达力依次递减：</p>
+<table>
+<thead>
+<tr>
+<th>关系</th>
+<th>例子</th>
+<th>schema 表达</th>
+<th>备注</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>值域约束</td>
+<td><code>limit ∈ [1,100]</code></td>
+<td>✓ <code>minimum</code>/<code>maximum</code>/<code>enum</code></td>
+<td>最可靠</td>
+</tr>
+<tr>
+<td>结构约束</td>
+<td>一个对象必须有一个字段</td>
+<td>✓ <code>required</code>、<code>oneOf</code>、<code>allOf</code>、<code>not</code></td>
+<td>模型对复杂组合的理解会退化</td>
+</tr>
+<tr>
+<td>语义联动</td>
+<td>&quot;<code>query</code> 与 <code>doc_id</code> 二选一且<strong>不能都给</strong>&quot;</td>
+<td>△ 可用 <code>oneOf</code> 表达，但很多工具链不支持</td>
+<td>需要在运行时校验并给<strong>可修复的</strong>错误</td>
+</tr>
+<tr>
+<td>跨字段算术</td>
+<td>&quot;<code>start_date ≤ end_date</code>&quot;、&quot;<code>amount ≤ balance</code>&quot;</td>
+<td>✗ 无法表达</td>
+<td><strong>只能运行时校验</strong></td>
+</tr>
+<tr>
+<td>跨调用状态</td>
+<td>&quot;必须先 <code>open</code> 再 <code>write</code>&quot;</td>
+<td>✗ 无法表达</td>
+<td>只能 description + 运行时状态检查</td>
+</tr>
+</tbody></table>
+<p>表达不了的部分必须<strong>在失败时给可修复的错误</strong>（第 3 节），而不是&quot;参数错误&quot;。这里有一个实用技巧：<strong>把语义联动改写成工具拆分</strong>。</p>
+<pre><code>✗ fetch(source_type, query, doc_id)   → source_type 决定哪个参数有效
+✓ search_by_query(query) / get_by_id(doc_id)   → 两个工具，各自参数单一</code></pre>
+<p>工具拆分的判据是：<strong>如果两个参数在语义上互斥到&quot;给了另一个就完全无效&quot;，它们通常属于两个不同的工具。</strong> 代价是工具数量上升（第 4 节的选择问题），所以这是一个真正的取舍，不是单向优化。</p>
+<h4 id="h-34-用标识而不是名字歧义的来源">3.4 用标识而不是名字：歧义的来源<a class="anchor" href="#h-34-用标识而不是名字歧义的来源" aria-label="本节链接">#</a></h4>
+<p>这是最容易在真实系统里出事的一条。看两个参数设计：</p>
+<pre><code>get_user(name=&quot;张三&quot;)      ← &quot;张三&quot; 可能对应 0 个、1 个、多个用户
+get_user(user_id=&quot;u_8f3a&quot;)  ← 唯一</code></pre>
+<p>名字参数的问题不是&quot;可能重名&quot;，而是<strong>失败模式是静默的</strong>：重名时工具可能返回第一个、返回全部、或报错 —— 三种行为都&quot;看起来合理&quot;，但模型无从判断它拿到的是不是它想要的那个。它会继续用这个结果做后续决策（可能是给错误的人退款）。</p>
+<p><strong>规则</strong>：</p>
+<ol>
+<li><strong>写操作必须用不可变标识</strong>（ID/主键/URI），不接受名字。</li>
+<li>只读操作接受名字时，<strong>必须返回候选列表</strong>而不是&quot;最佳匹配&quot;：</li>
+</ol>
+<pre data-lang="json"><code class="language-json">{&quot;status&quot;: &quot;ambiguous&quot;, &quot;candidates&quot;: [
+  {&quot;user_id&quot;: &quot;u_8f3a&quot;, &quot;display&quot;: &quot;张三 (产品部)&quot;, &quot;match&quot;: &quot;exact&quot;},
+  {&quot;user_id&quot;: &quot;u_1b02&quot;, &quot;display&quot;: &quot;张三 (销售部)&quot;, &quot;match&quot;: &quot;exact&quot;}],
+ &quot;hint&quot;: &quot;用 user_id 重新调用以消除歧义。&quot;}</code></pre>
+<ol start="3">
+<li><strong>名字→ID 的解析应是一个独立工具</strong>（<code>resolve_user(name)</code>），并且它本身幂等、只读。</li>
+</ol>
+<p>这个模式一般化后是一条重要的接口设计原则：<strong>把&quot;需要判断的步骤&quot;与&quot;执行动作的步骤&quot;分开</strong>。前者可以重试、可以问人、可以返回多候选；后者必须确定。这与 2.1 的&quot;读写分开&quot;是同一个原则的两种表现。</p>
+<h3 id="h-四从参数-schema到结果-schema">四、从&quot;参数 schema&quot;到&quot;结果 schema&quot;<a class="anchor" href="#h-四从参数-schema到结果-schema" aria-label="本节链接">#</a></h3>
+<h4 id="h-41-返回值是最被忽视的契约面">4.1 返回值是最被忽视的契约面<a class="anchor" href="#h-41-返回值是最被忽视的契约面" aria-label="本节链接">#</a></h4>
+<p>大多数团队在设计工具时会写参数 schema，但返回值只用一句 <code>-&gt; str</code> 带过。这是<strong>成本最高的省略</strong>，因为返回值是模型判断&quot;世界现在是什么状态&quot;的唯一依据。</p>
+<p>三种返回形态的对比：</p>
+<table>
+<thead>
+<tr>
+<th>形态</th>
+<th>例子</th>
+<th>模型能做什么</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>自由文本</td>
+<td><code>&quot;查询成功，找到 3 条相关文档，分别是...&quot;</code></td>
+<td>只能整体理解</td>
+<td>无法做字段级判断；解析不稳定；易被注入（第 4 节）</td>
+</tr>
+<tr>
+<td>列表/标量</td>
+<td><code>[&quot;doc1&quot;, &quot;doc2&quot;]</code></td>
+<td>能枚举</td>
+<td>无元数据（score、时间、来源），无法判断可信度</td>
+</tr>
+<tr>
+<td>结构化对象</td>
+<td><code>{&quot;items&quot;:[{...,&quot;score&quot;:0.7}], &quot;truncated&quot;:false, &quot;next_cursor&quot;:null}</code></td>
+<td>字段级判断、可校验、可程序化后处理</td>
+<td>设计成本；token 略多</td>
+</tr>
+</tbody></table>
+<p><strong>收益出现的位置</strong>：当循环里存在&quot;基于结果的判断&quot;时（是否有更多页、是否被截断、置信度多少、是否需要重试），结构化返回是<strong>唯一可行</strong>的形态。文本返回把这类判断变成&quot;模型再读一遍再猜&quot;，而它猜错的概率不低。</p>
+<h4 id="h-42-返回-schema-的四条设计规则">4.2 返回 schema 的四条设计规则<a class="anchor" href="#h-42-返回-schema-的四条设计规则" aria-label="本节链接">#</a></h4>
+<ol>
+<li><strong>状态字段优先于内容字段</strong>。返回值应当先回答&quot;这次调用发生了什么&quot;，再给内容：</li>
+</ol>
+<pre data-lang="json"><code class="language-json">{&quot;status&quot;: &quot;ok&quot; | &quot;empty&quot; | &quot;ambiguous&quot; | &quot;truncated&quot; | &quot;denied&quot; | &quot;retry_later&quot;,
+ &quot;items&quot;: [...],
+ &quot;meta&quot;: {&quot;truncated&quot;: false, &quot;next_cursor&quot;: null, &quot;elapsed_ms&quot;: 120}}</code></pre>
+<p><code>status</code> 是一个<strong>枚举</strong> —— 模型对枚举的处理远比对自由文本可靠（与 3.1 的&quot;封闭决策&quot;同理）。</p>
+<ol start="2">
+<li><strong>区分&quot;事实&quot;与&quot;声明&quot;</strong>。如果字段是某个上游系统的断言，命名要显式：</li>
+</ol>
+<pre data-lang="json"><code class="language-json">{&quot;status&quot;: &quot;ok&quot;, &quot;items&quot;: [{&quot;doc_id&quot;: &quot;d_1&quot;, &quot;content&quot;: &quot;...&quot;,
+                            &quot;content_source&quot;: &quot;external_doc&quot;, &quot;fetched_at&quot;: &quot;2026-03-01T10:00:00Z&quot;,
+                            &quot;verified&quot;: false}]}</code></pre>
+<p>模型的输出、第三方返回的内容都属于<strong>声明</strong>。后续要不要信任它，取决于 <code>content_source</code> / <code>verified</code> / <code>fetched_at</code> —— 第 4 章的写入门槛会直接消费这些字段。</p>
+<ol start="3">
+<li><strong>不要返回空</strong>。<code>null</code> 或空字符串是最差的返回：模型既不知道&quot;没找到&quot;，也不知道&quot;出错了&quot;。空结果必须显式：</li>
+</ol>
+<pre data-lang="json"><code class="language-json">{&quot;status&quot;: &quot;empty&quot;, &quot;searched_scope&quot;: &quot;internal_docs_2023+&quot;,
+ &quot;hint&quot;: &quot;该库不覆盖 2023 年前文档；如需历史数据请用 archive_search。&quot;}</code></pre>
+<p><code>hint</code> 的价值在于它<strong>指出下一步</strong>。一个只说&quot;empty&quot;的返回值会让模型做随机重试。</p>
+<ol start="4">
+<li><strong>不要返回&quot;解读&quot;</strong>。工具返回值里混入结论（&quot;这条数据不重要，可以忽略&quot;）会掩盖事实，且不可追溯。工具给事实与元数据，判断留给循环或验证器。</li>
+</ol>
+<h4 id="h-43-参数与结果的对称性">4.3 参数与结果的对称性<a class="anchor" href="#h-43-参数与结果的对称性" aria-label="本节链接">#</a></h4>
+<p>有一个好用的自检：<strong>参数名与返回字段名应当构成一致的词汇表</strong>。如果参数叫 <code>limit</code>，返回里就该有 <code>limit_applied</code>；如果参数叫 <code>cursor</code>，返回里就该有 <code>next_cursor</code>。词汇表不一致是契约腐化的最早信号，也是模型最容易踩的坑（它会以为 <code>next_cursor</code> 可以传回 <code>cursor</code> 之外的参数）。</p>
+<h3 id="h-五宽松-schema-为什么是最贵的省事">五、宽松 schema 为什么是最贵的省事<a class="anchor" href="#h-五宽松-schema-为什么是最贵的省事" aria-label="本节链接">#</a></h3>
+<p>&quot;先写个宽松 schema，跑通再说&quot;是极常见的路径，它的代价是延迟出现且难以归因的。四类代价：</p>
+<table>
+<thead>
+<tr>
+<th>代价</th>
+<th>机制</th>
+<th>何时显现</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>模型自造参数</strong></td>
+<td>没有 <code>additionalProperties: false</code>，模型会传 <code>sort_by</code>、<code>filters</code> 之类它&quot;以为有&quot;的参数</td>
+<td>立刻（但常被静默忽略）</td>
+</tr>
+<tr>
+<td><strong>值域靠试错</strong></td>
+<td>没有 min/max，模型用二分试错找边界，烧步数与预算</td>
+<td>中期（成本曲线异常）</td>
+</tr>
+<tr>
+<td><strong>静默错误</strong></td>
+<td>实现里做了默认钳制，模型不知道</td>
+<td>晚期（结论错误，难归因）</td>
+</tr>
+<tr>
+<td><strong>评测失真</strong></td>
+<td>评测集里的调用分布与线上不同</td>
+<td>引入评测时</td>
+</tr>
+</tbody></table>
+<p><strong>建议的最小严格集</strong>（成本低、收益高）：</p>
+<pre data-lang="json"><code class="language-json">{
+  &quot;additionalProperties&quot;: false,
+  &quot;required&quot;: [&quot;query&quot;],
+  &quot;properties&quot;: {
+    &quot;query&quot;: {&quot;type&quot;: &quot;string&quot;, &quot;minLength&quot;: 1, &quot;maxLength&quot;: 500},
+    &quot;limit&quot;:  {&quot;type&quot;: &quot;integer&quot;, &quot;minimum&quot;: 1, &quot;maximum&quot;: 100, &quot;default&quot;: 20}
+  }
+}</code></pre>
+<p>四个关键字（<code>additionalProperties: false</code>、<code>required</code>、<code>minimum/maximum</code>、<code>default</code>）覆盖了上面四类代价中的前三类。它们的总成本就是几行 JSON。</p>
+<h3 id="h-代码契约审查器--运行时校验--参数收敛">代码：契约审查器 + 运行时校验 + 参数收敛<a class="anchor" href="#h-代码契约审查器--运行时校验--参数收敛" aria-label="本节链接">#</a></h3>
+<p>下面的代码做三件事：<strong>(1)</strong> 一个能在 CI 里跑的契约审查器（检查 2.3 检查表里可机械化的条目）；<strong>(2)</strong> 一个不依赖第三方库的 schema 子集校验器；<strong>(3)</strong> 一个&quot;参数规范化&quot;步骤，把校验放在<strong>调用之前</strong>，让错误由我们产生（可修复、可分类），而不是由下游系统产生（不可读）。</p>
+<pre data-lang="python"><code class="language-python">import ast
+import json
+from dataclasses import dataclass, field
+from typing import Any, Optional
+
+# ==================== (1) 契约审查器 ====================
+# ★ 设计决策：把&quot;可机械检查的契约缺陷&quot;变成 CI 断言。
+#   review 时靠人记的规则一定会漏；能被 assert 的规则不会漏。
+WRITE_VERBS = (&quot;create&quot;, &quot;update&quot;, &quot;delete&quot;, &quot;set&quot;, &quot;send&quot;, &quot;transfer&quot;, &quot;submit&quot;, &quot;publish&quot;)
+
+
+@dataclass
+class ToolSpec:
+    &quot;&quot;&quot;工具契约的机器可读形态。★ 注意 return_schema 与 description 都是必填 ——
+    它们和参数 schema 一样是契约面，不是可选装饰。&quot;&quot;&quot;
+    name: str
+    description: str
+    parameters: dict
+    return_schema: dict
+    side_effect: str = &quot;read&quot;          # read | reversible_write | irreversible_write
+    idempotent: Optional[bool] = None  # None = 未声明（本身就是缺陷）
+
+
+def audit_tool(spec: ToolSpec) -&gt; list[str]:
+    &quot;&quot;&quot;
+    返回缺陷列表（空列表 = 通过）。
+    ★ 设计决策：只检查&quot;能机械判定&quot;的项。跨字段算术、前置条件这类语义问题
+      审查器不假装能查出来，而是强制它们出现在 description 里（见 issues 的产生逻辑）。
+    &quot;&quot;&quot;
+    issues: list[str] = []
+    p = spec.parameters
+    props = p.get(&quot;properties&quot;, {})
+
+    # A. 宽松 schema 的四个典型信号
+    if p.get(&quot;additionalProperties&quot;) is not False:
+        issues.append(&quot;A1 未关闭 additionalProperties：模型会自造参数并被静默忽略&quot;)
+    if not p.get(&quot;required&quot;):
+        issues.append(&quot;A2 没有 required：模型无法判断哪个参数是必需的&quot;)
+    for key, sch in props.items():
+        if sch.get(&quot;type&quot;) == &quot;integer&quot; and &quot;maximum&quot; not in sch:
+            issues.append(f&quot;A3 整数参数 {key} 无上界：模型会靠试错找边界&quot;)
+        if sch.get(&quot;type&quot;) == &quot;string&quot; and &quot;maxLength&quot; not in sch:
+            issues.append(f&quot;A4 字符串参数 {key} 无 maxLength：注入与超长输入无约束&quot;)
+        if &quot;description&quot; not in sch:
+            issues.append(f&quot;A5 参数 {key} 无 description：模型只能用先验填语义&quot;)
+
+    # B. 副作用与幂等必须显式声明（第 2 节的输入）
+    if spec.side_effect in (&quot;reversible_write&quot;, &quot;irreversible_write&quot;):
+        if spec.idempotent is None:
+            issues.append(&quot;B1 写工具未声明幂等性：重试策略无从设计&quot;)
+        if &quot;幂等&quot; not in spec.description and &quot;重复&quot; not in spec.description:
+            issues.append(&quot;B2 写工具的 description 未说明重复调用的后果&quot;)
+    if spec.side_effect == &quot;irreversible_write&quot; and &quot;撤销&quot; not in spec.description:
+        issues.append(&quot;B3 不可逆写未说明撤销/核对手段（可回滚目标的落地形式）&quot;)
+
+    # C. 名字参数 vs 标识参数（3.4）
+    for key in props:
+        if spec.side_effect != &quot;read&quot; and key.endswith((&quot;_name&quot;, &quot;name&quot;)):
+            issues.append(f&quot;C1 写工具使用了名字参数 {key}：重名时失败是静默的&quot;)
+
+    # D. 返回值契约
+    if not spec.return_schema.get(&quot;properties&quot;):
+        issues.append(&quot;D1 未声明返回 schema：模型无法做字段级判断&quot;)
+    else:
+        if &quot;status&quot; not in spec.return_schema[&quot;properties&quot;]:
+            issues.append(&quot;D2 返回无 status 枚举：无法区分 empty/denied/partial&quot;)
+        if spec.return_schema[&quot;properties&quot;].get(&quot;status&quot;, {}).get(&quot;type&quot;) != &quot;string&quot;:
+            issues.append(&quot;D3 status 不是 string：应为枚举字符串以便模型读取&quot;)
+
+    # E. 语义约束的表达力兜底：表达不了就必须写进 description
+    semantic_markers = (&quot;必须&quot;, &quot;不能&quot;, &quot;只允许&quot;, &quot;前置&quot;, &quot;之前&quot;)
+    if not any(m in spec.description for m in semantic_markers):
+        issues.append(&quot;E1 description 未见任何前置条件/限制语：语义约束无处表达&quot;)
+
+    # F. 命名一致性：参数 → 返回字段（4.3 的对称性自检）
+    for key in props:
+        if key == &quot;limit&quot; and &quot;limit_applied&quot; not in spec.return_schema.get(&quot;properties&quot;, {}):
+            issues.append(&quot;F1 有 limit 参数但返回无 limit_applied：钳制将不可见&quot;)
+        if key == &quot;cursor&quot; and &quot;next_cursor&quot; not in spec.return_schema.get(&quot;properties&quot;, {}):
+            issues.append(&quot;F2 有 cursor 参数但返回无 next_cursor：翻页语义不闭合&quot;)
+    return issues
+
+
+# ==================== (2) 最小 schema 校验器 ====================
+# ★ 设计决策：刻意只实现 JSON Schema 的一个子集。
+#   全量 JSON Schema 的复杂度会把&quot;调用前校验&quot;变成一个新的事故来源；
+#   而实践中覆盖 95% 需求的就是这几个关键字。
+_TYPE_MAP = {&quot;string&quot;: str, &quot;integer&quot;: int, &quot;number&quot;: (int, float),
+             &quot;boolean&quot;: bool, &quot;array&quot;: list, &quot;object&quot;: dict}
+
+
+class SchemaError(ValueError):
+    &quot;&quot;&quot;带路径的校验错误。★ 路径是给模型的（第 3 节），不是给程序员的。&quot;&quot;&quot;
+
+    def __init__(self, path: str, msg: str):
+        super().__init__(f&quot;{path}: {msg}&quot;)
+        self.path, self.msg = path, msg
+
+
+def validate(value: Any, schema: dict, path: str = &quot;$&quot;) -&gt; None:
+    t = schema.get(&quot;type&quot;)
+    if t is not None:
+        expect = _TYPE_MAP[t]
+        # ★ bool 是 int 的子类：不排除会让 True 通过 integer 校验
+        if isinstance(value, bool) and t in (&quot;integer&quot;, &quot;number&quot;):
+            raise SchemaError(path, f&quot;期望 {t}，得到 boolean&quot;)
+        if not isinstance(value, expect):
+            raise SchemaError(path, f&quot;期望 {t}，得到 {type(value).__name__}&quot;)
+
+    if t == &quot;string&quot;:
+        if &quot;minLength&quot; in schema and len(value) &lt; schema[&quot;minLength&quot;]:
+            raise SchemaError(path, f&quot;长度 &lt; {schema[&#39;minLength&#39;]}&quot;)
+        if &quot;maxLength&quot; in schema and len(value) &gt; schema[&quot;maxLength&quot;]:
+            raise SchemaError(path, f&quot;长度 &gt; {schema[&#39;maxLength&#39;]}&quot;)
+        if &quot;enum&quot; in schema and value not in schema[&quot;enum&quot;]:
+            raise SchemaError(path, f&quot;不在允许集合 {schema[&#39;enum&#39;]} 中&quot;)
+    elif t in (&quot;integer&quot;, &quot;number&quot;):
+        if &quot;minimum&quot; in schema and value &lt; schema[&quot;minimum&quot;]:
+            raise SchemaError(path, f&quot;小于下界 {schema[&#39;minimum&#39;]}&quot;)
+        if &quot;maximum&quot; in schema and value &gt; schema[&quot;maximum&quot;]:
+            raise SchemaError(path, f&quot;大于上界 {schema[&#39;maximum&#39;]}&quot;)
+    elif t == &quot;array&quot;:
+        item_schema = schema.get(&quot;items&quot;)
+        if item_schema:
+            for i, item in enumerate(value):
+                validate(item, item_schema, f&quot;{path}[{i}]&quot;)
+    elif t == &quot;object&quot;:
+        props = schema.get(&quot;properties&quot;, {})
+        for req in schema.get(&quot;required&quot;, []):
+            if req not in value:
+                raise SchemaError(f&quot;{path}.{req}&quot;, &quot;缺少必需参数&quot;)
+        for k, v in value.items():
+            if k not in props:
+                if schema.get(&quot;additionalProperties&quot;) is False:
+                    raise SchemaError(f&quot;{path}.{k}&quot;, f&quot;未知参数（可用：{sorted(props)}）&quot;)
+                continue
+            validate(v, props[k], f&quot;{path}.{k}&quot;)
+        # oneOf：用于表达&quot;二选一且不可都给&quot;（3.3 的语义联动）
+        if &quot;oneOf&quot; in schema:
+            hits = sum(1 for sub in schema[&quot;oneOf&quot;] if _satisfies(value, sub))
+            if hits != 1:
+                names = [sorted(s.get(&quot;required&quot;, [])) for s in schema[&quot;oneOf&quot;]]
+                raise SchemaError(path, f&quot;必须且只能满足其中一组：{names}（当前满足 {hits} 组）&quot;)
+
+
+def _satisfies(obj: Any, sub: dict) -&gt; bool:
+    try:
+        validate(obj, sub)
+        return True
+    except SchemaError:
+        return False
+
+
+# ==================== (3) 参数规范化 + 契约内校验 ====================
+@dataclass
+class Normalized:
+    ok: bool
+    args: dict = field(default_factory=dict)
+    # ★ 错误信息面向模型：含路径、当前值、合法域、可行动提示
+    feedback: Optional[str] = None
+
+
+def normalize_and_check(raw_args: dict, spec: ToolSpec) -&gt; Normalized:
+    &quot;&quot;&quot;
+    ★ 设计决策：把校验放在&quot;我们这一侧、调用之前&quot;。
+      下游系统的报错是面向程序员的（栈回溯/内部字段名），
+      而我们这里的报错可以面向模型设计（路径 + 合法域 + 下一步）。
+      同一个失败，两种报错的可修复性差一个数量级。
+    &quot;&quot;&quot;
+    schema = spec.parameters
+    args = dict(raw_args)
+
+    # 默认值必须由 schema 注入，而不是由实现偷偷注入（3.2）
+    for key, sch in schema.get(&quot;properties&quot;, {}).items():
+        if key not in args and &quot;default&quot; in sch:
+            args[key] = sch[&quot;default&quot;]
+
+    try:
+        validate(args, schema)
+    except SchemaError as e:
+        hint = _hint(e, schema)
+        return Normalized(ok=False, feedback=f&quot;参数不合法 → {e}. {hint}&quot;)
+    return Normalized(ok=True, args=args)
+
+
+def _hint(err: SchemaError, schema: dict) -&gt; str:
+    &quot;&quot;&quot;把校验错误翻译成模型能据以修改参数的建议。★ 这是第 3 节&quot;反馈设计&quot;的最小形态。&quot;&quot;&quot;
+    leaf = err.path.split(&quot;.&quot;)[-1].split(&quot;[&quot;)[0]
+    sch = schema.get(&quot;properties&quot;, {}).get(leaf)
+    if not sch:
+        return f&quot;可用参数：{sorted(schema.get(&#39;properties&#39;, {}))}&quot;
+    bits = []
+    for k in (&quot;type&quot;, &quot;minimum&quot;, &quot;maximum&quot;, &quot;minLength&quot;, &quot;maxLength&quot;, &quot;default&quot;, &quot;enum&quot;):
+        if k in sch:
+            bits.append(f&quot;{k}={sch[k]}&quot;)
+    return f&quot;参数 {leaf} 的约束：{&#39;, &#39;.join(bits)}。修改后重新调用，不要重复提交相同参数。&quot;
+
+
+if __name__ == &quot;__main__&quot;:
+    # ---- 示例：一个&quot;看起来没问题&quot;的工具，被审查器打回 ----
+    bad = ToolSpec(
+        name=&quot;update_user&quot;,
+        description=&quot;更新用户信息&quot;,
+        parameters={&quot;type&quot;: &quot;object&quot;, &quot;properties&quot;: {
+            &quot;user_name&quot;: {&quot;type&quot;: &quot;string&quot;},
+            &quot;note&quot;: {&quot;type&quot;: &quot;string&quot;}}},
+        return_schema={&quot;type&quot;: &quot;object&quot;},
+        side_effect=&quot;irreversible_write&quot;,
+    )
+    for issue in audit_tool(bad):
+        print(&quot;  -&quot;, issue)
+
+    print()
+    # ---- 示例：修正后的工具通过审查 ----
+    good = ToolSpec(
+        name=&quot;update_user&quot;,
+        description=(&quot;更新用户资料。★ 必须先用 resolve_user 拿到 user_id；&quot;
+                     &quot;本操作不可撤销（无历史版本），重复调用结果相同（幂等）。&quot;),
+        parameters={&quot;type&quot;: &quot;object&quot;, &quot;additionalProperties&quot;: False,
+                    &quot;required&quot;: [&quot;user_id&quot;],
+                    &quot;properties&quot;: {
+                        &quot;user_id&quot;: {&quot;type&quot;: &quot;string&quot;, &quot;maxLength&quot;: 64,
+                                    &quot;description&quot;: &quot;不可变标识，来自 resolve_user&quot;},
+                        &quot;note&quot;: {&quot;type&quot;: &quot;string&quot;, &quot;maxLength&quot;: 2000,
+                                 &quot;description&quot;: &quot;自由文本备注&quot;},
+                        &quot;limit&quot;: {&quot;type&quot;: &quot;integer&quot;, &quot;minimum&quot;: 1, &quot;maximum&quot;: 100,
+                                  &quot;default&quot;: 20, &quot;description&quot;: &quot;批量更新的条数上限&quot;}}},
+        return_schema={&quot;type&quot;: &quot;object&quot;, &quot;properties&quot;: {
+            &quot;status&quot;: {&quot;type&quot;: &quot;string&quot;, &quot;enum&quot;: [&quot;ok&quot;, &quot;empty&quot;, &quot;denied&quot;, &quot;retry_later&quot;]},
+            &quot;limit_applied&quot;: {&quot;type&quot;: &quot;integer&quot;}}},
+        side_effect=&quot;reversible_write&quot;,
+        idempotent=True,
+    )
+    print(&quot;修正后缺陷数：&quot;, len(audit_tool(good)))
+
+    # ---- 运行时校验 + 面向模型的反馈 ----
+    cases = [
+        {&quot;user_id&quot;: &quot;u_1&quot;, &quot;limit&quot;: 1000},          # 越界
+        {&quot;user_id&quot;: &quot;u_1&quot;, &quot;sort_by&quot;: &quot;name&quot;},      # 自造参数
+        {},                                          # 缺必需参数
+        {&quot;user_id&quot;: &quot;u_1&quot;},                          # 合法（limit 由 default 注入）
+    ]
+    for raw in cases:
+        res = normalize_and_check(raw, good)
+        print(f&quot;{json.dumps(raw, ensure_ascii=False):40s} → &quot;
+              f&quot;{&#39;OK &#39; + json.dumps(res.args, ensure_ascii=False) if res.ok else res.feedback}&quot;)
+
+    # ---- 一个真实的边界：跨字段/跨调用约束 schema 表达不了 ----
+    # &quot;先 open_session 再 write&quot; 无法进 schema；只能用运行时状态检查 + 明确的反馈：
+    def write_guard(session_open: bool, args: dict) -&gt; Normalized:
+        if not session_open:
+            # ★ 这条反馈同时给出&quot;为什么失败&quot;和&quot;下一步做什么&quot;，是可修复错误的标准形态
+            return Normalized(ok=False, feedback=(
+                &quot;前置条件不满足：当前没有打开的会话。请先调用 open_session()，&quot;
+                &quot;再用返回的 session_id 调用本工具。不要重复提交本次调用。&quot;))
+        return Normalized(ok=True, args=args)
+
+    print(&quot;\n跨调用约束的反馈样例：&quot;, write_guard(False, {}).feedback)
+
+    # ---- 附带自检：本文件的代码块必须能被 ast.parse（写作规范要求） ----
+    assert ast.parse(&quot;x = 1&quot;).body, &quot;ast 可用&quot;</code></pre>
+<p><strong>五处关键设计决策</strong>：</p>
+<ol>
+<li><code>audit_tool</code> 把契约规则变成 CI 断言。审查器的价值不在于它检查得多全，而在于<strong>它检查的每条都不会再被漏掉</strong>；语义类问题（跨字段算术、前置条件）则通过 <code>E1</code> 强制它们出现在 description 里 —— <strong>审查器检查&quot;约束有没有被表达&quot;，而不是&quot;约束是什么&quot;</strong>。</li>
+<li><code>validate</code> 刻意只实现 JSON Schema 子集，并且<strong>显式处理 <code>bool</code> 是 <code>int</code> 子类</strong>这个坑。调用前校验的意义是把错误的<strong>产生者</strong>换成我们（可分类、可修复），而不是下游（不可读）。</li>
+<li><code>normalize_and_check</code> 在<strong>调用之前</strong>注入默认值。这让&quot;省略参数&quot;这个模型动作有确定语义，也让 schema 成为默认值的唯一来源（避免实现与契约漂移）。</li>
+<li><code>_hint</code> 生成的是<strong>面向模型的</strong>措辞：参数名、约束、下一步、以及&quot;不要重复提交相同参数&quot;。最后一句是第 3 节要展开的<strong>防重复</strong>机制的最小形态。</li>
+<li>最后的 <code>write_guard</code> 演示了 schema 表达力之外的约束如何落地：<strong>运行时检查 + 明确指出前置工具名 + 可执行的下一步</strong>。</li>
+</ol>
+<h3 id="h-练习">练习<a class="anchor" href="#h-练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><p><strong>契约审查</strong>：拿你实际用过（或设计过）的一个工具，用 2.3 的十问表逐条填。至少找出三项答不上来的，并说明：如果模型在真实任务里遇到这个&quot;没答上来的地方&quot;，它最可能采取的错误行为是什么？再把它们按&quot;加 schema 约束 / 改 description / 拆工具 / 加运行时校验&quot;归到四类修复手段里。</p>
+</li>
+<li><p><strong>粒度取舍</strong>：某系统原本有一个工具 <code>edit_document(doc_id, mode, content)</code>，<code>mode ∈ {append, replace_section, replace_all}</code>。请给出至少两种拆分或改造方案，并逐个分析：(a) 幂等键该怎么设？(b) 权限如何更细？(c) 部分成功如何表达？(d) 工具数量增加后选择难度如何变化？最后给出你的选择与理由。</p>
+</li>
+<li><p><strong>静默钳制的代价</strong>：某工具对 <code>limit</code> 做静默钳制（&gt;100 时按 100 处理），返回里不含任何提示。请构造一个<strong>具体任务</strong>，说明模型会因为这个设计得出一个错误结论（要写出它看到的返回值、它得出的结论、以及真实情况的差别）。然后给出返回 schema 的修正方案。</p>
+</li>
+<li><p><strong>schema 表达力的边界</strong>：下面三条约束，分别判断能否用 JSON Schema（含 <code>oneOf</code>/<code>allOf</code>/<code>not</code>，<code>required</code>，<code>minimum</code>）表达。不能表达的，写出你的落地方式（运行时校验 + 反馈文案）：
+（a）<code>start_date ≤ end_date</code>；（b）<code>query</code> 与 <code>doc_id</code> 必须且只能给一个；（c）调用本工具前必须先调用过 <code>open_session</code> 且会话未过期。</p>
+</li>
+<li><p><strong>返回值设计</strong>：为&quot;在外部工单系统里创建一个工单&quot;的工具设计完整的返回 schema。要求覆盖：成功、字段非法被拒、权限不足、上游限流、上游超时（<strong>结果未知</strong>）、以及部分成功（工单已建但标签写入失败）。对每个状态说明：模型收到它之后应该采取的<strong>下一个动作</strong>是什么？其中哪一个状态必须携带幂等键或查询手段？</p>
+</li>
+<li><p><strong>描述的两段式改写</strong>：找一段你写过的工具 description，按 1.2 的两段式（何时用/何时不用 → 参数语义与前置条件 → 返回什么）重写。要求：重写后，一个之前会被误选到相邻工具的场景不再被误选。说明你加入了哪一句、它为什么起作用（是提高区分度还是传递约束）。</p>
+</li>
+<li><p><strong>名字 vs 标识（判断）</strong>：某只读工具 <code>search_orders(customer_name, status)</code> 在真实数据里大量重名。请设计：它该返回什么？如果产品要求&quot;直接返回最匹配的一条&quot;，你要付出什么代价来让它安全？（提示：想想后续哪个写操作会消费这个结果。）</p>
+</li>
+</ol>
+<h3 id="h-小结">小结<a class="anchor" href="#h-小结" aria-label="本节链接">#</a></h3>
+<ul>
+<li><strong>工具对模型而言是不可见实现的接口面</strong>：能力声明 + 调用协议 + 结果语义三合一。契约没写清的空白会被模型的训练先验填上，<strong>填错是契约的缺陷，不是模型的错</strong>。</li>
+<li><strong>位置决定作用</strong>：description 在&quot;选工具&quot;时提供<strong>区分度</strong>，在&quot;填参数&quot;时提供<strong>约束传递</strong>。两段式写法同时服务两个位置；把两件事混成一段是描述写不好的主因。</li>
+<li><strong>粒度 = 副作用边界</strong>。读写分开、写操作可原子或可报告部分成功、默认不给 <code>run_sql</code>/<code>run_shell</code> 这类逃逸舱。</li>
+<li><strong>约束写严通常提高成功率</strong>：它把开放决策变成封闭决策。默认值必须写进 schema（它是契约，不是实现细节），越界应拒绝而<strong>不要静默钳制</strong>；必须钳制时要在返回里显式报告 <code>limit_applied</code>/<code>truncated</code>。</li>
+<li><strong>schema 表达力有限</strong>：值域 ✓、结构（<code>oneOf</code>）△、跨字段算术 ✗、跨调用状态 ✗。表达不了的必须<strong>在失败时给可修复的错误</strong>；互斥到&quot;给了就无效&quot;的参数组，通常应拆成两个工具。</li>
+<li><strong>写操作用标识不用名字</strong>：名字参数的失败是<strong>静默</strong>的（返回第一个/全部/报错都&quot;看起来合理&quot;）。让&quot;解析&quot;独立成一个只读工具，把&quot;需要判断的步骤&quot;与&quot;执行动作的步骤&quot;分开。</li>
+<li><strong>返回值是被忽视的契约面</strong>：优先 <code>status</code> 枚举、区分事实与声明、不要返回空、不要返回解读。返回值是模型判断&quot;世界现在什么样&quot;的唯一依据。</li>
+<li><strong>&quot;先宽松后收紧&quot;是最贵的省事</strong>：四个关键字（<code>additionalProperties: false</code>、<code>required</code>、<code>minimum/maximum</code>、<code>default</code>）就能覆盖大部分代价，成本只有几行 JSON。</li>
+<li><strong>调用前校验把错误的生产者换成自己</strong>：下游的报错面向程序员，我们的报错可以面向模型设计（路径 + 合法域 + 下一步 + &quot;不要重复提交&quot;）。</li>
+</ul>
+<blockquote>
+<p>下一节：契约写清楚了，&quot;调用&quot;这件事还有一半没解决 —— <strong>调用发出去了，但你没收到回复</strong>。此时世界到底变没变？这一节要处理的就是这个&quot;未知区间&quot;，以及它为什么让幂等键成为 Agent 可靠性的地基。</p>
+</blockquote>

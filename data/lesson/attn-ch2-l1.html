@@ -1,0 +1,70 @@
+<h2 id="h-自注意力">自注意力<a class="anchor" href="#h-自注意力" aria-label="本节链接">#</a></h2>
+<p>第一章的注意力是<strong>编码器与解码器之间</strong>的：Query 来自解码器，Key/Value 来自编码器。现在换一个视角——如果一条序列<strong>自己对自己</strong>做注意力，让每个词都能直接&quot;看见&quot;序列里的其它词，会得到什么？这就是<strong>自注意力（self-attention）</strong>，Transformer 最核心的构件。它让每个位置的表示都融合了全序列的信息，而且完全并行，一举解决了 RNN 的顺序瓶颈。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-从两段之间到一段之内">1. 从&quot;两段之间&quot;到&quot;一段之内&quot;<a class="anchor" href="#h-1-从两段之间到一段之内" aria-label="本节链接">#</a></h4>
+<p>回顾普通注意力：解码器每生成一步，用 Query 去编码器那串 Key/Value 里找信息。这里 Query 和 Key/Value 来自<strong>两个不同的序列</strong>，方向是&quot;从生成端看输入端&quot;。</p>
+<p>自注意力则把这种&quot;查找&quot;用在一段序列<strong>内部</strong>：序列中的每个位置都既当 Query，也当 Key，也当 Value。第 <code>i</code> 个词的新表示，是它（作为 Query）与所有位置（作为 Key）比对出权重后，对全体位置（作为 Value）加权求和的结果。一句话说：<strong>每个词都问一句&quot;其它词和我有多相关&quot;，然后把它们按相关度融合进自己的表示里</strong>。</p>
+<h4 id="h-2-为什么它能取代-rnn">2. 为什么它能取代 RNN<a class="anchor" href="#h-2-为什么它能取代-rnn" aria-label="本节链接">#</a></h4>
+<p>RNN 处理序列是<strong>一步一步</strong>的：第 <code>i</code> 个词的表示要等第 <code>i-1</code> 个算完才能算，信息从前往后逐步传递，相隔很远的两个词要经过很多步才能&quot;见面&quot;，既慢又容易在长距离上衰减。</p>
+<p>自注意力让任意两个位置<strong>直接相连</strong>：计算第 <code>i</code> 个词时，它与第 <code>j</code> 个词的相关性是一次点积，无论 <code>i</code> 和 <code>j</code> 隔多远，路径长度都是 1。于是：</p>
+<ul>
+<li><strong>长距离依赖</strong>不再衰减，词与词之间是&quot;一步直达&quot;；</li>
+<li><strong>并行计算</strong>：所有位置可以同时算，因为彼此没有先后依赖（这正是 Transformer 能大规模并行训练的根本原因）。</li>
+</ul>
+<h4 id="h-3-注意力矩阵一张两两关系热力图">3. 注意力矩阵：一张&quot;两两关系&quot;热力图<a class="anchor" href="#h-3-注意力矩阵一张两两关系热力图" aria-label="本节链接">#</a></h4>
+<p>自注意力中间会得到一张形状为 <code>(序列长度, 序列长度)</code> 的权重矩阵。第 <code>i</code> 行第 <code>j</code> 列的元素，表示&quot;第 <code>i</code> 个词在多大程度上关注第 <code>j</code> 个词&quot;。每一行是一个概率分布（和为 1）。</p>
+<p>这张矩阵非常直观：对角线上往往权重较高（词与自己最相关），而句法上有关联的词对（如&quot;动词—宾语&quot;）会在对应位置亮起。可视化自注意力，就等于在观察&quot;模型在读这句话时，眼睛在哪些词之间来回跳&quot;。</p>
+<h4 id="h-4-一个关键性质置换不变性">4. 一个关键性质：置换不变性<a class="anchor" href="#h-4-一个关键性质置换不变性" aria-label="本节链接">#</a></h4>
+<p>自注意力本身<strong>不含位置信息</strong>——把序列里的词打乱顺序，只要词集合不变，每个词的输出（不考虑位置编码）只是按新顺序排列，内容不变。因为注意力权重只由 Query 与 Key 的<strong>内容</strong>决定，与它们在第几位无关。</p>
+<p>这意味着纯自注意力无法区分&quot;我 爱 你&quot;和&quot;你 爱 我&quot;。要让它感知顺序，必须额外注入<strong>位置信息</strong>（位置编码），这正是第四章&quot;为什么需要位置&quot;要讲的主题。现在先记住这个结论，它是理解 Transformer 为什么需要位置编码的钥匙。</p>
+<p><figure><img class="md-img" src="content/courses/attention-transformer/assets/chapter-2-figure-01.svg" alt="自注意力：序列内每个词与所有词建立两两联系" loading="lazy" decoding="async"><figcaption>自注意力：序列内每个词与所有词建立两两联系</figcaption></figure>
+</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面实现一个最朴素的自注意力（Q=K=V=x，还没加可学习投影），观察注意力矩阵的形状与性质。</p>
+<pre data-lang="python"><code class="language-python">import torch
+import torch.nn.functional as F
+
+torch.manual_seed(0)
+
+# 一个 4 词句子，每个词 6 维向量（真实模型里来自嵌入层，这里用随机数代替）
+x = torch.randn(4, 6)          # (序列长度, 维度)
+
+# 自注意力：Q、K、V 都来自 x 本身
+d = x.size(1)
+scores = x @ x.T / (d ** 0.5)   # (4,4)：第 i 行第 j 列 = 词 i 与词 j 的相关性
+weights = F.softmax(scores, dim=-1)   # 每行归一化成一个&quot;关注分布&quot;
+out = weights @ x               # 每个词的新表示 = 全体词的加权和
+
+print(&quot;注意力矩阵（每行和为 1）:&quot;)
+print(weights)
+print(&quot;每行之和:&quot;, weights.sum(dim=-1))   # 应为 1.0
+print(&quot;输出形状:&quot;, out.shape)            # (4,6)，与输入一致
+
+# 第 0 个词&quot;看&quot;其它词的权重
+print(&quot;第 0 个词对其它词的关注:&quot;, weights[0])
+
+# 验证置换不变性：把句子顺序打乱，输出只是按新顺序排列
+idx = torch.tensor([2, 0, 3, 1])
+x_perm = x[idx]
+out_perm = F.softmax(x_perm @ x_perm.T / (d ** 0.5), dim=-1) @ x_perm
+print(&quot;打乱后输出与按新顺序排列一致:&quot;, torch.allclose(out_perm, out[idx], atol=1e-6))</code></pre>
+<p>运行后注意：</p>
+<ul>
+<li>注意力矩阵是 4×4，每一行都是一个概率分布，代表&quot;第 i 个词把注意力分配给了哪些词&quot;；</li>
+<li><code>out</code> 与输入 <code>x</code> 形状相同（4×6），但每一行已经是全句信息的融合结果；</li>
+<li>最后一行验证了<strong>置换不变性</strong>：把输入按 <code>[2,0,3,1]</code> 重排，输出只是原来输出按同样顺序重排，内容不变。这印证了&quot;自注意力感知不到位置&quot;的结论。</li>
+</ul>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>把 <code>x</code> 改成 10×6（10 个词），重新运行，观察注意力矩阵变成 10×10；挑一个词打印它权重最大的前三个位置，看看它最&quot;关注&quot;谁。</li>
+<li>构造一个&quot;重复词&quot;的句子（比如让 <code>x[0]</code> 和 <code>x[2]</code> 完全相同），观察注意力矩阵第 0 行和第 2 行是否相同，解释为什么（自注意力只看内容不看位置）。</li>
+<li>把 <code>softmax</code> 的 <code>dim</code> 从 <code>-1</code> 改成 <code>0</code>，看看每列之和变成什么、每行还是否为 1，从而理解&quot;对行归一化&quot;（每个查询对自己的关注分布）的含义。</li>
+<li>思考：RNN 里信息从位置 1 传到位置 10 要走 9 步，而自注意力里这两者之间的&quot;路径长度&quot;是多少？这个差异为什么让 Transformer 能更好地处理长序列？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Vaswani et al. · Attention Is All You Need：<a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1706.03762</a></li>
+<li>Jay Alammar · The Illustrated Transformer：<a href="https://jalammar.github.io/illustrated-transformer/" target="_blank" rel="noopener noreferrer">https://jalammar.github.io/illustrated-transformer/</a></li>
+<li>PyTorch 官方文档 · torch.nn.functional.softmax：<a href="https://pytorch.org/docs/stable/generated/torch.nn.functional.softmax.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/docs/stable/generated/torch.nn.functional.softmax.html</a></li>
+</ul>
+<p><a href="#/l/attn-ch2-l2">下一课：QKV 与缩放点积</a></p>

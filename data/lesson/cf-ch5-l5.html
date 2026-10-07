@@ -1,0 +1,401 @@
+<h2 id="h-优化的正确性如何证明一个-pass-没改语义">优化的正确性：如何证明一个 pass 没改语义<a class="anchor" href="#h-优化的正确性如何证明一个-pass-没改语义" aria-label="本节链接">#</a></h2>
+<p>前四课给了你一堆&quot;看起来显然成立&quot;的改写。现在把它们推倒重问：<strong>凭什么说改写之后程序没变？</strong> 这个问题没有廉价答案：<code>x / 2</code> 换成 <code>x &gt;&gt; 1</code> 看起来天经地义，<code>x + 1 &gt; x</code> 看起来恒真，删掉&quot;没人用&quot;的除法看起来纯赚。本课用一个 60 行的 TAC 解释器加差分测试把其中几条抓出反例，再把&quot;每个 pass 要证的义务&quot;写成一张表，最后解释它与未定义行为（UB）的关系。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-没改语义的准确含义">1. &quot;没改语义&quot;的准确含义<a class="anchor" href="#h-1-没改语义的准确含义" aria-label="本节链接">#</a></h4>
+<p>优化改写的目标不是&quot;代码变短&quot;，而是<strong>观察等价</strong>（observational equivalence）：对每一个输入，两个程序的可观察行为相同。可观察行为包括<strong>返回的值</strong>、<strong>副作用</strong>（写内存、I/O）与<strong>是否陷阱/是否终止</strong>（除零、越界、死循环）。</p>
+<p>要证明&quot;两个程序的行为集合完全相等&quot;通常不现实，工程上做的是 <strong>refinement</strong>：新程序允许的行为集合 ⊆ 旧程序允许的行为集合（不许产生原来没有的结果，也不许丢掉原来的陷阱）。</p>
+<h4 id="h-2-三把锤子证明翻译验证测试">2. 三把锤子：证明、翻译验证、测试<a class="anchor" href="#h-2-三把锤子证明翻译验证测试" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>局部证明</strong>：为改写规则写出前提（右值相同、无使用、无副作用），再证前提成立时观察不变。</li>
+<li><strong>翻译验证</strong>（translation validation）：编译后让验证器自动证原 IR 与优化后 IR 等价。</li>
+<li><strong>差分测试</strong>：同一输入跑两个版本比较可观察结果，配合随机程序生成器扩大覆盖面；只能证伪。</li>
+</ul>
+<p>前两者是证明，第三者只能<strong>证伪</strong>：测试通过不代表正确，失败一定不正确。</p>
+<h4 id="h-3-差分测试的三个实现要点">3. 差分测试的三个实现要点<a class="anchor" href="#h-3-差分测试的三个实现要点" aria-label="本节链接">#</a></h4>
+<ol>
+<li><strong>参考语义要写死</strong>：解释器约定 32 位回绕、除法向零取整、除零抛陷阱——语义不确定，比较就没有意义。</li>
+<li><strong>两个版本都要能陷阱，并把它当结果比较</strong>：只比返回值会漏掉&quot;原程序崩、优化后不崩&quot;的错误。</li>
+<li><strong>输入池要含边界值</strong>：0、±1、<code>2^31-1</code>、<code>-2^31</code>、负数——小范围随机数碰不到边界。</li>
+</ol>
+<p>本课实测：200 个随机程序 × 10 组输入 = 2000 次比较，<strong>0 处不一致</strong>（其中 431 次两边都陷阱、结果一致）；被检验的优化器一共折叠 344 次、CSE 4 次、删除 714 条——<strong>测试有效性取决于&quot;优化确实改了东西&quot;</strong>。</p>
+<p><figure><img class="md-img" src="content/courses/compiler-foundations/assets/chapter-5-figure-04.svg" alt="三把锤子：局部证明、翻译验证与差分测试各自能证什么" loading="lazy" decoding="async"><figcaption>三把锤子：局部证明、翻译验证与差分测试各自能证什么</figcaption></figure>
+</p>
+<h4 id="h-4-三个反例为什么显然成立经常不成立">4. 三个反例：为什么&quot;显然成立&quot;经常不成立<a class="anchor" href="#h-4-三个反例为什么显然成立经常不成立" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>改写</th>
+<th>直觉</th>
+<th>反例（本课抓到）</th>
+<th>真正的语义原因</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>x / 2</code> → <code>x &gt;&gt; 1</code></td>
+<td>除以 2 就是右移</td>
+<td><code>x = -3</code>：原式 <code>-1</code></td>
+<td>除法向零取整、右移向下取整</td>
+</tr>
+<tr>
+<td><code>x + 1 &gt; x</code> → 恒真</td>
+<td>加一当然变大</td>
+<td><code>x = 2147483647</code>：原式 <code>0</code></td>
+<td>补码回绕后 <code>x + 1</code> 反而更小</td>
+</tr>
+<tr>
+<td>删掉没人用的 <code>100 / y</code></td>
+<td>结果没人用</td>
+<td><code>y = 0</code> 时原程序陷阱</td>
+<td>陷阱也是可观察行为</td>
+</tr>
+</tbody></table>
+<h4 id="h-5-每个-pass-的证明义务表">5. 每个 pass 的&quot;证明义务&quot;表<a class="anchor" href="#h-5-每个-pass-的证明义务表" aria-label="本节链接">#</a></h4>
+<p>写 pass 之前先把这张表填了，评审也按它检查：</p>
+<table>
+<thead>
+<tr>
+<th>pass</th>
+<th>要证明的</th>
+<th>最容易错的地方</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>常量折叠</td>
+<td>算出来的值 == 运行期算的值</td>
+<td>溢出/回绕、除零陷阱不能折掉</td>
+</tr>
+<tr>
+<td>公共子表达式</td>
+<td>两次右值在改写点同值，且其间操作数未被重定义</td>
+<td>可用表达式是 Must；跨块还要支配关系</td>
+</tr>
+<tr>
+<td>死代码消除</td>
+<td>结果无人使用，且无副作用、不陷阱</td>
+<td>除/移位/调用不能因&quot;没人用&quot;就删</td>
+</tr>
+<tr>
+<td>不变量外提</td>
+<td>每次迭代值相同，且无条件执行安全</td>
+<td>可能陷阱要留守卫，且需 preheader</td>
+</tr>
+<tr>
+<td>强度削减</td>
+<td>代数等价 + 不改变溢出/取整行为</td>
+<td>有符号除法不能用右移代替</td>
+</tr>
+</tbody></table>
+<p>工程原则：<strong>改写必须比分析结论更保守</strong>，且&quot;为什么这么改&quot;要写进 pass 文档。</p>
+<h4 id="h-6-为什么这事和未定义行为绑在一起">6. 为什么这事和未定义行为绑在一起<a class="anchor" href="#h-6-为什么这事和未定义行为绑在一起" aria-label="本节链接">#</a></h4>
+<p>回到那个尖锐的问题：<code>x + 1 &gt; x → true</code> 这个改写，编译器错没错？答案取决于<strong>语言语义</strong>——C 里有符号溢出是未定义行为（UB），编译器有权假设它不发生，所以 <code>x = 2147483647</code> 这个反例<strong>本来就不是合法程序</strong>。这也解释了经典困惑&quot;为什么 <code>-O2</code> 下程序炸了、<code>-O0</code> 下好好的&quot;：是 UB 被优化暴露，不是编译器 bug。</p>
+<p>LLVM 把 UB 做成显式的 IR 语义：<code>nsw</code>/<code>nuw</code> 标记与 <code>poison</code>、<code>undef</code> 值都写在语言参考手册与 UB 手册里；Alive 系列工具能形式化验证 peephole 优化，正因为它们验证的是<strong>IR 层面写死的语义</strong>。</p>
+<p>本机 clang 实测（见下方 bash 块）：同一个 <code>(x+1) &gt; x</code> 程序，<code>-O0</code> 对 <code>x = 2147483647</code> 输出 <code>0</code>、<code>-O1</code> 输出 <code>1</code>。<strong>合法性边界由 UB 规则划定，不由直觉划定</strong>。</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面这段纯 Python 有三样东西：固定了语义的 TAC 解释器（32 位回绕、向零取整、陷阱可见）、&quot;尽量正确&quot;的过程内优化器（折叠 + CSE + 复制传播 + 带陷阱保护的 DCE）、差分测试驱动。最后它把两个故意写错的 pass 塞进管线，看检查器能否自动抓到反例。</p>
+<pre data-lang="python"><code class="language-python"># ---- 语义保持的验证：解释器 + 差分测试 + 两个&quot;看起来对&quot;的错误 pass（纯 Python）----
+import random
+
+BIN = {&#39;add&#39;, &#39;sub&#39;, &#39;mul&#39;, &#39;div&#39;, &#39;shr&#39;}
+CMPS = {&#39;&gt;&#39;: lambda x, y: x &gt; y, &#39;&lt;&#39;: lambda x, y: x &lt; y, &#39;&gt;=&#39;: lambda x, y: x &gt;= y,
+        &#39;&lt;=&#39;: lambda x, y: x &lt;= y, &#39;==&#39;: lambda x, y: x == y, &#39;!=&#39;: lambda x, y: x != y}
+
+
+def nm(x):
+    return (&#39;name&#39;, x)
+
+
+def ct(k):
+    return (&#39;const&#39;, k)
+
+
+def def_use(ins):
+    op = ins[0]
+    if op == &#39;copy&#39;:
+        return ins[3], [ins[1]]
+    if op in BIN:
+        return ins[3], [ins[1], ins[2]]
+    if op == &#39;cmp&#39;:
+        return ins[4], [ins[2], ins[3]]
+    if op == &#39;return&#39;:
+        return None, [ins[1]]
+    return None, []
+
+
+def fmt(ins):
+    op = ins[0]
+    s = lambda x: str(x[1]) if x else &#39;-&#39;
+    if op == &#39;copy&#39;:
+        return f&#39;{ins[3]} = {s(ins[1])}&#39;
+    if op in BIN:
+        return f&#39;{ins[3]} = {s(ins[1])} {op} {s(ins[2])}&#39;
+    if op == &#39;cmp&#39;:
+        return f&#39;{ins[4]} = {s(ins[2])} {ins[1]} {s(ins[3])}&#39;
+    if op == &#39;return&#39;:
+        return f&#39;return {s(ins[1])}&#39;
+    return str(ins)
+
+
+class Trap(Exception):
+    pass
+
+
+def wrap32(v):
+    return ((v + 2 ** 31) % 2 ** 32) - 2 ** 31
+
+
+def trunc_div(a, b):
+    if b == 0:
+        raise Trap(&#39;除零&#39;)
+    q = abs(a) // abs(b)
+    return q if (a &lt; 0) == (b &lt; 0) else -q
+
+
+# ---------------- 参考语义：一个 TAC 解释器（32 位回绕 + 向零取整的除法）----------------
+def run(instrs, env):
+    env = dict(env)
+    for ins in instrs:
+        op = ins[0]
+        if op == &#39;return&#39;:
+            return env[ins[1][1]]
+        d, ops = def_use(ins)
+        vals = [env[x[1]] if x[0] == &#39;name&#39; else x[1] for x in ops]
+        if op == &#39;add&#39;:
+            v = wrap32(vals[0] + vals[1])
+        elif op == &#39;sub&#39;:
+            v = wrap32(vals[0] - vals[1])
+        elif op == &#39;mul&#39;:
+            v = wrap32(vals[0] * vals[1])
+        elif op == &#39;div&#39;:
+            v = wrap32(trunc_div(vals[0], vals[1]))       # 向零取整，除零 = 陷阱
+        elif op == &#39;shr&#39;:
+            if vals[1] &lt; 0 or vals[1] &gt; 31:
+                raise Trap(&#39;移位量非法&#39;)
+            v = vals[0] &gt;&gt; vals[1]                        # 算术右移 = 向下取整
+        elif op == &#39;cmp&#39;:
+            v = int(CMPS[ins[1]](vals[0], vals[1]))
+        else:
+            v = vals[0]
+        env[d] = v
+    raise Trap(&#39;控制流走到了终点却没有 return&#39;)
+
+
+# ---------------- 一个&quot;尽量正确&quot;的过程内优化器：折叠 + CSE/复制传播 + DCE ----------------
+def optimize(instrs):
+    state, alias, vn, out = {}, {}, {}, []
+    folds = cse = 0
+    for ins in instrs:
+        op = ins[0]
+        if op == &#39;return&#39;:
+            out.append(ins)
+            continue
+        d, ops = def_use(ins)
+        known = [(&#39;C&#39;, state[x[1]]) if x[0] == &#39;name&#39; and x[1] in state else
+                 (x if x[0] == &#39;const&#39; else None) for x in ops]
+        ok = all(k is not None for k in known)
+        # (1) 常量折叠（除法要额外确认除数非 0）
+        if ok and op in (&#39;add&#39;, &#39;sub&#39;, &#39;mul&#39;, &#39;div&#39;, &#39;shr&#39;, &#39;cmp&#39;):
+            a, b = known[0][1], known[1][1]
+            try:
+                if op == &#39;add&#39;:
+                    v = wrap32(a + b)
+                elif op == &#39;sub&#39;:
+                    v = wrap32(a - b)
+                elif op == &#39;mul&#39;:
+                    v = wrap32(a * b)
+                elif op == &#39;div&#39;:
+                    v = wrap32(trunc_div(a, b))
+                elif op == &#39;shr&#39;:
+                    if b &lt; 0 or b &gt; 31:
+                        raise Trap(&#39;移位量非法&#39;)
+                    v = a &gt;&gt; b
+                else:
+                    v = int(CMPS[ins[1]](a, b))
+                out.append((&#39;copy&#39;, ct(v), None, d))
+                state[d] = v
+                folds += 1
+                continue
+            except Trap:
+                pass                                       # 会陷阱的表达式不能折叠掉
+        if op == &#39;copy&#39; and ok:
+            state[d] = known[0][1]
+            out.append((&#39;copy&#39;, ct(known[0][1]), None, d))
+            continue
+        # (2) 把操作数里已知常量的名字换成常量字面量
+        newops = [ct(known[i][1]) if known[i] and known[i][0] == &#39;C&#39; else ops[i]
+                  for i in range(len(ops))]
+        for k in [k for k in vn if any(isinstance(x, tuple) and x == nm(d) for x in k[1:])]:
+            del vn[k]                                      # d 被重定义 → 相关右值失效
+        key = (&#39;copy&#39;, newops[0]) if op == &#39;copy&#39; else (
+            (op, newops[0], newops[1]) if op in BIN else (op, ins[1], newops[0], newops[1]))
+        if key in vn and vn[key] != d:                     # (3) 公共子表达式
+            out.append((&#39;copy&#39;, nm(vn[key]), None, d))
+            cse += 1
+            state.pop(d, None)
+            continue
+        vn[key] = d
+        state.pop(d, None)
+        if op == &#39;copy&#39;:
+            out.append((&#39;copy&#39;, newops[0], None, d))
+        elif op in BIN:
+            out.append((op, newops[0], newops[1], d))
+        else:
+            out.append((&#39;cmp&#39;, ins[1], newops[0], newops[1], d))
+    # 复制传播
+    alias = {}
+    for i, ins in enumerate(out):
+        if ins[0] == &#39;copy&#39; and ins[1] and ins[1][0] == &#39;name&#39;:
+            src = alias.get(ins[1][1], ins[1][1])
+            alias[ins[3]] = src
+            out[i] = (&#39;copy&#39;, nm(src), None, ins[3])
+    def sub(x):
+        return nm(alias[x[1]]) if x and x[0] == &#39;name&#39; and x[1] in alias else x
+    out = [((&#39;copy&#39;, sub(i[1]), None, i[3]) if i[0] == &#39;copy&#39; else
+            ((i[0], sub(i[1]), sub(i[2]), i[3]) if i[0] in BIN else
+             ((&#39;cmp&#39;, i[1], sub(i[2]), sub(i[3]), i[4]) if i[0] == &#39;cmp&#39; else i)))
+           for i in out]
+    # (4) 死代码消除：只删&quot;不会陷阱&quot;的指令（除/移位可能陷阱，不能因结果没人用就删）
+    dropped = 0
+    changed = True
+    while changed:
+        used = {x[1] for i in out for x in def_use(i)[1] if x and x[0] == &#39;name&#39;}
+        keep = []
+        for i in out:
+            d, ops = def_use(i)
+            safe = i[0] in (&#39;copy&#39;, &#39;add&#39;, &#39;sub&#39;, &#39;mul&#39;, &#39;cmp&#39;) or (
+                i[0] in (&#39;div&#39;, &#39;shr&#39;) and ops[1][0] == &#39;const&#39; and ops[1][1] &gt; 0)
+            if d is not None and d not in used and safe:
+                dropped += 1
+                continue
+            keep.append(i)
+        changed, out = len(keep) != len(out), keep
+    return out, (folds, cse, dropped)
+
+
+# ---------------- 差分测试：同一程序 + 同一输入，比较两个版本的可观察结果 ----------------
+INPUTS = [(0, 1), (1, 2), (-3, 2), (7, -4), (123, 456), (-1, -1),
+          (2 ** 31 - 1, 1), (-2 ** 31, 1), (1023, 3), (5, 0)]
+
+
+def observe(instrs, env):
+    try:
+        return (&#39;值&#39;, run(instrs, env))
+    except Trap as e:
+        return (&#39;陷阱&#39;, str(e))
+
+
+def gen_program(rng):
+    instrs, names = [], [&#39;x&#39;, &#39;y&#39;]
+    for k in range(rng.randint(4, 7)):
+        d = f&#39;t{k}&#39;
+        op = rng.choice([&#39;add&#39;, &#39;sub&#39;, &#39;mul&#39;, &#39;div&#39;, &#39;shr&#39;])
+
+        def operand():
+            r = rng.random()
+            if r &lt; 0.35:
+                return ct(rng.choice([1, 2, 3]))
+            if r &lt; 0.5:
+                return ct(rng.choice([0, 1, -1, 4]))
+            return nm(rng.choice(names))
+        a1, a2 = operand(), operand()
+        if op in (&#39;div&#39;, &#39;shr&#39;) and a2[0] == &#39;const&#39; and a2[1] &lt;= 0:
+            a2 = ct(2)
+        instrs.append((op, a1, a2, d))
+        names.append(d)
+    instrs.append((&#39;return&#39;, nm(rng.choice(names))))
+    return instrs
+
+
+print(&#39;=== 差分测试：一个&quot;证据驱动&quot;的正确性检查 ===&#39;)
+mismatch = bad_opt1 = bad_opt2 = 0
+traps, tot = 0, [0, 0, 0]
+for seed in range(200):
+    prog = gen_program(random.Random(seed))
+    opt, (f, c, dr) = optimize(prog)
+    for i in range(3):
+        tot[i] += (f, c, dr)[i]
+    for env in INPUTS:
+        a, b = observe(prog, dict(zip([&#39;x&#39;, &#39;y&#39;], env))), observe(opt, dict(zip([&#39;x&#39;, &#39;y&#39;], env)))
+        if a[0] == &#39;陷阱&#39; and b[0] == &#39;陷阱&#39;:
+            traps += 1
+        if a != b:
+            mismatch += 1
+print(f&#39;  200 个随机程序 × {len(INPUTS)} 组输入 = {200 * len(INPUTS)} 次比较；&#39;
+      f&#39;两侧结果不一致 {mismatch} 处（其中两侧都陷阱、结果一致的有 {traps} 次）&#39;)
+print(f&#39;  被检验的优化器确实做了事：折叠 {tot[0]} 次、CSE {tot[1]} 次、删除 {tot[2]} 条&#39;)
+
+print(&#39;\n  现在把两个&quot;看起来显然成立&quot;的改写塞进管线，看检查器能不能抓住：&#39;)
+NO_SHIFT = [( &#39;div&#39;, nm(&#39;x&#39;), ct(2), &#39;t0&#39;), (&#39;return&#39;, nm(&#39;t0&#39;))]
+WITH_SHIFT = [(&#39;shr&#39;, nm(&#39;x&#39;), ct(1), &#39;t0&#39;), (&#39;return&#39;, nm(&#39;t0&#39;))]
+for env in INPUTS:
+    e = {&#39;x&#39;: env[0], &#39;y&#39;: env[1]}
+    a, b = observe(NO_SHIFT, e), observe(WITH_SHIFT, e)
+    if a != b:
+        print(f&#39;  ✗ 「x / 2 ⇒ x &gt;&gt; 1」在 x={env[0]} 上不等价：原式 {a[1]}，改写后 {b[1]}&#39;
+              f&#39;（向零取整 vs 向下取整）&#39;)
+        bad_opt1 += 1
+NO_OVF = [(&#39;add&#39;, nm(&#39;x&#39;), ct(1), &#39;t0&#39;), (&#39;cmp&#39;, &#39;&gt;&#39;, nm(&#39;t0&#39;), nm(&#39;x&#39;), &#39;t1&#39;),
+          (&#39;return&#39;, nm(&#39;t1&#39;))]
+ASSUME_NO_OVF = [(&#39;copy&#39;, ct(1), None, &#39;t1&#39;), (&#39;return&#39;, nm(&#39;t1&#39;))]
+for env in INPUTS:
+    a, b = observe(NO_OVF, {&#39;x&#39;: env[0], &#39;y&#39;: env[1]}), observe(ASSUME_NO_OVF, {&#39;x&#39;: env[0]})
+    if a != b:
+        print(f&#39;  ✗ 「x + 1 &gt; x ⇒ 恒真」在 x={env[0]} 上不等价：原式 {a[1]}，改写后 {b[1]}&#39;
+              f&#39;（32 位回绕后 x+1 比 x 小）&#39;)
+        bad_opt2 += 1
+print(f&#39;  → 两个错误 pass 各被抓住 {bad_opt1} / {bad_opt2} 个反例；&#39;
+      f&#39;这是&quot;测试能证伪、不能证真&quot;的典型场景&#39;)
+
+print(&#39;\n=== 每个 pass 的证明义务（写 pass 前先想清这一栏）===&#39;)
+OBLIG = [
+    (&#39;常量折叠&#39;, &#39;算出来的值 == 运行期算的值&#39;, &#39;整数溢出/回绕、除零陷阱（不能折掉会陷阱的表达式）&#39;),
+    (&#39;公共子表达式&#39;, &#39;两次右值在改写点确实同值，且其间操作数未被重定义&#39;, &#39;可用表达式是 Must 分析；跨块还要支配关系&#39;),
+    (&#39;死代码消除&#39;, &#39;结果无人使用，且指令无副作用、不会陷阱&#39;, &#39;除/移位/函数调用不能因&quot;没人用&quot;就删&#39;),
+    (&#39;不变量外提&#39;, &#39;每次迭代算的值相同，且无条件执行是安全的&#39;, &#39;可能陷阱的运算要留守卫；需 preheader、支配所有出口&#39;),
+    (&#39;强度削减&#39;, &#39;等价代数改写 + 不改变溢出/取整行为&#39;, &#39;有符号除法不能用右移代替（向零取整 ≠ 向下取整）&#39;),
+]
+for name, duty, pitfall in OBLIG:
+    print(f&#39;  {name:&lt;8} 要证：{duty:&lt;38} 易错：{pitfall}&#39;)</code></pre>
+<p>运行结果：</p>
+<pre><code>=== 差分测试：一个&quot;证据驱动&quot;的正确性检查 ===
+  200 个随机程序 × 10 组输入 = 2000 次比较；两侧结果不一致 0 处（其中两侧都陷阱、结果一致的有 431 次）
+  被检验的优化器确实做了事：折叠 344 次、CSE 4 次、删除 714 条
+
+  现在把两个&quot;看起来显然成立&quot;的改写塞进管线，看检查器能不能抓住：
+  ✗ 「x / 2 ⇒ x &gt;&gt; 1」在 x=-3 上不等价：原式 -1，改写后 -2（向零取整 vs 向下取整）
+  ✗ 「x / 2 ⇒ x &gt;&gt; 1」在 x=-1 上不等价：原式 0，改写后 -1（向零取整 vs 向下取整）
+  ✗ 「x + 1 &gt; x ⇒ 恒真」在 x=2147483647 上不等价：原式 0，改写后 1（32 位回绕后 x+1 比 x 小）
+  → 两个错误 pass 各被抓住 2 / 1 个反例；这是&quot;测试能证伪、不能证真&quot;的典型场景
+
+=== 每个 pass 的证明义务（写 pass 前先想清这一栏）===
+  常量折叠     要证：算出来的值 == 运行期算的值                        易错：整数溢出/回绕、除零陷阱（不能折掉会陷阱的表达式）
+  公共子表达式   要证：两次右值在改写点确实同值，且其间操作数未被重定义               易错：可用表达式是 Must 分析；跨块还要支配关系
+  死代码消除    要证：结果无人使用，且指令无副作用、不会陷阱                    易错：除/移位/函数调用不能因&quot;没人用&quot;就删
+  不变量外提    要证：每次迭代算的值相同，且无条件执行是安全的                   易错：可能陷阱的运算要留守卫；需 preheader、支配所有出口
+  强度削减     要证：等价代数改写 + 不改变溢出/取整行为                    易错：有符号除法不能用右移代替（向零取整 ≠ 向下取整）</code></pre>
+<p>输出有三个关键读数：<strong>正确的优化器</strong>在 200 组随机程序 × 10 组输入上 0 处不一致，且确实做了 344 次折叠、4 次 CSE、714 次删除（不是空跑）；<strong>两个错误 pass</strong> 各被抓住反例（<code>x = -3</code>、<code>x = 2147483647</code>）；最后一节打印五个 pass 的证明义务。注意优化器里 DCE 的特殊规则——除法和移位只有除数是正常量时才允许删除，否则陷阱就丢了。</p>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选（需本机有 clang）：亲眼看优化器如何利用 UB ----
+# 存为 ub.c：
+#   #include &lt;stdio.h&gt;
+#   int main(void){ int x; if (scanf(&quot;%d&quot;,&amp;x)!=1) return 1;
+#                   printf(&quot;%d\n&quot;, (x+1) &gt; x); return 0; }
+# clang -O0 ub.c -o ub_O0 ; clang -O1 ub.c -o ub_O1
+# echo 2147483647 | ./ub_O0     # 本机实测输出 0（-O0 老实按补码算）
+# echo 2147483647 | ./ub_O1     # 本机实测输出 1（-O1 假设有符号溢出不会发生）
+# 结论：这个反例本身是 UB 路径，编译器有权给出不同答案——讨论&quot;改写是否正确&quot;之前，
+# 先确认语言的语义边界。没有 clang 不影响本课：上面的 Python 差分测试已经把
+# &quot;正确 pass vs 错误 pass&quot;的可观察差异完整演示了。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：给差分测试加一条&quot;副作用&quot;通道——记录每次 <code>store</code> 的地址与值，再测&quot;把 <code>A[i] = x</code> 提到循环外&quot;的错误改写，看它能否被抓住。</li>
+<li><strong>解释</strong>：为什么 refinement 比&quot;行为集合相等&quot;更适合做优化正确性的标准？举一个优化<strong>减少</strong>行为的例子（把陷阱路径变安全），说明它算不算合法优化。</li>
+<li><strong>对比/验证</strong>：把输入池换成只含 <code>[0, 1, 2]</code> 再跑——两个错误 pass 还能被抓到吗？由此说明&quot;覆盖面&quot;为什么比&quot;随机次数&quot;更重要。</li>
+<li><strong>思考</strong>：翻译验证与&quot;把 pass 本身证明一次&quot;各有什么代价？为什么两条路都要（提示：pass 组合后新出现的改写机会，局部证明并不覆盖）？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>George C. Necula, <em>Translation Validation for an Optimizing Compiler</em>, PLDI 2000（不信任编译器、每次编译后验证等价这条路线）：<a href="https://dl.acm.org/doi/10.1145/349299.349324" target="_blank" rel="noopener noreferrer">https://dl.acm.org/doi/10.1145/349299.349324</a></li>
+<li>Alive2 项目（把翻译验证做到 LLVM peephole 优化的规模；对应论文 <em>Alive2: Bounded Translation Validation for LLVM</em>, PLDI 2021）：<a href="https://github.com/AliveToolkit/alive2" target="_blank" rel="noopener noreferrer">https://github.com/AliveToolkit/alive2</a></li>
+<li>LLVM <em>IR Undefined Behavior (UB) Manual</em>（哪些行为被定义、优化器可以假设什么）：<a href="https://llvm.org/docs/UndefinedBehavior.html" target="_blank" rel="noopener noreferrer">https://llvm.org/docs/UndefinedBehavior.html</a></li>
+<li>LLVM <em>Language Reference Manual</em>（<code>poison</code>、<code>undef</code>、<code>nsw</code>/<code>nuw</code> 等标志的准确语义）：<a href="https://llvm.org/docs/LangRef.html" target="_blank" rel="noopener noreferrer">https://llvm.org/docs/LangRef.html</a></li>
+</ul>
+<p><a href="#/learn/../chapter-6/lesson-01">下一章：指令选择：树覆盖（tiling 的另一种视角）</a></p>

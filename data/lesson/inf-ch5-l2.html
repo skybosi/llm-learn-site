@@ -1,0 +1,119 @@
+<h2 id="h-流水线并行与数据并行">流水线并行与数据并行<a class="anchor" href="#h-流水线并行与数据并行" aria-label="本节链接">#</a></h2>
+<p>上一课的张量并行解决的是&quot;单个矩阵都装不下&quot;的场景。但分布式推理还有另外两种更宏观的切法：<strong>流水线并行（Pipeline Parallelism，PP）</strong>按&quot;层&quot;把模型切成若干段，各段放到不同卡上，像工厂流水线一样接力；<strong>数据并行（Data Parallelism，DP）</strong>则是把完整模型复制多份，各处理一批不同的请求。三者解决的是不同层次的瓶颈，真实系统里往往混着用。这一课把 PP 和 DP 讲清楚，并给出选型思路。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-流水线并行按层切接力处理">1. 流水线并行：按层切，接力处理<a class="anchor" href="#h-1-流水线并行按层切接力处理" aria-label="本节链接">#</a></h4>
+<p>流水线并行的对象是<strong>层</strong>。一个 80 层的模型切 4 段，每段 20 层，分别放到 4 张卡上。一个请求先由卡 0 算前 20 层，把激活值传给卡 1，卡 1 算完再传给卡 2……像流水线一样逐段前进。</p>
+<p>它的优点很明显：<strong>单卡显存占用只有整模型的 1/N</strong>，通信只发生在段与段的边界（传输的是激活值，量小、次数少），因此 PP 天然适合<strong>跨机器</strong>部署——用普通以太网连接多台服务器即可，不必依赖 NVLink。</p>
+<p>但它有一个致命缺点：<strong>流水线气泡（bubble）</strong>。同一时刻只有一张卡在&quot;干活&quot;，其余卡在等上家的输出，GPU 利用率很低。解决思路是把一个请求的序列切成多个 <strong>micro-batch（微批次）</strong>，交错地喂进流水线，让后面的卡在处理微批次 i 的同时，前面的卡已经在算微批次 i+1。业界常用的 <strong>1F1B（one-forward-one-backward）</strong> 调度就是在训练里通过交错前向/反向来压气泡；推理只有前向，问题更单纯，但气泡依然存在，段数越多、段间负载越不均衡，气泡越明显。</p>
+<h4 id="h-2-数据并行复制模型分摊请求">2. 数据并行：复制模型，分摊请求<a class="anchor" href="#h-2-数据并行复制模型分摊请求" aria-label="本节链接">#</a></h4>
+<p>数据并行把<strong>完整模型复制到每张卡</strong>，把请求流按批分给各卡独立处理。它不切模型，因此<strong>单卡必须放得下整个模型</strong>（否则要配合量化、或改用 TP/PP）。对推理而言，DP 是最&quot;便宜&quot;的扩展方式：加卡 = 加吞吐，几乎线性扩展，卡之间<strong>推理阶段不需要同步</strong>（不像训练要 AllReduce 梯度），只有参数更新时（比如在线更新权重）才通信一次。</p>
+<p>DP 的短板是：它只增加<strong>吞吐</strong>，不降低<strong>单个请求的延迟</strong>；而且每张卡都要存一份完整 KV Cache，显存没有被分摊。所以 DP 适合&quot;高并发、请求独立、单卡装得下&quot;的在线服务场景，PP/TP 适合&quot;单模型超大、单卡装不下&quot;的场景。</p>
+<h4 id="h-3-三种并行的对比与组合">3. 三种并行的对比与组合<a class="anchor" href="#h-3-三种并行的对比与组合" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>张量并行 TP</th>
+<th>流水线并行 PP</th>
+<th>数据并行 DP</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>切分对象</td>
+<td>单个权重矩阵</td>
+<td>模型的层</td>
+<td>完整模型（复制）</td>
+</tr>
+<tr>
+<td>单卡是否装得下全模型</td>
+<td>否</td>
+<td>否</td>
+<td>是</td>
+</tr>
+<tr>
+<td>通信频率</td>
+<td>高（每层多次）</td>
+<td>低（仅段边界）</td>
+<td>极低（仅参数更新）</td>
+</tr>
+<tr>
+<td>通信量</td>
+<td>中（权重/激活）</td>
+<td>小（激活值）</td>
+<td>中（梯度/参数，训练时）</td>
+</tr>
+<tr>
+<td>对互联带宽要求</td>
+<td>极高（需 NVLink）</td>
+<td>低（以太网即可）</td>
+<td>低</td>
+</tr>
+<tr>
+<td>主要收益</td>
+<td>降延迟 + 降单卡显存</td>
+<td>降单卡显存</td>
+<td>提吞吐</td>
+</tr>
+</tbody></table>
+<p>一句话选型经验：<strong>先把单卡显存问题交给 TP/PP，再把吞吐问题交给 DP</strong>。常见组合如 70B 模型用 <code>TP=4 × PP=2 × DP=3</code> 铺满一个 24 卡集群：4 卡切张量、2 段切流水线、3 份做数据并行副本。</p>
+<h4 id="h-4-流水线并行的负载均衡">4. 流水线并行的负载均衡<a class="anchor" href="#h-4-流水线并行的负载均衡" aria-label="本节链接">#</a></h4>
+<p>切流水线时若各段层数不均（或某些层更耗时），慢的那张卡会成为瓶颈，其余卡空转等它——气泡放大。因此切分时要按<strong>实际每层计算量</strong>而不是简单按层数均分，让各段耗时尽量接近。这是 PP 调优里最容易踩的坑。</p>
+<p><figure><img class="md-img" src="content/courses/llm-inference-optimization/assets/chapter-5-figure-02.svg" alt="流水线并行按层切段与数据并行复制模型的对比示意" loading="lazy" decoding="async"><figcaption>流水线并行按层切段与数据并行复制模型的对比示意</figcaption></figure>
+</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<h4 id="h-示例-1用-python-模拟流水线气泡与微批次调度">示例 1：用 Python 模拟流水线气泡与微批次调度<a class="anchor" href="#h-示例-1用-python-模拟流水线气泡与微批次调度" aria-label="本节链接">#</a></h4>
+<p>下面代码不依赖 GPU，用一个&quot;每段耗时不同&quot;的抽象模型，直观展示：单请求串行 = 满屏气泡；切成微批次交错喂入后利用率显著提升。</p>
+<pre data-lang="python"><code class="language-python">import time
+
+# 假设模型切成 4 段（4 张卡），每段处理一个微批次的耗时（秒）
+stage_cost = [0.4, 0.5, 0.3, 0.4]
+n_stages = len(stage_cost)
+
+def pipeline(micro_batches):
+    &quot;&quot;&quot;模拟流水线执行：返回总耗时与各卡实际忙碌时长。&quot;&quot;&quot;
+    busy = [0.0] * n_stages
+    # 每个微批次按顺序经过各段；第 m 个微批到达第 s 段时，要等 s 段空闲
+    stage_ready = [0.0] * n_stages      # 每段最早可开始处理下一任务的时间
+    for m in range(micro_batches):
+        t = 0.0
+        for s in range(n_stages):
+            t = max(t, stage_ready[s])  # 上家输出 + 本段空闲，取较晚者
+            stage_ready[s] = t + stage_cost[s]
+            busy[s] += stage_cost[s]
+            t += stage_cost[s]
+    makespan = max(stage_ready)
+    util = [b / makespan for b in busy]
+    return makespan, util
+
+# 串行：只喂 1 个微批次（等价于不切微批次，气泡最大）
+ms1, u1 = pipeline(1)
+print(f&quot;1 个微批次：总耗时 {ms1:.2f}s，各卡利用率 {[f&#39;{u:.0%}&#39; for u in u1]}&quot;)
+
+# 交错：喂 8 个微批次
+ms8, u8 = pipeline(8)
+print(f&quot;8 个微批次：总耗时 {ms8:.2f}s，各卡利用率 {[f&#39;{u:.0%}&#39; for u in u8]}&quot;)
+print(f&quot;吞吐提升倍数（每微批平均耗时）：{(ms1/1)/(ms8/8):.2f}x&quot;)</code></pre>
+<p>可以看到，微批次一多，前面卡的空等被后续微批次填满，利用率逼近 100%——这就是 1F1B 类调度在推理里&quot;填气泡&quot;的原理。</p>
+<h4 id="h-示例-2vllm-中指定-pp-与-dp">示例 2：vLLM 中指定 PP 与 DP<a class="anchor" href="#h-示例-2vllm-中指定-pp-与-dp" aria-label="本节链接">#</a></h4>
+<p>vLLM 用 <code>--pipeline-parallel-size</code> 控制 PP 段数，数据并行则体现在&quot;同一模型起多个服务实例、前置负载均衡&quot;（服务化章节详述）。TP + PP 可叠加：</p>
+<pre data-lang="bash"><code class="language-bash"># 8 张卡：TP=4 切张量，PP=2 切流水线（4×2=8）
+vllm serve meta-llama/Llama-3.1-70B-Instruct \
+    --tensor-parallel-size 4 \
+    --pipeline-parallel-size 2 \
+    --dtype bfloat16</code></pre>
+<p>经验法则：TP 吃高速互联（单机内），PP 吃网络（可跨机）。先定 TP 让它等于单机卡数，剩下的卡数再摊给 PP 和 DP。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>把示例 1 的 <code>stage_cost</code> 改成 <code>[0.5, 0.1, 0.1, 0.1]</code>（第一段明显更慢），观察微批次增多后利用率是否仍能逼近 100%；说明瓶颈段对整体吞吐的决定作用。</li>
+<li>推导：4 段流水线、段均耗时 T、共 M 个微批次时，理想 makespan 约为 <code>(M + 3) × T</code>；与 M=1 时 <code>4T</code> 对比，解释&quot;微批次越多气泡占比越低&quot;。</li>
+<li>结合上一课，解释为什么 TP 通常只在单机内、PP 可以跨机；若一个 70B 模型单卡装不下而你有 2 台 4 卡服务器，给出一个 TP/PP/DP 的组合方案并说明理由。</li>
+<li>用 vLLM 分别以 <code>tensor_parallel_size=1/2/4</code> 跑同一模型，记录 TTFT 与最大吞吐，观察 TP 提升是否随卡数递减（通信占比上升）。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>GPipe：Efficient Training of Giant Neural Networks using Pipeline Parallelism：<a href="https://arxiv.org/abs/1811.06965" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1811.06965</a></li>
+<li>Megatron-LM：Training Multi-Billion Parameter Language Models Using Model Parallelism：<a href="https://arxiv.org/abs/1909.08053" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1909.08053</a></li>
+<li>vLLM 文档 · 分布式推理：<a href="https://docs.vllm.ai/en/latest/serving/distributed_serving.html" target="_blank" rel="noopener noreferrer">https://docs.vllm.ai/en/latest/serving/distributed_serving.html</a></li>
+<li>NVIDIA TensorRT-LLM 文档 · 并行策略：<a href="https://nvidia.github.io/TensorRT-LLM/" target="_blank" rel="noopener noreferrer">https://nvidia.github.io/TensorRT-LLM/</a></li>
+</ul>
+<p><a href="#/l/inf-ch5-l3">下一课：多 GPU 拓扑</a></p>

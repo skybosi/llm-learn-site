@@ -1,0 +1,311 @@
+<h2 id="h-数据流分析框架活跃变量到达定值可用表达式">数据流分析框架：活跃变量、到达定值、可用表达式<a class="anchor" href="#h-数据流分析框架活跃变量到达定值可用表达式" aria-label="本节链接">#</a></h2>
+<p>第 4 章把源码降成了一堆基本块和一张 CFG，但&quot;能看见控制流&quot;不等于&quot;知道值从哪来、到哪去&quot;。一个 pass 想动程序，先要在图上回答三件事：这个变量在这里还可能被谁读？这条赋值能不能走到这个使用点？这个表达式是不是每条路径都算过？三个问题一个后向、一个前向，一个 May、一个 Must，却能塞进同一台引擎。这一课把<strong>数据流分析</strong>（data-flow analysis）拆成四个可替换的零件，再用一个 60 行的 worklist 引擎把三种经典分析跑出来。</p>
+<p><figure><img class="md-img" src="content/courses/compiler-foundations/assets/chapter-5-figure-01.svg" alt="数据流分析的不动点迭代：初始化、传播、meet、收敛" loading="lazy" decoding="async"><figcaption>数据流分析的不动点迭代：初始化、传播、meet、收敛</figcaption></figure>
+</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-一台引擎四个零件">1. 一台引擎、四个零件<a class="anchor" href="#h-1-一台引擎四个零件" aria-label="本节链接">#</a></h4>
+<p>数据流分析不是&quot;三种分析&quot;，而是<strong>一个通用框架 + 三份配置</strong>。龙书第 9 章 §9.2 把这套框架写成四个要素：</p>
+<table>
+<thead>
+<tr>
+<th>要素</th>
+<th>要回答的问题</th>
+<th>到达定值</th>
+<th>活跃变量</th>
+<th>可用表达式</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>方向</td>
+<td>事实沿边往哪流</td>
+<td>前向（入口→出口）</td>
+<td>后向（出口→入口）</td>
+<td>前向</td>
+</tr>
+<tr>
+<td>值域（格）</td>
+<td>每个程序点上的事实</td>
+<td>定值集合</td>
+<td>变量集合</td>
+<td>表达式集合</td>
+</tr>
+<tr>
+<td>传递函数</td>
+<td>一条语句怎么改事实</td>
+<td>先 kill 同名定值再 gen 本条</td>
+<td>先 kill 定义再 gen 使用</td>
+<td>先 kill 含被定值变量的表达式再 gen 本条右值</td>
+</tr>
+<tr>
+<td>汇合算子</td>
+<td>多条路径怎么合并</td>
+<td>∪（May）</td>
+<td>∪（May）</td>
+<td>∩（Must）</td>
+</tr>
+</tbody></table>
+<p>前向与后向各有一对方程（<code>f_B</code> 是块 B 的传递函数，<code>⊔</code> 是汇合算子）：</p>
+<ul>
+<li><strong>前向</strong>：<code>OUT[B] = f_B(IN[B])</code>，<code>IN[B] = ⊔ over P ∈ pred(B) : OUT[P]</code></li>
+<li><strong>后向</strong>：<code>IN[B] = f_B(OUT[B])</code>，<code>OUT[B] = ⊔ over S ∈ succ(B) : IN[S]</code></li>
+</ul>
+<p>传递函数几乎总能写成 GEN/KILL 形式：<code>f_B(x) = GEN_B ∪ (x − KILL_B)</code>。这条形式很重要——第 4 节的终止性靠它。</p>
+<h4 id="h-2-方向与-maymust-是两件独立的事">2. 方向与 May/Must 是两件独立的事<a class="anchor" href="#h-2-方向与-maymust-是两件独立的事" aria-label="本节链接">#</a></h4>
+<p><strong>方向由&quot;事实从哪来&quot;决定，May/Must 由汇合算子决定</strong>。</p>
+<ul>
+<li>到达定值是前向的：一条 <code>sum = 0</code> 定义完，事实顺着控制流往下走。</li>
+<li>活跃变量是后向的：<code>i</code> 是否活跃取决于&quot;从这一点出发会不会有人读 i&quot;——需求来自程序的未来，所以要逆着边传播。</li>
+<li>可用表达式用 ∩ 而不是 ∪：它支撑的改写（CSE）要求这个右值在这一点<strong>必然</strong>已经算好。若改用 ∪，只要一条路径算过就宣布&quot;可用&quot;，另一条路径上的改写就会读到没算过的值——把 May 当 Must 的经典错误。</li>
+</ul>
+<p>还有一个容易忽略的细节：Must 分析的初值取<strong>全集</strong>（格顶）再向下迭代，May 分析从空集向上迭代。本课代码用 <code>top()</code> 与 <code>boundary()</code> 两个钩子把这件事显式化。</p>
+<h4 id="h-3-三个分析的传递函数逐条看">3. 三个分析的传递函数，逐条看<a class="anchor" href="#h-3-三个分析的传递函数逐条看" aria-label="本节链接">#</a></h4>
+<p>以本课程序里的三条指令为例：</p>
+<ul>
+<li><code>sum = 0</code>（B1）：到达定值 GEN = <code>{sum@B1}</code>、KILL = 其他所有对 <code>sum</code> 的定值；活跃变量视角下 def = <code>{sum}</code>、use = <code>{}</code>，后向方程里就是 <code>live_in = live_out − {sum}</code>。</li>
+<li><code>t2 = a + b</code>（B2）：到达定值 GEN = <code>{t2@B2}</code>；可用表达式 GEN = <code>{a+b}</code>、KILL = 含 <code>t2</code> 的表达式（本程序里没有）。</li>
+<li><code>sum = sum + t2</code>（B2）：可用表达式先 KILL 含 <code>sum</code> 的右值，再 GEN 新的 <code>sum+t2</code>。</li>
+</ul>
+<p>&quot;先 kill 后 gen&quot;不是风格问题：反过来写，循环里的定值集合只增不减，要么不收敛，要么收敛到错误答案。</p>
+<h4 id="h-4-不动点为什么一定达到以及解为什么保守">4. 不动点为什么一定达到，以及解为什么保守<a class="anchor" href="#h-4-不动点为什么一定达到以及解为什么保守" aria-label="本节链接">#</a></h4>
+<p>三个条件保证迭代停下：<strong>格有限</strong>（集合包含关系构成有限偏序）、<strong>传递函数单调</strong>（GEN/KILL 形式显然满足）、<strong>每轮至少动一格</strong>（格子有限高，总步数上界 ≈ 块数 × 格高度）。本课程序 4 个块，三种分析都恰好扫 3 轮、调用 12 次传递函数就收敛。按逆后序（reverse postorder）排通常收敛最快，这是真实编译器的常规做法。</p>
+<p>精确解要枚举路径（路径爆炸），框架给的是&quot;所有路径&quot;层面的近似：May 说&quot;<strong>可能</strong>&quot;，Must 说&quot;<strong>必然</strong>&quot;，两者都只会比精确结果<strong>更保守</strong>——这正是 pass 敢拿它当改写依据的原因。</p>
+<h4 id="h-5-常见坑">5. 常见坑<a class="anchor" href="#h-5-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>用 ∪ 做 Must 分析</strong>：得到&quot;某条路径成立&quot;的结论，改写后程序在别的路径上崩。</li>
+<li><strong>边界值放错端</strong>：活跃变量的边界在出口（<code>OUT[exit] = ∅</code>），到达定值的边界在入口。</li>
+<li><strong>拿可用表达式直接做 CSE</strong>：它只说&quot;这个右值算过&quot;，还得知道&quot;结果落在哪个变量里&quot;——下一课补上值编号。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面这段纯 Python（无第三方依赖）实现通用 worklist 引擎，再把三种分析写成三个小类——每个类只改方向、汇合算子、传递函数与边界。程序是一段同时含 <code>while</code> 循环与 <code>if-else</code> 汇合的 4 元式（指令形状与第 4 章一致），三个分析的结果都不平凡。</p>
+<pre data-lang="python"><code class="language-python"># ---- 数据流分析框架：一个 worklist 不动点引擎跑三种分析（纯 Python，无第三方依赖）----
+# 程序用&quot;基本块 + 三地址码&quot;表示，指令形状沿用第 4 章的四元式
+BIN = {&#39;add&#39;, &#39;sub&#39;, &#39;mul&#39;, &#39;div&#39;}
+
+
+def nm(x):
+    return (&#39;name&#39;, x)
+
+
+def ct(k):
+    return (&#39;const&#39;, k)
+
+
+# 一段同时含&quot;循环&quot;和&quot;分支汇合&quot;的程序（i 与 sum 在循环里被反复重定义）
+BLOCKS = {
+    &#39;B1&#39;: [(&#39;copy&#39;, ct(0), None, &#39;i&#39;),
+           (&#39;copy&#39;, ct(0), None, &#39;sum&#39;),
+           (&#39;cmp&#39;, &#39;&gt;&#39;, nm(&#39;n&#39;), ct(0), &#39;t1&#39;),
+           (&#39;ifgoto&#39;, nm(&#39;t1&#39;), &#39;B2&#39;, &#39;B5&#39;)],
+    &#39;B2&#39;: [(&#39;add&#39;, nm(&#39;a&#39;), nm(&#39;b&#39;), &#39;t2&#39;),
+           (&#39;add&#39;, nm(&#39;sum&#39;), nm(&#39;t2&#39;), &#39;sum&#39;),
+           (&#39;add&#39;, nm(&#39;i&#39;), ct(1), &#39;i&#39;),
+           (&#39;cmp&#39;, &#39;&lt;&#39;, nm(&#39;i&#39;), nm(&#39;n&#39;), &#39;t3&#39;),
+           (&#39;ifgoto&#39;, nm(&#39;t3&#39;), &#39;B2&#39;, &#39;B4&#39;)],
+    &#39;B4&#39;: [(&#39;add&#39;, nm(&#39;a&#39;), nm(&#39;b&#39;), &#39;t4&#39;),
+           (&#39;copy&#39;, nm(&#39;t4&#39;), None, &#39;r&#39;)],
+    &#39;B5&#39;: [(&#39;add&#39;, nm(&#39;a&#39;), nm(&#39;b&#39;), &#39;t5&#39;),
+           (&#39;goto&#39;, &#39;B4&#39;)],
+}
+SUCC = {&#39;B1&#39;: [&#39;B2&#39;, &#39;B5&#39;], &#39;B2&#39;: [&#39;B2&#39;, &#39;B4&#39;], &#39;B4&#39;: [], &#39;B5&#39;: [&#39;B4&#39;]}
+PRED = {b: [p for p in SUCC if b in SUCC[p]] for b in SUCC}
+ENTRY = &#39;B1&#39;
+EXITS = [b for b in SUCC if not SUCC[b]]
+
+
+def names(xs):
+    return [x[1] for x in xs if x and x[0] == &#39;name&#39;]
+
+
+def def_use(ins):
+    &quot;&quot;&quot;(定义的名字或 None, 使用的名字集合)&quot;&quot;&quot;
+    op = ins[0]
+    if op == &#39;copy&#39;:
+        return ins[3], set(names([ins[1]]))
+    if op in BIN:
+        return ins[3], set(names([ins[1], ins[2]]))
+    if op == &#39;cmp&#39;:
+        return ins[4], set(names([ins[2], ins[3]]))
+    if op in (&#39;ifgoto&#39;, &#39;print&#39;):
+        return None, set(names([ins[1]]))
+    return None, set()                      # goto
+
+
+def rhs(ins):
+    &quot;&quot;&quot;本条指令算出的右值（可用表达式的键）；非运算指令为 None&quot;&quot;&quot;
+    if ins[0] in BIN:
+        return (ins[0], ins[1], ins[2])
+    if ins[0] == &#39;cmp&#39;:
+        return (&#39;cmp&#39;, ins[1], ins[2], ins[3])
+    return None
+
+
+# ---------- 三种分析：只改 direction / meet / top / boundary / transfer_block ----------
+class ReachingDefs:
+    title, direction = &#39;到达定值（前向 · May · ∪）&#39;, &#39;forward&#39;
+    meet = staticmethod(lambda sets: set().union(*sets) if sets else set())
+
+    def top(self):
+        return set()
+
+    def boundary(self):
+        return set()                        # 入口之前没有任何定值
+
+    def transfer_block(self, b, facts):
+        out = set(facts)
+        for k, ins in enumerate(BLOCKS[b]):
+            d, _ = def_use(ins)
+            if d is not None:
+                out = {f for f in out if f[0] != d} | {(d, b, k)}   # 先 kill 同名，再 gen
+        return out
+
+
+class LiveVars:
+    title, direction = &#39;活跃变量（后向 · May · ∪）&#39;, &#39;backward&#39;
+    meet = staticmethod(lambda sets: set().union(*sets) if sets else set())
+
+    def top(self):
+        return set()
+
+    def boundary(self):
+        return set()                        # 出口之后没有变量还活跃
+
+    def transfer_block(self, b, facts):
+        live = set(facts)
+        for ins in reversed(BLOCKS[b]):     # 后向：从块尾往块头走
+            d, u = def_use(ins)
+            live = (live - {d}) | u if d is not None else live | u
+        return live
+
+
+class AvailableExprs:
+    title, direction = &#39;可用表达式（前向 · Must · ∩）&#39;, &#39;forward&#39;
+    meet = staticmethod(lambda sets: set.intersection(*sets) if sets else set())
+
+    def top(self):
+        return {e for b in BLOCKS for e in (rhs(i) for i in BLOCKS[b]) if e is not None}
+
+    def boundary(self):
+        return set()                        # 入口处没有任何表达式&quot;已算好且未被重定义&quot;
+
+    def transfer_block(self, b, facts):
+        avail = set(facts)
+        for ins in BLOCKS[b]:
+            d, _ = def_use(ins)
+            if d is not None:               # 变量被重定义 → 所有含它的表达式失效
+                avail = {e for e in avail if d not in names(list(e[1:]))}
+            r = rhs(ins)
+            if r is not None:
+                avail.add(r)
+        return avail
+
+
+def solve(an, max_rounds=200):
+    IN = {b: set(an.top()) for b in BLOCKS}
+    OUT = {b: set(an.top()) for b in BLOCKS}
+    if an.direction == &#39;forward&#39;:
+        IN[ENTRY] = set(an.boundary())
+        OUT[ENTRY] = an.transfer_block(ENTRY, IN[ENTRY])
+    else:
+        for b in EXITS:
+            OUT[b] = set(an.boundary())
+    rounds = evals = 0
+    while rounds &lt; max_rounds:
+        rounds += 1
+        changed = False
+        for b in BLOCKS:
+            if an.direction == &#39;forward&#39;:
+                nin = IN[ENTRY] if b == ENTRY else an.meet([OUT[p] for p in PRED[b]])
+                nout = an.transfer_block(b, nin)
+            else:
+                nout = OUT[b] if not SUCC[b] else an.meet([IN[s] for s in SUCC[b]])
+                nin = an.transfer_block(b, nout)
+            evals += 1
+            if nin != IN[b] or nout != OUT[b]:
+                IN[b], OUT[b], changed = set(nin), set(nout), True
+        if not changed:
+            break
+    return IN, OUT, rounds, evals
+
+
+def show(f):
+    if isinstance(f, tuple) and len(f) == 3 and isinstance(f[2], int):
+        return f&#39;{f[0]}@{f[1]}#{f[2]}&#39;
+    if isinstance(f, tuple):
+        return &#39; &#39;.join(str(x[1]) if isinstance(x, tuple) else str(x) for x in f)
+    return str(f)
+
+
+def dump(s):
+    return &#39;{}&#39; if not s else &#39;{&#39; + &#39;, &#39;.join(sorted(show(f) for f in s)) + &#39;}&#39;
+
+
+for an in (ReachingDefs(), LiveVars(), AvailableExprs()):
+    IN, OUT, rounds, evals = solve(an)
+    print(f&#39;=== {an.title} ===&#39;)
+    for b in BLOCKS:
+        print(f&#39;  {b}  in={dump(IN[b]):&lt;44} out={dump(OUT[b])}&#39;)
+    print(f&#39;  → {len(BLOCKS)} 个块，worklist 扫 {rounds} 轮 / {evals} 次 transfer，达到不动点\n&#39;)
+
+rd_in = solve(ReachingDefs())[0]
+lv_in, lv_out = solve(LiveVars())[:2]
+av_in = solve(AvailableExprs())[0]
+E = (&#39;add&#39;, nm(&#39;a&#39;), nm(&#39;b&#39;))
+print(&#39;事实核对（把集合读成人能懂的话）：&#39;)
+print(f&#39;  B2 入口的 a+b 可用？ {&quot;是&quot; if E in av_in[&quot;B2&quot;] else &quot;否&quot;}（循环首次进入时还没算过）&#39;)
+print(f&#39;  B4 入口的 a+b 可用？ {&quot;是&quot; if E in av_in[&quot;B4&quot;] else &quot;否&quot;}（两条路径都算过 → Must 成立）&#39;)
+print(f&#39;  B1 出口的 i 活跃？  {&quot;是&quot; if &quot;i&quot; in lv_out[&quot;B1&quot;] else &quot;否&quot;}（i 在循环体里被读）&#39;)
+print(f&#39;  B4 入口的 sum 活跃？{&quot;是&quot; if &quot;sum&quot; in lv_in[&quot;B4&quot;] else &quot;否&quot;}（循环之后没人再读 sum）&#39;)
+print(&#39;  到达 B2 入口的 sum 定值：&#39;
+      + str(sorted(f&#39;{f[1]}#{f[2]}&#39; for f in rd_in[&#39;B2&#39;] if f[0] == &#39;sum&#39;)))
+print(&#39;  到达 B2 入口的 t2 定值（含回边那一份）：&#39;
+      + str(sorted(f&#39;{f[1]}#{f[2]}&#39; for f in rd_in[&#39;B2&#39;] if f[0] == &#39;t2&#39;)))</code></pre>
+<p>运行结果（<code>i@B1#0</code> 表示&quot;B1 块第 0 条指令对 i 的定值&quot;）：</p>
+<pre><code>=== 到达定值（前向 · May · ∪） ===
+  B1  in={}                                           out={i@B1#0, sum@B1#1, t1@B1#2}
+  B2  in={i@B1#0, i@B2#2, sum@B1#1, sum@B2#1, t1@B1#2, t2@B2#0, t3@B2#3} out={i@B2#2, sum@B2#1, t1@B1#2, t2@B2#0, t3@B2#3}
+  B4  in={i@B1#0, i@B2#2, sum@B1#1, sum@B2#1, t1@B1#2, t2@B2#0, t3@B2#3, t5@B5#0} out={i@B1#0, i@B2#2, r@B4#1, sum@B1#1, sum@B2#1, t1@B1#2, t2@B2#0, t3@B2#3, t4@B4#0, t5@B5#0}
+  B5  in={i@B1#0, sum@B1#1, t1@B1#2}                  out={i@B1#0, sum@B1#1, t1@B1#2, t5@B5#0}
+  → 4 个块，worklist 扫 3 轮 / 12 次 transfer，达到不动点
+
+=== 活跃变量（后向 · May · ∪） ===
+  B1  in={a, b, n}                                    out={a, b, i, n, sum}
+  B2  in={a, b, i, n, sum}                            out={a, b, i, n, sum}
+  B4  in={a, b}                                       out={}
+  B5  in={a, b}                                       out={a, b}
+  → 4 个块，worklist 扫 3 轮 / 12 次 transfer，达到不动点
+
+=== 可用表达式（前向 · Must · ∩） ===
+  B1  in={}                                           out={cmp &gt; n 0}
+  B2  in={cmp &gt; n 0}                                  out={add a b, add i 1, add sum t2, cmp &lt; i n, cmp &gt; n 0}
+  B4  in={add a b, cmp &gt; n 0}                         out={add a b, cmp &gt; n 0}
+  B5  in={cmp &gt; n 0}                                  out={add a b, cmp &gt; n 0}
+  → 4 个块，worklist 扫 3 轮 / 12 次 transfer，达到不动点
+
+事实核对（把集合读成人能懂的话）：
+  B2 入口的 a+b 可用？ 否（循环首次进入时还没算过）
+  B4 入口的 a+b 可用？ 是（两条路径都算过 → Must 成立）
+  B1 出口的 i 活跃？  是（i 在循环体里被读）
+  B4 入口的 sum 活跃？否（循环之后没人再读 sum）
+  到达 B2 入口的 sum 定值：[&#39;B1#1&#39;, &#39;B2#1&#39;]
+  到达 B2 入口的 t2 定值（含回边那一份）：[&#39;B2#0&#39;]</code></pre>
+<p>三份输出对照着读：<strong>到达定值</strong>最长的那行在循环头与汇合点（回边带来的定值也到达了）；<strong>活跃变量</strong>里 B4 入口的 <code>sum</code> 已不活跃，<code>a</code>、<code>b</code> 一路活跃；<strong>可用表达式</strong>在 B2 入口保留了 <code>n &gt; 0</code>——它是循环不变量，正是第 3 课不变量外提要用的原料。</p>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选（需本机有 clang / opt）：真实工具链里这些分析是显式对象 ----
+# LLVM 把支配树、循环信息、标量演化等都注册成 analysis，pass 按需声明依赖：
+#   clang -O0 -S -emit-llvm demo.c -o demo_O0.ll    # demo.c 里写一个带循环与 if-else 的函数
+#   opt -passes=&#39;print&lt;loops&gt;&#39; -S demo_O0.ll        # 打印循环结构（LoopInfo）
+# 没有 clang/opt 不影响本课：上面的 Python 版把三种分析的不动点迭代完整跑通了。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：给引擎加第四个分析——<strong>非常忙表达式</strong>（very busy expressions：后向 + ∩），用它支撑&quot;把 <code>a+b</code> 提到分支之前算一次&quot;。用 <code>if (c) x = a + b else x = a + b</code> 验证：分支汇合处 <code>a+b</code> 必须&quot;在上方所有路径上都用得到&quot;才成立。</li>
+<li><strong>解释</strong>：为什么可用表达式的初值要取全集 U，而到达定值取 ∅？如果可用表达式也从 ∅ 开始迭代，得到的解为什么不安全？</li>
+<li><strong>对比/验证</strong>：把程序里的回边去掉（<code>ifgoto t3 B2 B4</code> 改成 <code>goto B4</code>），观察三种分析的迭代轮数与事实集合怎么变；解释为什么此时&quot;直线代码&quot;一轮就够。</li>
+<li><strong>思考</strong>：到达定值告诉你&quot;哪些赋值可能到达这里&quot;。要判断&quot;这里 x 一定是常量 3&quot;，值域要从&quot;定值集合&quot;换成什么？换完之后汇合算子该怎么改？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Aho, Lam, Sethi, Ullman, <em>Compilers: Principles, Techniques, and Tools</em>（龙书，2nd ed.）第 9 章 §9.2「Introduction to Data-Flow Analysis」（传递函数、迭代算法与三种经典分析）：<a href="https://suif.stanford.edu/dragonbook/" target="_blank" rel="noopener noreferrer">https://suif.stanford.edu/dragonbook/</a></li>
+<li>同上，§9.3「Foundations of Data-Flow Analysis」（格、单调性、不动点与解的保守性）、§9.1「The Principal Sources of Optimization」（这些分析最终服务的改写清单）</li>
+<li>LLVM <em>Loop Terminology (and Canonical Forms)</em>（支配关系与循环信息如何暴露给 pass；<code>opt -passes=&#39;print&lt;loops&gt;&#39;</code>）：<a href="https://llvm.org/docs/LoopTerminology.html" target="_blank" rel="noopener noreferrer">https://llvm.org/docs/LoopTerminology.html</a></li>
+<li>Robert Nystrom, <em>Crafting Interpreters</em> 第 2 章（前端/中端/后端分工，以及&quot;分析信息供后续 pass 使用&quot;的定位）：<a href="https://craftinginterpreters.com/a-map-of-the-territory.html" target="_blank" rel="noopener noreferrer">https://craftinginterpreters.com/a-map-of-the-territory.html</a></li>
+</ul>
+<p><a href="#/l/cf-ch5-l2">下一课：常量传播与折叠、死代码消除、公共子表达式</a></p>

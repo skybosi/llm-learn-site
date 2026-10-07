@@ -1,0 +1,230 @@
+<h2 id="h-检查点容错与恢复大集群训练的必备工程">检查点、容错与恢复：大集群训练的必备工程<a class="anchor" href="#h-检查点容错与恢复大集群训练的必备工程" aria-label="本节链接">#</a></h2>
+<p>反直觉的事实：在千卡规模上，<strong>最大的时间黑洞往往不是算法问题，而是恢复流程</strong>。一份&quot;能续训&quot;的检查点动辄近 1 TB，写一次要几十秒到几分钟；集群规模翻一倍，期望故障次数也翻一倍。本课把检查点当<strong>一等公民</strong>记账：写多少、写多快、隔多久、失败丢多少。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-一个能续训的检查点里到底有什么">1. 一个&quot;能续训&quot;的检查点里到底有什么<a class="anchor" href="#h-1-一个能续训的检查点里到底有什么" aria-label="本节链接">#</a></h4>
+<p>很多人以为检查点 = 模型权重。要让训练从第 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 步无缝接上，至少要这些：</p>
+<table>
+<thead>
+<tr>
+<th>内容</th>
+<th>量级</th>
+<th>谁负责</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>模型参数（主权重）</td>
+<td>∝ 参数量</td>
+<td>框架</td>
+</tr>
+<tr>
+<td>优化器状态（Adam 的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">m</span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">v</span></span></span></span>）</td>
+<td>常是权重数倍</td>
+<td>框架</td>
+</tr>
+<tr>
+<td>学习率调度器状态</td>
+<td>可忽略</td>
+<td>框架</td>
+</tr>
+<tr>
+<td>训练进度（step / epoch / token 数）</td>
+<td>可忽略</td>
+<td>框架</td>
+</tr>
+<tr>
+<td>RNG 状态</td>
+<td>可忽略</td>
+<td>框架</td>
+</tr>
+<tr>
+<td><strong>数据加载器 / sampler 位置</strong></td>
+<td>可忽略</td>
+<td><strong>常要自己写</strong></td>
+</tr>
+</tbody></table>
+<p>最后一行是事故高发区：模型和优化器都恢复了，数据流却从头开始，表现为 loss 接得上但偶发跳变。PyTorch 的 <code>torch.distributed.checkpoint</code>（DCP）把前五项统一成 <code>state_dict</code> 语义，<strong>sampler 位置一般仍要显式保存</strong>。</p>
+<h4 id="h-2-体积账优化器状态常常是权重的好几倍">2. 体积账：优化器状态常常是权重的好几倍<a class="anchor" href="#h-2-体积账优化器状态常常是权重的好几倍" aria-label="本节链接">#</a></h4>
+<p>70B 参数的模型：bf16 权重 140 GB；Adam 的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">m</span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">v</span></span></span></span> 用 fp32 各 4 B/参数，合计 840 GB。示例 1 的结果是<strong>总计 980 GB</strong>。这个数字有一串直接后果：</p>
+<ul>
+<li><strong>写盘时间由存储带宽决定</strong>：示例里 2 GB/s → 490 s、10 GB/s → 98 s、50 GB/s → 19.6 s。这是训练集群需要并行文件系统的原因；</li>
+<li><strong>不能每个 rank 存一份完整模型</strong>：总写入量会乘以世界大小。正确做法是<strong>每个 rank 只写自己的分片</strong>（sharded / distributed checkpoint），墙钟时间由存储聚合带宽决定；</li>
+<li><strong>恢复也一样</strong>：各 rank 并行读回分片而非广播。这也是 DCP 提供 <code>resharding</code>（重分片）的原因——换并行度后仍能从旧检查点恢复。</li>
+</ul>
+<h4 id="h-3-间隔账写盘开销-vs-故障丢失量的最优点">3. 间隔账：写盘开销 vs 故障丢失量的最优点<a class="anchor" href="#h-3-间隔账写盘开销-vs-故障丢失量的最优点" aria-label="本节链接">#</a></h4>
+<p>设单步 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7651em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">s</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>、写盘 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7651em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0269em;">w</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>、加载 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7651em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0197em;">l</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>、间隔 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">K</span></span></span></span>：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord cjk_fallback">写盘开销占比</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.1281em;vertical-align:-0.836em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.2921em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">K</span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">s</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0269em;">w</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0269em;">w</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.836em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord cjk_fallback">单次故障平均丢失</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.0463em;vertical-align:-0.686em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3603em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">2</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">K</span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">s</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7651em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0197em;">l</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span></span></p>
+<p>示例 2（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7944em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">s</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord"><span class="mrel">=</span></span><span class="mord">8</span></span></span></span> s、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7944em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0269em;">w</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord"><span class="mrel">=</span></span><span class="mord">100</span></span></span></span> s、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7944em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0197em;">l</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord"><span class="mrel">=</span></span><span class="mord">60</span></span></span></span> s）把这条曲线打出来：</p>
+<table>
+<thead>
+<tr>
+<th>间隔 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">K</span></span></span></span></th>
+<th>写盘占比</th>
+<th>单次故障丢失</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>50</td>
+<td>20.00%</td>
+<td>260 s</td>
+</tr>
+<tr>
+<td>100</td>
+<td>11.11%</td>
+<td>460 s</td>
+</tr>
+<tr>
+<td>200</td>
+<td>5.88%</td>
+<td>860 s</td>
+</tr>
+<tr>
+<td>500</td>
+<td>2.44%</td>
+<td>2060 s</td>
+</tr>
+<tr>
+<td>1000</td>
+<td>1.23%</td>
+<td>4060 s</td>
+</tr>
+</tbody></table>
+<p><strong>没有普适最优解，只有权衡</strong>：把&quot;写盘开销 &lt;5%&quot;与&quot;单次丢失 &lt;15 min&quot;当约束，示例参数下 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">K</span></span></span></span> 落在 200 附近。真正该改的是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7651em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0269em;">w</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>——异步保存（状态先拷到 CPU、立刻继续训练，后台线程写盘）能把循环里的 100 s 压到接近 0，代价是额外内存与快照一致性。</p>
+<h4 id="h-4-故障率随规模线性增长这是大集群的第一性问题">4. 故障率随规模线性增长：这是大集群的第一性问题<a class="anchor" href="#h-4-故障率随规模线性增长这是大集群的第一性问题" aria-label="本节链接">#</a></h4>
+<p>若单 GPU 每小时故障率为 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">λ</span></span></span></span>，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span></span></span></span> 卡集群的期望故障率为 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">λ</span><span class="mord mathnormal" style="margin-right:0.109em;">N</span></span></span></span>。示例 3 取 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">λ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">3</span></span></span></span></span></span></span></span></span></span></span></span>（<strong>示例量级；真实集群可能差几个数量级，务必用自集群监控数据替换</strong>）：</p>
+<table>
+<thead>
+<tr>
+<th>集群规模</th>
+<th>期望故障（24 h）</th>
+<th>每次丢 14 min 时的额外时间</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>64 卡</td>
+<td>1.54 次</td>
+<td>~0.4 h</td>
+</tr>
+<tr>
+<td>1024 卡</td>
+<td>24.58 次</td>
+<td>~5.9 h</td>
+</tr>
+<tr>
+<td>4096 卡</td>
+<td>98.30 次</td>
+<td>~23.5 h</td>
+</tr>
+</tbody></table>
+<p>重点不是数字精确，而是<strong>恢复时间在大规模上直接换算成可用率</strong>：单次恢复从 14 min 压到 5 min，4096 卡每天就多出十几个小时有效训练——比调学习率的收益更大也更确定。</p>
+<p><figure><img class="md-img" src="content/courses/distributed-training-systems/assets/chapter-7-figure-04.svg" alt="检查点要写什么、隔多久写、故障后丢多少" loading="lazy" decoding="async"><figcaption>检查点要写什么、隔多久写、故障后丢多少</figcaption></figure>
+</p>
+<h4 id="h-5-容错机制谁在重试这件事上负责">5. 容错机制：谁在&quot;重试&quot;这件事上负责<a class="anchor" href="#h-5-容错机制谁在重试这件事上负责" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>弹性启动</strong>：<code>torchrun</code> 的 <code>--max-restarts</code> 配合 rendezvous 后端，可在成员失败后重建进程组并重启；官方教程称之为 fault-tolerant training。</li>
+<li><strong>调度器层</strong>：Slurm/K8s 负责重新排队；它只保证&quot;进程再起来&quot;，不保证&quot;状态正确&quot;。</li>
+<li><strong>框架层</strong>：DeepSpeed / Megatron 各有检查点格式与恢复流程；跨并行度恢复一般要经&quot;重分片&quot;或&quot;转换&quot;。<strong>换并行度前先确认检查点能否直接读</strong>。</li>
+</ul>
+<h4 id="h-6-恢复的正确性比能起来更难">6. 恢复的正确性：比&quot;能起来&quot;更难<a class="anchor" href="#h-6-恢复的正确性比能起来更难" aria-label="本节链接">#</a></h4>
+<p>四个必须写进 runbook 的动作：</p>
+<ol>
+<li><strong>写在临时路径，成功后原子改名</strong>：否则写盘中途失败时唯一的检查点是坏的；</li>
+<li><strong>保留多版本并轮转</strong>：检查点被静默损坏（截断、位翻转）时才有退路；</li>
+<li><strong>不就地重试 collective</strong>：通信器状态已不一致，正确动作是<strong>整组干净重启并从检查点恢复</strong>；</li>
+<li><strong>记录读取耗时与校验</strong>：加载慢会让 MTTR 失控，抽查关键张量能在 30 秒内判定可用性。</li>
+</ol>
+<p>至于&quot;为什么不该自己写 AllReduce 再套重试&quot;：第 2 章已证明 ring AllReduce 的带宽最优性与 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">2</span><span class="mopen">(</span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span></span></span></span> 步结构，NCCL 在其上做了通道、拓扑、协议自适应；自研实现若漏掉一个错误处理条件，<strong>代价是静默的数值错误而非崩溃</strong>。</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>三段纯 Python（标准库），把检查点体积、写盘时间、间隔权衡、故障率放大都算出来。</p>
+<pre data-lang="python"><code class="language-python"># ===== 示例 1：一个&quot;能续训&quot;的 checkpoint 到底有多大 =====
+GB = 1e9
+P_PARAM = 70e9
+def ckpt_gb(params=P_PARAM, weights_bytes=2, opt_bytes_per_param=12, extra=1):
+    &quot;&quot;&quot;weights: bf16 主权重 2 B/参数；Adam 状态 fp32 12 B/参数（m + v 各 4 B + 主副本 4 B）。
+    extra: 世界大小相关的小状态（scheduler/step/RNG），量级可忽略。&quot;&quot;&quot;
+    return (params * (weights_bytes + opt_bytes_per_param)) / GB
+
+total = ckpt_gb()
+print(&quot;示例 1：70B 模型（Adam，bf16 权重 + fp32 优化器状态）的 checkpoint 体积&quot;)
+print(f&quot;  权重部分      {P_PARAM*2/GB:7.1f} GB&quot;)
+print(f&quot;  优化器状态    {P_PARAM*12/GB:7.1f} GB   ← 通常是权重的好几倍&quot;)
+print(f&quot;  合计          {total:7.1f} GB&quot;)
+print(&quot;\n  写盘时间（示例存储带宽）：&quot;)
+for bw in (2.0, 10.0, 50.0):
+    print(f&quot;    {bw:&gt;5.1f} GB/s → {total/bw:7.1f} s&quot;)
+
+# ===== 示例 2：checkpoint 间隔怎么选 —— 训练时间、故障率与丢失量的三角账 =====
+def ckpt_overhead_frac(t_step_s, t_ckpt_s, interval_steps):
+    &quot;&quot;&quot;每 interval_steps 步写一次：写盘时间相对总训练时间的占比。&quot;&quot;&quot;
+    return t_ckpt_s / (interval_steps * t_step_s + t_ckpt_s)
+
+def expected_work_lost_s(interval_steps, t_step_s, t_load_s):
+    &quot;&quot;&quot;平均每次故障丢失的进度 = 半个检查点间隔 + 从最近检查点重新加载的时间。&quot;&quot;&quot;
+    return interval_steps * t_step_s / 2 + t_load_s
+
+print(&quot;\n示例 2：单步 8 s、写盘 100 s、加载 60 s（示例参数）&quot;)
+print(&quot;   间隔(步)   写盘占比   每次故障丢失(s)&quot;)
+for k in (50, 100, 200, 500, 1000):
+    print(f&quot;   {k:&gt;8}   {ckpt_overhead_frac(8, 100, k)*100:7.2f}%   {expected_work_lost_s(k, 8, 60):14.1f}&quot;)
+
+# ===== 示例 3：故障率随卡数线性增长 =====
+print(&quot;\n示例 3：单 GPU 每小时故障率 λ=1e-3（示例量级，请替换为自集群数据），训练 24 h&quot;)
+lam = 1e-3
+lost = expected_work_lost_s(200, 8, 60)
+for n in (64, 512, 1024, 4096):
+    exp_fail = lam * n * 24
+    print(f&quot;  {n:&gt;5} 卡 → 期望故障 {exp_fail:6.2f} 次/天，&quot;
+          f&quot;每次丢 {lost/60:.0f} min → 全天额外 {exp_fail*lost/3600:5.1f} h&quot;)</code></pre>
+<p>在 Python 3.14.5（仅标准库）下实际运行结果：</p>
+<pre data-lang="text"><code class="language-text">示例 1：70B 模型（Adam，bf16 权重 + fp32 优化器状态）的 checkpoint 体积
+  权重部分        140.0 GB
+  优化器状态      840.0 GB   ← 通常是权重的好几倍
+  合计            980.0 GB
+
+  写盘时间（示例存储带宽）：
+      2.0 GB/s →   490.0 s
+     10.0 GB/s →    98.0 s
+     50.0 GB/s →    19.6 s
+
+示例 2：单步 8 s、写盘 100 s、加载 60 s（示例参数）
+   间隔(步)   写盘占比   每次故障丢失(s)
+         50     20.00%            260.0
+        100     11.11%            460.0
+        200      5.88%            860.0
+        500      2.44%           2060.0
+       1000      1.23%           4060.0
+
+示例 3：单 GPU 每小时故障率 λ=1e-3（示例量级，请替换为自集群数据），训练 24 h
+     64 卡 → 期望故障   1.54 次/天，每次丢 14 min → 全天额外   0.4 h
+    512 卡 → 期望故障  12.29 次/天，每次丢 14 min → 全天额外   2.9 h
+   1024 卡 → 期望故障  24.58 次/天，每次丢 14 min → 全天额外   5.9 h
+   4096 卡 → 期望故障  98.30 次/天，每次丢 14 min → 全天额外  23.5 h</code></pre>
+<p>示例 1 与示例 2 合起来给出第一条工程规则：<strong>先量 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7651em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0269em;">w</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>（写一次多少秒），再定 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">K</span></span></span></span></strong>。若 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7651em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0269em;">w</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 是 490 s 而 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7651em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">s</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 只有 8 s，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">K</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">50</span></span></span></span> 就意味着 60% 时间在写盘——出路是缩短 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7651em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0269em;">w</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>（换存储、异步保存），而不是调间隔。</p>
+<p><strong>可选，需自备或云上按需 1~2 卡</strong>（没有卡也能学完本课）：最小实验如下：</p>
+<pre data-lang="bash"><code class="language-bash"># 用一个占位模型（几十 MB 而不是 70B）实测 t_w 与 t_l，再按比例换算到大模型
+# 1) DCP 分片保存/加载的标准写法（PyTorch 分布式检查点）
+python3 - &lt;&lt;&#39;PY&#39;
+import torch, torch.distributed.checkpoint as dcp
+from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
+sd = {&quot;model&quot;: model.state_dict(), &quot;optim&quot;: opt.state_dict()}
+dcp.save(sd, checkpoint_id=&quot;ckpt/step-100&quot;)        # 各 rank 只写自己的分片
+dcp.load(sd, checkpoint_id=&quot;ckpt/step-100&quot;)
+PY
+# 2) 换并行度后仍能恢复：dcp 的 resharding 会按新的分片布局重切
+# 3) 弹性启动：让它在成员失败后自动重启（--max-restarts 只在弹性模式下有意义）
+torchrun --standalone --nproc_per_node=2 --max-restarts=3 train.py
+# 判读：量出 t_w 后，把 checkpoint 目录体积代入示例 2 的表格选 K，而不是照抄别人的间隔</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：写一个 <code>pick_interval(t_step, t_write, t_load, max_overhead, max_loss_s)</code>，返回同时满足&quot;写盘占比 ≤ max_overhead&quot;与&quot;单次丢失 ≤ max_loss_s&quot;的最小间隔 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">K</span></span></span></span>（无解时返回 None 并指出哪条约束卡住）。</li>
+<li><strong>解释</strong>：为什么&quot;每个 rank 各存一份完整模型&quot;会让总写入量乘以世界大小，而&quot;每个 rank 只写自己的分片&quot;不会？后者在什么情况下反而更慢（提示：小文件数量、元数据操作）？</li>
+<li><strong>对比/验证</strong>：把示例 3 的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">λ</span></span></span></span> 改成 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">4</span></span></span></span></span></span></span></span></span></span></span></span> 与 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span></span>，重算 4096 卡那一行的额外时间；再说出你要用集群上哪一份监控数据来标定 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">λ</span></span></span></span>。</li>
+<li><strong>思考</strong>：某次恢复后训练能跑，但 loss 曲线在恢复点出现一次明显跳变，且之后收敛变慢。列出至少三种可能的原因（提示：优化器状态是否完整、数据流位置、RNG），并说明各自如何在恢复后 5 分钟内验证。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>PyTorch, <em>Distributed Checkpoint — torch.distributed.checkpoint</em>（DCP 的 <code>save</code> / <code>load</code>、<code>state_dict</code> 语义、resharding 能力的官方口径；本课第 1、2 节与&quot;可选&quot;一节的依据）：<a href="https://docs.pytorch.org/docs/stable/distributed.checkpoint.html" target="_blank" rel="noopener noreferrer">https://docs.pytorch.org/docs/stable/distributed.checkpoint.html</a></li>
+<li>PyTorch, <em>Fault-tolerant Distributed Training with torchrun</em>（进程组重建、弹性重启与 <code>--max-restarts</code> 的官方教程；本课第 5 节的依据）：<a href="https://docs.pytorch.org/tutorials/beginner/ddp_series_fault_tolerance.html" target="_blank" rel="noopener noreferrer">https://docs.pytorch.org/tutorials/beginner/ddp_series_fault_tolerance.html</a></li>
+<li>Microsoft, <em>DeepSpeed Configuration JSON</em> —「Checkpoint options」（ZeRO-3 的通用检查点与保存时聚合权重等选项；本课第 5 节跨并行度恢复的依据）：<a href="https://www.deepspeed.ai/docs/config-json/" target="_blank" rel="noopener noreferrer">https://www.deepspeed.ai/docs/config-json/</a></li>
+<li>NVIDIA, <em>Megatron Core Developer Guide</em> —「Parallelism Strategies Guide / Distributed Optimizer」（Megatron 侧启用分布式优化器时各 rank 只持有部分优化器状态，因而检查点也必须是分片的；本课第 2 节的依据）：<a href="https://docs.nvidia.com/megatron-core/developer-guide/latest/user-guide/parallelism-guide.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/megatron-core/developer-guide/latest/user-guide/parallelism-guide.html</a></li>
+</ul>
+<p><a href="#/l/dts-ch7-l4">下一课：多机多卡排障：慢节点、拓扑错配、性能回归</a></p>

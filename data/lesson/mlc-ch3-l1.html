@@ -1,0 +1,330 @@
+<h2 id="h-张量-ir-的要素shape--dtype--layout--依赖">张量 IR 的要素：shape / dtype / layout / 依赖<a class="anchor" href="#h-张量-ir-的要素shape--dtype--layout--依赖" aria-label="本节链接">#</a></h2>
+<p>同一段 <code>y = relu(x + 0)</code>，在框架里是两次算子调用（<code>add</code> 与 <code>relu</code>），在 IR 里则只是三个带类型的值加两个节点。实质差别是：<strong>IR 不允许先算着看</strong>——每个值在编译期就必须回答四件事：形状是什么、元素类型是什么、内存地址怎么算、它依赖谁。四件事凑齐，常量折叠、布局变换、生命周期复用才谈得上；缺一件，后面的 pass 就只能保守。本课用两百行 numpy 把 shape 推导、stride 计算、依赖拓扑序与动态 shape 的编译键全部跑出来。</p>
+<p><figure><img class="md-img" src="content/courses/ml-compilers/assets/chapter-3-figure-01.svg" alt="张量 IR 里的四类信息" loading="lazy" decoding="async"><figcaption>张量 IR 里的四类信息</figcaption></figure>
+</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-一个值--类型--地址公式">1. 一个值 = 类型 + 地址公式<a class="anchor" href="#h-1-一个值--类型--地址公式" aria-label="本节链接">#</a></h4>
+<p>术语先定死：<strong>shape</strong>（形状，各维大小）、<strong>dtype</strong>（元素类型）、<strong>layout</strong>（布局，逻辑索引到物理偏移的映射，行优先布局下就是一组 stride）、<strong>stride</strong>（步长，每沿该维走一格地址前进多少元素）。地址公式只有一行：</p>
+<p><span class="math-fallback math-fallback--block">\text{offset}(i_0,\dots,i_{R-1}) = \sum_{k} i_k \cdot s_k,\qquad\rs_k = \prod_{j&gt;k} d_j \text{（行优先）}</span></p>
+<p>R 是 rank（秩），<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">d</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0315em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 是第 k 维大小。字节数 = <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0497em;vertical-align:-0.2997em;"></span><span class="mop"><span class="mop op-symbol small-op" style="position:relative;top:0em;">∏</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1864em;"><span style="top:-2.4003em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0315em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2997em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">d</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0315em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord">sizeof(dtype)</span></span></span></span></span>。四者的分工是<strong>由谁决定、变了会怎样</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>要素</th>
+<th>谁决定</th>
+<th>变了会怎样</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>shape</td>
+<td>前端图 + 推导规则</td>
+<td>决定 buffer 大小、kernel 形状、是否要重编译</td>
+</tr>
+<tr>
+<td>dtype</td>
+<td>前端 + 计算图</td>
+<td>决定指令、寄存器占用、是否走 Tensor Core 路径</td>
+</tr>
+<tr>
+<td>layout</td>
+<td>后端在编译期选</td>
+<td>不改语义，只改地址公式，但直接决定访存效率</td>
+</tr>
+<tr>
+<td>依赖</td>
+<td>图的连边</td>
+<td>决定拓扑序、生命周期、能否融合、谁是死代码</td>
+</tr>
+</tbody></table>
+<p>本课代码第一段给出真实数字：<code>(1,3,224,224)</code> 共 150528 个 float32，占 602112 字节，行优先 strides 是 <code>(150528, 50176, 224, 1)</code>；换成 NHWC 写法后，形状的元素数一个没变，strides 变成 <code>(150528, 672, 3, 1)</code>。<strong>同一个张量，两套地址公式</strong>——这就是为什么&quot;类型&quot;里必须说清 layout 归谁管。</p>
+<h4 id="h-2-shape-有三种确定程度动态维会污染-stride">2. shape 有三种确定程度，动态维会污染 stride<a class="anchor" href="#h-2-shape-有三种确定程度动态维会污染-stride" aria-label="本节链接">#</a></h4>
+<p>静态维（<code>2</code>）、动态维（StableHLO 写作 <code>tensor&lt;?x3xf32&gt;</code>）、以及&quot;运行期才知道&quot;的完全未知维。StableHLO 规范里 shape 可以部分或完全未知，但<strong>不允许 unranked</strong>：秩必须先确定。动态维出现的位置决定代价：它落在最外维时，后面几维的 stride 仍是常量（代码输出里 <code>(None, 3)</code> 的 strides 是 <code>(3, 1)</code>）；一旦落到更内层，stride 只能写成符号表达式（<code>(2, None)</code> 的 strides 是 <code>&#39;1*S&#39;</code>），连&quot;下一个元素在哪&quot;都要运行期算。</p>
+<p>这份代价换来的收益是可以量化的。代码第 5 节用同一张图跑三次调用（batch=2、7、2）：把未知维写成符号，三次调用只产生 <strong>1 个编译键</strong>；把每一维都特化成实际值，就产生 <strong>2 个编译键</strong>（batch=2 命中两次、batch=7 触发一次新编译）。TorchInductor 走的正是第一条路：用 SymPy 符号表达形状，只在必要时插 guard，guard 失败才重编译——<strong>用轻微的运行期计算换掉整次编译</strong>。</p>
+<h4 id="h-3-dtype位宽之外的语义">3. dtype：位宽之外的语义<a class="anchor" href="#h-3-dtype位宽之外的语义" aria-label="本节链接">#</a></h4>
+<p>dtype 不只是&quot;几字节&quot;，它决定指令选择与累加精度。量化又把 dtype 拆成两层：<strong>storage type</strong>（真正存的整数，如 i8）与 <strong>expressed type</strong>（它代表的浮点，如 f32），二者靠 scale 与 zero_point 换算，StableHLO 规范用 <code>!quant.uniform</code> 把这对参数写进类型，还支持 per-axis（每个切片一组 scale）。常见坑有两个：一是隐式类型提升，<code>np.result_type(f32, f64)</code> 会把整条链拉成双精度，性能与数值一起变；二是把&quot;输入精度&quot;和&quot;累加器精度&quot;混为一谈——低精度输入配 fp32 累加是常规做法，反过来才是事故。</p>
+<h4 id="h-4-layout语义之外的另一半">4. layout：语义之外的另一半<a class="anchor" href="#h-4-layout语义之外的另一半" aria-label="本节链接">#</a></h4>
+<p>代码第 3 段是最小证据：同一个逻辑索引 <code>(1, 2)</code>，在 strides <code>(4, 1)</code> 下行优先偏移是 6，在 <code>(1, 2)</code> 下是 5。值一样，落在内存里的位置不一样。三条路线对 layout 的处置不同：<strong>StableHLO 的类型里没有 layout</strong>（规范明确把 layout 列为未来工作），MLIR 用 <code>memref</code> 的 affine/strided map 表达，TVM 则把 <code>operator layout alteration</code> 直接列为一类标准 pass。为什么要争这一件事？因为同一个 warp 里 32 个线程的地址是否连续，只由 stride 决定，与 shape 无关——这是前一门课访存合并分析的全部前提。</p>
+<h4 id="h-5-依赖图能被优化的前提">5. 依赖：图能被优化的前提<a class="anchor" href="#h-5-依赖图能被优化的前提" aria-label="本节链接">#</a></h4>
+<p>MLIR 对值的定义很硬：一个 Value 要么是块参数，要么是&quot;恰好一个 Operation 的结果&quot;。于是每个操作数都是一条有向边，图必然是 DAG，def-use 链一次性买来四件事：<strong>拓扑序</strong>（代码输出的实际顺序是 <code>mm → bias_b → sum → act → out</code>，与书写顺序无关）、<strong>执行顺序的自由度</strong>（互不依赖的节点可重排）、<strong>生命周期</strong>（最后一次使用之后即可复用 buffer）、以及<strong>优化判据</strong>（没有使用者的节点是死代码，单使用者的相邻点链可以融合）。广播是唯一的特例：stride 为 0 的视图让 broadcast 不搬一个字节，但拿这组 stride 去估显存峰值就会低估。</p>
+<h4 id="h-6-常见坑">6. 常见坑<a class="anchor" href="#h-6-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>把 strides 当 shape、按&quot;占内存&quot;估广播</strong>：同一个 shape 可对应多组 stride（切片、转置视图）；<code>broadcast_to</code> 的中间张量常常是零拷贝视图。</li>
+<li><strong>动态维放在内层还想常量折叠</strong>：stride 成了符号，折叠机会直接消失。</li>
+<li><strong>只推 shape 不推 dtype</strong>：kernel 签名对不上，只能回退到 eager。</li>
+<li><strong>忽略 <code>np.result_type</code> 的提升</strong>：链尾多出一个 fp64 转换节点，白付带宽。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>纯 Python + numpy，本机 <code>python3.10</code> + <code>numpy 1.26.2</code> 实跑，无需 GPU。五段分别对应上面五节：形状/地址、推导与拓扑序、两种 layout 的偏移、逐元素对拍、动态 shape 的编译键。</p>
+<pre data-lang="python"><code class="language-python"># ---- 最小张量 IR：shape / dtype / layout（strides）/ 依赖（numpy，本机 python3.10 + numpy 1.26.2 实跑）----
+import numpy as np
+
+# ---------- 1. shape 与 dtype：IR 里张量值的&quot;类型&quot; ----------
+def numel(shape):
+    n = 1
+    for d in shape:
+        n *= d
+    return n
+
+
+def row_major_strides(shape):
+    &quot;&quot;&quot;行优先（C 序）布局：strides[i] = 后面所有维度大小的乘积。
+    维度为 None（动态）时，stride 可能是符号表达式 —— 静态维才能折成常量。&quot;&quot;&quot;
+    st = [None] * len(shape)
+    acc = 1
+    for i in range(len(shape) - 1, -1, -1):
+        st[i] = acc
+        d = &#39;S&#39; if shape[i] is None else shape[i]
+        acc = acc * d if isinstance(acc, int) and isinstance(d, int) else f&#39;{acc}*{d}&#39;
+    return tuple(st)
+
+
+def offset(strides, idx):
+    &quot;&quot;&quot;地址公式 offset = Σ idx_i · strides_i；这就是 layout 的全部作用。&quot;&quot;&quot;
+    return sum(i * s for i, s in zip(idx, strides))
+
+
+print(&#39;=== 1. shape / dtype / layout 三者的分工 ===&#39;)
+for shape in [(2, 3), (1, 3, 224, 224)]:
+    st = row_major_strides(shape)
+    print(f&#39;  shape={shape}  元素数={numel(shape):&gt;8}  dtype=float32  &#39;
+          f&#39;行优先 strides={st}  字节={numel(shape) * 4}&#39;)
+n = (1, 3, 224, 224)
+print(&#39;  同一个逻辑张量，两种物理排布：&#39;)
+print(f&#39;    NCHW {n}          strides={row_major_strides(n)}&#39;)
+print(f&#39;    NHWC {(1, 224, 224, 3)}  strides={row_major_strides((1, 224, 224, 3))}&#39;)
+print(f&#39;  动态维让 stride 变成符号：shape=(2, None) → strides={row_major_strides((2, None))}&#39;)
+
+# ---------- 2. 一个可执行的小图 IR：节点 + 输入 + shape/dtype 推导 ----------
+class Node:
+    def __init__(self, name, op, inputs=(), attrs=None):
+        self.name, self.op, self.inputs, self.attrs = name, op, tuple(inputs), attrs or {}
+
+
+class Graph:
+    def __init__(self, nodes, inputs):
+        self.nodes = {n.name: n for n in nodes}
+        self.inputs = inputs                      # name -&gt; (shape, dtype)
+        self.shape, self.dtype, self.layout = {}, {}, {}
+
+    def infer(self):
+        for name, (sh, dt) in self.inputs.items():
+            self.shape[name], self.dtype[name] = tuple(sh), dt
+            self.layout[name] = (&#39;row_major&#39;, row_major_strides(sh))
+        for n in self.order():
+            sh, dt = self._infer_node(n)
+            self.shape[n.name], self.dtype[n.name] = sh, dt
+        return self
+
+    def _infer_node(self, n):
+        S = [self.shape[i] for i in n.inputs]
+        D = [self.dtype[i] for i in n.inputs]
+        if n.op == &#39;matmul&#39;:
+            (m, k), (k2, nn) = S
+            assert k == k2, f&#39;{n.name}: matmul K 维不匹配 {k} vs {k2}&#39;
+            assert D[0] == D[1], f&#39;{n.name}: matmul 两侧 dtype 不同&#39;
+            return (m, nn), D[0]
+        if n.op == &#39;add&#39;:                          # numpy 式双向广播；None = 动态维
+            out = []
+            for dims in zip(*[s[::-1] for s in S]):
+                sizes = {d for d in dims if d != 1 and d is not None}
+                if len(sizes) &gt; 1:
+                    raise ValueError(f&#39;{n.name}: 广播失败 {S}&#39;)
+                if sizes:
+                    out.append(sizes.pop())
+                else:
+                    out.append(1 if all(d == 1 for d in dims) else None)
+            return tuple(out[::-1]), np.result_type(*D)
+        if n.op == &#39;relu&#39;:
+            return S[0], D[0]
+        if n.op == &#39;transpose&#39;:
+            return tuple(S[0][p] for p in n.attrs[&#39;perm&#39;]), D[0]
+        if n.op == &#39;broadcast_to&#39;:
+            return tuple(n.attrs[&#39;shape&#39;]), D[0]
+        raise ValueError(f&#39;未知算子 {n.op}&#39;)
+
+    def order(self):
+        &quot;&quot;&quot;依赖 → 拓扑序：值依赖（SSA）就是有向边，必须无环。&quot;&quot;&quot;
+        producers = {name: [] for name in self.inputs}
+        producers.update({n.name: list(n.inputs) for n in self.nodes.values()})
+        for n in self.nodes.values():
+            for i in n.inputs:
+                if i not in producers:
+                    raise ValueError(f&#39;{n.name} 引用了不存在的值 {i}&#39;)
+        indeg = {k: len([i for i in v if i in self.nodes]) for k, v in producers.items()}
+        ready = [k for k, d in indeg.items() if d == 0]
+        out = []
+        while ready:
+            k = ready.pop(0)
+            if k in self.nodes:
+                out.append(self.nodes[k])
+            for m, deps in producers.items():
+                if k in deps:
+                    indeg[m] -= 1
+                    if indeg[m] == 0:
+                        ready.append(m)
+        if len(out) != len(self.nodes):
+            raise ValueError(&#39;图里有环：值依赖必须是 DAG&#39;)
+        return out
+
+
+def nodes_static():
+    &quot;&quot;&quot;out = relu(transpose(matmul(A, B) + bias, (1, 0)))&quot;&quot;&quot;
+    return [Node(&#39;mm&#39;, &#39;matmul&#39;, (&#39;A&#39;, &#39;B&#39;)),
+            Node(&#39;bias_b&#39;, &#39;broadcast_to&#39;, (&#39;bias&#39;,), {&#39;shape&#39;: (2, 4)}),
+            Node(&#39;sum&#39;, &#39;add&#39;, (&#39;mm&#39;, &#39;bias_b&#39;)),
+            Node(&#39;act&#39;, &#39;relu&#39;, (&#39;sum&#39;,)),
+            Node(&#39;out&#39;, &#39;transpose&#39;, (&#39;act&#39;,), {&#39;perm&#39;: (1, 0)})]
+
+
+g = Graph(nodes_static(), {&#39;A&#39;: ((2, 3), np.float32), &#39;B&#39;: ((3, 4), np.float32),
+                           &#39;bias&#39;: ((4,), np.float32)}).infer()
+print(&#39;\n=== 2. shape 推导 + 依赖拓扑序（值 → 类型在编译期就算清）===&#39;)
+for n in g.order():
+    print(f&#39;  {n.name:&lt;7} {n.op:&lt;12} {str(g.shape[n.name]):&lt;10} &#39;
+          f&#39;{np.dtype(g.dtype[n.name]).name:&lt;8} 依赖={list(n.inputs)}&#39;)
+print(&#39;  每个节点的 shape/dtype 都在执行前确定；这决定了 buffer 大小与 kernel 签名&#39;)
+
+# ---------- 3. layout 是&quot;怎么放&quot;，不是&quot;是什么&quot;：同一逻辑张量两种排布 ----------
+print(&#39;\n=== 3. layout：逻辑形状相同，物理地址公式不同 ===&#39;)
+for tag, st, idx in [(&#39;行优先 strides=(4,1)&#39;, (4, 1), (1, 2)),
+                     (&#39;列优先 strides=(1,2)&#39;, (1, 2), (1, 2))]:
+    print(f&#39;  {tag:&lt;22} 逻辑索引 {idx} → 偏移 {offset(st, idx):&gt;2}&#39;)
+print(&#39;  偏移 6 vs 5：值一样，落在内存里的位置不一样 —— layout 由后端在编译期定&#39;)
+
+# ---------- 4. 执行 + 对拍：验证 shape/dtype 推导没有说谎 ----------
+def run(graph, feeds):
+    env = dict(feeds)
+    for n in graph.order():
+        a = [env[i] for i in n.inputs]
+        if n.op == &#39;matmul&#39;:
+            v = a[0] @ a[1]
+        elif n.op == &#39;add&#39;:
+            v = a[0] + a[1]
+        elif n.op == &#39;relu&#39;:
+            v = np.maximum(a[0], np.float32(0))
+        elif n.op == &#39;transpose&#39;:
+            v = np.transpose(a[0], n.attrs[&#39;perm&#39;])
+        elif n.op == &#39;broadcast_to&#39;:
+            v = np.broadcast_to(a[0], n.attrs[&#39;shape&#39;])
+        env[n.name] = v
+    return env
+
+
+rng = np.random.default_rng(0)
+A = rng.integers(-5, 5, (2, 3)).astype(np.float32)
+B = rng.integers(-5, 5, (3, 4)).astype(np.float32)
+bias = np.array([1, -2, 3, -4], dtype=np.float32)
+env = run(g, {&#39;A&#39;: A, &#39;B&#39;: B, &#39;bias&#39;: bias})
+ref = np.maximum(A @ B + bias, 0).T
+print(&#39;\n=== 4. 逐元素对拍（IR 执行 vs numpy 参考实现）===&#39;)
+print(f&#39;  编译期推得 out.shape={g.shape[&quot;out&quot;]} 实际={env[&quot;out&quot;].shape} &#39;
+      f&#39;一致={g.shape[&quot;out&quot;] == env[&quot;out&quot;].shape}&#39;)
+print(f&#39;  编译期推得 out.dtype={np.dtype(g.dtype[&quot;out&quot;]).name} 实际={env[&quot;out&quot;].dtype} &#39;
+      f&#39;一致={np.dtype(g.dtype[&quot;out&quot;]) == env[&quot;out&quot;].dtype}&#39;)
+print(f&#39;  最大绝对差 = {np.abs(env[&quot;out&quot;] - ref).max()}&#39;)
+print(&#39;  执行顺序：&#39; + &#39; → &#39;.join(n.name for n in g.order()))
+
+# ---------- 5. 动态 shape：符号维 vs 特化维，决定&quot;一个图编译几次&quot; ----------
+print(&#39;\n=== 5. 动态 shape：编译键（guard）决定复用还是重编译 ===&#39;)
+g_dyn = Graph([Node(&#39;mm&#39;, &#39;matmul&#39;, (&#39;A&#39;, &#39;B&#39;)),
+               Node(&#39;bias_b&#39;, &#39;broadcast_to&#39;, (&#39;bias&#39;,), {&#39;shape&#39;: (None, 4)}),
+               Node(&#39;sum&#39;, &#39;add&#39;, (&#39;mm&#39;, &#39;bias_b&#39;)),
+               Node(&#39;act&#39;, &#39;relu&#39;, (&#39;sum&#39;,)),
+               Node(&#39;out&#39;, &#39;transpose&#39;, (&#39;act&#39;,), {&#39;perm&#39;: (1, 0)})],
+              {&#39;A&#39;: ((None, 3), np.float32), &#39;B&#39;: ((3, 4), np.float32),
+               &#39;bias&#39;: ((4,), np.float32)}).infer()
+print(f&#39;  动态图：A.shape={g_dyn.shape[&quot;A&quot;]}，A.layout.strides={g_dyn.layout[&quot;A&quot;][1]}&#39;
+      &#39;（首维还没进 stride，所以后面几维的 stride 仍是常量）&#39;)
+
+
+def shape_key(graph, feeds, specialize=False):
+    &quot;&quot;&quot;把每维转成&quot;键里的一格&quot;：特化模式写实际值，动态模式写符号。&quot;&quot;&quot;
+    key = []
+    for name, (sh, _) in graph.inputs.items():
+        dims = []
+        for i, d in enumerate(sh):
+            actual = feeds[name].shape[i]
+            if d is not None:
+                dims.append(d)
+            else:
+                dims.append(actual if specialize else f&#39;S{name}{i}&#39;)
+        key.append((name, tuple(dims)))
+    return tuple(key)
+
+
+for specialize in (False, True):
+    seen = {}
+    for batch in (2, 7, 2):
+        feeds = {&#39;A&#39;: rng.integers(-5, 5, (batch, 3)).astype(np.float32),
+                 &#39;B&#39;: B, &#39;bias&#39;: bias}
+        k = shape_key(g_dyn, feeds, specialize)
+        seen.setdefault(k, 0)
+        seen[k] += 1
+    tag = &#39;特化：每维写实际值&#39; if specialize else &#39;动态：未知维写符号 S&#39;
+    print(f&#39;  {tag}：3 次调用（batch=2,7,2）→ {len(seen)} 个编译键&#39;)
+    for k, cnt in seen.items():
+        print(f&#39;    键={k}  命中 {cnt} 次&#39;)
+print(&#39;  特化模式把 batch 折成常量、能多做常量折叠，但每个新 shape 都要重编译；&#39;)
+print(&#39;  动态模式一个键覆盖所有 batch —— 这正是 TorchInductor 用 SymPy 符号 + guard 的取舍&#39;)</code></pre>
+<p>运行结果：</p>
+<pre data-lang="text"><code class="language-text">=== 1. shape / dtype / layout 三者的分工 ===
+  shape=(2, 3)  元素数=       6  dtype=float32  行优先 strides=(3, 1)  字节=24
+  shape=(1, 3, 224, 224)  元素数=  150528  dtype=float32  行优先 strides=(150528, 50176, 224, 1)  字节=602112
+  同一个逻辑张量，两种物理排布：
+    NCHW (1, 3, 224, 224)          strides=(150528, 50176, 224, 1)
+    NHWC (1, 224, 224, 3)  strides=(150528, 672, 3, 1)
+  动态维让 stride 变成符号：shape=(2, None) → strides=(&#39;1*S&#39;, 1)
+
+=== 2. shape 推导 + 依赖拓扑序（值 → 类型在编译期就算清）===
+  mm      matmul       (2, 4)     float32  依赖=[&#39;A&#39;, &#39;B&#39;]
+  bias_b  broadcast_to (2, 4)     float32  依赖=[&#39;bias&#39;]
+  sum     add          (2, 4)     float32  依赖=[&#39;mm&#39;, &#39;bias_b&#39;]
+  act     relu         (2, 4)     float32  依赖=[&#39;sum&#39;]
+  out     transpose    (4, 2)     float32  依赖=[&#39;act&#39;]
+  每个节点的 shape/dtype 都在执行前确定；这决定了 buffer 大小与 kernel 签名
+
+=== 3. layout：逻辑形状相同，物理地址公式不同 ===
+  行优先 strides=(4,1)      逻辑索引 (1, 2) → 偏移  6
+  列优先 strides=(1,2)      逻辑索引 (1, 2) → 偏移  5
+  偏移 6 vs 5：值一样，落在内存里的位置不一样 —— layout 由后端在编译期定
+
+=== 4. 逐元素对拍（IR 执行 vs numpy 参考实现）===
+  编译期推得 out.shape=(4, 2) 实际=(4, 2) 一致=True
+  编译期推得 out.dtype=float32 实际=float32 一致=True
+  最大绝对差 = 0.0
+  执行顺序：mm → bias_b → sum → act → out
+
+=== 5. 动态 shape：编译键（guard）决定复用还是重编译 ===
+  动态图：A.shape=(None, 3)，A.layout.strides=(3, 1)（首维还没进 stride，所以后面几维的 stride 仍是常量）
+  动态：未知维写符号 S：3 次调用（batch=2,7,2）→ 1 个编译键
+    键=((&#39;A&#39;, (&#39;SA0&#39;, 3)), (&#39;B&#39;, (3, 4)), (&#39;bias&#39;, (4,)))  命中 3 次
+  特化：每维写实际值：3 次调用（batch=2,7,2）→ 2 个编译键
+    键=((&#39;A&#39;, (2, 3)), (&#39;B&#39;, (3, 4)), (&#39;bias&#39;, (4,)))  命中 2 次
+    键=((&#39;A&#39;, (7, 3)), (&#39;B&#39;, (3, 4)), (&#39;bias&#39;, (4,)))  命中 1 次
+  特化模式把 batch 折成常量、能多做常量折叠，但每个新 shape 都要重编译；
+  动态模式一个键覆盖所有 batch —— 这正是 TorchInductor 用 SymPy 符号 + guard 的取舍</code></pre>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选，需自备或云上按需：在真实工具链里看一眼&quot;类型&quot;和&quot;布局&quot;分别写在哪 ----
+# MLIR（mlir-opt 随 LLVM 发行版提供）：
+#   # demo.mlir 里同时写 tensor&lt;?x3xf32&gt;（张量类型）与 memref&lt;2x3xf32, strided&lt;[3,1]&gt;&gt;（含布局的缓冲类型）
+#   mlir-opt demo.mlir -pass-pipeline=&#39;builtin.module(func.func(cse))&#39;
+# Apache TVM（pip install apache-tvm）：
+#   # 用 TVMScript 写一个 PrimFunc 并 print(IRModule)，观察 buffer 上带的 shape/dtype/strides
+#   python -c &quot;import tvm; print(tvm.__version__)&quot;
+# PyTorch（本机有 torch 时，看编译期抓住了哪些 shape 假设）：
+#   python -c &quot;import torch; f=torch.compile(lambda x: torch.relu(x+0.0)); f(torch.randn(4)); print(&#39;ok&#39;)&quot;
+# 三个工具都没有也不影响本课：上面的 numpy 版已经把四类信息全部算出来了。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：给 <code>Graph._infer_node</code> 增加 <code>reshape</code> 与 <code>slice</code> 两个算子，让它们在存在动态维时推导出<strong>符号 stride</strong>；再用输入形状 <code>(None, 4, None)</code> 验证你的 stride 表达式。</li>
+<li><strong>解释</strong>：为什么 <code>(None, 3)</code> 的 strides 还是 <code>(3, 1)</code>，而 <code>(2, None)</code> 的 strides 成了 <code>&#39;1*S&#39;</code>？由此解释&quot;动态维越靠内，编译期能做的越少&quot;。</li>
+<li><strong>对比/验证</strong>：把第 5 节的 <code>specialize</code> 反向扩展——让 <code>B</code> 的 K 维也写成符号（<code>(None, 4)</code>），3 次调用（batch=2,7,2）会产生几个编译键？什么样的符号化是白拿收益、什么只是把编译推迟到运行期？</li>
+<li><strong>思考</strong>：如果 layout 不进类型（StableHLO 的选择），谁来保证&quot;同一个值在两处被假设成同一种排布&quot;？反过来，把 layout 写进类型，会付出什么代价（考虑两个后端、两个版本之间的互操作）？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>MLIR, <em>Understanding the IR Structure</em>（Value / BlockArgument 的定义、def-use 链与 <code>walk()</code> 遍历；本课第 5 节的依据）：<a href="https://mlir.llvm.org/docs/Tutorials/UnderstandingTheIRStructure/" target="_blank" rel="noopener noreferrer">https://mlir.llvm.org/docs/Tutorials/UnderstandingTheIRStructure/</a></li>
+<li>OpenXLA StableHLO 规范（<code>tensor&lt;?x3xf32&gt;</code> 动态维、不允许 unranked、<code>f8/bf16/tf32</code> 与 <code>!quant.uniform</code> 量化类型、layout 列为未来工作 #629）：<a href="https://github.com/openxla/stablehlo/blob/main/docs/spec.md" target="_blank" rel="noopener noreferrer">https://github.com/openxla/stablehlo/blob/main/docs/spec.md</a></li>
+<li>Apache TVM, <em>Design and Architecture</em>（<code>IRModule</code> / <code>PrimFunc</code> 中的多维存取、线程与向量信息；layout 变更属于标准 pass 序列）：<a href="https://tvm.apache.org/docs/arch/index.html" target="_blank" rel="noopener noreferrer">https://tvm.apache.org/docs/arch/index.html</a></li>
+<li>PyTorch dev-discuss, <em>TorchInductor: a PyTorch-native Compiler with Define-by-Run IR and Symbolic Shapes</em>（SymPy 符号 shape、guard 与重编译；本课第 2 节编译键的真实对应物）：<a href="https://dev-discuss.pytorch.org/t/torchinductor-a-pytorch-native-compiler-with-define-by-run-ir-and-symbolic-shapes/747" target="_blank" rel="noopener noreferrer">https://dev-discuss.pytorch.org/t/torchinductor-a-pytorch-native-compiler-with-define-by-run-ir-and-symbolic-shapes/747</a></li>
+</ul>
+<p><a href="#/l/mlc-ch3-l2">下一课：Relay / MLIR / StableHLO：三种路线的取舍</a></p>

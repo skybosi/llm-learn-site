@@ -1,0 +1,222 @@
+<h2 id="h-多机多卡排障慢节点拓扑错配性能回归">多机多卡排障：慢节点、拓扑错配、性能回归<a class="anchor" href="#h-多机多卡排障慢节点拓扑错配性能回归" aria-label="本节链接">#</a></h2>
+<p>同步训练有一条残酷的规则：<strong>每个集合通信都等最慢的那个成员</strong>。一个 rank 慢 50%，整组吞吐就可能掉三成；而&quot;集群变慢了&quot;毫无信息量——可能是慢节点、拓扑接错，也可能是你昨天改的参数。本课给出一条从现象到结论的诊断路径。</p>
+<p><figure><img class="md-img" src="content/courses/distributed-training-systems/assets/chapter-7-figure-02.svg" alt="从现象到结论的多机排障路径" loading="lazy" decoding="async"><figcaption>从现象到结论的多机排障路径</figcaption></figure>
+</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-先把现象分成三类第一动作完全不同">1. 先把现象分成三类，第一动作完全不同<a class="anchor" href="#h-1-先把现象分成三类第一动作完全不同" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>现象</th>
+<th>特征</th>
+<th>第一动作</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>慢</strong></td>
+<td>训练在动，但吞吐低于预期</td>
+<td>量每 rank 单步时间分布，找离群者</td>
+</tr>
+<tr>
+<td><strong>停</strong></td>
+<td>长时间无输出，step 数不动</td>
+<td>看超时日志与集合通信栈，而不是先调超参</td>
+</tr>
+<tr>
+<td><strong>报错</strong></td>
+<td>进程退出、异常栈</td>
+<td>读第一条异常（往往不是最后一条）</td>
+</tr>
+</tbody></table>
+<p>把&quot;慢&quot;与&quot;停&quot;混谈最浪费时间：前者靠统计定位，后者几乎总是顺序/规模不一致导致的挂死，处理方式相反。</p>
+<h4 id="h-2-慢节点为什么能拖住整组一个算得出来的例子">2. 慢节点为什么能拖住整组：一个算得出来的例子<a class="anchor" href="#h-2-慢节点为什么能拖住整组一个算得出来的例子" aria-label="本节链接">#</a></h4>
+<p>设一步 = 最慢 rank 的计算 + 一次全体同步的通信。示例 1 取 96 个 rank，95 个单步 500 ms、1 个 750 ms，通信 100 ms：</p>
+<ul>
+<li>全部正常 <strong>600.0 ms</strong>；有一个慢 rank <strong>850.0 ms</strong>；整组吞吐下降 <strong>29.4%</strong>。</li>
+<li>换算成浪费：多花的 250 ms 在 96 卡上是 <strong>576 GPU·h/天</strong>。</li>
+</ul>
+<p>节点内 DP=8 视角更直观：最慢卡是平均的 1.25 倍时损失 <strong>18.2%</strong>，2 倍时 <strong>47.2%</strong>，4 倍时 <strong>72.8%</strong>。<strong>&quot;慢一点没关系&quot;是错的，它被同步放大。</strong></p>
+<h4 id="h-3-定位慢节点看分布的形状而不是看平均值">3. 定位慢节点：看分布的形状，而不是看平均值<a class="anchor" href="#h-3-定位慢节点看分布的形状而不是看平均值" aria-label="本节链接">#</a></h4>
+<p>让每个 rank 记录自己每步的耗时（几百步即可），然后看分布：</p>
+<table>
+<thead>
+<tr>
+<th>分布形状</th>
+<th>指向</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>个别 rank 持续偏高</td>
+<td>该卡/进程的硬件或环境（降频、ECC、被抢占）</td>
+</tr>
+<tr>
+<td><strong>同节点多个 rank 同时偏高</strong></td>
+<td>该节点的共享资源：供电、散热、PCIe、NUMA、网卡</td>
+</tr>
+<tr>
+<td>全部一起偏高且随步数恶化</td>
+<td>通信层或存储 I/O（检查点、数据加载）</td>
+</tr>
+<tr>
+<td>周期性尖刺</td>
+<td>别的东西在抢资源（其它任务、日志刷盘、监控）</td>
+</tr>
+</tbody></table>
+<p>示例 2 就是第二行的典型指纹：node1 的中位数 621.5 ms 比全体中位数 502.0 ms 高 119 ms，而且<strong>只有该节点的一半卡偏高</strong>——这几乎可以排除网络（网络问题通常全节点一致），指向该节点的供电/散热/PCIe 链路。</p>
+<p><strong>只报&quot;平均单步时间&quot;的监控查不出慢节点</strong>：96 卡里 1 张慢 50%，平均值只动约 0.5%，吞吐却掉了 29%。</p>
+<h4 id="h-4-拓扑错配同一个8-卡机器链路可能完全不同">4. 拓扑错配：同一个&quot;8 卡机器&quot;，链路可能完全不同<a class="anchor" href="#h-4-拓扑错配同一个8-卡机器链路可能完全不同" aria-label="本节链接">#</a></h4>
+<p>第 3 章讲过：节点内 NVLink 域、跨节点 NIC、rail 是否对齐，带宽差一个数量级。最常见的错配形态是：</p>
+<ol>
+<li><strong>同构性被打破</strong>：多数节点 8 卡全 NVLink（<code>topo -m</code> 显示 <code>NV#</code>），少数插在 PCIe switch 后（<code>PIX</code>/<code>PHB</code>）→ 处处垫底；</li>
+<li><strong>P2P 未打开</strong>：NVLink 存在却不被使用（查 <code>nvidia-smi topo -p2p n</code>）→ 通信悄悄走 PCIe 或主机内存；</li>
+<li><strong>NCCL 看到的拓扑与物理不符</strong>：<code>NCCL_TOPO_FILE</code> 指错、容器里拓扑文件缺失、MIG 导致枚举不一致；</li>
+<li><strong>rail / 网卡绑定错</strong>：跨节点走了慢 rail，或同一环混用不同代际的网卡。</li>
+</ol>
+<p>诊断顺序是&quot;先证明下层没问题，再怀疑上层&quot;：<code>nvidia-smi topo -m</code> → <code>topo -p2p n</code> → <code>ib_write_bw</code> / <code>ib_write_lat</code>（跨机点对点）→ <code>nccl-tests</code> 跨机对拍。<strong>如果 <code>nccl-tests</code> 也慢，问题在硬件/拓扑/驱动层，回 Python 调参是白费功夫。</strong></p>
+<h4 id="h-5-性能回归的判据强扩展与弱扩展">5. 性能回归的判据：强扩展与弱扩展<a class="anchor" href="#h-5-性能回归的判据强扩展与弱扩展" aria-label="本节链接">#</a></h4>
+<p>&quot;感觉变慢了&quot;没有可操作性，两个标准判据才可操作：</p>
+<ul>
+<li><strong>强扩展（strong scaling）</strong>：总工作量固定，卡数增加时单步应变小。效率 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.3669em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">理想</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord">/</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">实测</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>，其中理想按算力线性折算；</li>
+<li><strong>弱扩展（weak scaling）</strong>：每卡的工作量固定，卡数增加时单步应基本不变。效率 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.3669em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.0001em;vertical-align:-0.2501em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.1389em;">P</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3173em;"><span style="top:-2.357em;margin-left:-0.1389em;margin-right:0.0714em;"><span class="pstrut" style="height:2.5em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.143em;"><span></span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2501em;"><span></span></span></span></span></span></span><span class="mord">/</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.1389em;">P</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>。</li>
+</ul>
+<p>示例 3 用&quot;计算项 + 通信项&quot;的模型说明：<strong>强扩展效率必然随卡数下滑</strong>，因为每卡计算越小、固定通信项占比越高（128 卡只剩 42.5%）；弱扩展的下滑就是&quot;卡数翻倍的通信与调度税&quot;（128 卡降到 75.0%，单步 0.120 → 0.160 s）。<strong>报回归必须说清是哪种扩展</strong>。</p>
+<h4 id="h-6-单变量原则与三个能立刻用的开关">6. 单变量原则与三个能立刻用的开关<a class="anchor" href="#h-6-单变量原则与三个能立刻用的开关" aria-label="本节链接">#</a></h4>
+<p>排障的最后一步是 A/B：<strong>一次只改一个变量</strong>，离开时撤掉诊断开关（<code>NCCL_DEBUG=INFO</code> 在千卡上会显著拖慢甚至撑爆日志盘）。常用工具：</p>
+<ul>
+<li><code>TORCH_NCCL_TRACE_BUFFER_SIZE</code> + <code>TORCH_NCCL_DUMP_ON_TIMEOUT</code>：PyTorch 在 NCCL 超时时把各 rank 的集合通信调用序列落盘（flight recorder），<strong>用于判断&quot;谁没到&quot;</strong>；</li>
+<li><code>NCCL_DEBUG=INFO</code> + <code>NCCL_DEBUG_SUBSYS=INIT,GRAPH,TUNING</code>：看选了哪些链路、环/树形状、算法与协议；</li>
+<li><code>CUDA_LAUNCH_BLOCKING=1</code>：只在&quot;怀疑 kernel 报错但栈不对&quot;时临时开，会严重拖慢，不能长期开。</li>
+</ul>
+<p>这些都指向同一句经验：<strong>先定位到&quot;哪一层的哪个 rank&quot;，再谈优化。</strong> 第 8 章的三本账回答&quot;这套配置值不值得&quot;，排障回答&quot;它有没有按你以为的方式在跑&quot;。</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>三段纯 Python（标准库）：慢节点放大效应、按节点分组的指纹识别、强/弱扩展效率。</p>
+<pre data-lang="python"><code class="language-python"># ===== 示例 1：一个慢节点怎么拖住整个同步组（集合通信是&quot;全员到齐&quot;） =====
+def one_step(compute_s, comm_s):
+    &quot;&quot;&quot;一步 = 最慢 rank 的计算 + 一次全体同步的通信（同步组里所有 rank 等最慢的那个）。&quot;&quot;&quot;
+    return max(compute_s) + comm_s
+
+data = [0.500] * 95 + [0.750]          # 96 个 rank：95 个 500 ms，1 个 750 ms
+comm = 0.100                           # 一次 allreduce 的通信时间（示例）
+t_healthy = one_step([0.500] * 96, comm)
+t_slow = one_step(data, comm)
+print(&quot;示例 1：96 卡同步训练，1 个 rank 慢 50%&quot;)
+print(f&quot;  全部正常单步      {t_healthy*1e3:7.1f} ms&quot;)
+print(f&quot;  有一个慢 rank     {t_slow*1e3:7.1f} ms&quot;)
+print(f&quot;  整组吞吐下降      {(1 - t_healthy/t_slow)*100:5.1f}%   ← 1/96 的卡拖慢全部 96 张&quot;)
+print(f&quot;  按 24h 计，这一步多花的 GPU 时间 = {(t_slow-t_healthy)*86400*96/3600:7.1f} GPU·h&quot;)
+
+print(&quot;\n  另一个角度：节点内 DP=8，最慢卡是平均的几倍 → 整组损失多少&quot;)
+base, comm8 = 0.500, 0.060
+for slow in (1.1, 1.25, 1.5, 2.0, 4.0):
+    t = base * slow + comm8
+    print(f&quot;    最慢是平均的 {slow:&gt;4.2f}× → 单步 {t*1e3:6.1f} ms，损失 {(1-(base+comm8)/t)*100:5.1f}%&quot;)
+
+# ===== 示例 2：从每个 rank 的迭代时间反解瓶颈位置 =====
+import statistics
+intra = {
+    &quot;node0&quot;: [0.502, 0.501, 0.503, 0.500, 0.501, 0.502, 0.500, 0.501],
+    &quot;node1&quot;: [0.503, 0.502, 0.501, 0.502, 0.741, 0.740, 0.742, 0.741],
+    &quot;node2&quot;: [0.503, 0.502, 0.501, 0.500, 0.501, 0.502, 0.500, 0.502],
+}
+print(&quot;\n示例 2：按 rank 分组统计单步时间，区分“卡慢”与“通信慢”&quot;)
+for node, times in intra.items():
+    print(f&quot;  {node}  中位数 {statistics.median(times)*1e3:6.1f} ms  &quot;
+          f&quot;最大 {max(times)*1e3:6.1f} ms  极差 {(max(times)-min(times))*1e3:5.1f} ms&quot;)
+allt = [t for v in intra.values() for t in v]
+med, n1 = statistics.median(allt), statistics.median(intra[&quot;node1&quot;])
+print(f&quot;  全体中位数 {med*1e3:.1f} ms；node1 的 4 张卡高出 {(n1-med)*1e3:+.0f} ms&quot;)
+print(&quot;  判读：同节点内一半卡偏慢 → 先查该节点的供电/散热/PCIe 链路，而不是网络&quot;)
+
+# ===== 示例 3：强/弱扩展的判据（计算项 + 通信项的解析模型，参数为示例量级） =====
+import math
+C_PER_SEQ = 0.020      # 每序列前反向时间 (s)，示例
+T_COMM0  = 0.05        # 单卡基线的固定通信开销 (s)，示例
+K_COMM   = 0.010       # 每翻一倍卡数，通信税增益 (s)，示例：T_comm = T_COMM0 + K_COMM*log2(P)
+
+def t_step(micro, p):
+    &quot;&quot;&quot;单步 = 每卡计算（micro 序列）+ 通信（随 P 对数增长）。&quot;&quot;&quot;
+    return micro * C_PER_SEQ + T_COMM0 + K_COMM * math.log2(p)
+
+print(&quot;\n示例 3A：弱扩展（每卡 micro-batch 固定 = 2，全局 batch 随 P 增长）&quot;)
+print(&quot;     P   实测单步   相对 P=8 的增量   弱扩展效率&quot;)
+t8 = t_step(2, 8)
+for p in (8, 16, 32, 64, 128):
+    t = t_step(2, p)
+    print(f&quot;  {p:&gt;5}  {t:7.3f} s   {t-t8:+8.3f} s        {t8/t*100:5.1f}%&quot;)
+
+print(&quot;\n示例 3B：强扩展（全局 batch 固定 512 序列，micro = 512/P）&quot;)
+TOTAL = 512
+print(&quot;     P   每卡 micro   实测单步   理想单步   加速效率&quot;)
+for p in (8, 16, 32, 64, 128):
+    t = t_step(TOTAL / p, p)
+    ideal = t_step(TOTAL / 8, 8) * 8 / p
+    print(f&quot;  {p:&gt;5}  {TOTAL/p:9.1f}   {t:7.3f} s   {ideal:7.3f} s   {ideal/t*100:5.1f}%&quot;)
+print(&quot;  判读：卡数越多，每卡那份计算越小，固定的通信项占比越高 → 强扩展效率必然下滑&quot;)</code></pre>
+<p>在 Python 3.14.5（仅标准库）下实际运行结果：</p>
+<pre data-lang="text"><code class="language-text">示例 1：96 卡同步训练，1 个 rank 慢 50%
+  全部正常单步        600.0 ms
+  有一个慢 rank       850.0 ms
+  整组吞吐下降       29.4%   ← 1/96 的卡拖慢全部 96 张
+  按 24h 计，这一步多花的 GPU 时间 =   576.0 GPU·h
+
+  另一个角度：节点内 DP=8，最慢卡是平均的几倍 → 整组损失多少
+    最慢是平均的 1.10× → 单步  610.0 ms，损失   8.2%
+    最慢是平均的 1.25× → 单步  685.0 ms，损失  18.2%
+    最慢是平均的 1.50× → 单步  810.0 ms，损失  30.9%
+    最慢是平均的 2.00× → 单步 1060.0 ms，损失  47.2%
+    最慢是平均的 4.00× → 单步 2060.0 ms，损失  72.8%
+
+示例 2：按 rank 分组统计单步时间，区分“卡慢”与“通信慢”
+  node0  中位数  501.0 ms  最大  503.0 ms  极差   3.0 ms
+  node1  中位数  621.5 ms  最大  742.0 ms  极差 241.0 ms
+  node2  中位数  501.5 ms  最大  503.0 ms  极差   3.0 ms
+  全体中位数 502.0 ms；node1 的 4 张卡高出 +119 ms
+  判读：同节点内一半卡偏慢 → 先查该节点的供电/散热/PCIe 链路，而不是网络
+
+示例 3A：弱扩展（每卡 micro-batch 固定 = 2，全局 batch 随 P 增长）
+     P   实测单步   相对 P=8 的增量   弱扩展效率
+      8    0.120 s     +0.000 s        100.0%
+     16    0.130 s     +0.010 s         92.3%
+     32    0.140 s     +0.020 s         85.7%
+     64    0.150 s     +0.030 s         80.0%
+    128    0.160 s     +0.040 s         75.0%
+
+示例 3B：强扩展（全局 batch 固定 512 序列，micro = 512/P）
+     P   每卡 micro   实测单步   理想单步   加速效率
+      8       64.0     1.360 s     1.360 s   100.0%
+     16       32.0     0.730 s     0.680 s    93.2%
+     32       16.0     0.420 s     0.340 s    81.0%
+     64        8.0     0.270 s     0.170 s    63.0%
+    128        4.0     0.200 s     0.085 s    42.5%
+  判读：卡数越多，每卡那份计算越小，固定的通信项占比越高 → 强扩展效率必然下滑</code></pre>
+<p>三段输出对应三条操作：<strong>慢节点按 rank 分布找，不能看平均</strong>；<strong>&quot;同一节点部分卡偏慢&quot;与&quot;全部卡一起偏慢&quot;指向不同的层</strong>；<strong>报回归必须附上扩展效率的定义与标定点</strong>。</p>
+<p><strong>可选，需自备或云上按需 1~2 卡</strong>（没有卡也能学完本课）：硬件证据链先在一台机器跑通，再推广到多机：</p>
+<pre data-lang="bash"><code class="language-bash"># 1) 拓扑与 P2P：每台机器都要对拍，不要只查一台
+nvidia-smi topo -m            # NV# = NVLink，PIX/PHB = 过 PCIe switch，SYS = 跨 NUMA
+nvidia-smi topo -p2p n        # 逐对确认 NVLink P2P 是否 OK
+# 2) 跨机点对点带宽/延迟（单卡即可跑，对端可在同机或用 2 卡）
+ib_write_bw -d mlx5_0 --report_gbits        # 带宽
+ib_write_lat -d mlx5_0                       # 延迟
+# 3) 集合通信对拍：先在单机看基线，再跨机看衰减
+git clone https://github.com/NVIDIA/nccl-tests &amp;&amp; cd nccl-tests &amp;&amp; make MPI=1
+./build/all_reduce_perf -b 8 -e 128M -f 2 -g 2
+mpirun -np 16 -H node0:8,node1:8 ./build/all_reduce_perf -b 8 -e 128M -f 2 -g 1
+# 判读：跨机 busbw 相比单机腰斩且与消息大小无关 → 先查 rail/网卡绑定，不要调 Python
+# 4) 超时的取证（PyTorch 侧的 NCCL flight recorder）
+TORCH_NCCL_TRACE_BUFFER_SIZE=1048576 TORCH_NCCL_DUMP_ON_TIMEOUT=1 torchrun ... train.py
+# 它会在超时时把各 rank 的集合通信调用序列落盘，用来回答“谁没到集合点”</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：写一个 <code>find_stragglers(per_rank_step_times, node_of_rank)</code>，输出三类结论：全局离群 rank、节点内一致偏慢的节点、&quot;全部一起变慢&quot;。用示例 2 的数据验证它能识别 node1。</li>
+<li><strong>解释</strong>：为什么&quot;平均单步时间&quot;这个指标在 96 卡规模上几乎测不出一个慢 50% 的 rank？给出具体数字（用示例 1 的数据算平均值的变化幅度）。</li>
+<li><strong>对比/验证</strong>：把示例 3 的 <code>K_COMM</code> 从 0.010 改成 0.002 与 0.050，重算 3A 与 3B 两表；说明 <code>K_COMM</code> 在真实系统里对应什么（提示：梯度 AllReduce、TP AllReduce、EP AllToAll 各增长多快）。</li>
+<li><strong>思考</strong>：某次实验把 PP 从 4 加到 8，吞吐反而下降。列出三种可能原因（气泡、通信、负载不均），并各给一个只用日志或 <code>nccl-tests</code> 就能完成的判别实验。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>NVIDIA, <em>NCCL User Guide</em> —「Troubleshooting / Logging」（<code>NCCL_DEBUG</code>、<code>NCCL_DEBUG_SUBSYS=INIT,GRAPH,TUNING</code> 的日志口径与超时排查路径；本课第 4、6 节的依据）：<a href="https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/troubleshooting.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/troubleshooting.html</a></li>
+<li>NVIDIA, <em>NCCL User Guide</em> —「Environment Variables」（<code>NCCL_TOPO_FILE</code>、<code>NCCL_CROSS_NIC</code> 等拓扑相关变量的官方定义；本课第 4 节拓扑错配的依据）：<a href="https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html</a></li>
+<li>PyTorch, <em>PYTORCH ProcessGroupNCCL Environment Variables</em>（<code>TORCH_NCCL_TRACE_BUFFER_SIZE</code> / <code>TORCH_NCCL_DUMP_ON_TIMEOUT</code> 等 flight recorder 与超时取证变量的官方说明；本课第 6 节与&quot;可选&quot;一节的依据）：<a href="https://docs.pytorch.org/docs/stable/torch_nccl_environment_variables.html" target="_blank" rel="noopener noreferrer">https://docs.pytorch.org/docs/stable/torch_nccl_environment_variables.html</a></li>
+<li>NVIDIA, <em>Megatron Core Developer Guide</em> —「Parallelism Strategies Guide / Communication Bottlenecks」（通信瓶颈的官方排查顺序：降 TP、增 PP、用 CP 替代更大 TP；本课第 5 节的依据）：<a href="https://docs.nvidia.com/megatron-core/developer-guide/latest/user-guide/parallelism-guide.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/megatron-core/developer-guide/latest/user-guide/parallelism-guide.html</a></li>
+</ul>
+<p><a href="#/l/dts-ch8-l1">下一章：三本账、成本与项目</a></p>

@@ -1,0 +1,816 @@
+<h2 id="h-影子流量与灰度放量放多少看什么指标什么时候可以停">影子流量与灰度放量：放多少、看什么指标、什么时候可以停<a class="anchor" href="#h-影子流量与灰度放量放多少看什么指标什么时候可以停" aria-label="本节链接">#</a></h2>
+<h3 id="h-这一节要解决什么">这一节要解决什么<a class="anchor" href="#h-这一节要解决什么" aria-label="本节链接">#</a></h3>
+<p>第 2 节把离线门禁写成了可复算的判据，但离线评测集永远只是线上分布的一个<strong>样本</strong>。三类偏差让&quot;离线通过&quot;和&quot;线上没事&quot;之间始终有缝：</p>
+<table>
+<thead>
+<tr>
+<th>偏差</th>
+<th>机制</th>
+<th>离线门禁能发现吗</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>分布偏差</strong></td>
+<td>评测集由人工/历史构造，与真实流量分布不同</td>
+<td>不能（除非在线数据回灌）</td>
+</tr>
+<tr>
+<td><strong>选择偏差</strong></td>
+<td>评测集里的样本是被挑出来的（难的、典型的）</td>
+<td>不能</td>
+</tr>
+<tr>
+<td><strong>系统偏差</strong></td>
+<td>离线没有真实并发、缓存、超时、限流、下游依赖</td>
+<td>不能</td>
+</tr>
+</tbody></table>
+<p>所以门禁必须推出到线上。本节处理<strong>发布门禁（G4）</strong>：影子流量与灰度放量。三个必须量化的问题：</p>
+<ol>
+<li><strong>放多少</strong>：1% 还是 10%？总样本 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span></span></span></span> 要多大才能判出关心的劣化？为什么&quot;对照组只占 1%&quot;会让所需样本量涨到接近 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">6</span></span></span></span></span></span></span></span></span></span></span>？</li>
+<li><strong>看什么</strong>：小流量阶段主指标判不动时，该看哪些指标（护栏、分歧率、p99）？<strong>不同阶段该看不同指标</strong>，混着看会得出错误结论。</li>
+<li><strong>什么时候可以停</strong>：连续观察数据必然导致 FWER 膨胀；预定 look + <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mord">/</span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 花费怎么设计？SPRT 的收益与代价在哪？</li>
+</ol>
+<p>一句话给出本节的结论：<strong>灰度不是&quot;小步上线&quot;的仪式，而是一次有明确样本量、明确分配单元、明确停止边界的实验；放量比例的每一个台阶只回答一个特定的问题，用错阶段看错指标，比不看更危险。</strong></p>
+<h3 id="h-一影子流量与灰度流量能回答的问题不一样">一、影子流量与灰度流量：能回答的问题不一样<a class="anchor" href="#h-一影子流量与灰度流量能回答的问题不一样" aria-label="本节链接">#</a></h3>
+<h4 id="h-11-三种流量形态">1.1 三种流量形态<a class="anchor" href="#h-11-三种流量形态" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>形态</th>
+<th>用户可见</th>
+<th>流量</th>
+<th>能回答</th>
+<th>不能回答</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>影子（shadow）</strong></td>
+<td>否</td>
+<td>100%（复制）</td>
+<td>新旧模型的<strong>分歧率</strong>、异常率、延迟、成本、崩溃</td>
+<td>任何业务影响（用户看不到）</td>
+</tr>
+<tr>
+<td><strong>灰度（canary）</strong></td>
+<td>是</td>
+<td>1%→100% 逐级</td>
+<td>护栏劣化（粗效应）、最终的业务指标</td>
+<td>小流量下的细效应</td>
+</tr>
+<tr>
+<td><strong>全量 A/B</strong></td>
+<td>是</td>
+<td>50/50</td>
+<td>主指标的精细效应</td>
+<td>成本最高，且长期不公平</td>
+</tr>
+</tbody></table>
+<p><strong>影子流量最容易被误用</strong>：因为它全量、&quot;无风险&quot;，团队常把它当成&quot;免费的全量评测&quot;。它的结构性局限是<strong>没有用户反应</strong>——你只能比较&quot;两个模型输出一不一样&quot;&quot;延迟高不高&quot;，不能比较&quot;用户更满意吗&quot;。它能抓住的是<strong>分歧与荒诞</strong>（&quot;两个模型在 12% 的请求上给出完全不同的答案，其中 3% 是明显错误&quot;），而不是价值。</p>
+<h4 id="h-12-影子流量的三个可算判据">1.2 影子流量的三个可算判据<a class="anchor" href="#h-12-影子流量的三个可算判据" aria-label="本节链接">#</a></h4>
+<p><strong>(a) 分歧率</strong>。定义新旧模型输出不一致的比例 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">d</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>。要检测&quot;分歧率比预期上升了 50%&quot;（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">1.5</span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>），两比例样本量（对等分配、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.05</span></span></span></span>、power 0.80）代码实测：</p>
+<pre data-lang="text"><code class="language-text">      影子分歧率 p0  p1 = 1.5 p0         所需样本     1e6/天 → 天
+        0.500%       0.750%        24574          0.02
+        1.000%       1.500%        12208          0.01
+        5.000%       7.500%         2318          0.00</code></pre>
+<p>影子拿到全量流量，所以<strong>罕见事件（0.5% 量级）在几分钟内可判</strong> —— 这是它相对灰度的最大优势。</p>
+<p><strong>(b) 影子与生产的差异率</strong>。更常用的是&quot;影子输出与外发输出的差异率&quot;（shadow divergence），它同时是<strong>正确性探针</strong>：差异率高不一定是坏事（可能新模型更好），但<strong>差异率突然跳变</strong>一定是坏事（换版本、缓存错位、prompt 没同步）。</p>
+<p><strong>(c) 成本差</strong>。影子流量跑在真实流量上，token/算力/延迟都是真实成本：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord">Δ</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">shadow</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord text"><span class="mord">TPS</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">shadow</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord"><span class="mord text"><span class="mord cjk_fallback">单请求成本</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">new</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord text"><span class="mord cjk_fallback">单请求成本</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">old</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span></span></span></span></span></p>
+<p>这一项经常是<strong>放弃影子、改小流量灰度</strong>的真实原因：纯复制一份线上流量，成本翻倍。</p>
+<h4 id="h-13-分配单元请求用户还是会话">1.3 分配单元：请求、用户还是会话<a class="anchor" href="#h-13-分配单元请求用户还是会话" aria-label="本节链接">#</a></h4>
+<p>这是灰度设计里最容易被忽略、后果最严重的一个决定：</p>
+<table>
+<thead>
+<tr>
+<th>分配单元</th>
+<th>一致性</th>
+<th>独立性（无干扰）</th>
+<th>适用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>请求级</strong></td>
+<td>同一用户可能被分到两组</td>
+<td>会话内污染（同一段对话换模型）</td>
+<td>无状态、单轮任务</td>
+</tr>
+<tr>
+<td><strong>用户级</strong></td>
+<td>同一用户始终一组</td>
+<td>用户间仍可能有社交干扰</td>
+<td>大多数推荐/搜索/对话</td>
+</tr>
+<tr>
+<td><strong>会话级</strong></td>
+<td>同一会话一组</td>
+<td>会话间干扰小</td>
+<td>多轮对话</td>
+</tr>
+<tr>
+<td><strong>时间片/区域</strong></td>
+<td>同一切片内一致</td>
+<td><strong>避免不了跨切片污染</strong></td>
+<td>无法按用户分流（缓存、频道）</td>
+</tr>
+</tbody></table>
+<p>选择规则：<strong>随机化单元必须 ≥ 干扰的作用范围</strong>。如果新模型的效果会通过&quot;用户下一次访问&quot;体现，请求级分流会让你把效果平均掉；如果同一个会话里来回换模型，用户体验会直接崩。</p>
+<p><strong>一致性的实现</strong>（本节代码）：</p>
+<pre data-lang="python"><code class="language-python">def bucket(key, salt, buckets=10000):
+    h = hashlib.md5(f&quot;{salt}:{key}&quot;.encode()).hexdigest()
+    return int(h[:8], 16) % buckets</code></pre>
+<p>同一 <code>key</code> 永远落同一桶，网关本地一次哈希 + 取模即可，无需中心查询。实测输出：</p>
+<pre data-lang="text"><code class="language-text">  key=user-0000  桶= 7121  进 1%: False  进 5%: False  重复一致: True
+  key=user-0001  桶= 5773  进 1%: False  进 5%: False  重复一致: True
+  key=user-0002  桶= 5557  进 1%: False  进 5%: False  重复一致: True
+  key=req-00000  桶=  870  进 1%: False  进 5%: False  重复一致: True
+  key=req-00001  桶= 2800  进 1%: False  进 5%: False  重复一致: True</code></pre>
+<p>两个工程细节：</p>
+<ol>
+<li><strong><code>salt</code> 就是&quot;实验边界&quot;</strong>：换 salt = 重新分流。发布新实验必须换 salt，否则会把上一轮实验的分组带进来（同一批用户永远当小白鼠）。</li>
+<li><strong>桶数取 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">4</span></span></span></span></span></span></span></span></span></span></span> 而不是 100</strong>：为了支持 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">0.01%</span></span></span></span> 级别的细粒度放量（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">4</span></span></span></span></span></span></span></span></span></span></span> 桶 = 0.01% 分辨率），同时保持整数比较的零开销。</li>
+</ol>
+<h3 id="h-二放多少样本量与分配比">二、放多少：样本量与分配比<a class="anchor" href="#h-二放多少样本量与分配比" aria-label="本节链接">#</a></h3>
+<h4 id="h-21-样本量公式不对等分配">2.1 样本量公式（不对等分配）<a class="anchor" href="#h-21-样本量公式不对等分配" aria-label="本节链接">#</a></h4>
+<p>对照组占比 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span></span></span></span>（通常 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5782em;vertical-align:-0.0391em;"></span><span class="mord mathnormal">s</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≪</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span>，因为要尽量让新模型服务用户），要检出 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">→</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:4.404em;vertical-align:-1.85em;"></span><span class="minner"><span class="minner"><span class="mopen"><span class="delimsizing mult"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:2.35em;"><span style="top:-4.35em;"><span class="pstrut" style="height:6.2em;"></span><span style="width:0.875em;height:4.2em;"><svg xmlns="http://www.w3.org/2000/svg" width="0.875em" height="4.2em" viewBox="0 0 875 4200"><path d="M863,9c0,-2,-2,-5,-6,-9c0,0,-17,0,-17,0c-12.7,0,-19.3,0.3,-20,1
+c-5.3,5.3,-10.3,11,-15,17c-242.7,294.7,-395.3,682,-458,1162c-21.3,163.3,-33.3,349,
+-36,557 l0,684c0.2,6,0,26,0,60c2,159.3,10,310.7,24,454c53.3,528,210,
+949.7,470,1265c4.7,6,9.7,11.7,15,17c0.7,0.7,7,1,19,1c0,0,18,0,18,0c4,-4,6,-7,6,-9
+c0,-2.7,-3.3,-8.7,-10,-18c-135.3,-192.7,-235.5,-414.3,-300.5,-665c-65,-250.7,-102.5,
+-544.7,-112.5,-882c-2,-104,-3,-167,-3,-189
+l0,-692c0,-162.7,5.7,-314,17,-454c20.7,-272,63.7,-513,129,-723c65.3,
+-210,155.3,-396.3,270,-559c6.7,-9.3,10,-15.3,10,-18z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.85em;"><span></span></span></span></span></span></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:2.31em;"><span style="top:-2.6023em;"><span class="pstrut" style="height:3.2883em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span><span style="top:-3.5183em;"><span class="pstrut" style="height:3.2883em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-4.31em;"><span class="pstrut" style="height:3.2883em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal" style="margin-right:0.044em;">z</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.044em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">1</span><span class="mbin mtight">−</span><span class="mord mathnormal mtight" style="margin-right:0.0037em;">α</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2083em;"><span></span></span></span></span></span></span><span class="mord sqrt"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.2083em;"><span class="svg-align" style="top:-3.8em;"><span class="pstrut" style="height:3.8em;"></span><span class="mord" style="padding-left:1em;"><span class="mord accent"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.5678em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal">p</span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.1667em;"><span class="mord">ˉ</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.1944em;"><span></span></span></span></span></span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord accent"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.5678em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal">p</span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.1667em;"><span class="mord">ˉ</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.1944em;"><span></span></span></span></span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="minner"><span class="mopen delimcenter" style="top:0em;"><span class="delimsizing size1">(</span></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8451em;"><span style="top:-2.655em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">s</span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.394em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.345em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8451em;"><span style="top:-2.655em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">1</span><span class="mbin mtight">−</span><span class="mord mathnormal mtight">s</span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.394em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.4033em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mclose delimcenter" style="top:0em;"><span class="delimsizing size1">)</span></span></span></span></span><span style="top:-3.1683em;"><span class="pstrut" style="height:3.8em;"></span><span class="hide-tail" style="min-width:1.02em;height:1.88em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="1.88em" viewBox="0 0 400000 1944" preserveAspectRatio="xMinYMin slice"><path d="M983 90
+l0 -0
+c4,-6.7,10,-10,18,-10 H400000v40
+H1013.1s-83.4,268,-264.1,840c-180.7,572,-277,876.3,-289,913c-4.7,4.7,-12.7,7,-24,7
+s-12,0,-12,0c-1.3,-3.3,-3.7,-11.7,-7,-25c-35.3,-125.3,-106.7,-373.3,-214,-744
+c-10,12,-21,25,-33,39s-32,39,-32,39c-6,-5.3,-15,-14,-27,-26s25,-30,25,-30
+c26.7,-32.7,52,-63,76,-91s52,-60,52,-60s208,722,208,722
+c56,-175.3,126.3,-397.3,211,-666c84.7,-268.7,153.8,-488.2,207.5,-658.5
+c53.7,-170.3,84.5,-266.8,92.5,-289.5z
+M1001 80h400000v40h-400000z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.6317em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.044em;">z</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.044em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">1</span><span class="mbin mtight">−</span><span class="mord mathnormal mtight" style="margin-right:0.0528em;">β</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mord sqrt"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.2883em;"><span class="svg-align" style="top:-3.8em;"><span class="pstrut" style="height:3.8em;"></span><span class="mord" style="padding-left:1em;"><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.01em;"><span style="top:-2.655em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">s</span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.485em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight"><span class="mord mathnormal mtight">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3173em;"><span style="top:-2.357em;margin-left:0em;margin-right:0.0714em;"><span class="pstrut" style="height:2.5em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.143em;"><span></span></span></span></span></span></span><span class="mopen mtight">(</span><span class="mord mtight">1</span><span class="mbin mtight">−</span><span class="mord mtight"><span class="mord mathnormal mtight">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3173em;"><span style="top:-2.357em;margin-left:0em;margin-right:0.0714em;"><span class="pstrut" style="height:2.5em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.143em;"><span></span></span></span></span></span></span><span class="mclose mtight">)</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.345em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.01em;"><span style="top:-2.655em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">1</span><span class="mbin mtight">−</span><span class="mord mathnormal mtight">s</span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.485em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight"><span class="mord mathnormal mtight">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3173em;"><span style="top:-2.357em;margin-left:0em;margin-right:0.0714em;"><span class="pstrut" style="height:2.5em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.143em;"><span></span></span></span></span></span></span><span class="mopen mtight">(</span><span class="mord mtight">1</span><span class="mbin mtight">−</span><span class="mord mtight"><span class="mord mathnormal mtight">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3173em;"><span style="top:-2.357em;margin-left:0em;margin-right:0.0714em;"><span class="pstrut" style="height:2.5em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.143em;"><span></span></span></span></span></span></span><span class="mclose mtight">)</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.4033em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span><span style="top:-3.2483em;"><span class="pstrut" style="height:3.8em;"></span><span class="hide-tail" style="min-width:1.02em;height:1.88em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="1.88em" viewBox="0 0 400000 1944" preserveAspectRatio="xMinYMin slice"><path d="M983 90
+l0 -0
+c4,-6.7,10,-10,18,-10 H400000v40
+H1013.1s-83.4,268,-264.1,840c-180.7,572,-277,876.3,-289,913c-4.7,4.7,-12.7,7,-24,7
+s-12,0,-12,0c-1.3,-3.3,-3.7,-11.7,-7,-25c-35.3,-125.3,-106.7,-373.3,-214,-744
+c-10,12,-21,25,-33,39s-32,39,-32,39c-6,-5.3,-15,-14,-27,-26s25,-30,25,-30
+c26.7,-32.7,52,-63,76,-91s52,-60,52,-60s208,722,208,722
+c56,-175.3,126.3,-397.3,211,-666c84.7,-268.7,153.8,-488.2,207.5,-658.5
+c53.7,-170.3,84.5,-266.8,92.5,-289.5z
+M1001 80h400000v40h-400000z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.5517em;"><span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.8804em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mclose"><span class="delimsizing mult"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:2.35em;"><span style="top:-4.35em;"><span class="pstrut" style="height:6.2em;"></span><span style="width:0.875em;height:4.2em;"><svg xmlns="http://www.w3.org/2000/svg" width="0.875em" height="4.2em" viewBox="0 0 875 4200"><path d="M76,0c-16.7,0,-25,3,-25,9c0,2,2,6.3,6,13c21.3,28.7,42.3,60.3,
+63,95c96.7,156.7,172.8,332.5,228.5,527.5c55.7,195,92.8,416.5,111.5,664.5
+c11.3,139.3,17,290.7,17,454c0,28,1.7,43,3.3,45l0,609
+c-3,4,-3.3,16.7,-3.3,38c0,162,-5.7,313.7,-17,455c-18.7,248,-55.8,469.3,-111.5,664
+c-55.7,194.7,-131.8,370.3,-228.5,527c-20.7,34.7,-41.7,66.3,-63,95c-2,3.3,-4,7,-6,11
+c0,7.3,5.7,11,17,11c0,0,11,0,11,0c9.3,0,14.3,-0.3,15,-1c5.3,-5.3,10.3,-11,15,-17
+c242.7,-294.7,395.3,-681.7,458,-1161c21.3,-164.7,33.3,-350.7,36,-558
+l0,-744c-2,-159.3,-10,-310.7,-24,-454c-53.3,-528,-210,-949.7,
+-470,-1265c-4.7,-6,-9.7,-11.7,-15,-17c-0.7,-0.7,-6.7,-1,-18,-1z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.85em;"><span></span></span></span></span></span></span></span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:2.554em;"><span style="top:-4.8029em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span></span></p>
+<p>注意两个标准差用的是<strong>不同的假设</strong>：第一项是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0813em;">H</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.0813em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 下的池化比例，第二项是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0813em;">H</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.0813em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 下各自的方差。<strong>只用池化比例（把 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0813em;">H</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.0813em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 的标准误用在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0813em;">H</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.0813em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 上）会系统性低估样本量</strong> —— 这是实现里最常见的错误之一，本节代码第 2/3/4 节的数字都用了正确的混合形式。</p>
+<p>代码实测（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">0.5%</span></span></span></span>，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.05</span></span></span></span>，power 0.80，对等分配）：</p>
+<table>
+<thead>
+<tr>
+<th>劣化 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0379em;">δ</span></span></span></span></th>
+<th><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span></th>
+<th>总样本 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span></span></span></span></th>
+<th>对照组（50%）</th>
+<th>实验组</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>0.1pp</td>
+<td>0.0060</td>
+<td>135266</td>
+<td>67633</td>
+<td>67633</td>
+</tr>
+<tr>
+<td>0.2pp</td>
+<td>0.0070</td>
+<td>36871</td>
+<td>18435</td>
+<td>18435</td>
+</tr>
+<tr>
+<td>0.5pp</td>
+<td>0.0100</td>
+<td>7361</td>
+<td>3681</td>
+<td>3681</td>
+</tr>
+<tr>
+<td>1.0pp</td>
+<td>0.0150</td>
+<td>2446</td>
+<td>1223</td>
+<td>1223</td>
+</tr>
+</tbody></table>
+<p><strong>分配比的影响</strong>（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0379em;">δ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">+</span><span class="mord">0.2</span></span></span></span>pp）：</p>
+<table>
+<thead>
+<tr>
+<th>对照组占比 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span></span></span></span></th>
+<th>总样本 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span></span></span></span></th>
+<th>对照组 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span></th>
+<th>实验组 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span></th>
+<th>1e6 请求/天 → 天</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>0.50</td>
+<td>36871</td>
+<td>18435</td>
+<td>18435</td>
+<td>0.0</td>
+</tr>
+<tr>
+<td>0.10</td>
+<td>106391</td>
+<td>10639</td>
+<td>95752</td>
+<td>0.1</td>
+</tr>
+<tr>
+<td>0.01</td>
+<td>974279</td>
+<td>9743</td>
+<td>964536</td>
+<td>1.0</td>
+</tr>
+</tbody></table>
+<p>这张表给出一个反直觉但正确的结论：<strong>把对照组从 50% 压到 1%，只需要多约 26 倍的流量（不是 50 倍）</strong>，因为对照组虽然少，实验组变大了、方差下降。但要小心：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">1%</span></span></span></span> 时<strong>对照组的绝对样本数只有 9743</strong>，它在 0.5% 基线下的期望错误数只有约 49 次 —— 小样本下的比例估计很不稳，实际用时应当留一点余量（例如 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">5%</span></span></span></span>）。</p>
+<h4 id="h-22-小流量阶段的判别力mde-表">2.2 小流量阶段的判别力：MDE 表<a class="anchor" href="#h-22-小流量阶段的判别力mde-表" aria-label="本节链接">#</a></h4>
+<p>固定流量上限（只放 1%），能判出什么？代码实测：</p>
+<table>
+<thead>
+<tr>
+<th>总样本 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span></span></span></span></th>
+<th>MDE（pp）</th>
+<th>功效（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0379em;">δ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">+</span><span class="mord">0.2</span></span></span></span>pp）</th>
+<th>功效（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0379em;">δ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">+</span><span class="mord">1</span></span></span></span>pp）</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">5</span></span></span></span></span></span></span></span></span></span></span></td>
+<td>0.557</td>
+<td>0.2253</td>
+<td>0.9972</td>
+</tr>
+<tr>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">6</span></span></span></span></span></span></span></span></span></span></span></td>
+<td>0.176</td>
+<td>0.8792</td>
+<td>1.0000</td>
+</tr>
+<tr>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">7</span></span></span></span></span></span></span></span></span></span></span></td>
+<td>0.056</td>
+<td>1.0000</td>
+<td>1.0000</td>
+</tr>
+<tr>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">8</span></span></span></span></span></span></span></span></span></span></span></td>
+<td>0.018</td>
+<td>1.0000</td>
+<td>1.0000</td>
+</tr>
+</tbody></table>
+<p>读法：</p>
+<ul>
+<li><strong><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">6</span></span></span></span></span></span></span></span></span></span></span> 时 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">+</span><span class="mord">0.2</span></span></span></span>pp 的功效是 0.879，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">+</span><span class="mord">1</span></span></span></span>pp 是 1.000。</strong> 所以&quot;1% 流量放一天&quot;能可靠抓出<strong>粗</strong>的劣化，抓细效应则要看运气；</li>
+<li><strong><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">5</span></span></span></span></span></span></span></span></span></span></span> 时 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">+</span><span class="mord">0.2</span></span></span></span>pp 的功效只剩 0.225。</strong> 如果 1% 流量只跑了几个小时就下结论&quot;没变差&quot;，那是<strong>证据不足</strong>，不是&quot;安全&quot;（第 2 节的纪律在这里再次生效：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span></span></span></span> 不显著 ≠ 等价）。</li>
+</ul>
+<p><strong>分阶段的正确用法</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>流量</th>
+<th>该回答的问题</th>
+<th>判据</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>影子</td>
+<td>100%</td>
+<td>新旧输出是否异常分歧？延迟/成本是否达标？</td>
+<td>分歧率、p99、错误率（粗效应）</td>
+</tr>
+<tr>
+<td>1%</td>
+<td>1%</td>
+<td>会不会崩？护栏是否劣化？</td>
+<td>护栏（粗效应，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8193em;vertical-align:-0.136em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≥</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">6</span></span></span></span></span></span></span></span></span></span></span>）</td>
+</tr>
+<tr>
+<td>5–20%</td>
+<td>逐级</td>
+<td>主指标是否有信号？</td>
+<td>主指标（中等效应）</td>
+</tr>
+<tr>
+<td>50%+</td>
+<td>持续</td>
+<td>主指标是否显著改善？</td>
+<td>主指标 + 护栏（第 2 节的全套判据）</td>
+</tr>
+</tbody></table>
+<p><strong>一张表只做一件事</strong>：让 1% 阶段去回答&quot;主指标有没有提升&quot;，是最常见的灰度误用 —— 它在样本量上必然失败。</p>
+<h3 id="h-三什么时候可以停预定-look-与--花费">三、什么时候可以停：预定 look 与 α 花费<a class="anchor" href="#h-三什么时候可以停预定-look-与--花费" aria-label="本节链接">#</a></h3>
+<h4 id="h-31-多看几眼的代价">3.1 多看几眼的代价<a class="anchor" href="#h-31-多看几眼的代价" aria-label="本节链接">#</a></h4>
+<p>流水线上的真实行为是&quot;数据分批回来，每批看一眼&quot;。<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 次查看、每次都用 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span> 的代价：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord">FWER</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.1491em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mclose"><span class="mclose">)</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8991em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0315em;">k</span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:1em;"></span><span class="mopen">(</span><span class="mord text"><span class="mord cjk_fallback">独立</span></span><span class="mclose">)</span><span class="mspace" style="margin-right:1em;"></span><span class="mord text"><span class="mord cjk_fallback">或更大（正相关时）</span></span></span></span></span></span></p>
+<p>等额花费方案（每次用 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mord">/</span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span>）代码实测（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0379em;">δ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">+</span><span class="mord">0.2</span></span></span></span>pp、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">0.5%</span></span></span></span>）：</p>
+<table>
+<thead>
+<tr>
+<th>查看次数 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span></th>
+<th>每次 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mord">/</span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span></th>
+<th><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.044em;">z</span></span></span></span> 边界</th>
+<th>所需总样本</th>
+<th>相对单看</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1</td>
+<td>0.05000</td>
+<td>1.6449</td>
+<td>36871</td>
+<td>1.00×</td>
+</tr>
+<tr>
+<td>2</td>
+<td>0.02500</td>
+<td>1.9600</td>
+<td>46808</td>
+<td>1.27×</td>
+</tr>
+<tr>
+<td>4</td>
+<td>0.01250</td>
+<td>2.2414</td>
+<td>56685</td>
+<td>1.54×</td>
+</tr>
+<tr>
+<td>10</td>
+<td>0.00500</td>
+<td>2.5758</td>
+<td>69650</td>
+<td>1.89×</td>
+</tr>
+</tbody></table>
+<p><strong>多看不是更严谨，而是更贵</strong>：每次的阈值被推高，样本量按 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.044em;">z</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span> 增长。<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">10</span></span></span></span> 时样本量要 1.89 倍。所以正确做法是<strong>在实验开始前写死 look 计划</strong>（例如&quot;第 1 天和第 3 天各看一次&quot;），而不是&quot;每来一批数据看一眼&quot;。</p>
+<h4 id="h-32-一个可手算的两-look-设计">3.2 一个可手算的两 look 设计<a class="anchor" href="#h-32-一个可手算的两-look-设计" aria-label="本节链接">#</a></h4>
+<p>设计：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.05</span></span></span></span>、看 2 次、每次 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mord">/2</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.025</span></span></span></span>：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8193em;vertical-align:-0.136em;"></span><span class="mord text"><span class="mord">FWER</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≤</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.1141em;vertical-align:-0.25em;"></span><span class="mord">0.025</span><span class="mclose"><span class="mclose">)</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8641em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7804em;vertical-align:-0.136em;"></span><span class="mord">0.0494</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≤</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.05</span></span></span></span></span></p>
+<p>这是标准 group sequential 的最简形式，上界可用独立情形精确算出：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord">FWER</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mop">Pr</span><span class="mopen">(</span><span class="mord text"><span class="mord cjk_fallback">两次都不越界</span></span><span class="mclose">)</span></span></span></span>。</p>
+<h4 id="h-33-累积-z-轨迹真值不同路径完全不同">3.3 累积 z 轨迹：真值不同，路径完全不同<a class="anchor" href="#h-33-累积-z-轨迹真值不同路径完全不同" aria-label="本节链接">#</a></h4>
+<p>代码的合成轨迹（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">6</span></span></span></span></span></span></span></span></span></span></span>、1% 对照、固定种子 ⚠️，输出逐字）：</p>
+<pre data-lang="text"><code class="language-text">  真值无差         z: 200k:-2.10 → 400k:-2.02 → 600k:-2.10 → 800k:-2.10 → 1000k:-2.12
+               首次越界(z&gt;1.64): 未越界
+  真值 +0.2pp    z: 200k:0.56 → 400k:0.53 → 600k:0.48 → 800k:0.56 → 1000k:0.55
+               首次越界(z&gt;1.64): 未越界
+  真值 +1pp      z: 200k:6.90 → 400k:6.90 → 600k:6.89 → 800k:6.95 → 1000k:6.96
+               首次越界(z&gt;1.64): 第 10000 条（流量 1.0%）</code></pre>
+<p>三个读法：</p>
+<ol>
+<li><strong>真值无差时 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.044em;">z</span></span></span></span> 在 0 附近抖动</strong>：本路径落在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">−</span><span class="mord">2.1</span></span></span></span>（负号只表示方向），这是抽样噪声，<strong>不是&quot;候选更好&quot;的证据</strong> —— 差分方向事先定死（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5782em;vertical-align:-0.0391em;"></span><span class="mord mathnormal" style="margin-right:0.044em;">z</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&gt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0</span></span></span></span> 才算劣化），否则会犯&quot;看符号下结论&quot;的错。</li>
+<li><strong><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">+</span><span class="mord">1</span></span></span></span>pp 的期望 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4831em;"></span><span class="mord mathnormal" style="margin-right:0.044em;">z</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4.3</span></span></span></span></strong>（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.04em;vertical-align:-0.2395em;"></span><span class="mord sqrt"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8005em;"><span class="svg-align" style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord" style="padding-left:0.833em;"></span></span><span style="top:-2.7605em;"><span class="pstrut" style="height:3em;"></span><span class="hide-tail" style="min-width:0.853em;height:1.08em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="1.08em" viewBox="0 0 400000 1080" preserveAspectRatio="xMinYMin slice"><path d="M95,702
+c-2.7,0,-7.17,-2.7,-13.5,-8c-5.8,-5.3,-9.5,-10,-9.5,-14
+c0,-2,0.3,-3.3,1,-4c1.3,-2.7,23.83,-20.7,67.5,-54
+c44.2,-33.3,65.8,-50.3,66.5,-51c1.3,-1.3,3,-2,5,-2c4.7,0,8.7,3.3,12,10
+s173,378,173,378c0.7,0,35.3,-71,104,-213c68.7,-142,137.5,-285,206.5,-429
+c69,-144,104.5,-217.7,106.5,-221
+l0 -0
+c5.3,-9.3,12,-14,20,-14
+H400000v40H845.2724
+s-225.272,467,-225.272,467s-235,486,-235,486c-2.7,4.7,-9,7,-19,7
+c-6,0,-10,-1,-12,-3s-194,-422,-194,-422s-65,47,-65,47z
+M834 80h400000v40h-400000z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2395em;"><span></span></span></span></span></span></span></span></span> 量级的信息积累），在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">6</span></span></span></span></span></span></span></span></span></span></span> 内稳定越界 —— 本路径 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">6</span></span></span></span></span></span></span></span></span></span></span> 时约 7.0，比期望高是因为固定种子的单次抽样。</li>
+<li><strong><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">+</span><span class="mord">0.2</span></span></span></span>pp 的期望 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4831em;"></span><span class="mord mathnormal" style="margin-right:0.044em;">z</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6835em;vertical-align:-0.0391em;"></span><span class="mord">1.13</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&lt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1.645</span></span></span></span></strong>：即使跑满 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">6</span></span></span></span></span></span></span></span></span></span></span> 也判不动。要让 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.044em;">z</span></span></span></span> 到 2.4（有把握的检出）需要约 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0641em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord">2.4/1.13</span><span class="mclose"><span class="mclose">)</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4.5</span></span></span></span> 倍的样本（约 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">4.5</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">6</span></span></span></span></span></span></span></span></span></span></span>），这正是第 2 节 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">9.7</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">5</span></span></span></span></span></span></span></span></span></span></span> 与 80% 功效口径的对应关系。</li>
+</ol>
+<h4 id="h-34-误报率的核对">3.4 误报率的核对<a class="anchor" href="#h-34-误报率的核对" aria-label="本节链接">#</a></h4>
+<p>代码用 400 次独立模拟（真值无差、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">6</span></span></span></span></span></span></span></span></span></span></span> 样本、1% 对照、阈值 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5782em;vertical-align:-0.0391em;"></span><span class="mord mathnormal" style="margin-right:0.044em;">z</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&gt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1.96</span></span></span></span>）实测：</p>
+<pre data-lang="text"><code class="language-text">  单个 look（1e6 总样本、1% 对照）在真值无差下越界比例 = 0.015（阈值 α/2=0.025 → z&gt;1.960）
+  两 look 设计的 FWER 上界 = 1-(1-0.025)^2 = 0.0494；
+  无预定计划地滚动查看必须按 α/k 放大阈值，否则 FWER 会膨胀。</code></pre>
+<p>实测 0.015 低于名义 0.025，符合预期（两比例检验在小 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span></span></span></span>、极端分配下略保守；且 400 次模拟的蒙特卡洛标准误约 0.006）。<strong>关键纪律是</strong>：如果实现在每次数据到达时都检查一次（可能几百次），名义 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span> 完全失真 —— 这正是&quot;看到通过为止&quot;的统计后果。</p>
+<p><figure><img class="md-img" src="content/courses/mlops/assets/chapter-2-figure-04.svg" alt="预定两 look 与无计划滚动查看" loading="lazy" decoding="async"><figcaption>预定两 look 与无计划滚动查看</figcaption></figure>
+</p>
+<h3 id="h-四工程细节影子灰度必须对齐的四样东西">四、工程细节：影子/灰度必须对齐的四样东西<a class="anchor" href="#h-四工程细节影子灰度必须对齐的四样东西" aria-label="本节链接">#</a></h3>
+<p>灰度最容易失败的地方不是统计，而是<strong>一致性</strong>。发布一个模型，实际换掉的东西至少有四样，任何一样错位都会让灰度结论无效：</p>
+<table>
+<thead>
+<tr>
+<th>要对齐的</th>
+<th>错位后果</th>
+<th>检查方式</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>权重版本</strong></td>
+<td>实验组其实跑的是旧权重</td>
+<td>启动时上报 <code>weights_hash</code>，与 manifest 比对</td>
+</tr>
+<tr>
+<td><strong>tokenizer / prompt 模板</strong></td>
+<td>输出风格变了但权重没变，指标变化不可归因</td>
+<td>把模板哈希进 manifest（ch1-l2 的推理单元）</td>
+</tr>
+<tr>
+<td><strong>缓存 key</strong></td>
+<td>命中旧缓存 → 实验组看到旧模型的输出</td>
+<td>缓存 key 必须含 <code>manifest_hash</code>（第 4 节）</td>
+</tr>
+<tr>
+<td><strong>分流 salt</strong></td>
+<td>分组不稳定 / 实验间互相污染</td>
+<td>salt 随实验 ID 变化，落库可审计</td>
+</tr>
+</tbody></table>
+<p><strong>影子的额外要求</strong>：影子请求<strong>不能写回</strong>任何用户可见状态（对话历史、推荐曝光、计费）。一旦影子写入，你就污染了对照组，而且无法撤销 —— 这条纪律必须在代码层面强制（只读副本 + 独立事务）。</p>
+<h3 id="h-五取舍与边界">五、取舍与边界<a class="anchor" href="#h-五取舍与边界" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>影子流量的成本可能是双倍</strong>：全量复制意味着全量算力。实践中常用<strong>采样影子</strong>（复制 5%–10%）而不是全量，代价是罕见事件要更久才判得出。</li>
+<li><strong>一致性哈希不是免费的</strong>：每个请求多一次 MD5（约 µs 级）。在 p99 &lt; 10ms 的服务里可忽略，但在边缘设备/极低延迟路径上要用更便宜的哈希（murmur/xxhash）或<strong>预分桶</strong>（把用户 ID 预分配到固定桶）。</li>
+<li><strong><code>salt</code> 换了以后，&quot;同一用户&quot;的历史会断裂</strong>：长期指标（留存、复购）无法跨实验累积。所以<strong>长期指标要用固定分配单元 + 专门的 holdback 组</strong>（永久保留 1% 用户不用新模型），而不是靠每一轮灰度拼接。</li>
+<li><strong>灰度的&quot;停止&quot;有两种含义</strong>：<strong>统计停止</strong>（判据越界）与<strong>工程停止</strong>（护栏崩了，立即回滚）。后者不应等统计判据 —— 明确的熔断阈值（错误率 &gt; 1%、p99 &gt; 1.5 倍）要独立于实验设计。</li>
+<li><strong>网络效应/干扰</strong>：如果新模型会改变用户行为从而影响其他用户（社交、市场类产品），请求级/用户级分流都会<strong>低估或高估</strong>效应。可用 switchback（时间片轮换）或区域级分流，代价是样本量与方差都变差。</li>
+<li><strong>短期指标与长期指标的冲突</strong>：灰度看的是短期（点击、转化），而发布决策常常关心长期（留存、信任）。短期涨、长期跌是最贵的失败模式，唯一可靠的对策是<strong>holdback 组</strong>长期观测，而不是更长的灰度。</li>
+</ol>
+<h3 id="h-代码">代码<a class="anchor" href="#h-代码" aria-label="本节链接">#</a></h3>
+<p>本节代码只用标准库，覆盖：分阶段指标表、对等/不对等分配的样本量与 MDE、功效、α 花费的停止边界、确定性分流、累积 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.044em;">z</span></span></span></span> 轨迹、误报率蒙特卡洛、影子流量样本量。合成观测 ⚠️ 用固定种子生成，输出可逐字节复现。</p>
+<pre data-lang="python"><code class="language-python">&quot;&quot;&quot;第 2 章第 3 节：影子流量与灰度放量 —— 样本量、停止边界、分配一致性。
+
+只用标准库。合成数据 ⚠️ 与模拟均已标注（固定种子，可逐字节复现）。
+&quot;&quot;&quot;
+import hashlib
+import math
+import random
+
+# ------------------------------------------------------------------ 正态工具
+def phi(x):
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def z_quantile(p, lo=-40.0, hi=40.0):
+    for _ in range(200):
+        mid = (lo + hi) / 2
+        if phi(mid) &lt; p:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2
+
+
+# ------------------------------------------------- 分组样本量（不对等分配）
+def split_sample_size(p0, p1, s=0.5, alpha=0.05, power=0.80):
+    &quot;&quot;&quot;A/B 两比例、对照组占比 s。返回总样本 N。
+
+    标准两比例公式：H0 下用池化比例、H1 下用各自比例（混合标准差）。
+    只用池化比例（等价于把 H0 的 SE 用在 H1 上）会系统性低估 N。
+    &quot;&quot;&quot;
+    za, zb = z_quantile(1 - alpha), z_quantile(power)
+    pbar = s * p0 + (1 - s) * p1
+    se = math.sqrt(pbar * (1 - pbar) * (1 / s + 1 / (1 - s)))
+    se_alt = math.sqrt(p0 * (1 - p0) / s + p1 * (1 - p1) / (1 - s))
+    return ((za * se + zb * se_alt) / (p1 - p0)) ** 2
+
+
+def mde_two_prop(p0, N, s=0.5, alpha=0.05, power=0.80):
+    &quot;&quot;&quot;给定总样本 N 与分配比 s，反推可分辨的绝对差。&quot;&quot;&quot;
+    za, zb = z_quantile(1 - alpha), z_quantile(power)
+    se = math.sqrt(p0 * (1 - p0) * (1 / (s * N) + 1 / ((1 - s) * N)))
+    return (za + zb) * se
+
+
+def power_two_prop(p0, p1, N, s=0.5, alpha=0.05):
+    &quot;&quot;&quot;在真实差 p1-p0 下的功效：z 的期望 = (p1-p0)/SE_alt，判据阈值是 z_{1-α}。&quot;&quot;&quot;
+    se_alt = math.sqrt(p0 * (1 - p0) / (s * N) + p1 * (1 - p1) / ((1 - s) * N))
+    return 1 - phi(z_quantile(1 - alpha) - (p1 - p0) / se_alt)
+
+
+def z_test_worse(xb, nb, xc, nc):
+    &quot;&quot;&quot;H0: p_cand &lt;= p_base  vs  H1: p_cand &gt; p_base（候选更差才报警）。&quot;&quot;&quot;
+    pb, pc = xb / nb, xc / nc
+    pbar = (xb + xc) / (nb + nc)
+    se = math.sqrt(pbar * (1 - pbar) * (1 / nb + 1 / nc))
+    return (pc - pb) / se if se &gt; 0 else 0.0
+
+
+# ------------------------------------------------- 确定性分流（同一 key 一致）
+def bucket(key, salt, buckets=10000):
+    &quot;&quot;&quot;把任意 key 稳定映射到 [0, buckets)；同一 key 永远同一桶。&quot;&quot;&quot;
+    h = hashlib.md5(f&quot;{salt}:{key}&quot;.encode()).hexdigest()
+    return int(h[:8], 16) % buckets
+
+
+def assign(key, salt, treatment_pct):
+    return bucket(key, salt) &lt; int(round(treatment_pct * 100))
+
+
+# ------------------------------------------------- 确定性比特流（合成观测 ⚠️）
+def stream(n, seed):
+    rng = random.Random(seed)
+    return [rng.random() for _ in range(n)]
+
+
+def bern(n, rate, seed):
+    &quot;&quot;&quot;固定种子的 Bernoulli 0/1 流（独立同分布，才能用两比例 z 判据）。&quot;&quot;&quot;
+    rng = random.Random(seed)
+    return [1 if rng.random() &lt; rate else 0 for _ in range(n)]
+
+
+def canary_obs(n_total, ctrl_pct, p_ctrl, p_treat, seed=7):
+    &quot;&quot;&quot;按顺序灌入流量；(是否进实验组, 是否出问题) 的序列。
+
+    两组各自独立同分布地按 p 抽 0/1，因此 z 判据合法；单条路径仍有抽样噪声。
+    &quot;&quot;&quot;
+    n_c = max(1, round(n_total * ctrl_pct / 100))
+    n_t = n_total - n_c
+    bc, bt = bern(n_c, p_ctrl, seed), bern(n_t, p_treat, seed + 1)
+    out = []
+    for i in range(max(n_c, n_t)):
+        if i &lt; n_c:
+            out.append((False, bc[i]))
+        if i &lt; n_t:
+            out.append((True, bt[i]))
+    return out
+
+
+def z_path(obs, checkpoints):
+    &quot;&quot;&quot;按累积观测数输出 z 轨迹（只在 checkpoints 上算）。&quot;&quot;&quot;
+    xb = nb = xc = nc = 0
+    path = []
+    j = 0
+    for i, (treat, bad) in enumerate(obs, start=1):
+        if treat:
+            nc += 1
+            xc += bad
+        else:
+            nb += 1
+            xb += bad
+        if j &lt; len(checkpoints) and i == checkpoints[j]:
+            j += 1
+            path.append((i, round(z_test_worse(xb, nb, xc, nc), 3)))
+    return path
+
+
+def first_cross(obs, zc, every=5000):
+    &quot;&quot;&quot;滚动检查（每 every 条算一次），返回第一次越界的位置与 z。&quot;&quot;&quot;
+    xb = nb = xc = nc = 0
+    for i, (treat, bad) in enumerate(obs, start=1):
+        if treat:
+            nc += 1
+            xc += bad
+        else:
+            nb += 1
+            xb += bad
+        if nb and nc and i % every == 0:
+            z = z_test_worse(xb, nb, xc, nc)
+            if z &gt; zc:
+                return i, z
+    return None, None
+
+
+# ------------------------------------------------------------------ 主输出
+P0 = 0.005          # 基线错误率 0.5%
+
+
+def main():
+    print(&quot;== 1. 分阶段该看什么指标：离线 / 影子 / 灰度 ==&quot;)
+    rows = [
+        (&quot;离线评测&quot;, &quot;全量离线集合&quot;, &quot;主指标 + 护栏&quot;, &quot;分布偏差、选择偏差&quot;),
+        (&quot;影子流量&quot;, &quot;线上 100% 用户（用户无感）&quot;, &quot;分歧率/异常率/延迟/成本&quot;, &quot;业务影响不可测&quot;),
+        (&quot;灰度 1%&quot;, &quot;1% 流量&quot;, &quot;护栏（延迟/成本/崩溃）&quot;, &quot;主指标样本量不足&quot;),
+        (&quot;灰度 5~50%&quot;, &quot;逐级放量&quot;, &quot;主指标 + 护栏&quot;, &quot;需要足够样本与时间&quot;),
+    ]
+    for name, scope, metric, blind in rows:
+        print(f&quot;  {name:10s} | {scope:22s} | 看 {metric:16s} | 盲区：{blind}&quot;)
+
+    print()
+    print(f&quot;== 2. 灰度样本量（对等分配）：p0={P0:.4f}，α=0.05、power=0.80 ==&quot;)
+    print(f&quot;  {&#39;劣化 δ(pp)&#39;:&gt;11s} {&#39;p1&#39;:&gt;8s} {&#39;总样本 N&#39;:&gt;12s}&quot;
+          f&quot; {&#39;对照组(50%)&#39;:&gt;12s} {&#39;实验组&#39;:&gt;10s}&quot;)
+    for dpp in (0.1, 0.2, 0.5, 1.0):
+        p1 = P0 + dpp / 100
+        N = split_sample_size(P0, p1, 0.5)
+        print(f&quot;  {dpp:11.1f} {p1:8.4f} {N:12.0f} {N / 2:12.0f} {N / 2:10.0f}&quot;)
+
+    print()
+    print(&quot;== 3. 分配比 vs 样本量：δ=+0.2pp（0.5% → 0.7%）==&quot;)
+    print(f&quot;  {&#39;对照组占比&#39;:&gt;10s} {&#39;总样本 N&#39;:&gt;12s} {&#39;对照组 n&#39;:&gt;11s}&quot;
+          f&quot; {&#39;实验组 n&#39;:&gt;11s} {&#39;1e6 请求/天 → 天&#39;:&gt;17s}&quot;)
+    N50 = split_sample_size(P0, P0 + 0.002, 0.5)
+    for s in (0.5, 0.1, 0.01):
+        N = split_sample_size(P0, P0 + 0.002, s)
+        print(f&quot;  {s:10.2f} {N:12.0f} {s * N:11.0f} {(1 - s) * N:11.0f}&quot;
+              f&quot; {N / 1e6:17.1f}&quot;)
+    print(&quot;  对照组越小，判同样的差需要越多总样本；1% 流量下要多 30 倍以上。&quot;)
+
+    print()
+    print(&quot;== 4. 小流量阶段的判别力：只放 1% 时能测出什么 ==&quot;)
+    print(f&quot;  {&#39;总样本 N&#39;:&gt;10s} {&#39;MDE(pp)&#39;:&gt;9s} {&#39;功效(δ=+0.2pp)&#39;:&gt;16s}&quot;
+          f&quot; {&#39;功效(δ=+1pp)&#39;:&gt;14s}&quot;)
+    for N in (1e5, 1e6, 1e7, 1e8):
+        print(f&quot;  {N:10.0e} {mde_two_prop(P0, N, 0.01) * 100:9.3f}&quot;
+              f&quot; {power_two_prop(P0, P0 + 0.002, N, 0.01):16.4f}&quot;
+              f&quot; {power_two_prop(P0, P0 + 0.01, N, 0.01):14.4f}&quot;)
+    n_80 = split_sample_size(P0, P0 + 0.002, 0.01)
+    print(f&quot;  1% 流量 + 1e6 请求：+0.2pp 的功效 {power_two_prop(P0, P0 + 0.002, 1e6, 0.01):.3f}&quot;
+          f&quot;（勉强够）；只放 1e5 时功效只剩 &quot;
+          f&quot;{power_two_prop(P0, P0 + 0.002, 1e5, 0.01):.3f} ——&quot;)
+    print(f&quot;  要判出 0.2pp（80% 功效）需总样本 {n_80:.2e}（按 1e6/天 也要 {n_80 / 1e6:.1f} 天）；&quot;
+          f&quot;+1pp 的功效已约 &quot;
+          f&quot;{power_two_prop(P0, P0 + 0.01, 1e6, 0.01):.3f}（判得动）。&quot;)
+
+    print()
+    print(&quot;== 5. 顺序查看的停止边界（α 花费：看 k 次、每次 α/k）==&quot;)
+    print(f&quot;  {&#39;查看次数 k&#39;:&gt;9s} {&#39;每次 α/k&#39;:&gt;10s} {&#39;z 边界&#39;:&gt;8s}&quot;
+          f&quot; {&#39;所需总样本&#39;:&gt;11s} {&#39;相对单看&#39;:&gt;9s}&quot;)
+    for k in (1, 2, 4, 10):
+        a = 0.05 / k
+        zc = z_quantile(1 - a)
+        n_at = split_sample_size(P0, P0 + 0.002, 0.5, a, 0.80)
+        print(f&quot;  {k:9d} {a:10.5f} {zc:8.4f} {n_at:11.0f} {n_at / N50:9.2f}×&quot;)
+    print(&quot;  多看几眼不是更严谨，而是把每次的阈值推高（样本量按 z² 增长）。&quot;)
+
+    print()
+    print(&quot;== 6. 确定性分流：同一 key 永远同一桶 ==&quot;)
+    keys = [f&quot;user-{i:04d}&quot; for i in range(3)] + [f&quot;req-{i:05d}&quot; for i in range(2)]
+    for k in keys:
+        b = bucket(k, &quot;canary-v1&quot;)
+        print(f&quot;  key={k:10s} 桶={b:5d}  进 1%: {str(assign(k, &#39;canary-v1&#39;, 1)):5s}&quot;
+              f&quot;  进 5%: {str(assign(k, &#39;canary-v1&#39;, 5)):5s}&quot;
+              f&quot;  重复一致: {bucket(k, &#39;canary-v1&#39;) == b}&quot;)
+    print(&quot;  分流在网关本地一次 MD5 + 取模即可，无需中心查询；换 salt = 重新分流。&quot;)
+
+    print()
+    print(&quot;== 7. 累积 z 轨迹：真值不同，路径完全不同 ==&quot;)
+    N = 1_000_000
+    checks = [200_000, 400_000, 600_000, 800_000, 1_000_000]
+    zc = z_quantile(0.95)
+    for p_treat, lab in ((P0, &quot;真值无差&quot;), (P0 + 0.002, &quot;真值 +0.2pp&quot;),
+                         (P0 + 0.01, &quot;真值 +1pp&quot;)):
+        obs = canary_obs(N, 1.0, P0, p_treat, seed=7)
+        path = &quot; → &quot;.join(f&quot;{i // 1000}k:{z:.2f}&quot; for i, z in z_path(obs, checks))
+        stop, zs = first_cross(obs, zc)
+        print(f&quot;  {lab:12s} z: {path}&quot;)
+        print(f&quot;  {&#39;&#39;:12s} 首次越界(z&gt;{zc:.2f}): &quot;
+              f&quot;{&#39;第 %d 条（流量 %.1f%%）&#39; % (stop, 100 * stop / N) if stop else &#39;未越界&#39;}&quot;)
+    print(&quot;  真值无差：z 在 0 附近抖动（本路径落在 -2.1，属抽样噪声）。&quot;)
+    print(&quot;  +1pp：期望 z≈4.3，1e6 内稳定越界（本路径 1e6 时约 7.0）。&quot;)
+    print(&quot;  +0.2pp：期望 z≈1.13 &lt; 1.645 —— 判不动，只能靠放量或更长的观察窗。&quot;)
+
+    print()
+    print(&quot;== 8. 蒙特卡洛核对：真值无差时的误报率 ==&quot;)
+    zc2 = z_quantile(1 - 0.05 / 2)      # 两个预定 look、每次 α/2
+    hits = trials = 0
+    for t in range(400):
+        sc = stream(5_000, 3000 + t)
+        st = stream(495_000, 9000 + t)
+        xb = sum(x &lt; P0 for x in sc)
+        xc = sum(x &lt; P0 for x in st)
+        if z_test_worse(xb, 5_000, xc, 495_000) &gt; zc2:
+            hits += 1
+        trials += 1
+    print(f&quot;  单个 look（1e6 总样本、1% 对照）在真值无差下越界比例 = &quot;
+          f&quot;{hits / trials:.3f}（阈值 α/2=0.025 → z&gt;{zc2:.3f}）&quot;)
+    print(f&quot;  两 look 设计的 FWER 上界 = 1-(1-0.025)^2 = {1 - (1 - 0.025) ** 2:.4f}；&quot;)
+    print(&quot;  无预定计划地滚动查看必须按 α/k 放大阈值，否则 FWER 会膨胀。&quot;)
+
+    print()
+    print(&quot;== 9. 影子流量的本钱：全量但只能看分歧 ==&quot;)
+    print(f&quot;  {&#39;影子分歧率 p0&#39;:&gt;12s} {&#39;p1 = 1.5 p0&#39;:&gt;12s} {&#39;所需样本&#39;:&gt;12s}&quot;
+          f&quot; {&#39;1e6/天 → 天&#39;:&gt;13s}&quot;)
+    for p0 in (0.005, 0.01, 0.05):
+        p1 = 1.5 * p0
+        N = split_sample_size(p0, p1, 0.5)
+        print(f&quot;  {p0:12.3%} {p1:12.3%} {N:12.0f} {N / 1e6:13.2f}&quot;)
+    print(&quot;  影子拿到全量流量，所以能查罕见事件；但它看不到用户反应。&quot;)
+
+
+main()</code></pre>
+<p><strong>实际运行输出</strong>（完整脚本运行，逐字节）：</p>
+<pre data-lang="text"><code class="language-text">== 1. 分阶段该看什么指标：离线 / 影子 / 灰度 ==
+  离线评测       | 全量离线集合                 | 看 主指标 + 护栏         | 盲区：分布偏差、选择偏差
+  影子流量       | 线上 100% 用户（用户无感）       | 看 分歧率/异常率/延迟/成本    | 盲区：业务影响不可测
+  灰度 1%      | 1% 流量                  | 看 护栏（延迟/成本/崩溃）     | 盲区：主指标样本量不足
+  灰度 5~50%   | 逐级放量                   | 看 主指标 + 护栏         | 盲区：需要足够样本与时间
+
+== 2. 灰度样本量（对等分配）：p0=0.0050，α=0.05、power=0.80 ==
+     劣化 δ(pp)       p1        总样本 N     对照组(50%)        实验组
+          0.1   0.0060       135266        67633      67633
+          0.2   0.0070        36871        18435      18435
+          0.5   0.0100         7361         3681       3681
+          1.0   0.0150         2446         1223       1223
+
+== 3. 分配比 vs 样本量：δ=+0.2pp（0.5% → 0.7%）==
+       对照组占比        总样本 N       对照组 n       实验组 n      1e6 请求/天 → 天
+        0.50        36871       18435       18435               0.0
+        0.10       106391       10639       95752               0.1
+        0.01       974279        9743      964536               1.0
+  对照组越小，判同样的差需要越多总样本；1% 流量下要多 30 倍以上。
+
+== 4. 小流量阶段的判别力：只放 1% 时能测出什么 ==
+       总样本 N   MDE(pp)     功效(δ=+0.2pp)     功效(δ=+1pp)
+       1e+05     0.557           0.2253         0.9972
+       1e+06     0.176           0.8792         1.0000
+       1e+07     0.056           1.0000         1.0000
+       1e+08     0.018           1.0000         1.0000
+  1% 流量 + 1e6 请求：+0.2pp 的功效 0.879（勉强够）；只放 1e5 时功效只剩 0.225 ——
+  要判出 0.2pp（80% 功效）需总样本 9.74e+05（按 1e6/天 也要 1.0 天）；+1pp 的功效已约 1.000（判得动）。
+
+== 5. 顺序查看的停止边界（α 花费：看 k 次、每次 α/k）==
+     查看次数 k     每次 α/k     z 边界       所需总样本      相对单看
+          1    0.05000   1.6449       36871      1.00×
+          2    0.02500   1.9600       46808      1.27×
+          4    0.01250   2.2414       56685      1.54×
+         10    0.00500   2.5758       69650      1.89×
+  多看几眼不是更严谨，而是把每次的阈值推高（样本量按 z² 增长）。
+
+== 6. 确定性分流：同一 key 永远同一桶 ==
+  key=user-0000  桶= 7121  进 1%: False  进 5%: False  重复一致: True
+  key=user-0001  桶= 5773  进 1%: False  进 5%: False  重复一致: True
+  key=user-0002  桶= 5557  进 1%: False  进 5%: False  重复一致: True
+  key=req-00000  桶=  870  进 1%: False  进 5%: False  重复一致: True
+  key=req-00001  桶= 2800  进 1%: False  进 5%: False  重复一致: True
+  分流在网关本地一次 MD5 + 取模即可，无需中心查询；换 salt = 重新分流。
+
+== 7. 累积 z 轨迹：真值不同，路径完全不同 ==
+  真值无差         z: 200k:-2.10 → 400k:-2.02 → 600k:-2.10 → 800k:-2.10 → 1000k:-2.12
+               首次越界(z&gt;1.64): 未越界
+  真值 +0.2pp    z: 200k:0.56 → 400k:0.53 → 600k:0.48 → 800k:0.56 → 1000k:0.55
+               首次越界(z&gt;1.64): 未越界
+  真值 +1pp      z: 200k:6.90 → 400k:6.90 → 600k:6.89 → 800k:6.95 → 1000k:6.96
+               首次越界(z&gt;1.64): 第 10000 条（流量 1.0%）
+  真值无差：z 在 0 附近抖动（本路径落在 -2.1，属抽样噪声）。
+  +1pp：期望 z≈4.3，1e6 内稳定越界（本路径 1e6 时约 7.0）。
+  +0.2pp：期望 z≈1.13 &lt; 1.645 —— 判不动，只能靠放量或更长的观察窗。
+
+== 8. 蒙特卡洛核对：真值无差时的误报率 ==
+  单个 look（1e6 总样本、1% 对照）在真值无差下越界比例 = 0.015（阈值 α/2=0.025 → z&gt;1.960）
+  两 look 设计的 FWER 上界 = 1-(1-0.025)^2 = 0.0494；
+  无预定计划地滚动查看必须按 α/k 放大阈值，否则 FWER 会膨胀。
+
+== 9. 影子流量的本钱：全量但只能看分歧 ==
+      影子分歧率 p0  p1 = 1.5 p0         所需样本     1e6/天 → 天
+        0.500%       0.750%        24574          0.02
+        1.000%       1.500%        12208          0.01
+        5.000%       7.500%         2316          0.00
+  影子拿到全量流量，所以能查罕见事件；但它看不到用户反应。</code></pre>
+<h3 id="h-练习">练习<a class="anchor" href="#h-练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><p><strong>给你的服务算一张&quot;1% 流量判据表&quot;</strong>：
+（a）写下基线错误率 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 与三个候选劣化 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0379em;">δ</span></span></span></span>（0.1 / 0.5 / 1pp）；
+（b）用 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0044em;vertical-align:-0.31em;"></span><span class="mord text"><span class="mord">split_sample_size</span></span></span></span></span> 算各自需要的总样本，换算成&quot;按当前 QPS 要跑多久&quot;；
+（c）指出哪些 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0379em;">δ</span></span></span></span> 在你能接受的观察窗（例如 24 小时）内根本判不出来，并给出替代方案（改判据 / 扩流量 / 放弃该粒度）。</p>
+</li>
+<li><p><strong>分配单元的选择与验证</strong>：
+（a）为你的场景列出可能的分配单元（请求/用户/会话/区域）与干扰范围；
+（b）给出选择，并写出&quot;分组一致性&quot;的验证方法（同一用户多次请求的分桶日志抽样 1000 条，统计跨组比例）；
+（c）如果你的系统有缓存，说明缓存 key 里必须包含什么才能让分组生效。</p>
+</li>
+<li><p><strong>α 花费设计</strong>：
+（a）为一个 3 天的灰度写死 look 计划（例如第 1、2、3 天各一次），给出每次的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mord">/</span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 与 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.044em;">z</span></span></span></span> 边界；
+（b）算出这个计划相对单看的样本量代价（倍数）；
+（c）用第 2 节的模拟方法核对 FWER 是否 ≤ 0.05，并报告实测值。</p>
+</li>
+<li><p><strong>影子流量的收益核算</strong>：
+（a）估出你系统复制 100% 流量的成本（算力 + 延迟 + token）与复制 5% 的成本；
+（b）给出&quot;用影子能提前发现的事故类型&quot;清单，并为每一类估一个检出所需样本量（用第 9 节的公式）；
+（c）论证：在你的场景里影子划算，还是直接 1% 灰度更划算。</p>
+</li>
+<li><p><strong>护栏的熔断阈值</strong>：
+（a）为错误率、p99 延迟、单请求成本各定一个&quot;工程熔断&quot;阈值（不等统计判据）；
+（b）说明熔断的触发频率（每 10s？每 1000 请求？）与最小样本量，避免单个慢请求就回滚；
+（c）设计&quot;熔断 → 回滚&quot;的自动化流程，并说明它和第 4 节的可回滚发布怎么衔接。</p>
+</li>
+<li><p><strong>短期 vs 长期指标</strong>：
+（a）列出你的产品的短期指标与长期指标；
+（b）设计一个 holdback 组（固定 1% 用户永不进新模型），给出它的样本量与观测周期；
+（c）论证：为什么&quot;灰度看短期指标&quot;不能替代 holdback 的长期观测。</p>
+</li>
+<li><p><strong>累积 z 的复现</strong>：
+（a）用本节代码的第 7 节，把真值改成 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">+</span><span class="mord">0.05</span></span></span></span>pp，观察 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.044em;">z</span></span></span></span> 轨迹与期望值的差距；
+（b）把种子换 5 次，报告&quot;首次越界&quot;的分布（次数与位置）；
+（c）回答：单次灰度的&quot;没越界&quot;能证明什么？不能证明什么？</p>
+</li>
+</ol>
+<h3 id="h-小结">小结<a class="anchor" href="#h-小结" aria-label="本节链接">#</a></h3>
+<ul>
+<li><strong>影子 / 灰度 / 全量 A/B 回答不同的问题，不能互相替代</strong>：影子（100% 流量、用户无感）只能抓分歧与资源问题；灰度（1%→100%）抓护栏与粗劣化；主指标的细效应要靠放量。<strong>用 1% 阶段判断主指标是最常见的灰度误用。</strong></li>
+<li><strong>样本量由效应量与分配比共同决定</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">0.5%</span></span></span></span> 下检出 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">+</span><span class="mord">0.2</span></span></span></span>pp 需总样本约 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">3.7</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">4</span></span></span></span></span></span></span></span></span></span></span>（对等分配）到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">9.7</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">5</span></span></span></span></span></span></span></span></span></span></span>（1% 对照）。两比例公式必须用<strong>混合标准差</strong>（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0813em;">H</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.0813em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 池化 + <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0813em;">H</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.0813em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 各自方差），只用池化会系统性低估 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span></span></span></span>。</li>
+<li><strong>小流量的判别力表（MDE）必须事先算</strong>：1% 流量 + <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">6</span></span></span></span></span></span></span></span></span></span></span> 请求时 MDE 约 0.176pp，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">+</span><span class="mord">0.2</span></span></span></span>pp 的功效 0.879、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">+</span><span class="mord">1</span></span></span></span>pp 约 1.0；只有 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">5</span></span></span></span></span></span></span></span></span></span></span> 请求时 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">+</span><span class="mord">0.2</span></span></span></span>pp 的功效只剩 0.225 —— 此时&quot;没发现&quot;是证据不足。</li>
+<li><strong>多看几眼的代价是算出来的</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mord">/</span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 花费把 FWER 压回 0.05（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2</span></span></span></span> 时 0.0494），但样本量要涨到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1.27</span><span class="mord">×</span></span></span></span>（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2</span></span></span></span>）、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1.89</span><span class="mord">×</span></span></span></span>（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">10</span></span></span></span>）。<strong>look 计划必须写死在实验开始前</strong>；滚动查看等于把 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span> 花光。</li>
+<li><strong>分组一致性是可验证的工程属性</strong>：确定性哈希（<code>md5(salt:key) % 10^4</code>）保证同一 key 永远同一桶，网关本地完成；<code>salt</code> 是实验边界，换 salt = 重新分流。</li>
+<li><strong>发布要同时对齐四样东西</strong>：权重、tokenizer/prompt、缓存 key（必须含 <code>manifest_hash</code>）、分流 salt。任何一样错位，灰度的结论都无效。</li>
+<li><strong>灰度的停止有两种</strong>：统计停止（判据越界）与工程熔断（护栏崩了立即回滚）。后者不该等统计判据；同时要有 holdback 组来观测长期指标，因为&quot;短期涨、长期跌&quot;不会在灰度窗口里显形。</li>
+</ul>
+<blockquote>
+<p>下一节：灰度发现问题要回滚，但&quot;回滚&quot;在生产里远不是&quot;把代码切回去&quot;。第 4 节要把回滚做成一个可承诺的能力：<strong>版本一致性</strong>（权重/tokenizer/prompt/缓存/下游依赖如何绑成一个不可变的 manifest）、<strong>指针层与历史可解析</strong>（怎么保证回滚到的是当时那个模型，而不是&quot;用今天的数据重建的同一个 commit&quot;）、以及<strong>回滚时间账本</strong>（探测、决策、传播、重启、缓存预热各占多久，怎么把它压进 SLO）。</p>
+</blockquote>

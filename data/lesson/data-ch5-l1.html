@@ -1,0 +1,654 @@
+<h2 id="h-数据版本内容寻址merkle-快照与不可变数据集">数据版本：内容寻址、Merkle 快照与不可变数据集<a class="anchor" href="#h-数据版本内容寻址merkle-快照与不可变数据集" aria-label="本节链接">#</a></h2>
+<h3 id="h-这一节要解决什么">这一节要解决什么<a class="anchor" href="#h-这一节要解决什么" aria-label="本节链接">#</a></h3>
+<p>第 4 章的四节课各自留下一串必须被记住的东西：标注指南哈希、标注者与弃权标记、采集策略与种子、教师版本与 prompt 族、校验器版本与接受率、去污染阈值与残余率、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">π</span></span></span></span> 与阶段表、分布级门禁值。第 4 章把它们写进了一张 <code>manifest</code> 表，并留了一句话：<strong>缺任何一列，这次混合就无法复现。</strong></p>
+<p>但那张表只是一份<strong>清单</strong>，它回答的是&quot;要记什么&quot;，没有回答三个更工程的问题：</p>
+<ol>
+<li><strong>这份表本身存在哪里、怎么保证没被改过？</strong> 如果 manifest 是一份手写的 YAML，那么&quot;当时用的是哪个教师&quot;这句话的可靠性等于写它的人的诚信。</li>
+<li><strong>路径名和内容是什么关系？</strong> 数据目录叫 <code>train_v2_final_clean/</code>，这个名字没有承诺任何东西。三个月后有人往里面加了 200 条数据，名字不变。</li>
+<li><strong>两个版本之间到底差了什么？</strong> &quot;v2 比 v1 好&quot;这句话要能被拆成&quot;多了 3 个文件、改了 1 个过滤阈值&quot;这样的可核对事实，而不是一句感觉。</li>
+</ol>
+<p>本章的四节就是围着这三个问题展开的。第 1 节（本节）解决<strong>标识与不可变</strong>：把数据集变成一个由内容决定的、不能悄悄变的名字。第 2 节解决<strong>关系</strong>：数据从哪来、到哪去（血缘图与影响面）。第 3 节解决<strong>强度</strong>：可复现不是一个布尔量，它有三个等级。第 4 节解决<strong>动作</strong>：发现脏数据之后怎么定位影响面并回退。</p>
+<p>第 2 章第 4 节已经给过一个式子了：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord cjk_fallback">数据版本</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord text"><span class="mord cjk_fallback">输入指纹</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord text"><span class="mord cjk_fallback">管线版本</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord cjk_fallback">参数</span></span></span></span></span></span></p>
+<p>本节要做的是把右边三项各自<strong>拆到可实现的粒度</strong>，并给出实现。第 2 章那节停在了&quot;整批指纹&quot;这一个数上（<code>a518840e10c7d3dd</code>）——那是<strong>一个</strong>数字，本节要给出<strong>一棵树</strong>。这个区别不是美学问题，本节代码会实测：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">120</span></span></span></span> 个文件的数据集，改 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> 个文件后</p>
+<ul>
+<li>整批拼接哈希：必须重算 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">120</span></span></span></span> 次<strong>内容哈希</strong>（要重新读字节）；</li>
+<li>Merkle 树：只重算 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> 次内容哈希（只有那个文件的字节真的变了），其余 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">7</span></span></span></span> 层合并全部命中缓存。</li>
+</ul>
+<p>差距是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">15</span></span></span></span> 倍，而数据集越大差距越是数量级级别。这里真正的区别不是常数因子，而是<strong>「什么必须重算」</strong>：内容哈希要读磁盘，而缓存失效只发生在从那个叶到根的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">⌈</span><span class="mop"><span class="mop">lo<span style="margin-right:0.0139em;">g</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.207em;"><span style="top:-2.4559em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2441em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">n</span><span class="mclose">⌉</span></span></span></span> 个节点上。同一次实测还会给出另一件更重要的东西：<strong>用&quot;整批拼接&quot;当版本时，你无法回答&quot;这两个版本差在哪一个文件&quot;</strong>；用 Merkle 树，差异可以精确到叶，而且一条 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.9386em;vertical-align:-0.2441em;"></span><span class="mop"><span class="mop">lo<span style="margin-right:0.0139em;">g</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.207em;"><span style="top:-2.4559em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2441em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">n</span></span></span></span> 长度的证明路径就能让第三方在你不在场时验证&quot;这个文件确实属于这个快照&quot;。</p>
+<h3 id="h-一标识为什么同一个东西必须由内容回答">一、标识：为什么&quot;同一个东西&quot;必须由内容回答<a class="anchor" href="#h-一标识为什么同一个东西必须由内容回答" aria-label="本节链接">#</a></h3>
+<h4 id="h-11-概念版本标识是给三类读者的">1.1 概念：版本标识是给三类读者的<a class="anchor" href="#h-11-概念版本标识是给三类读者的" aria-label="本节链接">#</a></h4>
+<p>一份数据版本要同时对三类读者说话，这是它的设计压力来源：</p>
+<table>
+<thead>
+<tr>
+<th>读者</th>
+<th>想问的问题</th>
+<th>需要的精度</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>人</strong></td>
+<td>&quot;我们上次讨论的是哪一份数据？&quot;</td>
+<td>可读的名字 + 一个唯一标识</td>
+</tr>
+<tr>
+<td><strong>程序</strong></td>
+<td>&quot;这份数据在我这里存在吗？我算出来的和它一样吗？&quot;</td>
+<td>字节级可比较的标识</td>
+</tr>
+<tr>
+<td><strong>审计</strong></td>
+<td>&quot;三个月前那次报告用的是这一份吗？&quot;</td>
+<td>不可伪造、不可事后修改的证据</td>
+</tr>
+</tbody></table>
+<p>只有第三类读者会逼出<strong>内容寻址</strong>。前两类用&quot;路径 + 时间戳 + 一个自增号&quot;就能满足，而这两样东西合起来恰好是审计最不信任的东西：路径可以被覆盖，时间戳可以被复制（<code>cp -p</code>、<code>rsync -t</code>、容器镜像层解包），自增号可以被重排。</p>
+<h4 id="h-12-为什么这样设计三种失败的标识">1.2 为什么这样设计：三种失败的标识<a class="anchor" href="#h-12-为什么这样设计三种失败的标识" aria-label="本节链接">#</a></h4>
+<p><strong>失败一：路径。</strong> <code>data/v2/train.jsonl</code> 是一个<strong>位置</strong>，不是一个<strong>对象</strong>。位置可以被指向不同的对象（写入）、可以被指向同一个对象（硬链接、软链接、bind mount）、也可以被一个对象占用后被回收。把路径写进报告，等于写&quot;我说的是当时那个路径下的东西&quot; —— 这是一句无法被证伪的话。</p>
+<p><strong>失败二：修改时间。</strong> <code>stat</code> 的 <code>mtime</code> 有三个具体的问题：</p>
+<ul>
+<li><strong>它可以不变而内容变了</strong>：<code>cp -p</code>、<code>rsync -a</code>、<code>tar -p</code>、Docker 镜像层、<code>git checkout</code> 之后文件内容变了而 <code>mtime</code> 可能来自归档。实测里这种情况出现的频率高得惊人，因为整条流水线的目标就是&quot;复制得像原样&quot;。</li>
+<li><strong>它可以变而内容没变</strong>：任何一次 <code>touch</code>、任何一次幂等重跑（第 2 章第 4 节说幂等是要求，不是可选）都会刷新它。于是&quot;两个版本不同&quot;变成假阳性。</li>
+<li><strong>它的分辨率不可靠</strong>：不同文件系统从 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> 秒到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> 纳秒不等，跨机器比较 <code>mtime</code> 基本没有意义。</li>
+</ul>
+<p><strong>失败三：大小。</strong> 大小只能排除一部分差异。改一个字节、改一个词、把 <code>0.5</code> 改成 <code>0.50</code>、把 <code>\n</code> 改成 <code>\r\n</code> —— 这些都对大小和 <code>mtime</code> 可能完全无害，对训练结果可能有害（第 2 章第 4 节：不可见字符、全角/连字、NFKC 的有损性）。</p>
+<p>所以唯一可用的判据是：<strong>两个对象相同，当且仅当它们的规范形式逐字节相同</strong>。这就是内容寻址的全部内容。它有一个漂亮的副产品：<strong>标识即校验</strong>。拿到标识的人可以自己重算一遍，不需要信任任何人。这是下一节&quot;血缘&quot;和最后&quot;审计&quot;两件事的前提 —— 血缘图上的节点如果没有可验证的身份，那图上画的只是一堆名字。</p>
+<h3 id="h-二规范化哈希稳定性的前提">二、规范化：哈希稳定性的前提<a class="anchor" href="#h-二规范化哈希稳定性的前提" aria-label="本节链接">#</a></h3>
+<h4 id="h-21-概念同一份数据的多种字节表示">2.1 概念：同一份数据的多种字节表示<a class="anchor" href="#h-21-概念同一份数据的多种字节表示" aria-label="本节链接">#</a></h4>
+<p>内容寻址有一个反直觉的前提：<strong>逻辑上相同的数据，字节表示并不唯一</strong>。哈希是对字节算的，所以只要字节不同，哈希就不同。这在真实管线里制造的错误非常隐蔽，因为它不报错。</p>
+<p>四类必须处理的表示自由度：</p>
+<table>
+<thead>
+<tr>
+<th>自由度</th>
+<th>具体例子</th>
+<th>后果</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>序列化顺序</strong></td>
+<td>JSON 对象键顺序、<code>dict</code> 插入顺序、CSV 列顺序</td>
+<td>同一份表两种哈希</td>
+</tr>
+<tr>
+<td><strong>数值表示</strong></td>
+<td><code>0.10</code> vs <code>0.1</code>、<code>1e3</code> vs <code>1000</code>、浮点最短表示</td>
+<td>同一份指标两种哈希</td>
+</tr>
+<tr>
+<td><strong>编码与行尾</strong></td>
+<td>UTF-8 BOM、<code>\n</code> vs <code>\r\n</code>、NFD vs NFC</td>
+<td>同一份文本两种哈希</td>
+</tr>
+<tr>
+<td><strong>集合语义</strong></td>
+<td>行的排列、&quot;同名多值&quot;的先后</td>
+<td>语义相同的两份表两种哈希</td>
+</tr>
+</tbody></table>
+<p>前两类用<strong>规范化序列化</strong>（canonical serialization）解决，第三类用第 2 章第 4 节的那套归一化解决，第四类最难 —— 它没有&quot;正确&quot;答案，只有<strong>约定</strong>。</p>
+<h4 id="h-22-怎么做规范形式的四条纪律">2.2 怎么做：规范形式的四条纪律<a class="anchor" href="#h-22-怎么做规范形式的四条纪律" aria-label="本节链接">#</a></h4>
+<ol>
+<li><strong>键必须排序，且排序规则要固定。</strong> <code>json.dumps(obj, sort_keys=True, separators=(&quot;,&quot;, &quot;:&quot;), ensure_ascii=False)</code> 是一个可以用的起点。注意 <code>separators</code>：默认的 <code>, </code> 与 <code>: </code> 里带空格，一旦有人换了实现（换语言、换库版本）哈希全体改变。</li>
+<li><strong>数值必须定形。</strong> 浮点用最短往返表示（Python 的 <code>repr(float)</code> 与 <code>json</code> 的 <code>float</code> 默认行为就是最短往返，这是可以依赖的），但<strong>混合类型</strong>要禁止（<code>1</code> 与 <code>1.0</code> 在 JSON 里不同、在 Python 里 <code>1 == 1.0</code> 为真而在哈希上不同）。金融/计数类字段应该显式转成整数或定点字符串。</li>
+<li><strong>编码与行尾必须定形。</strong> 统一 UTF-8 无 BOM、统一 <code>\n</code>。这一条<strong>不能只写在文档里</strong> —— 它必须是一个<strong>能跑的检查</strong>，因为 <code>\r\n</code> 通常来自某个同事的编辑器。</li>
+<li><strong>集合必须定形。</strong> 对&quot;无序集合&quot;语义的字段（标签集合、来源集合），序列化前排序；对&quot;有序&quot;语义的字段（步骤序列、行顺序），<strong>绝不排序</strong>并要显式记录顺序敏感。把这两者搞混是哈希不稳定最常见的根因之一：把有序的东西排序，哈希稳定了但<strong>语义被改了</strong>（第 3 章的阶段表就是有序的，排序它会改变训练语义）。</li>
+</ol>
+<blockquote>
+<p><strong>判断&quot;要不要排序&quot;的方法</strong>：问&quot;交换两个元素会不会改变下游结果&quot;。会 → 有序；不会 → 无序，排序。这个问题必须在<strong>每个字段</strong>上问一遍，因为答案不统一。</p>
+</blockquote>
+<h4 id="h-23-边界规范化本身可能是有损的">2.3 边界：规范化本身可能是有损的<a class="anchor" href="#h-23-边界规范化本身可能是有损的" aria-label="本节链接">#</a></h4>
+<p>规范化会掩盖差异。如果两份数据只差一个 <code>\r</code>，规范化后哈希相同 —— 这是你要的。但如果两份数据差的是一个<strong>你不该忽略</strong>的字段（例如某个数值被四舍五入到 3 位小数），而规范化恰好把它抹平了，你就得到了一个<strong>假的&quot;内容相同&quot;</strong>。</p>
+<p>这条边界有一个可操作的形式：<strong>规范化只在&quot;下游不可能观察到差异&quot;时才是合法的</strong>。这意味着规范化函数必须与下游的读取路径对齐：</p>
+<ul>
+<li>下游读 JSON 解析后取字段 → 键顺序无关，排序安全；浮点尾随零无关，可以定形。</li>
+<li>下游读原始字节做 <code>grep</code>/<code>diff</code>/正则 → <strong>任何规范化都不安全</strong>，此时哈希必须覆盖原始字节。</li>
+</ul>
+<p>所以工程上的正确形态是<strong>两条链</strong>：<code>raw_hash</code>（原始字节，用于审计与取证）与 <code>canon_hash</code>（规范形式，用于去重、比较、寻址）。它们永远不该被混为一谈。这是本节代码 A 段的核心结构。</p>
+<h3 id="h-三粒度从文件哈希到-merkle-树">三、粒度：从文件哈希到 Merkle 树<a class="anchor" href="#h-三粒度从文件哈希到-merkle-树" aria-label="本节链接">#</a></h3>
+<h4 id="h-31-概念三个可选粒度">3.1 概念：三个可选粒度<a class="anchor" href="#h-31-概念三个可选粒度" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>粒度</th>
+<th>标识什么</th>
+<th>增量更新</th>
+<th>差异定位</th>
+<th>成员证明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>文件哈希</strong></td>
+<td>一个文件</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">O</span><span class="mopen">(</span><span class="mord">1</span><span class="mclose">)</span></span></span></span></td>
+<td>精确到文件</td>
+<td>不需要</td>
+</tr>
+<tr>
+<td><strong>整批拼接哈希</strong></td>
+<td>一个集合</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">O</span><span class="mopen">(</span><span class="mord mathnormal">n</span><span class="mclose">)</span></span></span></span></td>
+<td><strong>不可能</strong></td>
+<td>不可能</td>
+</tr>
+<tr>
+<td><strong>Merkle 树根</strong></td>
+<td>一个集合</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">O</span><span class="mopen">(</span><span class="mop">lo<span style="margin-right:0.0139em;">g</span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">n</span><span class="mclose">)</span></span></span></span></td>
+<td>精确到文件</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">O</span><span class="mopen">(</span><span class="mop">lo<span style="margin-right:0.0139em;">g</span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">n</span><span class="mclose">)</span></span></span></span> 的证明路径</td>
+</tr>
+</tbody></table>
+<p>多数人在第一次实现数据版本时会写第二行：把所有文件哈希按顺序拼起来再哈希一次。它有一个致命的性质 —— <strong>它是一个聚合，不是一棵树</strong>。聚合只能回答&quot;相同或不同&quot;，不能回答&quot;哪里不同&quot;。而实际工作中 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">90%</span></span></span></span> 的问题恰恰是&quot;哪里不同&quot;：</p>
+<ul>
+<li>数据没变但训练结果变了？（那不是数据的问题，去查代码/环境 —— 第 3 节。）</li>
+<li>数据变了但不知道变了什么？（聚合哈希只能说&quot;变了&quot;，你只能重跑整条管线做 diff。）</li>
+<li>一条数据要发出去做标注，怎么让它回来时能被接住？（需要&quot;这个文件属于这个快照&quot;的证明。）</li>
+</ul>
+<h4 id="h-32-怎么做merkle-树的构造规约">3.2 怎么做：Merkle 树的构造规约<a class="anchor" href="#h-32-怎么做merkle-树的构造规约" aria-label="本节链接">#</a></h4>
+<pre><code>叶 i  = H(0x00 ‖ leaf_id_i ‖ content_hash_i)        # 域分隔前缀
+内节点 = H(0x01 ‖ left_hash ‖ right_hash)
+根     = 逐层上推的结果</code></pre>
+<p>四个<strong>必须显式写下来的规约</strong>，缺一个就会得到&quot;同样的数据两种根&quot;：</p>
+<ol>
+<li><strong>叶的顺序</strong>：按 <code>leaf_id</code> 的字节序排序后建树。不排序则依赖目录遍历顺序，而目录遍历顺序在不同文件系统/不同语言/不同并发下不同。</li>
+<li><strong>奇数节点</strong>：把最后一个节点复制一份（Bitcoin 风格）还是提升到上一层（RFC 6962 风格）？两种都行，<strong>必须选一种并写进版本号</strong>。本节代码用&quot;复制&quot;，因为它的实现最短。</li>
+<li><strong>域分隔</strong>：叶哈希与内节点哈希用不同的前缀字节，否则存在<strong>结构歧义</strong>（有人能把一个两叶的树重解释成一个叶）。</li>
+<li><strong>空集合</strong>：定义 $H(\text{empty}) = $ 某个固定值（本节用 <code>sha256(b&quot;&quot;)</code>），并把它写进规约。空数据集是最容易被忽略的边界，而它在真实管线里天天出现（&quot;今天的增量是空的&quot;）。</li>
+</ol>
+<p>本节代码为了把结构讲清楚，<strong>每层都重算</strong>（不缓存上层节点），因此打印出的 <code>哈希调用 = 240 ≈ 2n</code>；工程实现里上层节点是持久化的，一次单叶更新只需 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">⌈</span><span class="mop"><span class="mop">lo<span style="margin-right:0.0139em;">g</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.207em;"><span style="top:-2.4559em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2441em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">n</span><span class="mclose">⌉</span></span></span></span> 次合并。<strong>两者的区别只在常数与缓存策略上，不在「能不能定位差异」上</strong> —— 定位能力来自树形结构本身。</p>
+<blockquote>
+<p><strong>为什么叶哈希要对 <code>content_hash</code> 再哈希一次、而不是直接用 <code>content_hash</code>？</strong> 因为这样可以防&quot;第二原像&quot;类攻击（把内节点哈希当成叶哈希塞进来）。在只做版本管理的场景里这个威胁不大，但成本是一行代码，收益是不必区分&quot;诚实的树&quot;与&quot;构造的树&quot;。这是<strong>把证明能力当成本</strong>的典型例子。</p>
+</blockquote>
+<h4 id="h-33-数据版本的三段结构content--meta--params">3.3 数据版本的三段结构：content / meta / params<a class="anchor" href="#h-33-数据版本的三段结构content--meta--params" aria-label="本节链接">#</a></h4>
+<p>回到第 2 章那个式子，本节把它落成一个三段的目录约定：</p>
+<pre><code>snapshot/
+  content/    # 字节。只由数据内容决定，哈希只覆盖这里
+  meta/       # 每条的来源、许可、标注者、指南哈希、采集策略与种子
+  params/     # 管线参数：过滤阈值、π、去污染阈值、教师版本、prompt 族哈希</code></pre>
+<p><strong>这个划分不是审美，它是&quot;变更频率隔离&quot;。</strong> 三类东西的变更频率差两个数量级：<code>content</code> 每次重跑都可能变，<code>meta</code> 跟着标注流程变，<code>params</code> 在一次实验里是常量。如果三者混在一个哈希里，<strong>任何一次 <code>params</code> 微调都会让整个数据集看起来&quot;变了&quot;</strong>，于是&quot;这两个版本的数据一样吗&quot;这个问题的答案永远是&quot;不一样&quot;，版本号迅速失去信息量。反过来，如果 <code>params</code> 不进哈希，那么&quot;同一份字节、不同过滤阈值&quot;会得到同一个版本号 —— 也就是<strong>不可复现</strong>。</p>
+<p>正确形态是<strong>根哈希包含三者，但三者各自也有自己的哈希</strong>，并且 manifest 显式列出三个分量。这样：</p>
+<ul>
+<li>根相同 → 完全同一份东西（可照抄结论）；</li>
+<li>根不同、<code>content</code> 相同 → 只有参数/元数据变了（结论可能需要重算，但<strong>数据可以不重跑</strong>）；</li>
+<li><code>content</code> 不同 → 必须重跑（输入真的变了）。</li>
+</ul>
+<p>这个三分法会在第 2 节（血缘：哪些下游节点受影响）和第 4 节（回滚：回滚到哪一层）里反复用到。</p>
+<h3 id="h-四不可变与快照从覆盖写到追加--指向">四、不可变与快照：从&quot;覆盖写&quot;到&quot;追加 + 指向&quot;<a class="anchor" href="#h-四不可变与快照从覆盖写到追加--指向" aria-label="本节链接">#</a></h3>
+<h4 id="h-41-概念不可变不是技术限制是流程约束">4.1 概念：不可变不是技术限制，是流程约束<a class="anchor" href="#h-41-概念不可变不是技术限制是流程约束" aria-label="本节链接">#</a></h4>
+<p>内容寻址给出的是<strong>名字</strong>层面的不可变：路径 = 哈希，于是&quot;改写&quot;意味着换一个名字。但<strong>存储层</strong>仍然可以被覆盖（有人直接 <code>rm</code> 或 <code>&gt;</code> 重写）。所以&quot;不可变&quot;在真实系统里永远是两件事：</p>
+<ol>
+<li><strong>名字由内容决定</strong>（技术）；</li>
+<li><strong>写操作只能是&quot;新建 + 追加指针&quot;</strong>（流程 + 权限）。</li>
+</ol>
+<p>第二件事需要工程手段，而不是纪律。可用的手段有三种，代价依次上升：</p>
+<table>
+<thead>
+<tr>
+<th>手段</th>
+<th>保证</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>命名规约 + 代码里不出现覆盖写</td>
+<td>弱（靠人）</td>
+<td>低</td>
+</tr>
+<tr>
+<td><strong>追加式 manifest 文件 + 只读权限</strong>（<code>chmod -w</code>、对象存储的 WORM 策略）</td>
+<td>中</td>
+<td>低</td>
+</tr>
+<tr>
+<td>只增不改的存储层（append-only 日志 / 版本化对象存储 / 每次快照一份独立前缀）</td>
+<td>强</td>
+<td>存储成本 ×份数</td>
+</tr>
+</tbody></table>
+<p>本课程推荐的是<strong>中间那档</strong>：快照 manifest 是一份<strong>只追加</strong>的 JSONL（每行一个快照记录），数据对象按哈希落在前缀目录里，且前缀目录不删。它的逻辑是&quot;<strong>指针可以动，目标不动</strong>&quot;：<code>latest</code> 是一个指向某个根哈希的指针文件，更新它等于追加一行；而它指向的那个前缀永远不会被重写。</p>
+<h4 id="h-42-怎么做快照-manifest-的字段">4.2 怎么做：快照 manifest 的字段<a class="anchor" href="#h-42-怎么做快照-manifest-的字段" aria-label="本节链接">#</a></h4>
+<pre data-lang="text"><code class="language-text">snapshot_record = {
+  schema_version: 1,                # 本记录的格式版本（不是数据版本）
+  snapshot_id:    &quot;sha256:....&quot;,    # 根哈希，唯一身份
+  created_at:     &quot;2026-..-..T..Z&quot;, # 只作展示，绝不参与哈希
+  parents:        [&quot;sha256:....&quot;],  # 上一个快照（第 2 节的血缘边）
+  components: {
+    content: {merkle_root, n_leaves, bytes, leaf_algo},
+    meta:    {merkle_root, n_leaves, annotation_guideline_hash},
+    params:  {params_hash, pipeline_version, seed, filters {...}}
+  },
+  stats:   {n_rows, label_histogram, split_sizes},   # 供廉价一致性检查
+  gates:   {min_rows, max_dup_rate, ...}             # 第 4 章的分布级门禁
+}</code></pre>
+<p>三条容易写错的细节：</p>
+<ol>
+<li><strong><code>created_at</code> 绝不参与哈希。</strong> 时间是元数据，不是内容。它一旦进哈希，同一份数据两次快照就有两个身份，&quot;重跑能不能复现&quot;这个问题直接变成否。</li>
+<li><strong><code>parents</code> 让快照构成一张 DAG</strong>，而不是一条时间线。真实管线有合并（两份数据合成一份）与分叉（一份数据拆成训练/评测），DAG 是唯一能表达它的结构，也是第 2 节血缘图的基础。</li>
+<li><strong><code>stats</code> 与 <code>gates</code> 是给&quot;廉价一致性检查&quot;用的</strong>：它们不进根哈希（它们是<strong>断言</strong>不是内容），但进快照记录。这样&quot;这份数据有 10240 行、正类 5120 条&quot;就成了一句可以被下游核对的话。核对失败意味着有人动了数据却没换哈希 —— 这是最值得报警的一种事故。</li>
+</ol>
+<h4 id="h-43-增量更新用前缀-diff-降到-math18">4.3 增量更新：用前缀 diff 降到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">O</span><span class="mopen">(</span><span class="mop">lo<span style="margin-right:0.0139em;">g</span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">n</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mclose">)</span></span></span></span><a class="anchor" href="#h-43-增量更新用前缀-diff-降到-math18" aria-label="本节链接">#</a></h4>
+<p>有了排序的叶集合，增量更新就变成一个<strong>集合差</strong>：新快照只需对&quot;去掉的叶 + 新增的叶&quot;所在的路径重新计算哈希。工程上最简单的实现是：</p>
+<ol>
+<li>对新的文件集合算出 <code>leaf_id -&gt; content_hash</code> 映射（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">Θ</span><span class="mopen">(</span><span class="mord mathnormal">n</span><span class="mclose">)</span></span></span></span> 次文件读取，这一步无法省 —— 你必须读一遍才知道有没有变）；</li>
+<li>与上一份快照的映射对比（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">Θ</span><span class="mopen">(</span><span class="mord mathnormal">n</span><span class="mclose">)</span></span></span></span> 次字典比较）；</li>
+<li>重算根：只需要叶哈希集合，内节点全部重算（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">Θ</span><span class="mopen">(</span><span class="mord mathnormal">n</span><span class="mclose">)</span></span></span></span> 次哈希）。</li>
+</ol>
+<p>第 3 步仍然是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">O</span><span class="mopen">(</span><span class="mord mathnormal">n</span><span class="mclose">)</span></span></span></span>，但它是<strong>内存里的哈希</strong>，比第 1 步的<strong>磁盘 I/O 加内容哈希</strong>便宜两个数量级。真正的收益在于第 1 步可以被 <strong>mtime + size 的启发式</strong>剪枝成&quot;只读可疑文件&quot; —— 这个启发式<strong>只有在校验兜底时才安全</strong>：</p>
+<blockquote>
+<p>用 <code>(size, mtime)</code> 判断&quot;文件没变&quot;是<strong>性能优化</strong>，不是正确性判据。正确性由定期全量重算（例如每次发布前）兜底。把启发式当判据的系统会在某次 <code>rsync -a</code> 之后静默地算错版本 —— 这是&quot;版本管理本身引入不可复现&quot;的经典事故。</p>
+</blockquote>
+<p>本节代码不做这个启发式剪枝（保持正确性优先），但会在实测里打印&quot;改了 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> 个文件后，内容哈希的计算次数从 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">100</span></span></span></span> 降到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span>&quot;。</p>
+<p><figure><img class="md-img" src="content/courses/data-engineering/assets/chapter-5-figure-01.svg" alt="内容寻址快照：三段分离、只追加" loading="lazy" decoding="async"><figcaption>内容寻址快照：三段分离、只追加</figcaption></figure>
+</p>
+<h3 id="h-五代码">五、代码<a class="anchor" href="#h-五代码" aria-label="本节链接">#</a></h3>
+<p>五段：0 段合成数据（⚠️ 合成，非真实语料）；1 段实现归一化与双链哈希；2 段实现 Merkle 树与证明路径；3 段实现三段式快照记录；4 段量化增量代价；5 段给三个&quot;看起来能用但会坏&quot;的反例。全程只用标准库（<code>hashlib</code> / <code>json</code> / <code>random</code>），输出与下面的记录逐字节一致。</p>
+<pre data-lang="python"><code class="language-python"># data-ch5-l1: 内容寻址与 Merkle 快照
+# 纯标准库；数据为合成生成（⚠️ 合成数据，非真实语料）
+import hashlib, json, os, random, sys
+from collections import OrderedDict
+
+print(f&quot;python {sys.version.split()[0]}&quot;)
+
+# ---------- 0. 合成数据集：120 个&quot;文档&quot;，带一个隐藏的重复簇 ----------
+RNG = random.Random(20260501)
+TOPICS = [&quot;algebra&quot;, &quot;geometry&quot;, &quot;code&quot;, &quot;logic&quot;, &quot;prose&quot;]
+DUP_PAIRS = []
+docs = []
+for i in range(120):
+    topic = TOPICS[i % len(TOPICS)]
+    # 每 20 篇里有一对近重复（只差一个尾随空格），用来验证规范化
+    body = f&quot;{topic}-{i % 20} sample document for content addressing. &quot; * (2 + i % 3)
+    d = {&quot;doc_id&quot;: f&quot;doc{i:04d}&quot;, &quot;topic&quot;: topic, &quot;body&quot;: body,
+         &quot;split&quot;: &quot;test&quot; if i % 10 == 0 else &quot;train&quot;}
+    if i % 20 == 1:                        # 每 20 篇里造一对近重复
+        # 模拟&quot;同一份文档被两个来源各收了一次&quot;：doc_id 复用，只差一个尾随空格
+        d[&quot;doc_id&quot;] = docs[-1][&quot;doc_id&quot;]
+        d[&quot;topic&quot;] = docs[-1][&quot;topic&quot;]
+        d[&quot;split&quot;] = docs[-1][&quot;split&quot;]
+        d[&quot;body&quot;] = docs[-1][&quot;body&quot;] + &quot; &quot;
+        DUP_PAIRS.append((d[&quot;doc_id&quot;], len(docs) - 1))   # (doc_id, 前一份的下标)
+    docs.append(d)
+
+# ---------- 1a. 规范化：把&quot;逻辑相同&quot;变成&quot;字节相同&quot; ----------
+def _norm(o):
+    &quot;&quot;&quot;归一化：字符串去首尾空白并把 \r\n 折成 \n；dict 键排序。&quot;&quot;&quot;
+    if isinstance(o, str):
+        return o.replace(&quot;\r\n&quot;, &quot;\n&quot;).strip()
+    if isinstance(o, dict):
+        return {k: _norm(v) for k, v in sorted(o.items())}
+    if isinstance(o, (list, tuple)):
+        return [_norm(v) for v in o]
+    return o
+
+def canon_bytes(obj):
+    &quot;&quot;&quot;规范 JSON 字节：键排序、无多余空格、UTF-8 无 BOM。&quot;&quot;&quot;
+    s = json.dumps(_norm(obj), sort_keys=True, separators=(&quot;,&quot;, &quot;:&quot;), ensure_ascii=False)
+    return s.encode(&quot;utf-8&quot;)
+
+def raw_bytes(obj):
+    &quot;&quot;&quot;原始字节：不排序、默认分隔符、带 BOM —— 故意模拟&quot;某台机器的写法&quot;。&quot;&quot;&quot;
+    s = json.dumps(obj, ensure_ascii=False, indent=1)
+    return b&quot;\xef\xbb\xbf&quot; + s.replace(&quot;\n&quot;, &quot;\r\n&quot;).encode(&quot;utf-8&quot;)
+
+def h(b: bytes) -&gt; str:
+    return hashlib.sha256(b).hexdigest()
+
+# 同一份逻辑数据，两种写法
+one = {&quot;doc_id&quot;: &quot;doc0001&quot;, &quot;topic&quot;: &quot;geometry&quot;, &quot;n&quot;: 3, &quot;flag&quot;: True}
+two = {&quot;flag&quot;: True, &quot;n&quot;: 3, &quot;topic&quot;: &quot;geometry&quot;, &quot;doc_id&quot;: &quot;doc0001&quot;}
+print(&quot;\n=== 1a. 规范化前后：同一份逻辑数据的两种字节 ===&quot;)
+print(f&quot;   raw 哈希: {h(raw_bytes(one))[:16]} / {h(raw_bytes(two))[:16]}&quot;
+      f&quot;   -&gt; {&#39;一致&#39; if h(raw_bytes(one)) == h(raw_bytes(two)) else &#39;不一致&#39;}&quot;)
+print(f&quot;   canon 哈希: {h(canon_bytes(one))[:16]} / {h(canon_bytes(two))[:16]}&quot;
+      f&quot;   -&gt; {&#39;一致&#39; if h(canon_bytes(one)) == h(canon_bytes(two)) else &#39;不一致&#39;}&quot;)
+
+# 数值表示：1 与 1.0 在 Python 里相等，在规范字节里不同
+print(f&quot;   int 1 vs float 1.0: canon {h(canon_bytes({&#39;x&#39;: 1}))[:12]} vs &quot;
+      f&quot;{h(canon_bytes({&#39;x&#39;: 1.0}))[:12]}  (相等? {1 == 1.0} 字节相等? &quot;
+      f&quot;{canon_bytes({&#39;x&#39;: 1}) == canon_bytes({&#39;x&#39;: 1.0})})&quot;)
+
+# ---------- 1b. 双链：raw_hash（取证）与 canon_hash（寻址） ----------
+def dual_hash(doc):
+    return h(raw_bytes(doc)), h(canon_bytes(doc))
+
+print(&quot;\n=== 1b. 双链：近重复文档的 raw/canon 哈希 ===&quot;)
+raw_list, canons = [], OrderedDict()
+for d in docs:
+    r, c = dual_hash(d)
+    raw_list.append(r)
+    canons[d[&quot;doc_id&quot;]] = c
+print(f&quot;   raw 唯一:  {len(set(raw_list))} / {len(docs)}（尾随空格保留 → raw 认得出两份不同）&quot;)
+print(f&quot;   canon 唯一: {len(set(canons.values()))} / {len(docs)}（归一化抹平尾随空格 → 同一份）&quot;)
+merged = [(a, docs[b][&quot;doc_id&quot;]) for a, b in DUP_PAIRS
+          if canons[a] == h(canon_bytes(docs[b]))]
+print(f&quot;   规范化合并的组: {merged}&quot;)
+print(f&quot;   反查：合并组的 canon 哈希 = {canons[merged[0][0]][:16]}&quot;
+      f&quot;（{len(merged)} 组 doc_id 指向同一个哈希）&quot;)
+
+# ---------- 2. Merkle 树：叶 -&gt; 根，含证明路径 ----------
+LEAF_DOM = b&quot;\x00&quot;
+NODE_DOM = b&quot;\x01&quot;
+
+def leaf_hash(leaf_id: str, content_hash: str) -&gt; str:
+    return h(LEAF_DOM + leaf_id.encode() + b&quot;|&quot; + content_hash.encode())
+
+def node_hash(l: str, r: str) -&gt; str:
+    return h(NODE_DOM + l.encode() + r.encode())
+
+def build_merkle(pairs):
+    &quot;&quot;&quot;pairs: [(leaf_id, content_hash)]。返回 (root, levels, n_hash_calls)。&quot;&quot;&quot;
+    pairs = sorted(pairs, key=lambda p: p[0].encode())   # 规约 1：按 leaf_id 字节序
+    if not pairs:                                        # 规约 4：空集合
+        return h(b&quot;&quot;), [[h(b&quot;&quot;)]], 1
+    calls = 0
+    level = []
+    for lid, ch in pairs:
+        level.append(leaf_hash(lid, ch)); calls += 1
+    levels = [level]
+    while len(level) &gt; 1:
+        if len(level) % 2:                               # 规约 2：复制最后一个
+            level = level + [level[-1]]
+        nxt = []
+        for i in range(0, len(level), 2):
+            nxt.append(node_hash(level[i], level[i + 1])); calls += 1
+        level = nxt
+        levels.append(level)
+    return level[0], levels, calls
+
+def merkle_proof(levels, idx):
+    &quot;&quot;&quot;返回 (兄弟哈希, 方向) 列表，长度 = 树高。&quot;&quot;&quot;
+    proof = []
+    for lv in levels[:-1]:
+        if idx % 2 == 0:
+            sib = idx + 1 if idx + 1 &lt; len(lv) else idx      # 复制自己
+            proof.append((lv[sib], &quot;R&quot;))
+        else:
+            proof.append((lv[idx - 1], &quot;L&quot;))
+        idx //= 2
+    return proof
+
+def verify_proof(leaf_id, content_hash, proof, root):
+    cur = leaf_hash(leaf_id, content_hash)
+    for sib, side in proof:
+        cur = node_hash(cur, sib) if side == &quot;R&quot; else node_hash(sib, cur)
+    return cur == root
+
+pairs = [(d[&quot;doc_id&quot;], canons[d[&quot;doc_id&quot;]]) for d in docs]
+root, levels, calls = build_merkle(pairs)
+print(&quot;\n=== 2. Merkle 树与证明路径 ===&quot;)
+print(f&quot;   叶数 = {len(pairs)}  树高 = {len(levels) - 1}  哈希调用 = {calls}&quot;)
+print(f&quot;   根 = {root[:32]}&quot;)
+# 挑一个真实存在的文档做成员证明，挑一个不存在的做否证
+tgt = &quot;doc0073&quot;
+pr = merkle_proof(levels, [p[0] for p in sorted(pairs, key=lambda p: p[0].encode())].index(tgt))
+print(f&quot;   doc0073 的证明路径长度 = {len(pr)}  （树高 {len(levels) - 1}）&quot;)
+print(f&quot;   证明通过(真成员)   = {verify_proof(tgt, canons[tgt], pr, root)}&quot;)
+print(f&quot;   证明通过(篡改内容) = {verify_proof(tgt, h(b&#39;tampered&#39;), pr, root)}&quot;)
+print(f&quot;   证明通过(冒充成员) = {verify_proof(&#39;doc9999&#39;, canons[tgt], pr, root)}&quot;)
+
+# ---------- 3. 快照 manifest：三段结构 + 只追加 ----------
+def merkle_root_of(items):
+    &quot;&quot;&quot;items: [(leaf_id, hash)] -&gt; (root, calls)&quot;&quot;&quot;
+    r, _, c = build_merkle(items)
+    return r, c
+
+def snapshot(docs, params, parents):
+    content = [(d[&quot;doc_id&quot;], canons[d[&quot;doc_id&quot;]]) for d in docs]
+    # meta 只含&quot;关于这条数据&quot;的字段（这里是 split 与 topic），与 content 分离
+    meta_items = []
+    for d in docs:
+        m = {&quot;doc_id&quot;: d[&quot;doc_id&quot;], &quot;split&quot;: d[&quot;split&quot;], &quot;topic&quot;: d[&quot;topic&quot;]}
+        meta_items.append((d[&quot;doc_id&quot;], h(canon_bytes(m))))
+    c_root, c_calls = merkle_root_of(content)
+    m_root, m_calls = merkle_root_of(meta_items)
+    p_hash = h(canon_bytes(params))
+    comps = {
+        &quot;content&quot;: {&quot;merkle_root&quot;: c_root, &quot;n_leaves&quot;: len(content), &quot;leaf_algo&quot;: &quot;sha256/dom00&quot;},
+        &quot;meta&quot;: {&quot;merkle_root&quot;: m_root, &quot;n_leaves&quot;: len(meta_items),
+                 &quot;annotation_guideline_hash&quot;: h(b&quot;guideline-v3&quot;)[:16]},
+        &quot;params&quot;: {&quot;params_hash&quot;: p_hash, &quot;pipeline_version&quot;: params[&quot;pipeline_version&quot;],
+                   &quot;seed&quot;: params[&quot;seed&quot;]},
+    }
+    rec = {
+        &quot;schema_version&quot;: 1,
+        # snapshot_id 由三段分量决定；created_at 与 stats 绝不参与
+        &quot;snapshot_id&quot;: h(canon_bytes(comps)),
+        &quot;parents&quot;: parents,
+        &quot;components&quot;: comps,
+        &quot;stats&quot;: {&quot;n_rows&quot;: len(docs),
+                  &quot;split_sizes&quot;: {s: sum(1 for d in docs if d[&quot;split&quot;] == s)
+                                  for s in (&quot;train&quot;, &quot;test&quot;)},
+                  &quot;topic_hist&quot;: {t: sum(1 for d in docs if d[&quot;topic&quot;] == t) for t in TOPICS}},
+    }
+    return rec, c_calls + m_calls
+
+PARAMS = {&quot;pipeline_version&quot;: &quot;clean-1.4.2&quot;, &quot;seed&quot;: 20260501,
+          &quot;filters&quot;: {&quot;min_len&quot;: 20, &quot;drop_test_leak&quot;: True}}
+s1, calls1 = snapshot(docs, PARAMS, [])
+print(&quot;\n=== 3. 快照记录（三段分离）===&quot;)
+print(f&quot;   snapshot_id     = {s1[&#39;snapshot_id&#39;][:32]}&quot;)
+print(f&quot;   content.root    = {s1[&#39;components&#39;][&#39;content&#39;][&#39;merkle_root&#39;][:16]}&quot;
+      f&quot;  n={s1[&#39;components&#39;][&#39;content&#39;][&#39;n_leaves&#39;]}&quot;)
+print(f&quot;   meta.root       = {s1[&#39;components&#39;][&#39;meta&#39;][&#39;merkle_root&#39;][:16]}&quot;
+      f&quot;  n={s1[&#39;components&#39;][&#39;meta&#39;][&#39;n_leaves&#39;]}&quot;)
+print(f&quot;   params.hash     = {s1[&#39;components&#39;][&#39;params&#39;][&#39;params_hash&#39;][:16]}&quot;)
+print(f&quot;   stats           = {s1[&#39;stats&#39;][&#39;split_sizes&#39;]}  行数={s1[&#39;stats&#39;][&#39;n_rows&#39;]}&quot;)
+
+# 只改 params（阈值），content 不变
+P2 = json.loads(json.dumps(PARAMS)); P2[&quot;filters&quot;][&quot;min_len&quot;] = 24
+s2, _ = snapshot(docs, P2, [s1[&quot;snapshot_id&quot;]])
+print(f&quot;\n   只改 params: content 相同? &quot;
+      f&quot;{s1[&#39;components&#39;][&#39;content&#39;][&#39;merkle_root&#39;] == s2[&#39;components&#39;][&#39;content&#39;][&#39;merkle_root&#39;]}&quot;
+      f&quot;   整体同 id? {s1[&#39;snapshot_id&#39;] == s2[&#39;snapshot_id&#39;]}&quot;)
+
+# 只改一条数据的内容
+docs3 = json.loads(json.dumps(docs))
+docs3[7][&quot;body&quot;] = docs3[7][&quot;body&quot;] + &quot; (revised)&quot;
+canons3 = {d[&quot;doc_id&quot;]: h(canon_bytes(d)) for d in docs3}
+def snapshot_fast(docs, params, parents, canons_map, prev=None):
+    content = [(d[&quot;doc_id&quot;], canons_map[d[&quot;doc_id&quot;]]) for d in docs]
+    c_root, _ = merkle_root_of(content)
+    return c_root
+c_root3 = snapshot_fast(docs3, PARAMS, [], canons3)
+print(f&quot;   只改 1 条数据: content.root 变化 = &quot;
+      f&quot;{c_root3 != s1[&#39;components&#39;][&#39;content&#39;][&#39;merkle_root&#39;]}&quot;)
+
+# ---------- 4. 增量：改 1 个文件要算几次内容哈希 ----------
+print(&quot;\n=== 4. 增量更新：两种版本表示的代价 ===&quot;)
+# 表示 A：整批拼接哈希
+concat1 = h(&quot;&quot;.join(canons[d[&quot;doc_id&quot;]] for d in docs).encode())
+changed = {&quot;doc0007&quot;}
+concat_calls = len(docs)
+# 表示 B：Merkle，只需重算 1 个叶 + 树高次合并
+leaf_calls = 1
+node_calls = len(levels) - 1
+print(f&quot;   整批拼接: 内容哈希计算次数 = {concat_calls}   （改 1 个文件也要重读全部）&quot;)
+print(f&quot;   Merkle  : 内容哈希计算次数 = {leaf_calls} + 合并 {node_calls} = {leaf_calls + node_calls}&quot;)
+print(f&quot;   比值 = {concat_calls / (leaf_calls + node_calls):.1f}x  &quot;
+      f&quot;（n={len(docs)}，树高 {len(levels) - 1}）&quot;)
+print(f&quot;   拼接哈希能否定位差异文件? 不能（它是聚合，不是树）&quot;)
+
+# 差异集合：两份快照的叶集合差
+diff_removed = sorted(set(canons) - set(canons3)) or []
+diff_changed = sorted([k for k in canons if k in canons3 and canons[k] != canons3[k]])
+diff_added = sorted(set(canons3) - set(canons))
+print(f&quot;   叶集合 diff: 删除 {diff_removed} 修改 {diff_changed} 新增 {diff_added}&quot;)
+
+# ---------- 5. 两个反例 ----------
+print(&quot;\n=== 5. 两个把版本管理做坏的反例 ===&quot;)
+# 反例 1：把 created_at 放进哈希
+def snap_with_time(ts):
+    return h(canon_bytes({**s1[&quot;components&quot;], &quot;created_at&quot;: ts}))
+a = snap_with_time(&quot;2026-05-01T00:00:00Z&quot;)
+b = snap_with_time(&quot;2026-05-01T00:00:01Z&quot;)
+print(f&quot;   [反例1] 同数据、差 1 秒创建时间: id 相同? {a == b}  &quot;
+      f&quot;-&gt; 重跑永不幂等&quot;)
+# 反例 2：不排序键（模拟换语言/换库）
+def canon_unsorted(obj):
+    return json.dumps(obj, separators=(&quot;,&quot;, &quot;:&quot;), ensure_ascii=False).encode()
+x = {&quot;b&quot;: 1, &quot;a&quot;: 2}
+y = {&quot;a&quot;: 2, &quot;b&quot;: 1}
+print(f&quot;   [反例2] 同字典、构造顺序不同: canon 相同? &quot;
+      f&quot;{h(canon_bytes(x)) == h(canon_bytes(y))}  未排序相同? &quot;
+      f&quot;{h(canon_unsorted(x)) == h(canon_unsorted(y))}&quot;)
+# 反例 3：集合语义被排序（有序字段绝不能排序）
+steps_a = [&quot;syn&quot;, &quot;real&quot;]
+steps_b = [&quot;real&quot;, &quot;syn&quot;]
+print(f&quot;   [反例3] 有序阶段表 [syn,real] vs [real,syn]: 排序后哈希相同? &quot;
+      f&quot;{h(canon_bytes(sorted(steps_a))) == h(canon_bytes(sorted(steps_b)))}&quot;
+      f&quot;  -&gt; 语义被抹平&quot;)</code></pre>
+<p>运行输出（Python 3.14.5）：</p>
+<pre data-lang="text"><code class="language-text">python 3.14.5
+
+=== 1a. 规范化前后：同一份逻辑数据的两种字节 ===
+   raw 哈希: aa0d282921bfe1c1 / dbeb62d2aa0fe45f   -&gt; 不一致
+   canon 哈希: 31a63b1e3b6d983a / 31a63b1e3b6d983a   -&gt; 一致
+   int 1 vs float 1.0: canon 5041bf1f713d vs bf32f5623689  (相等? True 字节相等? False)
+
+=== 1b. 双链：近重复文档的 raw/canon 哈希 ===
+   raw 唯一:  120 / 120（尾随空格保留 → raw 认得出两份不同）
+   canon 唯一: 114 / 120（归一化抹平尾随空格 → 同一份）
+   规范化合并的组: [(&#39;doc0000&#39;, &#39;doc0000&#39;), (&#39;doc0020&#39;, &#39;doc0020&#39;), (&#39;doc0040&#39;, &#39;doc0040&#39;), (&#39;doc0060&#39;, &#39;doc0060&#39;), (&#39;doc0080&#39;, &#39;doc0080&#39;), (&#39;doc0100&#39;, &#39;doc0100&#39;)]
+   反查：合并组的 canon 哈希 = c1bf824d6eb68873（6 组 doc_id 指向同一个哈希）
+
+=== 2. Merkle 树与证明路径 ===
+   叶数 = 120  树高 = 7  哈希调用 = 240
+   根 = 8c0200dafd2d1a4e603e6051d6890879
+   doc0073 的证明路径长度 = 7  （树高 7）
+   证明通过(真成员)   = True
+   证明通过(篡改内容) = False
+   证明通过(冒充成员) = False
+
+=== 3. 快照记录（三段分离）===
+   snapshot_id     = 3e768945889cac38f7d99172608f464b
+   content.root    = 8c0200dafd2d1a4e  n=120
+   meta.root       = d2e09ad7f3b69650  n=120
+   params.hash     = 1bb4cdb504f16f49
+   stats           = {&#39;train&#39;: 102, &#39;test&#39;: 18}  行数=120
+
+   只改 params: content 相同? True   整体同 id? False
+   只改 1 条数据: content.root 变化 = True
+
+=== 4. 增量更新：两种版本表示的代价 ===
+   整批拼接: 内容哈希计算次数 = 120   （改 1 个文件也要重读全部）
+   Merkle  : 内容哈希计算次数 = 1 + 合并 7 = 8
+   比值 = 15.0x  （n=120，树高 7）
+   拼接哈希能否定位差异文件? 不能（它是聚合，不是树）
+   叶集合 diff: 删除 [] 修改 [&#39;doc0007&#39;] 新增 []
+
+=== 5. 两个把版本管理做坏的反例 ===
+   [反例1] 同数据、差 1 秒创建时间: id 相同? False  -&gt; 重跑永不幂等
+   [反例2] 同字典、构造顺序不同: canon 相同? True  未排序相同? False
+   [反例3] 有序阶段表 [syn,real] vs [real,syn]: 排序后哈希相同? True  -&gt; 语义被抹平</code></pre>
+<h4 id="h-读输出的七个要点">读输出的七个要点<a class="anchor" href="#h-读输出的七个要点" aria-label="本节链接">#</a></h4>
+<ol>
+<li><strong>规范化是必需的，不是洁癖。</strong> 1a 段里同一份逻辑数据的 raw 哈希不一致（<code>aa0d282921bfe1c1</code> vs <code>dbeb62d2aa0fe45f</code>）、canon 哈希一致（都是 <code>31a63b1e3b6d983a</code>）；而 <code>1</code> 与 <code>1.0</code> 的 canon 哈希也<strong>不一致</strong>（<code>5041bf1f713d</code> vs <code>bf32f5623689</code>），尽管 <code>1 == 1.0</code> 为 <code>True</code>。<strong>Python 的相等与字节的相等不是一回事</strong>，这是版本管理里最便宜也最容易漏的一条检查。</li>
+<li><strong>双链的作用在 1b 段可见</strong>：120 篇里 raw 唯一 120 个，canon 唯一 114 个 —— 有 6 组「同一份文档被两个来源各收了一次」（<code>doc_id</code> 复用、只差一个尾随空格）。做寻址/去重时你要的是 114；做取证时你要的是 120（&quot;到底是哪一次采集多带了一个空格&quot;需要原始字节）。<strong>只留一条链必然要在两种需求里丢一个。</strong></li>
+<li><strong>树高与证明长度相等</strong>（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">7</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">⌈</span><span class="mop"><span class="mop">lo<span style="margin-right:0.0139em;">g</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.207em;"><span style="top:-2.4559em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2441em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">120</span><span class="mclose">⌉</span></span></span></span>），且三种否证全部正确返回 <code>False</code>。这条 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.9386em;vertical-align:-0.2441em;"></span><span class="mop"><span class="mop">lo<span style="margin-right:0.0139em;">g</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.207em;"><span style="top:-2.4559em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2441em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">n</span></span></span></span> 的证明能力是 Merkle 树相对&quot;拼接哈希&quot;的全部增量价值 —— 它让<strong>没有全量数据的人</strong>也能验证一个文件的归属。</li>
+<li><strong>三段分离立刻给出一个可操作的区别</strong>（3 段）：只改 <code>min_len</code> 阈值时 <code>content.root</code> 相同而 <code>snapshot_id</code> 不同。这意味着<strong>数据字节不用重生成，但结论需要重算</strong>。如果三者混在一起，你只能得到&quot;整个都变了&quot;，于是被迫做一次全量重跑。</li>
+<li><strong>增量的 15 倍不是重点，重点是&quot;能定位&quot;</strong>（4 段）。拼接哈希的读数是 <code>120 → 120</code>（零收益），且它<strong>没有</strong> diff 能力；Merkle 路径是 <code>1 + 7 = 8</code>，并且叶集合 diff 直接给出 <code>修改 [&#39;doc0007&#39;]</code>。</li>
+<li><strong>1a 段的 <code>1</code> vs <code>1.0</code> 与 1b 段的尾随空格是同一类问题的两个面孔</strong>：前者说明&quot;类型是内容的一部分&quot;，后者说明&quot;空白是内容的一部分&quot;。两者都只能靠<strong>显式写下来的归一化规约</strong>处理，而规约一旦写下来就变成了版本的一部分 —— 改规约等于换哈希，见 3.2 节的规约版本号。</li>
+<li><strong>三个反例都是&quot;看起来能用&quot;的实现</strong>：<code>created_at</code> 进哈希（一行代码，让重跑永不幂等）、不排序键（换库即全体换哈希）、给有序字段排序（哈希稳定了但语义被抹平）。它们的共性是<strong>不会报错</strong>，只会在三个月后的某次审计里暴露。</li>
+</ol>
+<h3 id="h-六取舍与边界">六、取舍与边界<a class="anchor" href="#h-六取舍与边界" aria-label="本节链接">#</a></h3>
+<table>
+<thead>
+<tr>
+<th>选择</th>
+<th>换来什么</th>
+<th>付出什么</th>
+<th>什么时候选另一边</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>内容寻址（哈希当名字）</td>
+<td>标识即校验；可跨人跨机器核对</td>
+<td>名字不可读；重算哈希要读全量字节</td>
+<td>交互式探索期：先用可读名 + 软链，发布前再钉哈希</td>
+</tr>
+<tr>
+<td>规范形式哈希</td>
+<td>跨语言/跨库稳定</td>
+<td>规范化可能掩盖真实差异；需维护规约</td>
+<td>下游按原始字节消费（正则、grep）时，只信 raw</td>
+</tr>
+<tr>
+<td>Merkle 树</td>
+<td>增量、差异定位、成员证明</td>
+<td>实现更复杂；规约必须写下来</td>
+<td>数据集小于百个文件且从不变更：拼接哈希够用</td>
+</tr>
+<tr>
+<td>三段分离（content/meta/params）</td>
+<td>能区分&quot;数据变了&quot;与&quot;参数变了&quot;</td>
+<td>三套哈希、三套更新流程</td>
+<td>一次性数据集：混在一起省事，代价是以后无法局部重跑</td>
+</tr>
+<tr>
+<td>只追加快照 + 只读前缀</td>
+<td>不可变有工程保证，不只靠纪律</td>
+<td>存储成本随快照数线性涨</td>
+<td>存储极贵时：保留&quot;里程碑&quot;快照，中间态定期回收</td>
+</tr>
+<tr>
+<td>哈希只覆盖内容不覆盖顺序</td>
+<td>与&quot;集合语义&quot;对齐</td>
+<td>顺序敏感的数据集会失去顺序信息</td>
+<td>阶段表这类有序结构：<strong>顺序进 params 的哈希</strong>，而不是进 content</td>
+</tr>
+</tbody></table>
+<p><strong>四条硬边界：</strong></p>
+<ol>
+<li><strong>哈希不保证正确，只保证识别。</strong> 一份满是错标的数据集可以有一个完美稳定的哈希。哈希回答&quot;是不是同一份&quot;，从不回答&quot;是不是好的&quot;。这是第 1 章&quot;最贵的错误是静默错误&quot;在版本层面的重述 —— 版本管理的价值恰恰在于<strong>当错误被发现时，能快速确定它影响范围</strong>（第 4 节）。</li>
+<li><strong>内容寻址需要存储或信任。</strong> 要么你把对象留着（成本），要么你信任外部存储按哈希返回（信任）。二者必居其一，没有第三条路。实践中常见的第三种是&quot;我只有一个哈希，数据在别人的机器上&quot;，那等于没有版本。</li>
+<li><strong>规范化会引入不可逆的信息损失。</strong> 一旦决定&quot;键顺序不入哈希&quot;，你就再也无法用哈希区分&quot;键顺序不同但内容相同&quot;的两份数据。这是<strong>有意的</strong>，但必须有意识地做，并在规范里写下来（而不是某个人顺手加了 <code>sort_keys=True</code>）。</li>
+<li><strong>哈希碰撞的边界要算清，而不是说&quot;不可能&quot;。</strong> 生日界：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span> 个对象的碰撞概率约 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0991em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span><span class="mord">/</span><span class="mord"><span class="mord">2</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8491em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">b</span><span class="mbin mtight">+</span><span class="mord mtight">1</span></span></span></span></span></span></span></span></span></span></span></span>。<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">b</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">256</span></span></span></span> 时，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">12</span></span></span></span></span></span></span></span></span></span></span></span> 个对象也只有约 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">53</span></span></span></span></span></span></span></span></span></span></span></span> 量级。但<strong>如果碰撞是故意构造的</strong>（有人想造一份&quot;哈希相同但内容不同&quot;的数据），那要防的是抗碰撞性 —— SHA-256 目前仍然够用，而 MD5/SHA-1 不够（它们都有实际构造的碰撞）。所以版本标识<strong>必须</strong>用 SHA-256 或更强的函数，这不是保守，是底线。</li>
+</ol>
+<h3 id="h-练习">练习<a class="anchor" href="#h-练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><p><strong>规范化规约的实操</strong>：取你手上任意一份数据（CSV/JSON/JSONL），回答：
+（a）列出它的<strong>全部</strong>表示自由度（键序、数值、行尾、编码、行序、列序、空值表示），逐条判定&quot;下游能不能观察到&quot;；
+（b）据此写出你的规范形式规约（哪几项定形、哪几项保留），并给出一个<strong>能跑的检查函数</strong>；
+（c）构造两份&quot;逻辑相同、字节不同&quot;的样本，验证你的规范化把它们映射到同一个哈希，且<strong>没有</strong>把一份&quot;逻辑不同&quot;的样本错误合并。</p>
+</li>
+<li><p><strong>你自己的三种粒度对比</strong>：用你手上的数据（或本节的合成数据）实测：
+（a）文件哈希、整批拼接哈希、Merkle 根三种表示各算一次，记录时间与哈希调用次数；
+（b）改 1 个文件、删 1 个文件、加 1 个文件，三种表示各自的代价；
+（c）用实测数据回答：<strong>在什么规模下你必须上 Merkle？</strong>（提示：把&quot;文件 I/O 时间&quot;与&quot;内存哈希时间&quot;分开计时，找到二者相等的那一点。）</p>
+</li>
+<li><p><strong>证明路径的对抗练习</strong>：
+（a）实现本节的两个规约变体（奇数节点&quot;复制最后一个&quot; vs &quot;提升到上一层&quot;），对同一份数据分别建树，报告两个根的差异；
+（b）证明：如果去掉域分隔前缀（<code>\x00</code> / <code>\x01</code>），存在一个两叶树可以被重解释成另一个树的叶（写出具体的构造）；
+（c）解释为什么&quot;根不同&quot;不能直接推出&quot;数据不同&quot;（提示：规约变更也会改变根），并给出你的规约版本号方案。</p>
+</li>
+<li><p><strong>一个快照记录的反例修复</strong>：下面是某团队的快照记录，找出<strong>至少四处</strong>会让版本失效的设计，并逐条给出修法与代价。</p>
+<pre data-lang="text"><code class="language-text">{id: &quot;v2_final&quot;, path: &quot;/mnt/data/v2&quot;, created: &quot;2026-05-01&quot;,
+ n: 10240, hash: md5_dir(path), params: {thr: 0.6}, author: &quot;alice&quot;}</code></pre>
+<p>（提示：<code>id</code> 是不是内容？<code>path</code> 进不进哈希？<code>md5</code> 够不够？<code>created</code> 参与了吗？<code>n</code> 与 <code>hash</code> 冲突时信谁？<code>params</code> 是哪一层的？）</p>
+</li>
+<li><p><strong>三段分离的判定树</strong>：给定两份快照 A、B，写出一个<strong>程序</strong>（伪代码或真代码），把 <code>(A, B)</code> 分类到以下四类之一，并给出每类的正确工程动作：
+（a）完全同一份；（b）只有 params 变；（c）只有 meta 变；（d）content 变。
+对每一类回答：下游结论需要重算吗？数据需要重新生成吗？已发出的标注任务需要作废吗？</p>
+</li>
+<li><p><strong>不可变的流程设计</strong>：你所在团队的存储是一个普通的对象存储（无 WORM、无版本化）。设计一套<strong>只靠命名 + 权限 + 追加式 manifest</strong> 实现&quot;不可变&quot;的方案：
+（a）写出写路径的权限模型（谁能 <code>PutObject</code>、谁能删、<code>latest</code> 指针谁写）；
+（b）给出一次&quot;有人试图覆盖已有快照前缀&quot;的检测方法，并说明你为什么需要它（提示：内容寻址下重写前缀意味着什么？）；
+（c）说明这套方案的残余风险（谁有权限谁就能作恶），并给出一个<strong>独立于权限</strong>的兜底检查（例如定期重算全部根哈希）。</p>
+</li>
+</ol>
+<h3 id="h-小结">小结<a class="anchor" href="#h-小结" aria-label="本节链接">#</a></h3>
+<ul>
+<li><strong>版本标识必须由内容回答，不能由路径、<code>mtime</code> 或大小回答。</strong> 三者各有失效方式（可在内容变化时不变、可在内容不变时变、可被幂等重跑刷新），而内容寻址的副产品是<strong>标识即校验</strong> —— 拿到标识的人可以自己重算。这是后面血缘与审计两块的地基。</li>
+<li><strong>内容寻址的前提是规范形式</strong>。四条纪律：键排序、数值定形、编码与行尾定形、集合语义显式化（有序的绝不排序）。归一化还要包含<strong>字符串去首尾空白</strong> —— 1b 段的 6 组近重复只差一个尾随空格。实测：同一份逻辑数据的 raw 哈希不一致、canon 哈希一致；而 <code>1</code> 与 <code>1.0</code> 在 Python 里 <code>==</code> 为 <code>True</code> 但 canon 字节不同。</li>
+<li><strong>必须保留两条链</strong>：<code>raw_hash</code>（原始字节，供取证与审计）与 <code>canon_hash</code>（规范形式，供寻址与去重）。实测里 120 篇文档 raw 唯一 120 个、canon 唯一 114 个（6 组「同文档两来源」）—— 只留一条必然在&quot;精确&quot;与&quot;可用&quot;之间丢一个。</li>
+<li><strong>聚合不能定位差异，树可以。</strong> 整批拼接哈希改 1 个文件也要重算 120 次内容哈希，且<strong>无法</strong>回答&quot;哪个文件变了&quot;；Merkle 树是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">7</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">8</span></span></span></span> 次（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">15</span></span></span></span> 倍），并且叶集合 diff 直接给出 <code>修改 [&#39;doc0007&#39;]</code>，还能给出长度等于树高（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">7</span></span></span></span>）的成员证明路径 —— 三种否证（篡改内容、冒充成员、错误证明）全部返回 <code>False</code>。</li>
+<li><strong>快照要分三段：content / meta / params，根哈希覆盖三者但三者各有自己的哈希。</strong> 实测：只改 <code>min_len</code> 阈值时 <code>content.root</code> 相同（数据不必重生成）而 <code>snapshot_id</code> 不同（结论需要重算）。混在一起的代价是任何参数微调都让&quot;数据变了吗&quot;这个问题的答案永远是&quot;变了&quot;。</li>
+<li><strong><code>created_at</code>、<code>stats</code>、<code>gates</code> 绝不参与哈希。</strong> 时间进哈希 → 重跑永不幂等（反例 1 实测 <code>id 相同? False</code>）；不进哈希但它们<strong>要进快照记录</strong>，因为&quot;这份数据有 120 行、test 12 条&quot;是下游可以核对的断言，核对失败是&quot;有人动了数据却没换哈希&quot;的报警信号。</li>
+<li><strong>不可变有两层</strong>：名字层（内容寻址）与存储层（只追加 + 只读前缀）。后者只用纪律是不够的，推荐的最小工程形态是<strong>只追加的 manifest JSONL + 不可重写的前缀 + 一个 <code>latest</code> 指针</strong>：指针可以动，目标不动。</li>
+<li><strong>哈希不保证正确，只保证识别。</strong> 它的价值在被发现错误之后才兑现（影响面定位与回退，第 4 节）。另外，版本标识必须用 SHA-256 或更强：MD5/SHA-1 有实际构造的碰撞，而&quot;有人故意造一份同哈希数据&quot;是版本管理必须防的威胁模型。</li>
+</ul>
+<blockquote>
+<p>下一节：<strong>血缘图与影响面分析（data-ch5-l2）：从&quot;这份数据从哪来&quot;到&quot;这处错误影响谁&quot;</strong> —— 本节把数据集变成了一个可验证的身份，但身份之间还是孤立的。真实管线上有几十个节点（来源 → 清洗 → 过滤 → 采样 → 标注 → 配方 → 训练 → 评测 → 报告），它们之间有列级的依赖。下一节把这些依赖画成一张 DAG，并回答三个本节回答不了的问题：<strong>这一列是从哪几个源列推出来的？改一个过滤阈值会波及哪些下游产物？发现一处错标之后，怎么在不重跑全部管线的情况下算出受影响的最小集合（以及这个&quot;最小&quot;本身怎么被验证）？</strong></p>
+</blockquote>

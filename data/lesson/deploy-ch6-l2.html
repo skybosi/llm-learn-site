@@ -1,0 +1,157 @@
+<h2 id="h-完整部署实现">完整部署实现<a class="anchor" href="#h-完整部署实现" aria-label="本节链接">#</a></h2>
+<p>上一课把蓝图画好了，这一课动手把它变成能跑的一整套服务。我们把前面所有章节的产物——量化、张量并行、OpenAI 兼容 API、Docker、监控——装进一个 <code>docker compose</code>，用一个命令把&quot;客服问答助手&quot;完整拉起来。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-实现顺序自底向上逐步点亮">1. 实现顺序：自底向上，逐步点亮<a class="anchor" href="#h-1-实现顺序自底向上逐步点亮" aria-label="本节链接">#</a></h4>
+<p>不要一上来就写整套编排。正确顺序是<strong>每一步都可验证</strong>：</p>
+<ol>
+<li><strong>先裸机跑通</strong>：命令行 <code>vllm serve</code>，确认模型能加载、能回答（第 2 章）；</li>
+<li><strong>再容器化</strong>：用官方镜像 + 挂载权重，确认 GPU 在容器内可见（第 4 章 l2）；</li>
+<li><strong>再加网关</strong>：Nginx 前置，确认 SSE 流式能透传；</li>
+<li><strong>再加监控</strong>：Prometheus 抓取指标、Grafana 出图（第 4 章 l3）；</li>
+<li><strong>最后写成一个 Compose</strong>：一条命令拉起全部。</li>
+</ol>
+<h4 id="h-2-三个最容易踩的集成点">2. 三个最容易踩的集成点<a class="anchor" href="#h-2-三个最容易踩的集成点" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>SSE 透传</strong>：Nginx 默认会<strong>缓冲</strong>上游响应，导致流式 token 攒成一大块才吐出，打字机效果消失。必须 <code>proxy_buffering off</code>；</li>
+<li><strong>张量并行与容器设备声明</strong>：vLLM 里写了 <code>--tensor-parallel-size 2</code>，Compose 里就要申请 <code>count: 2</code> 的 GPU，两边必须一致，否则要么起不来、要么只有一张卡在干活；</li>
+<li><strong>监控网络打通</strong>：Prometheus 容器访问 vLLM 用的是<strong>容器网络里的服务名</strong>（<code>vllm:8000</code>），不是宿主机 <code>localhost</code>，写错就抓不到指标。</li>
+</ul>
+<p><figure><img class="md-img" src="content/courses/llm-deployment-practice/assets/chapter-6-figure-02.svg" alt="容器编排拓扑图：中央一个&quot;Docker Compose&quot;虚线大框，内含四个容器方块——vllm（标&quot;TP=2、AWQ、/metrics&quot;）、gateway（标&quot;Nginx、SSE 透传&quot;）、prometheus、grafana；vllm 与 gateway 之间实线箭头，vllm 与 prometheus 之间虚线箭头（抓取 /metrics），gateway 顶部露出对外的 8080 端口，vllm 底部连一个&quot;模型权重卷 /models&quot;；底部一句话&quot;一条命令拉起全套服务&quot;" loading="lazy" decoding="async"><figcaption>容器编排拓扑图：中央一个&quot;Docker Compose&quot;虚线大框，内含四个容器方块——vllm（标&quot;TP=2、AWQ、/metrics&quot;）、gateway（标&quot;Nginx、SSE 透传&quot;）、prometheus、grafana；vllm 与 gateway 之间实线箭头，vllm 与 prometheus 之间虚线箭头（抓取 /metrics），gateway 顶部露出对外的 8080 端口，vllm 底部连一个&quot;模型权重卷 /models&quot;；底部一句话&quot;一条命令拉起全套服务&quot;</figcaption></figure>
+</p>
+<h3 id="h-二可运行示例">二、可运行示例<a class="anchor" href="#h-二可运行示例" aria-label="本节链接">#</a></h3>
+<h4 id="h-示例-1目录结构">示例 1：目录结构<a class="anchor" href="#h-示例-1目录结构" aria-label="本节链接">#</a></h4>
+<pre data-lang="text"><code class="language-text">support-bot/
+├── docker-compose.yml
+├── nginx.conf
+├── prometheus.yml
+└── README.md</code></pre>
+<h4 id="h-示例-2完整的-docker-composeyml">示例 2：完整的 docker-compose.yml<a class="anchor" href="#h-示例-2完整的-docker-composeyml" aria-label="本节链接">#</a></h4>
+<pre data-lang="yaml"><code class="language-yaml"># docker-compose.yml —— 一条命令拉起客服问答助手全套
+services:
+  vllm:
+    image: vllm/vllm-openai:latest
+    command: &gt;
+      --model /models/Llama-3.1-8B-Instruct-AWQ
+      --quantization awq
+      --served-model-name support-assistant
+      --max-model-len 8192
+      --max-num-seqs 64
+      --gpu-memory-utilization 0.85
+      --enable-chunked-prefill
+      --tensor-parallel-size 2
+    volumes:
+      - /data/models:/models:ro       # 只读挂载 AWQ 权重
+    shm_size: 8g
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 2                # 与 TP=2 一致
+              capabilities: [gpu]
+    healthcheck:
+      test: [&quot;CMD&quot;, &quot;curl&quot;, &quot;-f&quot;, &quot;http://localhost:8000/health&quot;]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 180s              # 模型加载 + 量化初始化较慢
+
+  gateway:
+    image: nginx:alpine
+    ports:
+      - &quot;8080:80&quot;
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - vllm
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - &quot;9090:9090&quot;
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - &quot;3000:3000&quot;
+    depends_on:
+      - prometheus</code></pre>
+<h4 id="h-示例-3nginxconf--流式透传--统一入口">示例 3：nginx.conf —— 流式透传 + 统一入口<a class="anchor" href="#h-示例-3nginxconf--流式透传--统一入口" aria-label="本节链接">#</a></h4>
+<pre data-lang="nginx"><code class="language-nginx"># nginx.conf：对外暴露 8080，代理到 vllm
+server {
+    listen 80;
+
+    # 关键：关闭代理缓冲，SSE 才能逐 token 透传
+    proxy_buffering off;
+    proxy_cache off;
+
+    location /v1/ {
+        proxy_pass http://vllm:8000;
+        proxy_read_timeout 300s;          # 长生成不超时
+        proxy_set_header Host $host;
+        proxy_set_header Connection &#39;&#39;;
+    }
+
+    location /metrics {
+        proxy_pass http://vllm:8000;       # 监控也走网关或直连
+    }
+}</code></pre>
+<h4 id="h-示例-4prometheusyml">示例 4：prometheus.yml<a class="anchor" href="#h-示例-4prometheusyml" aria-label="本节链接">#</a></h4>
+<pre data-lang="yaml"><code class="language-yaml"># prometheus.yml：抓取 vllm 的 /metrics
+global:
+  scrape_interval: 15s
+scrape_configs:
+  - job_name: vllm
+    static_configs:
+      - targets: [&quot;vllm:8000&quot;]     # 容器网络内用服务名</code></pre>
+<h4 id="h-示例-5启动并冒烟测试">示例 5：启动并冒烟测试<a class="anchor" href="#h-示例-5启动并冒烟测试" aria-label="本节链接">#</a></h4>
+<pre data-lang="bash"><code class="language-bash"># 1. 一键拉起全套
+docker compose up -d
+
+# 2. 看 vllm 是否健康（等 start_period 过后）
+docker compose ps
+
+# 3. 冒烟：经网关发一次请求
+curl http://localhost:8080/v1/chat/completions \
+  -H &quot;Content-Type: application/json&quot; \
+  -d &#39;{&quot;model&quot;:&quot;support-assistant&quot;,
+       &quot;messages&quot;:[{&quot;role&quot;:&quot;user&quot;,&quot;content&quot;:&quot;我的订单什么时候发货？&quot;}],
+       &quot;max_tokens&quot;:100}&#39;
+
+# 4. 验证监控
+curl -s http://localhost:9090/api/v1/query \
+  --data-urlencode &#39;query=vllm:num_requests_running&#39;</code></pre>
+<h4 id="h-示例-6流式客户端验证网关没把-sse-卡住">示例 6：流式客户端（验证网关没把 SSE 卡住）<a class="anchor" href="#h-示例-6流式客户端验证网关没把-sse-卡住" aria-label="本节链接">#</a></h4>
+<pre data-lang="python"><code class="language-python"># -*- coding: utf-8 -*-
+# 走网关请求，确认流式逐 token 返回（打字机效果）
+from openai import OpenAI
+
+client = OpenAI(base_url=&quot;http://localhost:8080/v1&quot;, api_key=&quot;EMPTY&quot;)
+stream = client.chat.completions.create(
+    model=&quot;support-assistant&quot;,
+    messages=[{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;退货流程是怎样的？&quot;}],
+    stream=True,
+)
+for chunk in stream:
+    d = chunk.choices[0].delta
+    if d.content is not None:
+        print(d.content, end=&quot;&quot;, flush=True)
+print()</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>把 <code>--tensor-parallel-size 2</code> 改成 <code>1</code>、Compose 的 <code>count</code> 也改成 <code>1</code>，重跑并对比吞吐，验证双卡 TP 对 decode 吞吐的提升。</li>
+<li>故意删掉 nginx.conf 里的 <code>proxy_buffering off</code>，再跑示例 6，观察流式是否变成&quot;憋一大段才吐&quot;，说明网关缓冲对流式的影响。</li>
+<li>在 Grafana 里把 Prometheus 配成数据源，画一张&quot;P99 TTFT + 排队长度&quot;大盘，完成监控闭环。</li>
+<li>思考：为什么监控指标经网关走 <code>/metrics</code> 转发时，要小心限流策略把 Prometheus 的抓取也限掉？如何为监控路径单独放行？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Docker Compose · 规范与使用：<a href="https://docs.docker.com/compose/" target="_blank" rel="noopener noreferrer">https://docs.docker.com/compose/</a></li>
+<li>NGINX · 反向代理与流式（SSE）配置：<a href="https://nginx.org/en/docs/" target="_blank" rel="noopener noreferrer">https://nginx.org/en/docs/</a></li>
+<li>vLLM · 使用 Docker 部署：<a href="https://docs.vllm.ai/en/latest/serving/deploying_with_docker.html" target="_blank" rel="noopener noreferrer">https://docs.vllm.ai/en/latest/serving/deploying_with_docker.html</a></li>
+<li>Prometheus · 配置文档：<a href="https://prometheus.io/docs/prometheus/latest/configuration/configuration/" target="_blank" rel="noopener noreferrer">https://prometheus.io/docs/prometheus/latest/configuration/configuration/</a></li>
+</ul>
+<p><a href="#/l/deploy-ch6-l3">下一课：验收与总结</a></p>

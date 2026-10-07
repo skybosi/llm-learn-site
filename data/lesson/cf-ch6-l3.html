@@ -1,0 +1,349 @@
+<h2 id="h-指令调度与流水线延迟隐藏与-gpu-occupancy-同理">指令调度与流水线：延迟隐藏（与 GPU occupancy 同理）<a class="anchor" href="#h-指令调度与流水线延迟隐藏与-gpu-occupancy-同理" aria-label="本节链接">#</a></h2>
+<p>第 2 课结束时每个值都有了自己的寄存器，但&quot;有寄存器&quot;不等于&quot;跑得快&quot;：指令从发射到结果可用之间隔着若干周期的<strong>延迟</strong>（latency），顺序发射的机器上，紧接着要用这个结果的指令只能让流水线空转——这几周期叫<strong>停顿</strong>（stall）。指令调度（instruction scheduling）就是重排顺序、把无关工作塞进停顿槽。本课讲清&quot;需要多少无关工作才够&quot;，并说明它与 GPU occupancy 是同一件事的两个层次。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-延迟从哪来">1. 延迟从哪来<a class="anchor" href="#h-1-延迟从哪来" aria-label="本节链接">#</a></h4>
+<p>流水线把指令拆成取指、译码、执行、写回等阶段，因此<strong>发射间隔</strong>（reciprocal throughput，如每 2 周期一条）与<strong>结果可用时间</strong>（latency，如 8 周期）是两个不同的数。五级流水线靠&quot;转发&quot;让紧邻的 ALU 依赖不产生气泡，但访存、浮点乘加没那么幸运：凡是 RAW 依赖，要么等，要么让机器先做别的。</p>
+<h4 id="h-2-依赖-dag-与表调度">2. 依赖 DAG 与表调度<a class="anchor" href="#h-2-依赖-dag-与表调度" aria-label="本节链接">#</a></h4>
+<p>把指令当节点、RAW 依赖当边得到一张 DAG；节点的<strong>高度</strong>（height）是从它出发到任一汇点的最长路径（含自身延迟）。<strong>表调度</strong>（list scheduling）只有两条规则：① 维护&quot;就绪集合&quot;（前驱已发射的指令）；② 每周期从就绪集合里挑高度最大的发射。这是龙书第 10 章的标准启发式——不保证最优（NP-hard），但足够好也足够快。</p>
+<h4 id="h-3-延迟隐藏的定量需要多少并行度">3. 延迟隐藏的定量：需要多少并行度<a class="anchor" href="#h-3-延迟隐藏的定量需要多少并行度" aria-label="本节链接">#</a></h4>
+<p>把发射槽看成服务台、在飞指令看成排队人数，可以直接搬小定律（Little&#39;s law）的直觉：<strong>要让发射槽一直有活干，在飞指令数必须 ≥ 延迟 / 发射间隔</strong>——延迟 4 周期、每周期发射 1 条，就需要 ≥ 4 条独立指令同时在飞。本课代码量了这条结论（<code>填隙率</code> = 指令数 / 发射跨度）：</p>
+<table>
+<thead>
+<tr>
+<th>并行度（独立链数）</th>
+<th>发射跨度</th>
+<th>完成周期</th>
+<th>填隙率</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1</td>
+<td>29</td>
+<td>32</td>
+<td>0.28</td>
+</tr>
+<tr>
+<td>2</td>
+<td>14</td>
+<td>17</td>
+<td>0.57</td>
+</tr>
+<tr>
+<td>4</td>
+<td>8</td>
+<td>11</td>
+<td>1.00</td>
+</tr>
+<tr>
+<td>8</td>
+<td>8</td>
+<td>11</td>
+<td>1.00</td>
+</tr>
+</tbody></table>
+<p>并行度 1、2 时大量空转，4 条独立链就顶满（填隙率 1.00），再加到 8 条不会再快——<strong>够用即可，多出来的并行度是浪费寄存器</strong>。</p>
+<p><figure><img class="md-img" src="content/courses/compiler-foundations/assets/chapter-6-figure-03.svg" alt="依赖 DAG 与表调度：从就绪集合里挑高度最大的指令发射" loading="lazy" decoding="async"><figcaption>依赖 DAG 与表调度：从就绪集合里挑高度最大的指令发射</figcaption></figure>
+</p>
+<h4 id="h-4-同一批算术写法不同周期数差一倍">4. 同一批算术，写法不同周期数差一倍<a class="anchor" href="#h-4-同一批算术写法不同周期数差一倍" aria-label="本节链接">#</a></h4>
+<p>调度器只能重排已存在的独立工作，变不出并行度；改变并行度得靠中端变换，最典型的是<strong>重结合</strong>（reassociation）：8 个乘积求和用 1 个累加器是一条 8 层依赖链，拆成 4 个就有 4 路独立工作，最后用归约树合并。本课代码实测（同样延迟 4 周期）：</p>
+<table>
+<thead>
+<tr>
+<th>写法</th>
+<th>指令数</th>
+<th>程序序</th>
+<th>表调度</th>
+<th>峰值寄存器</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>单累加器</td>
+<td>8</td>
+<td>32</td>
+<td>32</td>
+<td>2</td>
+</tr>
+<tr>
+<td>4 累加器交错</td>
+<td>11</td>
+<td>19</td>
+<td>19</td>
+<td>5</td>
+</tr>
+<tr>
+<td>4 累加器顺序</td>
+<td>11</td>
+<td>31</td>
+<td>19</td>
+<td>5</td>
+</tr>
+<tr>
+<td>8 累加器树</td>
+<td>15</td>
+<td>23</td>
+<td>23</td>
+<td>9</td>
+</tr>
+</tbody></table>
+<p>① 单累加器那 32 周期几乎全是等待，调度器无能为力；② 4 累加器把时间压到 19 周期，代价是峰值寄存器 2 → 5；③ &quot;顺序写&quot;行最能说明调度的价值——同一份代码写成一串是 31 周期，重排后回到 19。再加累加器反而变差（23 周期、9 个寄存器）：归约树自己的延迟成了新瓶颈。<strong>并行度不是越多越好，它和寄存器压力一起被约束。</strong></p>
+<h4 id="h-5-与-gpu-occupancy-同理">5. 与 GPU occupancy 同理<a class="anchor" href="#h-5-与-gpu-occupancy-同理" aria-label="本节链接">#</a></h4>
+<p>GPU 走另一条路。一个 SM 上驻留的 warp 数是硬件层面的并行度，<strong>occupancy</strong> = 活跃 warp 数 / 最大 warp 数。访存延迟高达数百周期，单线程内的 ILP 远不够，硬件于是在 warp 之间切换：一个等数据，就换另一个上执行单元。</p>
+<p>这与编译器做表调度满足的是同一个不等式——<strong>在飞工作量要盖住延迟 × 发射率</strong>，只是 CPU 侧主要用 ILP、GPU 侧主要用 TLP。代价也同构：本课表里&quot;峰值寄存器 2 → 5&quot;，在 GPU 上就是&quot;每线程寄存器越多 → 驻留 warp 越少 → occupancy 越低&quot;；CUDA 最佳实践文档也提醒，高 occupancy 有助于隐藏延迟，但不必盲目追求最大值。<strong>第 2 课的溢出与 GPU 的 occupancy 下降，是同一个资源约束的两套硬件版本。</strong></p>
+<h4 id="h-6-常见坑">6. 常见坑<a class="anchor" href="#h-6-常见坑" aria-label="本节链接">#</a></h4>
+<p>基本块内调度看不到跨块机会；真实的编译器还有 <strong>trace scheduling / 超块</strong>与<strong>软件流水</strong>（让不同迭代的指令重叠）两件武器，都在 LLVM 的&quot;调度与形成&quot;与&quot;SSA 机器码优化&quot;阶段。</p>
+<ul>
+<li><strong>调度会拉长活跃范围</strong>：提前算&quot;晚用&quot;的指令会让值活得更久，可能把第 2 课的分配逼到溢出；好做法是调度与分配协同（LLVM 的 MachineScheduler 带寄存器压力感知）。</li>
+<li><strong>乱动有副作用的指令</strong>：访存、可能触发异常的除法不能随意提前或推后；浮点重结合同样不合法（<code>(a+b)+c ≠ a+(b+c)</code>），只在允许不安全优化时才做。</li>
+<li><strong>在乱序机器上过度乐观</strong>：硬件窗口本身会重排，调度的收益主要在顺序核、DSP、GPU 这类暴露延迟的机器上。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面这段纯 Python（无第三方依赖）实现顺序发射模拟 + 表调度，量出上面两张表的每个数。模型是<strong>本课自定义的玩具机器</strong>：单发射、顺序发射、延迟 4 周期——为看清机制，不是真实 CPU 参数。</p>
+<pre data-lang="python"><code class="language-python"># ---- 指令调度：顺序发射 + 停顿 vs 表调度（list scheduling） ----
+# 纯 Python，无第三方依赖。
+# 玩具机器模型：单发射（1 条/周期）、顺序发射；操作数未就绪就停顿；所有算术指令延迟 4 周期。
+LAT = 4
+
+def op(text, dst, srcs):
+    return {&#39;t&#39;: text, &#39;d&#39;: dst, &#39;s&#39;: list(srcs)}
+
+# ---------- 1. 三个程序：8 个乘积求和的三种写法 ----------
+def single_acc(n=8):
+    &quot;&quot;&quot;单累加器：一条长依赖链 acc = acc + v[i]*w[i]（SSA 名字，每条指令一个结果）&quot;&quot;&quot;
+    ops = [op(f&#39;c0 = v0*w0&#39;, &#39;c0&#39;, [&#39;v0&#39;, &#39;w0&#39;])]
+    for i in range(1, n):
+        ops.append(op(f&#39;c{i} = fma(v{i}, w{i}, c{i-1})&#39;, f&#39;c{i}&#39;, [f&#39;v{i}&#39;, f&#39;w{i}&#39;, f&#39;c{i-1}&#39;]))
+    return ops
+
+def multi_acc(n=8, k=4, interleaved=True):
+    &quot;&quot;&quot;k 个累加器：每条链 n/k 个乘积，最后用归约树合并&quot;&quot;&quot;
+    m = n // k
+    chains = []
+    for j in range(k):
+        ch = [op(f&#39;c{j}_0 = v{j*m}*w{j*m}&#39;, f&#39;c{j}_0&#39;, [f&#39;v{j*m}&#39;, f&#39;w{j*m}&#39;])]
+        for i in range(1, m):
+            ch.append(op(f&#39;c{j}_{i} = fma(v{j*m+i}, w{j*m+i}, c{j}_{i-1})&#39;, f&#39;c{j}_{i}&#39;,
+                         [f&#39;v{j*m+i}&#39;, f&#39;w{j*m+i}&#39;, f&#39;c{j}_{i-1}&#39;]))
+        chains.append(ch)
+    ops = []
+    if interleaved:
+        for step in range(m):
+            for j in range(k):
+                ops.append(chains[j][step])
+    else:
+        for ch in chains: ops += ch
+    # 归约树
+    level, idx = [f&#39;c{j}_{m-1}&#39; for j in range(k)], 0
+    while len(level) &gt; 1:
+        nxt = []
+        for i in range(0, len(level) - 1, 2):
+            t = f&#39;s{idx}&#39;; idx += 1
+            ops.append(op(f&#39;{t} = {level[i]}+{level[i+1]}&#39;, t, [level[i], level[i+1]]))
+            nxt.append(t)
+        if len(level) % 2: nxt.append(level[-1])
+        level = nxt
+    return ops
+
+def indep_chains(k):
+    &quot;&quot;&quot;k 条互相独立的单指令链：用来量&quot;延迟隐藏需要多少并行度&quot; &quot;&quot;&quot;
+    return [op(f&#39;x{i} = v{i}*w{i}&#39;, f&#39;x{i}&#39;, [f&#39;v{i}&#39;, f&#39;w{i}&#39;]) for i in range(k)]
+
+# ---------- 2. 顺序发射模拟（程序序 / 给定顺序） ----------
+def simulate(order):
+    ready, clock, timeline = {}, 0, []
+    for ins in order:
+        t = max([ready.get(s, 0) for s in ins[&#39;s&#39;]] or [0])   # 操作数全部就绪的最早时间
+        issue = max(clock, t)                                # 顺序发射：不能越过上一条
+        clock = issue + 1
+        ready[ins[&#39;d&#39;]] = issue + LAT
+        timeline.append((issue, ins))
+    cycles = max(i + LAT for i, _ in timeline)
+    return cycles, timeline
+
+# ---------- 3. 表调度：每次从&quot;就绪指令&quot;里挑关键路径最长的那条 ----------
+def height_map(ops):
+    &quot;&quot;&quot;height[i] = 从 i 出发到任一汇点的最长路径（含自身延迟）；successor = 消费者&quot;&quot;&quot;
+    succ = {i: [j for j, o in enumerate(ops) if ops[i][&#39;d&#39;] in o[&#39;s&#39;]] for i in range(len(ops))}
+    h = {}
+    for i in range(len(ops) - 1, -1, -1):
+        h[i] = LAT + max([h[j] for j in succ[i]] or [0])
+    return h, succ
+
+def list_schedule(ops):
+    h, succ = height_map(ops)
+    preds = {i: [j for j, o in enumerate(ops) if o[&#39;d&#39;] in ops[i][&#39;s&#39;]] for i in range(len(ops))}
+    done, order, clock = set(), [], 0
+    while len(done) &lt; len(ops):
+        ready = [i for i in range(len(ops)) if i not in done and all(p in done for p in preds[i])]
+        if not ready:                       # 全在等结果：空转一个周期
+            clock += 1
+            continue
+        i = max(ready, key=lambda x: (h[x], -x))     # 关键路径最长的先发
+        order.append(ops[i]); done.add(i); clock += 1
+    return order, simulate(order)
+
+# ---------- 4. 寄存器压力：每个结果从发射到&quot;最后一次被用&quot;都占一个寄存器 ----------
+def peak_regs(ops, timeline):
+    issue = {ins[&#39;d&#39;]: c for c, ins in timeline}
+    last_use = {}
+    for ins in ops:
+        for s in ins[&#39;s&#39;]:
+            last_use[s] = max(last_use.get(s, 0), issue[ins[&#39;d&#39;]])
+    ivs = []
+    for ins in ops:
+        start = issue[ins[&#39;d&#39;]]
+        end = last_use.get(ins[&#39;d&#39;], start)
+        ivs.append((start, max(end, start)))
+    peak = 0
+    for c in range(max(e for _, e in ivs) + 1):
+        peak = max(peak, sum(1 for a, b in ivs if a &lt;= c &lt;= b))
+    return peak
+
+def span(timeline):
+    &quot;&quot;&quot;发射跨度：从第 0 周期到&quot;最后一条指令被发射&quot;，含被迫停顿的周期&quot;&quot;&quot;
+    return max(c for c, _ in timeline) + 1
+
+def report(label, ops):
+    c1, tl1 = simulate(ops)                      # 程序序
+    order2, (c2, tl2) = list_schedule(ops)       # 表调度
+    s1, s2 = span(tl1), span(tl2)
+    print(f&#39;  {label:&lt;22} {len(ops):&gt;3} 条  程序序：跨度 {s1:&gt;2}/填隙 {len(ops)/s1:.2f}&#39;
+          f&#39;  完成 {c1:&gt;2} 周期 ｜ list：跨度 {s2:&gt;2}/填隙 {len(ops)/s2:.2f}&#39;
+          f&#39;  完成 {c2:&gt;2} 周期  峰值寄存器 {peak_regs(ops, tl2)}&#39;)
+    return c1, c2
+
+if __name__ == &#39;__main__&#39;:
+    print(&#39;=== 模型：单发射、顺序发射、算术指令延迟 %d 周期 ===&#39; % LAT)
+    print(&#39;\n=== 写法一：8 个乘积求和的四种写法（同一批算术） ===&#39;)
+    report(&#39;单累加器（依赖链）&#39;, single_acc(8))
+    report(&#39;4 累加器（交错写）&#39;, multi_acc(8, 4, True))
+    report(&#39;4 累加器（顺序写）&#39;, multi_acc(8, 4, False))
+    report(&#39;8 累加器（归约树）&#39;, multi_acc(8, 8, True))
+
+    print(&#39;\n=== 写法二：k 条互相独立的指令（无依赖，纯看发射是否停顿） ===&#39;)
+    for k in (1, 2, 4, 8):
+        ops = indep_chains(k)
+        c2, tl2 = simulate(ops)
+        print(f&#39;  {k} 条独立指令：发射跨度 {span(tl2)} 周期，完成 {c2} 周期&#39;
+              f&#39;（延迟 {LAT} 只体现为末尾的流水线排空）&#39;)
+
+    print(&#39;\n=== 写法三：并行度不足会怎样（k 条长度 8 的独立链） ===&#39;)
+    for k in (1, 2, 4, 8):
+        ops, n = [], 8 // k
+        for j in range(k):
+            ch = single_acc(n)
+            ops += [op(o[&#39;t&#39;].replace(&#39;c&#39;, f&#39;k{j}_c&#39;), o[&#39;d&#39;].replace(&#39;c&#39;, f&#39;k{j}_c&#39;),
+                       [s.replace(&#39;c&#39;, f&#39;k{j}_c&#39;) for s in o[&#39;s&#39;]]) for o in ch]
+        c1, tl1 = simulate(ops)
+        _, (c2, tl2) = list_schedule(ops)
+        print(f&#39;  并行度 {k}（{len(ops)} 条）：发射跨度 {span(tl2)}，完成 {c2} 周期，&#39;
+              f&#39;填隙率 {len(ops)/span(tl2):.2f}&#39;)
+
+    print(&#39;\n=== 时间线（4 累加器交错写，list 调度） ===&#39;)
+    ops = multi_acc(8, 4, True)
+    _, (c2, tl2) = list_schedule(ops)
+    for c, ins in tl2:
+        print(f&#39;  周期 {c:&gt;2}: {ins[&quot;t&quot;]:&lt;28} 结果就绪于 {c + LAT}&#39;)
+    print(f&#39;  合计 {c2} 周期（缺号的周期就是没指令可发的空转周期）&#39;)</code></pre>
+<p>运行结果（纯 Python，本机实跑，输出原样粘贴）：</p>
+<pre><code>=== 模型：单发射、顺序发射、算术指令延迟 4 周期 ===
+
+=== 写法一：8 个乘积求和的四种写法（同一批算术） ===
+  单累加器（依赖链）                8 条  程序序：跨度 29/填隙 0.28  完成 32 周期 ｜ list：跨度 29/填隙 0.28  完成 32 周期  峰值寄存器 2
+  4 累加器（交错写）              11 条  程序序：跨度 16/填隙 0.69  完成 19 周期 ｜ list：跨度 16/填隙 0.69  完成 19 周期  峰值寄存器 5
+  4 累加器（顺序写）              11 条  程序序：跨度 28/填隙 0.39  完成 31 周期 ｜ list：跨度 16/填隙 0.69  完成 19 周期  峰值寄存器 5
+  8 累加器（归约树）              15 条  程序序：跨度 20/填隙 0.75  完成 23 周期 ｜ list：跨度 20/填隙 0.75  完成 23 周期  峰值寄存器 9
+
+=== 写法二：k 条互相独立的指令（无依赖，纯看发射是否停顿） ===
+  1 条独立指令：发射跨度 1 周期，完成 4 周期（延迟 4 只体现为末尾的流水线排空）
+  2 条独立指令：发射跨度 2 周期，完成 5 周期（延迟 4 只体现为末尾的流水线排空）
+  4 条独立指令：发射跨度 4 周期，完成 7 周期（延迟 4 只体现为末尾的流水线排空）
+  8 条独立指令：发射跨度 8 周期，完成 11 周期（延迟 4 只体现为末尾的流水线排空）
+
+=== 写法三：并行度不足会怎样（k 条长度 8 的独立链） ===
+  并行度 1（8 条）：发射跨度 29，完成 32 周期，填隙率 0.28
+  并行度 2（8 条）：发射跨度 14，完成 17 周期，填隙率 0.57
+  并行度 4（8 条）：发射跨度 8，完成 11 周期，填隙率 1.00
+  并行度 8（8 条）：发射跨度 8，完成 11 周期，填隙率 1.00
+
+=== 时间线（4 累加器交错写，list 调度） ===
+  周期  0: c0_0 = v0*w0                 结果就绪于 4
+  周期  1: c1_0 = v2*w2                 结果就绪于 5
+  周期  2: c2_0 = v4*w4                 结果就绪于 6
+  周期  3: c3_0 = v6*w6                 结果就绪于 7
+  周期  4: c0_1 = fma(v1, w1, c0_0)     结果就绪于 8
+  周期  5: c1_1 = fma(v3, w3, c1_0)     结果就绪于 9
+  周期  6: c2_1 = fma(v5, w5, c2_0)     结果就绪于 10
+  周期  7: c3_1 = fma(v7, w7, c3_0)     结果就绪于 11
+  周期  9: s0 = c0_1+c1_1               结果就绪于 13
+  周期 11: s1 = c2_1+c3_1               结果就绪于 15
+  周期 15: s2 = s0+s1                   结果就绪于 19
+  合计 19 周期（缺号的周期就是没指令可发的空转周期）</code></pre>
+<h4 id="h-可选用-llvm-mca-看真实流水线模型需自备-llvm本机实测">可选：用 llvm-mca 看真实流水线模型（需自备 LLVM；本机实测）<a class="anchor" href="#h-可选用-llvm-mca-看真实流水线模型需自备-llvm本机实测" aria-label="本节链接">#</a></h4>
+<p>玩具机器的结论能对上真机器吗？LLVM 自带的 <code>llvm-mca</code> 用目标机调度模型模拟汇编的吞吐与延迟（<strong>模型模拟值，不是实机测量</strong>）。本机（Homebrew LLVM 22.1.5，<code>-mcpu=apple-m1</code> 模型）实测：</p>
+<pre data-lang="bash"><code class="language-bash"># mca_4.s：4 条互相独立的 FMADD（各自累加到不同的寄存器，跨迭代仍是链）
+cat &gt; mca_4.s &lt;&lt;&#39;EOF&#39;
+    fmadd s0, s1, s2, s0
+    fmadd s4, s5, s6, s4
+    fmadd s8, s9, s10, s8
+    fmadd s12, s13, s14, s12
+EOF
+llvm-mca -mtriple=aarch64-apple-darwin -mcpu=apple-m1 mca_4.s</code></pre>
+<pre><code>Iterations:        100
+Instructions:      400
+Total Cycles:      804
+Total uOps:        400
+
+Dispatch Width:    6
+uOps Per Cycle:    0.50
+IPC:               0.50</code></pre>
+<p>模型里 <code>FMADD</code> 的延迟是 <strong>8 周期</strong>、倒数为 <strong>0.50</strong>（理论吞吐 2 条/周期）。同段代码换成 k = 1 / 2 / 8 条独立链：</p>
+<table>
+<thead>
+<tr>
+<th>独立链数 k</th>
+<th>Instructions</th>
+<th>Total Cycles</th>
+<th>IPC</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1</td>
+<td>100</td>
+<td>803</td>
+<td>0.12</td>
+</tr>
+<tr>
+<td>2</td>
+<td>200</td>
+<td>803</td>
+<td>0.25</td>
+</tr>
+<tr>
+<td>4</td>
+<td>400</td>
+<td>804</td>
+<td>0.50</td>
+</tr>
+<tr>
+<td>8</td>
+<td>800</td>
+<td>806</td>
+<td>0.99</td>
+</tr>
+</tbody></table>
+<p>总周期几乎不随 k 变（803→806），因为每条链每 8 周期才能推进一次；k 越大同样周期里塞进的指令越多，IPC 按 k/8 线性上升，到 k = 8 顶到 1.0——正好复现第 3 节的结论：<strong>需要&quot;延迟 × 吞吐&quot;量级的独立工作才能填满发射槽</strong>。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：给玩具机器加&quot;双发射&quot;（每周期可发 2 条），重跑三张表，看填隙率 1.00 的阈值怎么变。</li>
+<li><strong>解释</strong>：为什么 8 累加器反而变慢？用输出里的数字说明瓶颈转移到哪。</li>
+<li><strong>对比/验证</strong>：把 <code>LAT</code> 改成 8 再跑&quot;写法三&quot;，验证并行度阈值是否从 4 变成 8。</li>
+<li><strong>思考</strong>：既然表调度能把&quot;顺序写&quot;的 31 周期救回 19，为什么仍强调&quot;先把代码写得好调度&quot;（避免长依赖链、避免过早物化）？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Aho, Lam, Sethi, Ullman, <em>Compilers: Principles, Techniques, and Tools</em>（龙书）第 10 章「Instruction-Level Parallelism」：<a href="https://suif.stanford.edu/dragonbook/" target="_blank" rel="noopener noreferrer">https://suif.stanford.edu/dragonbook/</a></li>
+<li>LLVM 文档《The LLVM Target-Independent Code Generator》（Scheduling and Formation、modulo-scheduling）：<a href="https://llvm.org/docs/CodeGenerator.html" target="_blank" rel="noopener noreferrer">https://llvm.org/docs/CodeGenerator.html</a></li>
+<li>LLVM 命令指南 <code>llvm-mca</code>（用目标机调度模型分析汇编的吞吐与延迟）：<a href="https://llvm.org/docs/CommandGuide/llvm-mca.html" target="_blank" rel="noopener noreferrer">https://llvm.org/docs/CommandGuide/llvm-mca.html</a></li>
+<li>NVIDIA, <em>CUDA C++ Best Practices Guide</em>（occupancy 与延迟隐藏）：<a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/contents.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/contents.html</a></li>
+</ul>
+<p><a href="#/l/cf-ch6-l4">下一课：目标代码与汇编：从 IR 到可运行程序</a></p>

@@ -1,0 +1,202 @@
+<h2 id="h-核心实现llm-领域微调">核心实现（LLM 领域微调）<a class="anchor" href="#h-核心实现llm-领域微调" aria-label="本节链接">#</a></h2>
+<p>本课实现微调的三段核心：<strong>数据准备 → LoRA 微调 → 评估</strong>。每一段都面向&quot;能复现、能解释&quot;，尤其要把 LoRA 的关键超参（rank/alpha/target modules）和显存优化讲清楚——这是面试最常被追问的地方。</p>
+<h3 id="h-一目标与步骤">一、目标与步骤<a class="anchor" href="#h-一目标与步骤" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>数据准备</strong>：把原始数据清洗成统一的指令格式，并正确切分训练/验证集。</li>
+<li><strong>LoRA 微调</strong>：配置 LoRA 参数，用 TRL <code>SFTTrainer</code> 完成训练，给出 LoRA/QLoRA 两种显存方案。</li>
+<li><strong>评估</strong>：在同一测试集上对比基座与微调模型，量化&quot;格式遵循率&quot;与&quot;领域准确率&quot;。</li>
+</ol>
+<h3 id="h-二代码骨架与实现指导">二、代码骨架与实现指导<a class="anchor" href="#h-二代码骨架与实现指导" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-数据准备">1. 数据准备<a class="anchor" href="#h-1-数据准备" aria-label="本节链接">#</a></h4>
+<p>统一成 <code>instruction / input / output</code> 或 <code>messages</code> 格式，关键是<strong>用模型的 chat template 正确编码</strong>，而不是手动拼字符串：</p>
+<pre data-lang="python"><code class="language-python">import json
+from datasets import Dataset
+
+# 读取并清洗：去空、去重、统一字段名
+def load_and_clean(path):
+    rows = []
+    for line in open(path, encoding=&quot;utf-8&quot;):
+        d = json.loads(line)
+        inst, inp, out = d.get(&quot;instruction&quot;, &quot;&quot;).strip(), d.get(&quot;input&quot;, &quot;&quot;).strip(), d.get(&quot;output&quot;, &quot;&quot;).strip()
+        if not out:            # 丢弃无输出的脏数据
+            continue
+        rows.append({&quot;instruction&quot;: inst, &quot;input&quot;: inp, &quot;output&quot;: out})
+    # 按 (instruction, input, output) 去重
+    seen, dedup = set(), []
+    for r in rows:
+        key = (r[&quot;instruction&quot;], r[&quot;input&quot;], r[&quot;output&quot;])
+        if key not in seen:
+            seen.add(key); dedup.append(r)
+    return dedup
+
+train_rows = load_and_clean(&quot;data/train.jsonl&quot;)
+val_rows = load_and_clean(&quot;data/val.jsonl&quot;)
+print(f&quot;训练 {len(train_rows)} 条, 验证 {len(val_rows)} 条&quot;)
+
+# 组织成 messages 格式，交给 chat template 编码
+def format_example(r):
+    user = r[&quot;instruction&quot;] + ((&quot;\n&quot; + r[&quot;input&quot;]) if r[&quot;input&quot;] else &quot;&quot;)
+    return {&quot;messages&quot;: [
+        {&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: user},
+        {&quot;role&quot;: &quot;assistant&quot;, &quot;content&quot;: r[&quot;output&quot;]},
+    ]}
+
+train_ds = Dataset.from_list([format_example(r) for r in train_rows])
+val_ds = Dataset.from_list([format_example(r) for r in val_rows])</code></pre>
+<blockquote>
+<p>数据要点：<strong>去重与抽检</strong>是微调质量的半壁江山；<code>messages</code> 格式让 tokenizer 自动套用 chat template，避免手动拼接带来的格式偏差（例如缺少 <code>&lt;|im_end|&gt;</code>）。</p>
+</blockquote>
+<h4 id="h-2-lora-配置与显存方案">2. LoRA 配置与显存方案<a class="anchor" href="#h-2-lora-配置与显存方案" aria-label="本节链接">#</a></h4>
+<p>LoRA 只在部分权重旁挂&quot;低秩增量&quot;，冻结原权重，因此可训练参数极少：</p>
+<pre data-lang="python"><code class="language-python">from peft import LoraConfig, get_peft_model, TaskType
+
+# 方案 A：LoRA（bf16，需约 16-20GB 显存）
+lora_config = LoraConfig(
+    task_type=TaskType.CAUSAL_LM,
+    r=8,                          # 低秩维度：越大表达力越强、参数越多
+    lora_alpha=16,                # 缩放系数，通常取 r 的 2 倍
+    lora_dropout=0.05,            # 防止 LoRA 分支过拟合
+    target_modules=[&quot;q_proj&quot;, &quot;k_proj&quot;, &quot;v_proj&quot;, &quot;o_proj&quot;,
+                    &quot;gate_proj&quot;, &quot;up_proj&quot;, &quot;down_proj&quot;],  # Qwen 全注意力+MLP
+)</code></pre>
+<p>参数含义与选择（第 3 课会用实验验证）：</p>
+<table>
+<thead>
+<tr>
+<th>参数</th>
+<th>作用</th>
+<th>起步建议</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>r</code></td>
+<td>低秩矩阵秩，决定增量表达能力</td>
+<td>8（简单任务）~64（复杂/大数据）</td>
+</tr>
+<tr>
+<td><code>lora_alpha</code></td>
+<td>缩放到 r 的比例，等效学习率量级</td>
+<td>取 r 的 1~2 倍</td>
+</tr>
+<tr>
+<td><code>lora_dropout</code></td>
+<td>LoRA 分支 dropout</td>
+<td>0.05~0.1</td>
+</tr>
+<tr>
+<td><code>target_modules</code></td>
+<td>注入 LoRA 的层</td>
+<td>至少 <code>q_proj/v_proj</code>，效果优先可加 MLP</td>
+</tr>
+</tbody></table>
+<p><strong>方案 B：QLoRA</strong>——基座 4-bit 量化 + LoRA，显存降到 ~8-10GB：</p>
+<pre data-lang="python"><code class="language-python">from transformers import BitsAndBytesConfig
+
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type=&quot;nf4&quot;,           # 4bit NormalFloat
+    bnb_4bit_compute_dtype=torch.bfloat16,
+    bnb_4bit_use_double_quant=True,      # 二次量化，进一步省显存
+)
+model = AutoModelForCausalLM.from_pretrained(
+    model_name, quantization_config=bnb_config, device_map=&quot;auto&quot;,
+    torch_dtype=torch.bfloat16,
+)</code></pre>
+<h4 id="h-3-训练trl-sfttrainer">3. 训练（TRL SFTTrainer）<a class="anchor" href="#h-3-训练trl-sfttrainer" aria-label="本节链接">#</a></h4>
+<p>用 <code>SFTTrainer</code> 把 tokenize、损失计算、梯度累积、显存优化都封装好：</p>
+<pre data-lang="python"><code class="language-python">from trl import SFTTrainer, SFTConfig
+from transformers import TrainingArguments
+
+def format_chat(example):
+    # 用 tokenizer 的 chat template 转成文本
+    return tokenizer.apply_chat_template(example[&quot;messages&quot;], tokenize=False)
+
+training_args = SFTConfig(
+    output_dir=&quot;outputs/lora&quot;,
+    num_train_epochs=3,
+    per_device_train_batch_size=2,        # 小批量 + 梯度累积，适配单卡
+    gradient_accumulation_steps=8,
+    gradient_checkpointing=True,          # 用计算换显存
+    learning_rate=2e-4,                   # LoRA 常用学习率，比全参微调高
+    lr_scheduler_type=&quot;cosine&quot;,
+    warmup_ratio=0.03,
+    logging_steps=10,
+    save_strategy=&quot;steps&quot;,
+    save_steps=200,
+    eval_strategy=&quot;steps&quot;,
+    eval_steps=200,
+    bf16=True,
+    max_seq_length=1024,                  # 截断/打包长度
+    report_to=&quot;none&quot;,
+)
+
+trainer = SFTTrainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_ds,
+    eval_dataset=val_ds,
+    formatting_func=format_chat,          # 关键：统一用 chat template
+    peft_config=lora_config,              # 传入 LoRA 配置
+)
+trainer.train()
+trainer.save_model(&quot;outputs/lora&quot;)       # 保存 LoRA 权重（Adapter）</code></pre>
+<blockquote>
+<p>显存不足的排查顺序：减小 <code>per_device_train_batch_size</code> → 开 <code>gradient_checkpointing</code> → 缩短 <code>max_seq_length</code> → 换 QLoRA（4bit）。<strong>学习率 2e-4 是 LoRA 常见起点</strong>，明显高于全参数微调的 1e-5~5e-5，别照搬。</p>
+</blockquote>
+<h4 id="h-4-合并与加载可部署">4. 合并与加载（可部署）<a class="anchor" href="#h-4-合并与加载可部署" aria-label="本节链接">#</a></h4>
+<pre data-lang="python"><code class="language-python">from peft import PeftModel
+
+# 推理时：基座 + LoRA 权重，无需重新训练
+base = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.bfloat16, device_map=&quot;auto&quot;)
+model = PeftModel.from_pretrained(base, &quot;outputs/lora&quot;)
+model = model.merge_and_unload()   # 合并回权重，便于直接部署/导出
+
+# 生成对比：同样的输入，分别用基座与微调模型生成
+def generate(model, prompt):
+    messages = [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: prompt}]
+    text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = tokenizer(text, return_tensors=&quot;pt&quot;).to(model.device)
+    out = model.generate(**inputs, max_new_tokens=256, do_sample=False)
+    return tokenizer.decode(out[0][inputs[&quot;input_ids&quot;].shape[1]:], skip_special_tokens=True)</code></pre>
+<h4 id="h-5-评估">5. 评估<a class="anchor" href="#h-5-评估" aria-label="本节链接">#</a></h4>
+<p>评估不能只看 loss（loss 低不等于答案好），要测&quot;格式遵循率&quot;和&quot;领域准确率&quot;：</p>
+<pre data-lang="python"><code class="language-python">def eval_format_following(model, eval_rows):
+    &quot;&quot;&quot;格式遵循率：输出是否以 { 开头、能被 json.loads 解析。&quot;&quot;&quot;
+    ok = 0
+    for r in eval_rows:
+        user = r[&quot;instruction&quot;] + ((&quot;\n&quot; + r[&quot;input&quot;]) if r[&quot;input&quot;] else &quot;&quot;)
+        ans = generate(model, user)
+        try:
+            json.loads(ans)      # 期望模型输出合法 JSON
+            ok += 1
+        except Exception:
+            pass
+    return ok / len(eval_rows)
+
+def eval_domain_accuracy(model, eval_rows):
+    &quot;&quot;&quot;领域准确率：用关键词/规则判断答案是否包含正确结论。&quot;&quot;&quot;
+    ok = 0
+    for r in eval_rows:
+        user = r[&quot;instruction&quot;] + ((&quot;\n&quot; + r[&quot;input&quot;]) if r[&quot;input&quot;] else &quot;&quot;)
+        ans = generate(model, user)
+        if r[&quot;gold_keywords&quot;] and all(k in ans for k in r[&quot;gold_keywords&quot;]):
+            ok += 1
+    return ok / len(eval_rows)</code></pre>
+<p>把这两个函数分别跑在<strong>基座模型</strong>和<strong>微调模型</strong>上，输出同一批问题的对比分数，就是第 3 课的&quot;微调前后对比表&quot;。</p>
+<h3 id="h-三验收与复盘">三、验收与复盘<a class="anchor" href="#h-三验收与复盘" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>数据口径验收</strong>：训练/验证集无重叠（按原文去重后仍要检查跨集重复）；验证集不参与训练。</li>
+<li><strong>训练可复现验收</strong>：固定随机种子后，两个 seed 的验证 loss 趋势一致。</li>
+<li><strong>显存/时间记账</strong>：记录实际峰值显存、单 epoch 时长、总时长——第 3 课复盘成本必用。</li>
+<li><strong>评估双指标验收</strong>：格式遵循率与领域准确率都已跑出&quot;基座 vs 微调&quot;两组数字。</li>
+<li><strong>复盘提示</strong>：记录训练中遇到的一个真实问题（如 loss 不降 → 发现学习率太高/数据没套 chat template），这是面试&quot;你踩过什么坑&quot;的最佳答案。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Hugging Face PEFT 文档（LoRA 与 QLoRA）：<a href="https://huggingface.co/docs/peft/index" target="_blank" rel="noopener noreferrer">https://huggingface.co/docs/peft/index</a></li>
+<li>Hugging Face TRL 文档（SFTTrainer）：<a href="https://huggingface.co/docs/trl/sft_trainer" target="_blank" rel="noopener noreferrer">https://huggingface.co/docs/trl/sft_trainer</a></li>
+<li>LoRA 原始论文：<a href="https://arxiv.org/abs/2106.09685" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2106.09685</a></li>
+<li>QLoRA 论文：<a href="https://arxiv.org/abs/2305.14314" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2305.14314</a></li>
+<li>Qwen2.5 模型：<a href="https://huggingface.co/Qwen" target="_blank" rel="noopener noreferrer">https://huggingface.co/Qwen</a></li>
+</ul>
+<p><a href="#/l/proj-ch3-l3">下一课：结果与复盘</a></p>

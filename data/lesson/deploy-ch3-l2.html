@@ -1,0 +1,119 @@
+<h2 id="h-多卡集群部署">多卡集群部署<a class="anchor" href="#h-多卡集群部署" aria-label="本节链接">#</a></h2>
+<p>上一课用 TP 把大模型拆到多卡，这一课把视野从&quot;单机多卡&quot;扩展到&quot;多机多卡集群&quot;，并回答一个更实际的问题：<strong>当流量大到单实例扛不住时，怎么用多副本 + 负载均衡横向扩展</strong>。这里要分清三件事——<strong>并行（拆一个模型）</strong>、<strong>副本（复制多个服务）</strong>、<strong>集群（把卡组织起来调度）</strong>。学完本课，你应当能区分张量/流水线/数据并行，能搭起单机多卡与多机 Ray 集群，并理解多副本 + LB 的横向扩展方式。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-三种多卡根本不是一回事">1. 三种&quot;多卡&quot;根本不是一回事<a class="anchor" href="#h-1-三种多卡根本不是一回事" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>方式</th>
+<th>拆什么</th>
+<th>解决什么</th>
+<th>典型参数/机制</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>张量并行 TP</strong></td>
+<td>单层权重按维度拆</td>
+<td>单卡装不下模型</td>
+<td><code>--tensor-parallel-size</code></td>
+</tr>
+<tr>
+<td><strong>流水线并行 PP</strong></td>
+<td>按层切成几段，逐段流过</td>
+<td>模型层数多、跨机通信少</td>
+<td><code>--pipeline-parallel-size</code></td>
+</tr>
+<tr>
+<td><strong>数据并行 / 多副本 DP</strong></td>
+<td>复制多个完整服务</td>
+<td>流量大、吞吐不够、高可用</td>
+<td>多实例 + 负载均衡</td>
+</tr>
+</tbody></table>
+<p>要点：<strong>TP/PP 解决&quot;装得下&quot;，DP 解决&quot;扛得住&quot;</strong>。三者可以组合（TP=2 + 4 副本），vLLM 通过 <code>--data-parallel-size</code> 或直接起多个进程 + LB 实现。</p>
+<h4 id="h-2-单机多卡最简形态">2. 单机多卡：最简形态<a class="anchor" href="#h-2-单机多卡最简形态" aria-label="本节链接">#</a></h4>
+<p>单机 8 卡是绝大多数中小规模的上限。单机内用 NVLink 互连（比跨机 PCIe/以太网快一个数量级），所以<strong>能单机解决就别跨机</strong>：</p>
+<pre data-lang="bash"><code class="language-bash"># 单机 4 卡 TP=4 跑 70B
+vllm serve Qwen/Qwen2.5-72B-Instruct --tensor-parallel-size 4 \
+    --gpu-memory-utilization 0.9 --max-model-len 8192</code></pre>
+<p>启动前用 <code>nvidia-smi topo -m</code> 确认卡间拓扑，优先让 TP 组落在 NVLink 直连的卡上。</p>
+<h4 id="h-3-多机多卡ray-集群">3. 多机多卡：Ray 集群<a class="anchor" href="#h-3-多机多卡ray-集群" aria-label="本节链接">#</a></h4>
+<p>单机 8 卡不够（超大模型或超大流量）时，用 <strong>Ray</strong> 把多台机器的卡聚合成一个逻辑集群，vLLM 通过 Ray 调度跨机 TP/PP：</p>
+<pre data-lang="bash"><code class="language-bash"># 每台机器（头节点 + 工作节点）都执行
+ray start --head --num-gpus=8            # 头节点
+ray start --address=&#39;&lt;头节点IP&gt;:6379&#39; --num-gpus=8   # 工作节点加入
+
+# 任意节点上，用 Ray 启动 vLLM 跨机并行
+vllm serve Qwen/Qwen2.5-72B-Instruct \
+    --tensor-parallel-size 8 \           # 跨 2 台机器各 4 卡
+    --gpu-memory-utilization 0.9</code></pre>
+<p><strong>跨机通信走网络（NCCL over IB/以太网），带宽远低于 NVLink</strong>，所以跨机 TP 的通信开销很大——这也是为什么跨机场景更倾向&quot;TP 留单机内 + 多副本&quot;而不是&quot;超大 TP 跨机&quot;。</p>
+<h4 id="h-4-多副本--负载均衡横向扩展的常态">4. 多副本 + 负载均衡：横向扩展的常态<a class="anchor" href="#h-4-多副本--负载均衡横向扩展的常态" aria-label="本节链接">#</a></h4>
+<p>生产里最常用的扩容不是加 TP，而是<strong>多副本 + 负载均衡（LB）</strong>：</p>
+<pre><code>用户请求 -&gt; 负载均衡器 -&gt; 副本1 (TP=2) / 副本2 (TP=2) / 副本3 (TP=2)</code></pre>
+<ul>
+<li>每副本是一个独立 vLLM 实例（可能各自 TP=2）；</li>
+<li>LB 按轮询/最少连接分发请求；</li>
+<li>副本数 = 峰值吞吐 / 单副本达标吞吐（第一章的容量规划公式）；</li>
+<li>多副本同时带来<strong>高可用</strong>：单个副本挂了，LB 自动摘除。</li>
+</ul>
+<p>vLLM 在 Kubernetes 上常配 HPA 按 QPS/延迟自动扩缩容，闲时缩到 0、忙时弹上去。</p>
+<p><figure><img class="md-img" src="content/courses/llm-deployment-practice/assets/chapter-3-figure-02.svg" alt="多卡集群形态：上层&quot;负载均衡器&quot;把请求分发到多个副本（各副本内部 TP=2 双卡）；下方一条&quot;单机 8 卡 NVLink 直连&quot;与一条&quot;多机 Ray 集群（跨机走网络）&quot;的对比，标注带宽差异" loading="lazy" decoding="async"><figcaption>多卡集群形态：上层&quot;负载均衡器&quot;把请求分发到多个副本（各副本内部 TP=2 双卡）；下方一条&quot;单机 8 卡 NVLink 直连&quot;与一条&quot;多机 Ray 集群（跨机走网络）&quot;的对比，标注带宽差异</figcaption></figure>
+</p>
+<h3 id="h-二可运行示例">二、可运行示例<a class="anchor" href="#h-二可运行示例" aria-label="本节链接">#</a></h3>
+<h4 id="h-示例-1单机多卡tp2-双副本--简单负载均衡">示例 1：单机多卡（TP=2 双副本 + 简单负载均衡）<a class="anchor" href="#h-示例-1单机多卡tp2-双副本--简单负载均衡" aria-label="本节链接">#</a></h4>
+<pre data-lang="bash"><code class="language-bash"># 同机两张 A100-80G：先起 TP=2 单实例验证
+vllm serve Qwen/Qwen2.5-72B-Instruct-AWQ --quantization awq \
+    --tensor-parallel-size 2 --host 0.0.0.0 --port 8000
+
+# 横向扩展：再起第二个副本（TP=2）到 8001，两张卡跑两个 70B 副本需 4 卡，这里示意
+vllm serve Qwen/Qwen2.5-72B-Instruct-AWQ --quantization awq \
+    --tensor-parallel-size 2 --host 0.0.0.0 --port 8001</code></pre>
+<h4 id="h-示例-2用-python-做一个最简轮询负载均衡">示例 2：用 Python 做一个最简轮询负载均衡<a class="anchor" href="#h-示例-2用-python-做一个最简轮询负载均衡" aria-label="本节链接">#</a></h4>
+<pre data-lang="python"><code class="language-python"># -*- coding: utf-8 -*-
+# 最简轮询负载均衡：把请求轮流分发到多个 vLLM 副本
+import itertools, httpx
+
+REPLICAS = [&quot;http://localhost:8000&quot;, &quot;http://localhost:8001&quot;]
+pool = itertools.cycle(REPLICAS)          # 轮询游标
+
+def chat(prompt: str, max_tokens: int = 64):
+    url = next(pool) + &quot;/v1/chat/completions&quot;
+    resp = httpx.post(url, json={
+        &quot;model&quot;: &quot;Qwen/Qwen2.5-72B-Instruct-AWQ&quot;,
+        &quot;messages&quot;: [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: prompt}],
+        &quot;max_tokens&quot;: max_tokens,
+    }, timeout=120)
+    return resp.json()[&quot;choices&quot;][0][&quot;message&quot;][&quot;content&quot;]
+
+for i in range(6):                          # 6 个请求应均匀落到两个副本
+    print(f&quot;请求{i} -&gt; {chat(&#39;一句话介绍张量并行&#39;)[:20]}...&quot;)</code></pre>
+<h4 id="h-示例-3多机-ray-集群启动命令">示例 3：多机 Ray 集群启动命令<a class="anchor" href="#h-示例-3多机-ray-集群启动命令" aria-label="本节链接">#</a></h4>
+<pre data-lang="bash"><code class="language-bash"># 头节点（机器 A，IP 10.0.0.1）
+ray start --head --num-gpus=8 --dashboard-host 0.0.0.0
+
+# 工作节点（机器 B、C）
+ray start --address=&#39;10.0.0.1:6379&#39; --num-gpus=8
+
+# 集群就绪后，任意节点跨机跑 TP=8（2 台 × 4 卡）
+vllm serve Qwen/Qwen2.5-72B-Instruct --tensor-parallel-size 8 \
+    --gpu-memory-utilization 0.9 --max-model-len 8192
+
+# 查看集群与拓扑
+ray status              # 节点、GPU 数、资源使用
+nvidia-smi topo -m      # 单机内卡间拓扑</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>组合并行</strong>：一个 70B 模型要服务 200 峰值 QPS，单副本（TP=2）达标吞吐 400 token/s。用第一章的公式计算需要多少个 TP=2 副本，并画出&quot;LB + N 副本&quot;的拓扑。</li>
+<li><strong>单机 vs 跨机</strong>：解释为什么&quot;TP=8 跨 2 机&quot;的吞吐通常不如&quot;TP=4 单机 × 2 副本&quot;，从通信带宽角度说明，并给出你会优先选哪个。</li>
+<li><strong>加健康检查</strong>：给示例 2 的 LB 加上&quot;副本探活 + 失败摘除&quot;，说明生产 LB 为什么必须有健康检查，而不只是轮询。</li>
+<li><strong>Ray 排障</strong>：<code>ray start</code> 报&quot;地址不可达/端口占用&quot;时，写出你的排查顺序（先查 6379 端口、再查头节点 IP 是否可达、再看防火墙/安全组）。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>vLLM 文档 · 分布式推理与数据并行：<a href="https://docs.vllm.ai/en/latest/serving/distributed_serving.html" target="_blank" rel="noopener noreferrer">https://docs.vllm.ai/en/latest/serving/distributed_serving.html</a></li>
+<li>vLLM 文档 · Kubernetes 部署与自动扩缩容：<a href="https://docs.vllm.ai/en/latest/serving/deploying_with_kubernetes.html" target="_blank" rel="noopener noreferrer">https://docs.vllm.ai/en/latest/serving/deploying_with_kubernetes.html</a></li>
+<li>Ray 文档 · 集群启动：<a href="https://docs.ray.io/en/latest/cluster/getting-started.html" target="_blank" rel="noopener noreferrer">https://docs.ray.io/en/latest/cluster/getting-started.html</a></li>
+<li>NVIDIA · NCCL 文档：<a href="https://docs.nvidia.com/deeplearning/nccl/" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/deeplearning/nccl/</a></li>
+</ul>
+<p><a href="#/l/deploy-ch3-l3">下一课：性能验证</a></p>

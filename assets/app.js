@@ -1,0 +1,370 @@
+/* ============================================================================
+ * llm-learn 学习站 · 应用外壳：主题 / 路由 / 搜索 / 进度 / 快捷键
+ * 纯静态：没有任何 /api 调用，所有数据来自 data/*.json 与 content/**
+ * ==========================================================================*/
+(function (root) {
+  'use strict';
+  var LLM = root.LLM = root.LLM || {};
+  var ui = LLM.ui, fmt = LLM.fmt, data = LLM.data;
+
+  LLM.views = LLM.views || {};
+
+  /* ---------------- 事件总线 ---------------- */
+  var listeners = {};
+  LLM.on = function (ev, fn) { (listeners[ev] = listeners[ev] || []).push(fn); return function () { LLM.off(ev, fn); }; };
+  LLM.off = function (ev, fn) { listeners[ev] = (listeners[ev] || []).filter(function (f) { return f !== fn; }); };
+  LLM.emit = function (ev, payload) { (listeners[ev] || []).forEach(function (f) { try { f(payload); } catch (e) { console.error(e); } }); };
+
+  /* ---------------- 主题 ---------------- */
+  var THEME_KEY = 'llmlearn.site.theme';
+  function preferredTheme() {
+    try {
+      var saved = localStorage.getItem(THEME_KEY);
+      if (saved === 'light' || saved === 'dark') return saved;
+      if (LLM.store && LLM.store.settings) {
+        var s = LLM.store.settings();
+        if (s && (s.theme === 'light' || s.theme === 'dark')) return s.theme;
+      }
+    } catch (e) { /* 隐私模式下忽略 */ }
+    return matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  }
+  function applyTheme(t) {
+    document.documentElement.setAttribute('data-theme', t);
+    var meta = document.querySelector('meta[name="theme-color"]');
+    if (meta) meta.setAttribute('content', t === 'dark' ? '#0e1118' : '#1b2559');
+    try { localStorage.setItem(THEME_KEY, t); } catch (e) {}
+    if (LLM.store && LLM.store.setSetting) { try { LLM.store.setSetting('theme', t, true); } catch (e) {} }
+  }
+  function toggleTheme() { applyTheme(document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark'); }
+
+  /* ---------------- 路由 ---------------- */
+  function parseHash() {
+    var h = (location.hash || '').replace(/^#\/?/, '');
+    var qIdx = h.indexOf('?');
+    var query = {};
+    if (qIdx >= 0) {
+      h.slice(qIdx + 1).split('&').forEach(function (kv) {
+        var p = kv.split('=');
+        if (p[0]) query[decodeURIComponent(p[0])] = decodeURIComponent(p[1] || '');
+      });
+      h = h.slice(0, qIdx);
+    }
+    var seg = h.split('/').filter(Boolean).map(decodeURIComponent);
+    if (!seg.length) return { name: 'home', seg: [], query: query };
+    var head = seg[0];
+    if (head === 'l' && seg[1]) return { name: 'lessonById', seg: seg, query: query };
+    if (head === 'learn' && seg[3]) return { name: 'lesson', seg: seg, query: query };
+    if (head === 'course' && seg[1]) return { name: 'course', seg: seg, query: query };
+    if (head === 'courses') return { name: 'courses', seg: seg, query: query };
+    if (head === 'paths') return { name: 'paths', seg: seg, query: query };
+    if (head === 'figures') return { name: 'figures', seg: seg, query: query };
+    if (head === 'glossary') return { name: 'glossary', seg: seg, query: query };
+    if (head === 'me') return { name: 'me', seg: seg, query: query };
+    if (head === 'search') return { name: 'search', seg: seg, query: query };
+    return { name: 'notfound', seg: seg, query: query };
+  }
+
+  var cleanup = null;
+  var currentRoute = null;
+
+  function setNav(name) {
+    var map = { home: 'home', paths: 'paths', courses: 'courses', course: 'courses', lesson: 'courses', lessonById: 'courses', figures: 'figures', glossary: 'glossary', me: 'me', search: 'courses' };
+    var want = map[name] || '';
+    ui.$$('.navlink').forEach(function (a) { a.classList.toggle('active', a.dataset.nav === want); });
+    var nav = ui.$('#navlinks');
+    if (nav) nav.classList.remove('open');
+  }
+
+  LLM.setTitle = function (t) {
+    document.title = t ? t + ' · llm-learn 学习站' : 'llm-learn · 大模型系统学习站';
+  };
+
+  function render() {
+    var route = parseHash();
+    currentRoute = route;
+    var viewRoot = ui.$('#view');
+    if (typeof cleanup === 'function') { try { cleanup(); } catch (e) {} cleanup = null; }
+    setNav(route.name);
+
+    var view = LLM.views[route.name] || LLM.views.notfound;
+    ui.clear(viewRoot);
+    var done = function () {
+      LLM.emit('route', route);
+      if (!(route.query && route.query.keepScroll)) window.scrollTo({ top: 0, behavior: 'auto' });
+    };
+    try {
+      var r = view ? view.render(viewRoot, route) : null;
+      if (r && typeof r.then === 'function') {
+        r.then(function (c) { cleanup = c || null; done(); })
+         .catch(function (e) { showError(viewRoot, e); done(); });
+      } else {
+        cleanup = (typeof r === 'function' ? r : null);
+        done();
+      }
+    } catch (e) {
+      showError(viewRoot, e);
+      done();
+    }
+  }
+
+  function showError(viewRoot, e) {
+    console.error(e);
+    ui.clear(viewRoot);
+    var box = ui.el('div', 'container container--narrow');
+    box.innerHTML = '<div class="empty"><strong>这个页面没能渲染出来</strong>' +
+      '<p class="small">' + fmt.esc(e && e.message ? e.message : String(e)) + '</p>' +
+      '<p><a class="btn btn--primary" href="#/">回到首页</a></p></div>';
+    viewRoot.appendChild(box);
+  }
+
+  LLM.go = function (hash) {
+    if (location.hash === hash) render();
+    else location.hash = hash;
+  };
+  LLM.route = function () { return currentRoute; };
+
+  /* ---------------- 顶栏进度 / 阅读进度条 ---------------- */
+  function paintProgress() {
+    if (!LLM.store || !LLM.store.stats) return;
+    var st;
+    try { st = LLM.store.stats(); } catch (e) { return; }
+    var p = st.totalLessons ? Math.round((st.doneLessons / st.totalLessons) * 100) : 0;
+    var fg = ui.$('#mini-ring-fg');
+    if (fg) {
+      var C = 2 * Math.PI * 15.5;
+      fg.setAttribute('stroke-dasharray', C.toFixed(1));
+      fg.setAttribute('stroke-dashoffset', (C * (1 - p / 100)).toFixed(1));
+    }
+    var txt = ui.$('#mini-text');
+    if (txt) txt.textContent = p + '%';
+    var mini = ui.$('#mini-progress');
+    if (mini) mini.title = '已完成 ' + st.doneLessons + ' / ' + st.totalLessons + ' 课时 · 笔记 ' + (st.notes || 0) + ' 条';
+  }
+  function paintReadbar() {
+    var bar = ui.$('#readbar');
+    if (!bar) return;
+    var h = document.documentElement.scrollHeight - window.innerHeight;
+    var p = h > 0 ? Math.min(100, Math.max(0, (window.scrollY / h) * 100)) : 0;
+    if (!bar.firstChild) bar.appendChild(document.createElement('i'));
+    bar.firstChild.style.width = p + '%';
+  }
+
+  /* ---------------- 全站搜索浮层 ---------------- */
+  var overlay, input, results, scopeEl;
+  var searchIndex = null;   // {lessons:[], terms:[], courses:[]}
+  var activeIdx = -1;
+  var lastResults = [];
+
+  var indexPromise = null;
+
+  /**
+   * 建搜索索引：**先出快索引**（课时标题 + 小标题 + 课程名，只要 2 个请求），
+   * 词条（22 个分片、1.4MB）在后台补齐后再刷一次结果。
+   * 为什么：一上来就等 23 个请求，用户敲完关键词会看到「没找到」——这是最伤的假空态。
+   */
+  function buildIndex() {
+    if (searchIndex) return Promise.resolve(searchIndex);
+    if (indexPromise) return indexPromise;
+    indexPromise = Promise.all([data.search(), data.courses()]).then(function (res) {
+      var items = res[0] || [];
+      var courses = res[1] || [];
+      searchIndex = {
+        lessons: items.map(function (it) {
+          return { kind: 'lesson', id: it[0], slug: it[1], title: it[2], chapter: it[3], heads: it[4] || '', snippet: it[5] || '' };
+        }),
+        courses: courses.map(function (c) { return { kind: 'course', slug: c.slug, title: c.title, desc: c.description, line: c.line }; }),
+        terms: [],
+      };
+      // 后台补词条：补完广播一次，打开着的搜索浮层会重刷
+      data.glossaryIndex().then(function (gIdx) {
+        var layers = (gIdx.layers || []).slice(0, 40);
+        return Promise.all(layers.map(function (l) {
+          return data.glossaryLayer(l.id).then(function (d) { return { layer: l, terms: d.terms || [] }; }).catch(function () { return null; });
+        }));
+      }).then(function (all) {
+        all.filter(Boolean).forEach(function (L) {
+          L.terms.forEach(function (t) {
+            searchIndex.terms.push({ kind: 'term', key: t.key, layer: L.layer.id, layerName: L.layer.name, zh: t.zh, en: t.en, def: t.def, aliases: t.aliases || [] });
+          });
+        });
+        LLM.emit('search-index', searchIndex);
+      }).catch(function () { /* 词条补不上不影响课时搜索 */ });
+      return searchIndex;
+    });
+    return indexPromise;
+  }
+
+  function score(hay, needle) {    var i = hay.toLowerCase().indexOf(needle);
+    if (i < 0) return -1;
+    return i === 0 ? 100 : (i < 8 ? 60 - i : 30 - Math.min(i, 20));
+  }
+
+  function runSearch(q) {
+    if (!searchIndex) return [];
+    var needle = q.trim().toLowerCase();
+    if (!needle) return [];
+    var out = [];
+    searchIndex.courses.forEach(function (c) {
+      var s = Math.max(score(c.title, needle), score(c.desc || '', needle) * 0.4);
+      if (s > 0) out.push({ kind: 'course', score: s + 5, item: c });
+    });
+    searchIndex.lessons.forEach(function (l) {
+      var s = Math.max(score(l.title, needle), score(l.heads, needle) * 0.7, score(l.snippet, needle) * 0.3);
+      if (s > 0) out.push({ kind: 'lesson', score: s, item: l });
+    });
+    searchIndex.terms.forEach(function (t) {
+      var s = Math.max(score(t.zh, needle), score(t.en || '', needle) * 0.8, score(t.def || '', needle) * 0.4);
+      if (s <= 0) {
+        for (var i = 0; i < t.aliases.length; i++) { if (score(t.aliases[i], needle) > 0) { s = 20; break; } }
+      }
+      if (s > 0) out.push({ kind: 'term', score: s, item: t });
+    });
+    out.sort(function (a, b) { return b.score - a.score; });
+    return out.slice(0, 40);
+  }
+
+  function paintSearch(q) {
+    ui.clear(results);
+    lastResults = runSearch(q);
+    activeIdx = lastResults.length ? 0 : -1;
+    if (!q.trim()) {
+      results.innerHTML = '<div class="sr-empty">输入关键词：课程名、课时标题、正文小标题、百科词条都能搜到。<br>' +
+        '按 <kbd>Shift</kbd>+<kbd>Enter</kbd> 可在全部课程正文里深搜（会逐课加载，稍慢）。</div>';
+      return;
+    }
+    if (!lastResults.length) {
+      results.innerHTML = '<div class="sr-empty">没找到「' + fmt.esc(q) + '」<br><span class="small">按 Shift+Enter 试试全文深搜</span></div>';
+      return;
+    }
+    var groups = { course: '课程', lesson: '课时', term: '关键词' };
+    var curKind = null;
+    lastResults.forEach(function (r, i) {
+      if (r.kind !== curKind) {
+        curKind = r.kind;
+        results.appendChild(ui.el('div', 'sr-group', groups[r.kind] || r.kind));
+      }
+      var row = ui.el('div', 'sr-item' + (i === activeIdx ? ' active' : ''));
+      row.dataset.idx = i;
+      if (r.kind === 'course') {
+        row.innerHTML = '<div class="sr-main"><div class="sr-title">' + fmt.highlight(r.item.title, q) + '</div>' +
+          '<div class="sr-sub">' + fmt.esc(r.item.line || '') + ' · ' + fmt.esc(fmt.clamp(r.item.desc || '', 70)) + '</div></div>' +
+          '<span class="sr-kind">课程</span>';
+      } else if (r.kind === 'lesson') {
+        row.innerHTML = '<div class="sr-main"><div class="sr-title">' + fmt.highlight(r.item.title, q) + '</div>' +
+          '<div class="sr-sub">' + fmt.esc(r.item.slug) + ' › ' + fmt.highlight(r.item.chapter || '', q) + '</div></div>' +
+          '<span class="sr-kind">课时</span>';
+      } else {
+        row.innerHTML = '<div class="sr-main"><div class="sr-title">' + fmt.highlight(r.item.zh, q) + '</div>' +
+          '<div class="sr-sub">' + fmt.esc(r.item.layerName || '') + ' · ' + fmt.esc(fmt.clamp(r.item.def || '', 70)) + '</div></div>' +
+          '<span class="sr-kind">词条</span>';
+      }
+      row.addEventListener('click', function () { openResult(r); });
+      row.addEventListener('mousemove', function () { setActive(i); });
+      results.appendChild(row);
+    });
+  }
+
+  function setActive(i) {
+    activeIdx = i;
+    ui.$$('.sr-item', results).forEach(function (n, k) { n.classList.toggle('active', k === i); });
+    var el = ui.$('.sr-item.active', results);
+    if (el) el.scrollIntoView({ block: 'nearest' });
+  }
+
+  function openResult(r) {
+    closeSearch();
+    if (r.kind === 'course') LLM.go('#/course/' + r.item.slug);
+    else if (r.kind === 'lesson') LLM.go('#/l/' + r.item.id);
+    else LLM.go('#/glossary/t/' + r.item.key);
+  }
+
+  function openSearch(prefill) {
+    overlay = overlay || ui.$('#search-overlay');
+    input = input || ui.$('#search-input');
+    results = results || ui.$('#search-results');
+    scopeEl = scopeEl || ui.$('#search-scope');
+    overlay.hidden = false;
+    document.body.classList.add('no-scroll');
+    var st = LLM.store && LLM.store.stats ? LLM.store.stats() : null;
+    if (scopeEl) scopeEl.textContent = st ? ('你的进度：已完成 ' + st.doneLessons + ' / ' + st.totalLessons + ' 课时') : '';
+    buildIndex().then(function () {
+      if (prefill) input.value = prefill;
+      paintSearch(input.value || '');
+      input.focus();
+      input.select();
+    }).catch(function (e) { toast('搜索索引加载失败：' + fmt.esc(e.message), 'err'); });
+  }
+  function closeSearch() {
+    if (!overlay) return;
+    overlay.hidden = true;
+    document.body.classList.remove('no-scroll');
+  }
+
+  /* ---------------- 启动 ---------------- */
+  // 供其它视图复用（搜索页要同一份索引，避免重复加载）
+  LLM.search = { build: buildIndex, run: runSearch, open: openSearch, close: closeSearch, index: function () { return searchIndex; } };
+
+  function initShell() {
+    applyTheme(preferredTheme());
+    ui.$('#btn-theme').addEventListener('click', toggleTheme);
+    paintProgress();
+
+    ui.$('#btn-menu').addEventListener('click', function () { ui.$('#navlinks').classList.toggle('open'); });
+    ui.$('#btn-search').addEventListener('click', function () { openSearch(''); });
+    ui.$('#btn-search-close').addEventListener('click', closeSearch);
+    ui.$('#search-overlay').addEventListener('click', function (e) { if (e.target === ui.$('#search-overlay')) closeSearch(); });
+
+    if (input == null) input = ui.$('#search-input');
+    input.addEventListener('input', ui.debounce(function () { paintSearch(input.value || ''); }, 90));
+    input.addEventListener('keydown', function (e) {
+      if (e.key === 'ArrowDown') { e.preventDefault(); setActive(Math.min(activeIdx + 1, lastResults.length - 1)); }
+      else if (e.key === 'ArrowUp') { e.preventDefault(); setActive(Math.max(activeIdx - 1, 0)); }
+      else if (e.key === 'Enter') {
+        e.preventDefault();
+        if (e.shiftKey) { var q = input.value.trim(); closeSearch(); LLM.go('#/search/' + encodeURIComponent(q)); }
+        else if (lastResults[activeIdx]) openResult(lastResults[activeIdx]);
+      } else if (e.key === 'Escape') { closeSearch(); }
+    });
+
+    document.addEventListener('keydown', function (e) {
+      var tag = (e.target.tagName || '').toLowerCase();
+      var typing = tag === 'input' || tag === 'textarea' || e.target.isContentEditable;
+      if (e.key === '/' && !typing) { e.preventDefault(); openSearch(''); }
+      else if (e.key === 'Escape') { closeSearch(); var n = ui.$('.notes-drawer.open'); if (n) n.classList.remove('open'); }
+      else if ((e.key === 'd' || e.key === 'D') && !typing) { toggleTheme(); }
+    });
+
+    window.addEventListener('scroll', ui.debounce(paintReadbar, 60), { passive: true });
+    window.addEventListener('hashchange', render);
+
+    LLM.on('search-index', function () {
+      if (overlay && !overlay.hidden && input) paintSearch(input.value || '');
+    });
+    LLM.on('progress', paintProgress);
+    LLM.on('route', paintReadbar);
+
+    // 首屏：站点统计（页脚 + 首页 hero 共用）
+    data.site().then(function (s) {
+      LLM.site = s;
+      var f = ui.$('#footer-stats');
+      if (f) {
+        f.innerHTML = '<strong>内容规模</strong><p class="small muted">' +
+          s.counts.courses + ' 门课 · ' + s.counts.chapters + ' 章 · ' + s.counts.lessons + ' 课时 · ' +
+          fmt.num(s.counts.figures) + ' 张图表 · ' + fmt.num(s.counts.glossaryTerms) + ' 条关键词</p>';
+      }
+      var b = ui.$('#footer-bottom');
+      if (b) {
+        b.textContent = '构建于 ' + String(s.generated).slice(0, 10) + ' · 数据版本 ' + (s.version || '—') +
+          ' · 纯静态站点（无服务端、无账号）· 进度与笔记只保存在本机浏览器';
+      }
+      LLM.emit('site', s);
+    }).catch(function (e) {
+      console.warn('site.json 加载失败', e);
+    });
+
+    render();
+  }
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', initShell);
+  else initShell();
+})(typeof globalThis !== 'undefined' ? globalThis : this);

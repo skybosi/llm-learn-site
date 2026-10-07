@@ -1,0 +1,164 @@
+<h2 id="h-核心实现结构化数据端到端预测">核心实现（结构化数据端到端预测）<a class="anchor" href="#h-核心实现结构化数据端到端预测" aria-label="本节链接">#</a></h2>
+<p>上一课完成了项目规划与工程骨架，本课进入核心：<strong>特征工程 + 多模型对比 + XGBoost/LightGBM 调优</strong>。主线以信用卡欺诈检测为例给出可运行代码，末尾附房价回归的变体。所有代码面向&quot;能复现、能讲解&quot;，而不是&quot;能跑通就完&quot;。</p>
+<h3 id="h-一目标与步骤">一、目标与步骤<a class="anchor" href="#h-一目标与步骤" aria-label="本节链接">#</a></h3>
+<p>本课要完成的四步，对应最终报告的四块内容：</p>
+<ol>
+<li><strong>特征工程</strong>：缩放、编码、构造时间/金额衍生特征。</li>
+<li><strong>基线 + 多模型对比</strong>：从 Logistic 回归到 XGBoost/LightGBM，用一致的交叉验证口径打分。</li>
+<li><strong>超参数调优</strong>：用 Optuna 对树模型调参，关注&quot;不平衡下的指标选择&quot;。</li>
+<li><strong>阈值与业务换算</strong>：把概率转成&quot;可用/不用&quot;的业务决策。</li>
+</ol>
+<p>先统一口径：由于正类极稀，<strong>所有模型的对比指标都用 AUC-PR 与 AUC-ROC</strong>，绝不看 Accuracy。</p>
+<h3 id="h-二代码骨架与实现指导">二、代码骨架与实现指导<a class="anchor" href="#h-二代码骨架与实现指导" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-特征工程">1. 特征工程<a class="anchor" href="#h-1-特征工程" aria-label="本节链接">#</a></h4>
+<p>欺诈数据的 28 个 <code>V</code> 特征已经过 PCA 匿名化（近似无量纲），真正需要处理的是 <code>Time</code> 与 <code>Amount</code>：</p>
+<pre data-lang="python"><code class="language-python">import numpy as np
+import pandas as pd
+from sklearn.preprocessing import RobustScaler
+
+def build_features(df):
+    &quot;&quot;&quot;在原始特征上做工程，返回特征矩阵 X 与标签 y。&quot;&quot;&quot;
+    df = df.copy()
+
+    # 金额：长尾分布，用 RobustScaler 比 StandardScaler 更抗极端大额交易
+    df[&quot;Amount_scaled&quot;] = RobustScaler().fit_transform(
+        df[&quot;Amount&quot;].values.reshape(-1, 1)
+    )
+
+    # 时间：把秒级时间戳转成&quot;一天内的时刻&quot;，捕捉交易时间规律
+    df[&quot;hour&quot;] = (df[&quot;Time&quot;] // 3600) % 24          # 0~23 点
+    df[&quot;is_night&quot;] = (df[&quot;hour&quot;] &gt;= 0) &amp; (df[&quot;hour&quot;] &lt; 6)  # 凌晨交易标志
+
+    # 可选：金额的粗分箱交叉特征（面试时说明&quot;为何构造&quot;即可）
+    df[&quot;amount_bucket&quot;] = pd.qcut(df[&quot;Amount&quot;], 4, labels=False, duplicates=&quot;drop&quot;)
+
+    feature_cols = [c for c in df.columns if c.startswith(&quot;V&quot;)]
+    feature_cols += [&quot;Amount_scaled&quot;, &quot;hour&quot;, &quot;is_night&quot;, &quot;amount_bucket&quot;]
+    X = df[feature_cols]
+    y = df[&quot;Class&quot;]
+    return X, y</code></pre>
+<blockquote>
+<p>说明：匿名特征已标准化，一般不必再整体缩放；但如果想统一量纲，可对 <code>V</code> 列再套一层 <code>StandardScaler</code>。这里的重点不是&quot;堆特征&quot;，而是<strong>每一步都有理由</strong>——面试时你要能解释为什么对 <code>Amount</code> 用鲁棒缩放。</p>
+</blockquote>
+<h4 id="h-2-训练验证划分延续时间切分">2. 训练/验证划分（延续时间切分）<a class="anchor" href="#h-2-训练验证划分延续时间切分" aria-label="本节链接">#</a></h4>
+<pre data-lang="python"><code class="language-python">from sklearn.model_selection import TimeSeriesSplit
+
+# 时间序列交叉验证：每次用更早的数据训练、更晚的数据验证
+# 比 KFold 更贴合&quot;用历史预测未来&quot;的真实部署场景
+tscv = TimeSeriesSplit(n_splits=5)
+
+# 简单起见，这里同时保留一个&quot;提前切好&quot;的 train/val 供最终报告使用
+# train_df, val_df 由 lesson-01 的时间切分得到（见上一课骨架）</code></pre>
+<h4 id="h-3-基线--多模型对比">3. 基线 + 多模型对比<a class="anchor" href="#h-3-基线--多模型对比" aria-label="本节链接">#</a></h4>
+<p>用一个统一的评分函数，把各模型放进同一口径对比：</p>
+<pre data-lang="python"><code class="language-python">from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import roc_auc_score, average_precision_score
+import xgboost as xgb
+import lightgbm as lgb
+
+def evaluate_cv(model, X, y, cv):
+    &quot;&quot;&quot;用时间序列 CV 计算 AUC-ROC 与 AUC-PR 的均值/标准差。&quot;&quot;&quot;
+    rocs, prs = [], []
+    for tr_idx, va_idx in cv.split(X):
+        model.fit(X.iloc[tr_idx], y.iloc[tr_idx])
+        proba = model.predict_proba(X.iloc[va_idx])[:, 1]
+        rocs.append(roc_auc_score(y.iloc[va_idx], proba))
+        prs.append(average_precision_score(y.iloc[va_idx], proba))
+    return np.mean(rocs), np.std(rocs), np.mean(prs), np.std(prs)
+
+# 注意：LogisticRegression 对类别不平衡敏感，可加 class_weight=&#39;balanced&#39;
+models = {
+    &quot;LogisticRegression&quot;: LogisticRegression(max_iter=1000, class_weight=&quot;balanced&quot;),
+    &quot;RandomForest&quot;: RandomForestClassifier(
+        n_estimators=200, class_weight=&quot;balanced&quot;, n_jobs=-1, random_state=42
+    ),
+    &quot;XGBoost&quot;: xgb.XGBClassifier(
+        n_estimators=500, learning_rate=0.1, max_depth=6,
+        scale_pos_weight=99,  # 正负样本权重：约 (1-0.0017)/0.0017
+        eval_metric=&quot;aucpr&quot;, tree_method=&quot;hist&quot;, n_jobs=-1, random_state=42
+    ),
+    &quot;LightGBM&quot;: lgb.LGBMClassifier(
+        n_estimators=500, learning_rate=0.1, num_leaves=31,
+        scale_pos_weight=99, n_jobs=-1, random_state=42
+    ),
+}
+
+X, y = build_features(train_df)
+for name, model in models.items():
+    roc_m, roc_s, pr_m, pr_s = evaluate_cv(model, X, y, tscv)
+    print(f&quot;{name:20s} AUC-ROC={roc_m:.4f}(±{roc_s:.4f})  AUC-PR={pr_m:.4f}(±{pr_s:.4f})&quot;)</code></pre>
+<p>预期结果方向：树模型（XGBoost/LightGBM）显著优于线性基线；随机森林居中。<strong>如果你跑出来的顺序不是这样，先查数据泄漏，再谈调参</strong>——顺序异常本身就是最该警惕的信号。</p>
+<h4 id="h-4-optuna-超参数调优">4. Optuna 超参数调优<a class="anchor" href="#h-4-optuna-超参数调优" aria-label="本节链接">#</a></h4>
+<p>以 LightGBM 为例，用 Optuna 在验证集上做贝叶斯搜索（比 GridSearch 快一个量级）：</p>
+<pre data-lang="python"><code class="language-python">import optuna
+from sklearn.metrics import average_precision_score
+
+def objective(trial):
+    params = {
+        &quot;n_estimators&quot;: trial.suggest_int(&quot;n_estimators&quot;, 200, 1500),
+        &quot;learning_rate&quot;: trial.suggest_float(&quot;learning_rate&quot;, 0.01, 0.3, log=True),
+        &quot;num_leaves&quot;: trial.suggest_int(&quot;num_leaves&quot;, 8, 128),
+        &quot;min_child_samples&quot;: trial.suggest_int(&quot;min_child_samples&quot;, 10, 200),
+        &quot;subsample&quot;: trial.suggest_float(&quot;subsample&quot;, 0.5, 1.0),
+        &quot;colsample_bytree&quot;: trial.suggest_float(&quot;colsample_bytree&quot;, 0.5, 1.0),
+        &quot;scale_pos_weight&quot;: trial.suggest_float(&quot;scale_pos_weight&quot;, 10, 200),
+    }
+    model = lgb.LGBMClassifier(**params, n_jobs=-1, random_state=42)
+    model.fit(X.iloc[tr_idx], y.iloc[tr_idx])
+    proba = model.predict_proba(X.iloc[va_idx])[:, 1]
+    return average_precision_score(y.iloc[va_idx], proba)  # 用 AUC-PR 作优化目标
+
+study = optuna.create_study(direction=&quot;maximize&quot;)
+study.optimize(objective, n_trials=50, show_progress_bar=True)
+print(&quot;最优 AUC-PR:&quot;, study.best_value)
+print(&quot;最优参数:&quot;, study.best_params)</code></pre>
+<blockquote>
+<p>调参原则：<strong>先粗后细</strong>。先固定 <code>learning_rate</code> 用少量 <code>n_estimators</code> 快速扫出大致区间，再在最优附近细化。避免一上来就 500 次 trial 烧时间，且容易在验证集上过拟合。</p>
+</blockquote>
+<h4 id="h-5-阈值选择与业务换算">5. 阈值选择与业务换算<a class="anchor" href="#h-5-阈值选择与业务换算" aria-label="本节链接">#</a></h4>
+<p>模型输出的是概率，业务要的是&quot;拦还是不拦&quot;。用验证集选阈值：</p>
+<pre data-lang="python"><code class="language-python">from sklearn.metrics import precision_recall_curve
+
+proba = best_model.predict_proba(X.iloc[va_idx])[:, 1]
+precision, recall, thresholds = precision_recall_curve(y.iloc[va_idx], proba)
+
+# 业务假设：拦一笔真欺诈省 1000 元，误拦一笔正常交易损失 50 元（客服+流失）
+# 目标：最大化 收益 = 1000 * TP - 50 * FP，等价于在 PR 曲线上找最优工作点
+cost_fp, cost_fn = 50, 1000  # 误报成本、漏报成本
+optimal_idx = np.argmax(
+    (recall[:-1] * cost_fn * pos_count) - ((1 - precision[:-1]) * cost_fp * neg_count)
+)
+best_threshold = thresholds[optimal_idx]
+print(f&quot;推荐阈值: {best_threshold:.4f}, 对应 Recall={recall[optimal_idx]:.4f}, &quot;
+      f&quot;Precision={precision[optimal_idx]:.4f}&quot;)</code></pre>
+<p>这段是面试的&quot;分水岭&quot;：绝大多数候选人只报 AUC，而你能回答&quot;<strong>这个模型上线该用什么阈值、为什么</strong>&quot;。</p>
+<h4 id="h-6-房价回归变体速览">6. 房价回归变体（速览）<a class="anchor" href="#h-6-房价回归变体速览" aria-label="本节链接">#</a></h4>
+<p>房价问题换成回归管线，思路一致、指标不同：</p>
+<pre data-lang="python"><code class="language-python">from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_squared_error
+
+# 目标取对数：价格右偏，对数化后残差更接近正态、RMSE 更稳定
+y = np.log1p(df[&quot;SalePrice&quot;])
+
+# 特征工程：数值缺失用中位数、类别用众数填充 + 独热编码，
+# 并构造 TotalSF = 地上面积 + 地下室面积 这类&quot;领域常识&quot;特征
+# 模型：Ridge(基线) -&gt; RandomForestRegressor -&gt; XGBRegressor/LGBMRegressor
+# 评估：cross_val_score(neg_mean_squared_error)，取负再开方得 RMSE
+rmse = np.sqrt(-cross_val_score(model, X, y, cv=5, scoring=&quot;neg_mean_squared_error&quot;).mean())</code></pre>
+<h3 id="h-三验收与复盘">三、验收与复盘<a class="anchor" href="#h-三验收与复盘" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>口径一致性验收</strong>：四个模型是否都用了同一套 CV 划分、同一组 <code>X/y</code>、同两个指标？口径不一，对比表就无意义。</li>
+<li><strong>结果合理性验收</strong>：树模型是否明显优于线性基线？AUC-PR 是否远低于 AUC-ROC（这正是&quot;不平衡&quot;的体现，说明指标选对了）？</li>
+<li><strong>可复现验收</strong>：固定 <code>random_state</code> 后重跑一遍，结果是否稳定？误差是否在一个可接受区间内？</li>
+<li><strong>复盘提示</strong>：把本课的对比表、最优参数、推荐阈值整理进 <code>reports/</code>。下一课将基于这些产出做特征重要性分析与面试话术，本课的每张表都会成为面试时&quot;你做了什么&quot;的证据。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>XGBoost 官方文档（参数与 early stopping）：<a href="https://xgboost.readthedocs.io/" target="_blank" rel="noopener noreferrer">https://xgboost.readthedocs.io/</a></li>
+<li>LightGBM 官方文档：<a href="https://lightgbm.readthedocs.io/" target="_blank" rel="noopener noreferrer">https://lightgbm.readthedocs.io/</a></li>
+<li>Optuna 官方文档：<a href="https://optuna.org/" target="_blank" rel="noopener noreferrer">https://optuna.org/</a></li>
+<li>scikit-learn 交叉验证与指标文档：<a href="https://scikit-learn.org/stable/modules/cross_validation.html" target="_blank" rel="noopener noreferrer">https://scikit-learn.org/stable/modules/cross_validation.html</a></li>
+<li>Kaggle 信用卡欺诈检测数据集：<a href="https://www.kaggle.com/datasets/mlg-ulb/creditcardfraud" target="_blank" rel="noopener noreferrer">https://www.kaggle.com/datasets/mlg-ulb/creditcardfraud</a></li>
+</ul>
+<p><a href="#/l/proj-ch1-l3">下一课：结果与复盘</a></p>

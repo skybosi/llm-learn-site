@@ -1,0 +1,1009 @@
+<h2 id="h-上线与迭代灰度回滚成本优化顺序以及按收益风险排的-5-步清单">上线与迭代：灰度、回滚、成本优化顺序，以及按收益/风险排的 5 步清单<a class="anchor" href="#h-上线与迭代灰度回滚成本优化顺序以及按收益风险排的-5-步清单" aria-label="本节链接">#</a></h2>
+<h3 id="h-这一节要解决什么">这一节要解决什么<a class="anchor" href="#h-这一节要解决什么" aria-label="本节链接">#</a></h3>
+<p>前三节把一个服务从需求做到了&quot;压测通过的配置&quot;。但上线不是终点，而是<strong>一串会改变配置的动作</strong>的开头：</p>
+<pre><code>模型换精度（bf16 → FP8）     → 数值变了
+缓存 key 设计改了             → 命中率变了
+调度参数调了                  → batch 分布变了
+流量涨了                      → 副本要加</code></pre>
+<p>每个动作都有两个必须回答的问题：</p>
+<pre><code>① 怎么知道它坏了？—— 灰度要多少样本、看多久（第 5 章给了统计口径）
+② 坏了怎么办？—— 回滚要多快、回滚窗口够不够</code></pre>
+<p>以及一个更少被问、但决定长期成本的问题：</p>
+<pre><code>③ 这些能做的优化里，按什么顺序做？—— 每步的收益/风险比不一样，
+   而&quot;先做哪个&quot;直接决定了下个季度的账单</code></pre>
+<p>本节把这三件事都变成算式，并给出<strong>按收益/风险排序的 5 步清单</strong>，每步都带可量化的前后对比。</p>
+<p>本节的可算产出：</p>
+<table>
+<thead>
+<tr>
+<th>要算的量</th>
+<th>公式</th>
+<th>本节算例值</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>金丝雀样本量</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4831em;"></span><span class="mord mathnormal">n</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">10/</span><span class="mord mathnormal">ε</span></span></span></span></td>
+<td>检出 1% → 1,000；0.1% → 10,000</td>
+</tr>
+<tr>
+<td>观察时长</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0361em;vertical-align:-0.2861em;"></span><span class="mord mathnormal">n</span><span class="mord">/</span><span class="mord"><span class="mord mathnormal">λ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">canary</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span></span></td>
+<td>1,000/2 = 500 s（1% 流量）</td>
+</tr>
+<tr>
+<td>错误预算消耗</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">fail</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord mathnormal">λ</span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="mord">/</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0502em;">B</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0502em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">err</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span></td>
+<td>1%、30 min → 0.694%</td>
+</tr>
+<tr>
+<td>回滚窗口容量</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.109em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">left</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≥</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6887em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6887em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span></span></span></span></span></span></span></span></td>
+<td>双跑 6 副本 ✓ / 滚动 2 副本 ✗</td>
+</tr>
+<tr>
+<td>每步收益/风险比</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">Δ</span><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="mord">/</span><span class="mord text"><span class="mord">risk</span></span></span></span></span></td>
+<td>S1 最优先（−1,944 元/月，风险低）</td>
+</tr>
+</tbody></table>
+<h3 id="h-一灰度样本量时长与错误预算">一、灰度：样本量、时长与错误预算<a class="anchor" href="#h-一灰度样本量时长与错误预算" aria-label="本节链接">#</a></h3>
+<h4 id="h-11-观察时长是算出来的">1.1 观察时长是<strong>算出来的</strong><a class="anchor" href="#h-11-观察时长是算出来的" aria-label="本节链接">#</a></h4>
+<p>金丝雀的核心约束是&quot;要看多久才能有统计意义&quot;。检出退化幅度 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">ε</span></span></span></span> 需要的样本量（第 5 章 SPRT 口径）：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">n</span><span class="mopen">(</span><span class="mord mathnormal">ε</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.0074em;vertical-align:-0.686em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3214em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">ε</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">10</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></p>
+<p>观察时长由流量决定：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">obs</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.3991em;vertical-align:-0.9721em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.427em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal">λ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">canary</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">n</span><span class="mopen">(</span><span class="mord mathnormal">ε</span><span class="mclose">)</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.9721em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.3991em;vertical-align:-0.9721em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.427em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">λ</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.1076em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">canary</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">n</span><span class="mopen">(</span><span class="mord mathnormal">ε</span><span class="mclose">)</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.9721em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></p>
+<table>
+<thead>
+<tr>
+<th>流量比例 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span></span></span></span></th>
+<th><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.9805em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal">λ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">canary</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span></span></th>
+<th>检出 1% 需请求</th>
+<th>观察时长</th>
+<th>检出 0.1% 需请求</th>
+<th>观察时长</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1%</td>
+<td>2.0 req/s</td>
+<td>1,000</td>
+<td><strong>500.0 s</strong></td>
+<td>10,000</td>
+<td>5,000.0 s（83 min）</td>
+</tr>
+<tr>
+<td>2%</td>
+<td>4.0</td>
+<td>1,000</td>
+<td>250.0 s</td>
+<td>10,000</td>
+<td>2,500.0 s</td>
+</tr>
+<tr>
+<td>5%</td>
+<td>10.0</td>
+<td>1,000</td>
+<td>100.0 s</td>
+<td>10,000</td>
+<td>1,000.0 s</td>
+</tr>
+<tr>
+<td>10%</td>
+<td>20.0</td>
+<td>1,000</td>
+<td>50.0 s</td>
+<td>10,000</td>
+<td>500.0 s</td>
+</tr>
+<tr>
+<td>25%</td>
+<td>50.0</td>
+<td>1,000</td>
+<td>20.0 s</td>
+<td>10,000</td>
+<td>200.0 s</td>
+</tr>
+</tbody></table>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.68em;vertical-align:-0.59em;"></span><span class="mord"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.09em;"><span style="top:-3.68em;"><span class="pstrut" style="height:3.68em;"></span><span class="boxpad"><span class="mord"><span class="mord"><span class="mord text"><span class="mord cjk_fallback">观察时长</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mord text"><span class="mord cjk_fallback">样本量</span></span><span class="mord">/</span><span class="mord text"><span class="mord cjk_fallback">金丝雀流量</span></span><span class="mpunct">;</span><span class="mspace" style="margin-right:1em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord cjk_fallback">要更小的</span><span class="mord"> </span></span><span class="mord mathnormal">ε</span><span class="mord text"><span class="mord"> </span><span class="mord cjk_fallback">只能靠更大的流量</span></span></span></span></span></span><span style="top:-3.09em;"><span class="pstrut" style="height:3.68em;"></span><span class="stretchy fbox" style="height:1.68em;border-style:solid;border-width:0.04em;"></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.59em;"><span></span></span></span></span></span></span></span></span></span></p>
+<p><strong>这张表否定了一个常见做法</strong>：&quot;1% 流量跑 10 分钟&quot;。1% 流量（2 req/s）跑 10 分钟只有 1,200 个请求，只够检出 <strong>0.83%</strong> 的退化；要检出 0.1% 得跑 83 分钟。<strong>如果你的目标是&quot;检出 0.1% 的退化&quot;，就必须把流量提到 25%（50 req/s）跑 200 s</strong> —— 而不是&quot;多跑一会儿&quot;。</p>
+<h4 id="h-12-错误预算花的是检测时间">1.2 错误预算：花的是<strong>检测时间</strong><a class="anchor" href="#h-12-错误预算花的是检测时间" aria-label="本节链接">#</a></h4>
+<p>月度错误预算（可用性 99.9%）：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0502em;">B</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0502em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">err</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">30</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">24</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">60</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">0.999</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6679em;"></span><span class="mord">43.2</span><span class="mspace"> </span><span class="mord text"><span class="mord">min</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8778em;vertical-align:-0.1944em;"></span><span class="mord">518</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">400</span><span class="mspace"> </span><span class="mord text"><span class="mord cjk_fallback">个请求</span></span></span></span></span></span></p>
+<p>消耗量：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord cjk_fallback">消耗</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.2074em;vertical-align:-0.836em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3714em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal" style="margin-right:0.0502em;">B</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0502em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">err</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">fail</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord mathnormal">λ</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.836em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:1em;"></span><span class="mopen">(</span><span class="mord text"><span class="mord cjk_fallback">按请求数折算</span></span><span class="mclose">)</span></span></span></span></span></p>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>坏请求率</th>
+<th>持续</th>
+<th>坏请求</th>
+<th>占月预算</th>
+<th>折合预算秒</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>健康版本（纯误报，无坏请求）</td>
+<td>0.0%</td>
+<td>600 s</td>
+<td>0</td>
+<td>0.000%</td>
+<td>0.00 s</td>
+</tr>
+<tr>
+<td>真退化 1%，120 s 内发现</td>
+<td>1.0%</td>
+<td>120 s</td>
+<td>240</td>
+<td>0.046%</td>
+<td>1.20 s</td>
+</tr>
+<tr>
+<td>真退化 1%，30 min 才发现</td>
+<td>1.0%</td>
+<td>1,800 s</td>
+<td>3,600</td>
+<td><strong>0.694%</strong></td>
+<td>18.00 s</td>
+</tr>
+<tr>
+<td>真退化 10%，60 s 内发现</td>
+<td>10.0%</td>
+<td>60 s</td>
+<td>1,200</td>
+<td>0.231%</td>
+<td>6.00 s</td>
+</tr>
+<tr>
+<td>真退化 10%，30 min 才发现</td>
+<td>10.0%</td>
+<td>1,800 s</td>
+<td>36,000</td>
+<td><strong>6.944%</strong></td>
+<td>180.00 s</td>
+</tr>
+</tbody></table>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.4856em;vertical-align:-0.3956em;"></span><span class="mord"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.09em;"><span style="top:-3.4856em;"><span class="pstrut" style="height:3.4856em;"></span><span class="boxpad"><span class="mord"><span class="mord"><span class="mord text"><span class="mord cjk_fallback">同一坏版本：</span><span class="mord">120 s </span><span class="mord cjk_fallback">发现花</span><span class="mord"> 0.046%</span><span class="mord cjk_fallback">，</span><span class="mord">30 min </span><span class="mord cjk_fallback">才发现花</span><span class="mord"> 0.694% —— </span><span class="mord cjk_fallback">差</span><span class="mord"> 15 </span><span class="mord cjk_fallback">倍</span></span></span></span></span></span><span style="top:-3.09em;"><span class="pstrut" style="height:3.4856em;"></span><span class="stretchy fbox" style="height:1.4856em;border-style:solid;border-width:0.04em;"></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.3956em;"><span></span></span></span></span></span></span></span></span></span></p>
+<p><strong>读法</strong>：消耗预算的是<strong>检测时间</strong>，不是灰度本身。所以：</p>
+<ol>
+<li><strong>&quot;灰度慢慢看&quot;是有价格的</strong>：多看的每一分钟都按&quot;坏请求率 × 流量&quot;扣预算。</li>
+<li><strong>把预算花在&quot;缩短检测时间&quot;上最划算</strong>：自动化的异常检测（第 5 章的指标指纹分类器）比&quot;多看 20 分钟&quot;有效 15 倍。</li>
+<li><strong>退化幅度越大，越要快发现</strong>：10% 的退化拖 30 min 就吃掉 6.9% 的月预算 —— 一个月出两次这种事故，SLO 就守不住了。</li>
+</ol>
+<h4 id="h-13-灰度的三个阶段本节的推荐流程">1.3 灰度的三个阶段（本节的推荐流程）<a class="anchor" href="#h-13-灰度的三个阶段本节的推荐流程" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>流量</th>
+<th>时长</th>
+<th>通过判据</th>
+<th>失败动作</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>冒烟</td>
+<td>1 副本内部</td>
+<td>5 min</td>
+<td>无 5xx、数值回归集一致</td>
+<td>立即回滚（不接流量）</td>
+</tr>
+<tr>
+<td>金丝雀</td>
+<td>5%（10 req/s）</td>
+<td>100 s（检出 1%）</td>
+<td>TTFT/TPOT p99 在 ±5% 验收带内、错误率不升</td>
+<td>回滚，消耗预算 0.046%</td>
+</tr>
+<tr>
+<td>扩大</td>
+<td>25% → 50% → 100%</td>
+<td>每档 200 s</td>
+<td>同上 + 逐环节指标无异常</td>
+<td>回滚到上一档</td>
+</tr>
+</tbody></table>
+<p><strong>注意&quot;冒烟&quot;不能省</strong>：它花 5 分钟、不接流量，能拦住&quot;根本跑不起来&quot;和&quot;数值明显错&quot;这两类问题 —— 而它们在金丝雀阶段会造成真实坏请求。</p>
+<p><strong>为什么扩大到 100% 时要分档</strong>：如果从 25% 直接跳 100%，一旦在 100% 才发现问题，回滚窗口内的影响是满流量的。<strong>分档的本质是把&quot;错误预算的暴露面&quot;逐级放大。</strong></p>
+<h3 id="h-二回滚窗口代价与回得去的判据">二、回滚：窗口代价与&quot;回得去&quot;的判据<a class="anchor" href="#h-二回滚窗口代价与回得去的判据" aria-label="本节链接">#</a></h3>
+<h4 id="h-21-三种回滚方式的容量核算">2.1 三种回滚方式的容量核算<a class="anchor" href="#h-21-三种回滚方式的容量核算" aria-label="本节链接">#</a></h4>
+<p>本节舰队 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6887em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6887em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">3</span></span></span></span>（6 卡 / 2 节点），每副本 2 卡：</p>
+<table>
+<thead>
+<tr>
+<th>回滚方式</th>
+<th>窗口内可用副本</th>
+<th>容量损失</th>
+<th>窗口需求</th>
+<th>判定</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>原地重启（不可用）</td>
+<td>0</td>
+<td>100%</td>
+<td>1.0×</td>
+<td>✗</td>
+</tr>
+<tr>
+<td>双跑（新旧并存）</td>
+<td>6</td>
+<td>0%</td>
+<td>1.0×</td>
+<td>✓</td>
+</tr>
+<tr>
+<td>滚动（每次 1 副本）</td>
+<td>2</td>
+<td>67%</td>
+<td>1.0×</td>
+<td>△</td>
+</tr>
+</tbody></table>
+<p><strong>判据（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.109em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">left</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≥</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6887em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6887em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span></span></span></span></span></span></span></span>）</strong>：双跑时 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7804em;vertical-align:-0.136em;"></span><span class="mord">6</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≥</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">3</span></span></span></span> ✓；滚动时 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6835em;vertical-align:-0.0391em;"></span><span class="mord">2</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&lt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">3</span></span></span></span> ✗。</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.5244em;vertical-align:-0.49em;"></span><span class="mord"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.0344em;"><span style="top:-3.5244em;"><span class="pstrut" style="height:3.5244em;"></span><span class="boxpad"><span class="mord"><span class="mord"><span class="mord text"><span class="mord cjk_fallback">回滚的前提是</span><span class="mord">&quot;</span><span class="mord cjk_fallback">窗口内剩余容量仍满足</span><span class="mord"> SLO&quot;</span><span class="mord cjk_fallback">；本项目要求</span><span class="mord"> </span></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.109em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">left</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≥</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mord">3</span><span class="mord text"><span class="mord cjk_fallback">，即至少</span><span class="mord"> 6 </span><span class="mord cjk_fallback">副本可用</span></span></span></span></span></span><span style="top:-3.0344em;"><span class="pstrut" style="height:3.5244em;"></span><span class="stretchy fbox" style="height:1.5244em;border-style:solid;border-width:0.04em;"></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.49em;"><span></span></span></span></span></span></span></span></span></span></p>
+<p><strong>注意&quot;滚动&quot;不是回滚方式</strong>：滚动是<strong>升级</strong>方式（一个一个换），它保证&quot;服务不中断&quot;，但不保证&quot;容量够&quot;。升级期容量掉到 2/3 是可以接受的（有冗余），<strong>回滚期同样掉到 2/3 就危险了，因为回滚通常伴随故障</strong>。</p>
+<h4 id="h-22-双跑的成本">2.2 双跑的成本<a class="anchor" href="#h-22-双跑的成本" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>双跑时长</th>
+<th>卡时</th>
+<th>成本（2.70 元/卡时）</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1 h</td>
+<td>6</td>
+<td>16 元</td>
+</tr>
+<tr>
+<td>4 h</td>
+<td>24</td>
+<td>65 元</td>
+</tr>
+<tr>
+<td>8 h</td>
+<td>48</td>
+<td>130 元</td>
+</tr>
+<tr>
+<td>24 h</td>
+<td>144</td>
+<td>389 元</td>
+</tr>
+</tbody></table>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord text"><span class="mord cjk_fallback">双跑</span><span class="mord"> 8 h </span><span class="mord cjk_fallback">的成本</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7224em;vertical-align:-0.0391em;"></span><span class="mord">130</span><span class="mspace"> </span><span class="mord text"><span class="mord cjk_fallback">元</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≪</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord cjk_fallback">一次事故的代价</span></span></span></span></span></span></p>
+<p><strong>所以&quot;回滚要双跑&quot;在成本上几乎无争议</strong> —— 24 小时双跑 389 元，不到一条 GPU 卡日租的 1/5。<strong>反对双跑的常见理由是&quot;资源不够&quot;，但那其实是容量规划问题（第 3 节说容量要按节点冗余）。</strong></p>
+<h4 id="h-23-只备份不双跑的三个前提">2.3 &quot;只备份不双跑&quot;的三个前提<a class="anchor" href="#h-23-只备份不双跑的三个前提" aria-label="本节链接">#</a></h4>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:4.32em;vertical-align:-1.91em;"></span><span class="minner"><span class="mopen"><span class="delimsizing mult"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:2.35em;"><span style="top:-2.2em;"><span class="pstrut" style="height:3.15em;"></span><span class="delimsizinginner delim-size4"><span>⎩</span></span></span><span style="top:-2.192em;"><span class="pstrut" style="height:3.15em;"></span><span style="height:0.316em;width:0.8889em;"><svg xmlns="http://www.w3.org/2000/svg" width="0.8889em" height="0.316em" style="width:0.8889em" viewBox="0 0 888.89 316" preserveAspectRatio="xMinYMin"><path d="M384 0 H504 V316 H384z M384 0 H504 V316 H384z"/></svg></span></span><span style="top:-3.15em;"><span class="pstrut" style="height:3.15em;"></span><span class="delimsizinginner delim-size4"><span>⎨</span></span></span><span style="top:-4.292em;"><span class="pstrut" style="height:3.15em;"></span><span style="height:0.316em;width:0.8889em;"><svg xmlns="http://www.w3.org/2000/svg" width="0.8889em" height="0.316em" style="width:0.8889em" viewBox="0 0 888.89 316" preserveAspectRatio="xMinYMin"><path d="M384 0 H504 V316 H384z M384 0 H504 V316 H384z"/></svg></span></span><span style="top:-4.6em;"><span class="pstrut" style="height:3.15em;"></span><span class="delimsizinginner delim-size4"><span>⎧</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.85em;"><span></span></span></span></span></span></span><span class="mord"><span class="mtable"><span class="col-align-l"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:2.41em;"><span style="top:-4.41em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord text"><span class="mord">① </span><span class="mord cjk_fallback">旧版本镜像仍可拉起（含权重、</span><span class="mord">CUDA</span><span class="mord cjk_fallback">、依赖）</span></span></span></span><span style="top:-2.97em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord text"><span class="mord">② </span><span class="mord cjk_fallback">回滚决策到生效</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≤</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mord text"><span class="mord cjk_fallback">检测时间</span></span></span></span><span style="top:-1.53em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord text"><span class="mord">③ </span><span class="mord cjk_fallback">回滚窗口内剩余容量仍满足</span><span class="mord"> SLO</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.91em;"><span></span></span></span></span></span><span class="arraycolsep" style="width:1em;"></span><span class="col-align-l"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:2.41em;"><span style="top:-4.41em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord text"><span class="mord cjk_fallback">镜像仓库与权重都保留</span><span class="mord"> </span></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord">1</span><span class="mord text"><span class="mord"> </span><span class="mord cjk_fallback">个版本</span></span></span></span><span style="top:-2.97em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord text"><span class="mord cjk_fallback">需要自动化：一键切流</span><span class="mord"> + </span><span class="mord cjk_fallback">预拉镜像</span></span></span></span><span style="top:-1.53em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.109em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">left</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≥</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6887em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.91em;"><span></span></span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:4.32em;vertical-align:-1.91em;"></span><span class="minner"><span class="mopen"><span class="delimsizing mult"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:2.35em;"><span style="top:-2.2em;"><span class="pstrut" style="height:3.15em;"></span><span class="delimsizinginner delim-size4"><span>⎩</span></span></span><span style="top:-2.192em;"><span class="pstrut" style="height:3.15em;"></span><span style="height:0.316em;width:0.8889em;"><svg xmlns="http://www.w3.org/2000/svg" width="0.8889em" height="0.316em" style="width:0.8889em" viewBox="0 0 888.89 316" preserveAspectRatio="xMinYMin"><path d="M384 0 H504 V316 H384z M384 0 H504 V316 H384z"/></svg></span></span><span style="top:-3.15em;"><span class="pstrut" style="height:3.15em;"></span><span class="delimsizinginner delim-size4"><span>⎨</span></span></span><span style="top:-4.292em;"><span class="pstrut" style="height:3.15em;"></span><span style="height:0.316em;width:0.8889em;"><svg xmlns="http://www.w3.org/2000/svg" width="0.8889em" height="0.316em" style="width:0.8889em" viewBox="0 0 888.89 316" preserveAspectRatio="xMinYMin"><path d="M384 0 H504 V316 H384z M384 0 H504 V316 H384z"/></svg></span></span><span style="top:-4.6em;"><span class="pstrut" style="height:3.15em;"></span><span class="delimsizinginner delim-size4"><span>⎧</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.85em;"><span></span></span></span></span></span></span><span class="mord"><span class="mtable"><span class="col-align-l"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:2.41em;"><span style="top:-4.41em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord text"><span class="mord">① </span><span class="mord cjk_fallback">旧版本镜像仍可拉起（含权重、</span><span class="mord">CUDA</span><span class="mord cjk_fallback">、依赖）</span></span></span></span><span style="top:-2.97em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord text"><span class="mord">② </span><span class="mord cjk_fallback">回滚决策到生效</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≤</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mord text"><span class="mord cjk_fallback">检测时间</span></span></span></span><span style="top:-1.53em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord text"><span class="mord">③ </span><span class="mord cjk_fallback">回滚窗口内剩余容量仍满足</span><span class="mord"> SLO</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.91em;"><span></span></span></span></span></span><span class="arraycolsep" style="width:1em;"></span><span class="col-align-l"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:2.41em;"><span style="top:-4.41em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord text"><span class="mord cjk_fallback">镜像仓库与权重都保留</span><span class="mord"> </span></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord">1</span><span class="mord text"><span class="mord"> </span><span class="mord cjk_fallback">个版本</span></span></span></span><span style="top:-2.97em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord text"><span class="mord cjk_fallback">需要自动化：一键切流</span><span class="mord"> + </span><span class="mord cjk_fallback">预拉镜像</span></span></span></span><span style="top:-1.53em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.109em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">left</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≥</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6887em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.91em;"><span></span></span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></p>
+<p><strong>三条同时成立才允许不双跑</strong>。本节的项目里 ③ 不成立（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6835em;vertical-align:-0.0391em;"></span><span class="mord">2</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&lt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">3</span></span></span></span>），所以必须双跑。<strong>这条判据把&quot;要不要双跑&quot;从经验问题变成了代数问题。</strong></p>
+<h4 id="h-24-回滚演练一个必须做的动作">2.4 回滚演练：一个必须做的动作<a class="anchor" href="#h-24-回滚演练一个必须做的动作" aria-label="本节链接">#</a></h4>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord cjk_fallback">回滚能力的验证</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord text"><span class="mord cjk_fallback">每季度一次演练，量出</span><span class="mord">&quot;</span><span class="mord cjk_fallback">决策</span><span class="mord">→</span><span class="mord cjk_fallback">生效</span><span class="mord">&quot;</span><span class="mord cjk_fallback">的实测时间</span></span></span></span></span></span></p>
+<table>
+<thead>
+<tr>
+<th>演练项</th>
+<th>观测</th>
+<th>目标</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>切流生效</td>
+<td>从&quot;点击回滚&quot;到&quot;新版本不再收流量&quot;</td>
+<td>≤ 60 s</td>
+</tr>
+<tr>
+<td>旧版本就绪</td>
+<td>从切流到旧版本开始服务</td>
+<td>≤ 180 s</td>
+</tr>
+<tr>
+<td>缓存失效范围</td>
+<td>回滚后 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">h</span></span></span></span> 掉多少</td>
+<td>量化，不影响 SLO</td>
+</tr>
+<tr>
+<td>数值一致性</td>
+<td>回归集与上一版本 diff</td>
+<td>完全一致</td>
+</tr>
+</tbody></table>
+<p><strong>为什么必须演练</strong>：模型里假设&quot;回滚决策到生效 ≤ 检测时间&quot;，但实测里这一步经常是<strong>手工操作 + 找镜像 + 等调度</strong>，5~30 min 都可能。<strong>没有演练过的回滚等于没有回滚</strong> —— 这句话在第 5 章的错误预算账里已经量化过（30 min 才发现 = 0.694%）。</p>
+<h3 id="h-三优化清单按收益风险排序的-5-步">三、优化清单：按收益/风险排序的 5 步<a class="anchor" href="#h-三优化清单按收益风险排序的-5-步" aria-label="本节链接">#</a></h3>
+<h4 id="h-31-收益风险比的定义">3.1 收益/风险比的定义<a class="anchor" href="#h-31-收益风险比的定义" aria-label="本节链接">#</a></h4>
+<p>每一步的&quot;性价比&quot;：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord text"><span class="mord">RoR</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.1963em;vertical-align:-0.836em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3603em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord text"><span class="mord">Risk</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">Δ</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord">Δ</span><span class="mord mathnormal">p</span><span class="mord">9</span><span class="mord"><span class="mord">9</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.836em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></p>
+<ul>
+<li><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord">Δ</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>：月成本的下降（元/月）</li>
+<li><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8778em;vertical-align:-0.1944em;"></span><span class="mord">Δ</span><span class="mord mathnormal">p</span><span class="mord">9</span><span class="mord"><span class="mord">9</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>：延迟的改善（折算成钱 —— 用&quot;每条 1 ms 的 p99 值 X 元&quot;或简单按 SLO 余量计价）</li>
+<li><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord text"><span class="mord">Risk</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>：回滚难度 × 数值风险 × 影响面的乘积（分级：低/中/高）</li>
+</ul>
+<p>本节用<strong>可排序的简化口径</strong>：先按&quot;月成本下降&quot;排，同档再看风险。</p>
+<h4 id="h-32-五步清单含量化前后对比">3.2 五步清单（含量化前后对比）<a class="anchor" href="#h-32-五步清单含量化前后对比" aria-label="本节链接">#</a></h4>
+<p><strong>基线 S0 的定义</strong>：S0 是&quot;上线前的最小实现&quot; —— <strong>没有前缀缓存</strong>、bf16 权重、单节点 TP=2。它的最优解是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6887em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6887em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4</span></span></span></span>（8 卡 / 7,776 元/月）。<strong>第 2 节的 6 卡方案就是 S1 之后的形态</strong>，不是 S0；本节的清单正是&quot;从 S0 走到 6 卡，再继续压成本&quot;的路径。</p>
+<table>
+<thead>
+<tr>
+<th>步骤</th>
+<th><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6887em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6887em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span></span></span></span></span></span></span></span></th>
+<th>卡</th>
+<th>节点</th>
+<th>TTFT</th>
+<th>TPOT</th>
+<th>KV</th>
+<th>月成本</th>
+<th>$/1M</th>
+<th>相对上一步</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>S0 基线（关缓存）</strong></td>
+<td>4</td>
+<td>8</td>
+<td>2</td>
+<td>51.6 ms</td>
+<td>6.83 ms</td>
+<td>3.655 GB</td>
+<td>7,776 元</td>
+<td>0.1076</td>
+<td>—</td>
+</tr>
+<tr>
+<td><strong>S1 + 前缀缓存 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">h</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.45</span></span></span></span></strong></td>
+<td>3</td>
+<td>6</td>
+<td>2</td>
+<td>49.2 ms</td>
+<td>7.14 ms</td>
+<td>5.034 GB</td>
+<td>5,832 元</td>
+<td>0.0817</td>
+<td>−2 卡、−1,944 元、−0.0258 $/1M、TTFT −2.4 ms</td>
+</tr>
+<tr>
+<td><strong>S2 + 权重 FP8</strong></td>
+<td>3</td>
+<td>6</td>
+<td>2</td>
+<td>36.9 ms</td>
+<td>5.37 ms</td>
+<td>3.805 GB</td>
+<td>5,832 元</td>
+<td>0.0812</td>
+<td>卡数不变、TTFT −12.3 ms、TPOT −1.77 ms、KV −1.23 GB</td>
+</tr>
+<tr>
+<td><strong>S3 + KV 8bit 量化</strong></td>
+<td>3</td>
+<td>6</td>
+<td>2</td>
+<td>34.2 ms</td>
+<td>4.89 ms</td>
+<td>1.739 GB</td>
+<td>5,832 元</td>
+<td>0.0810</td>
+<td>卡数不变、TTFT −2.7 ms、TPOT −0.48 ms、KV −2.07 GB</td>
+</tr>
+<tr>
+<td><strong>S4 + TP=4 重排</strong></td>
+<td>2</td>
+<td>8</td>
+<td>2</td>
+<td>28.3 ms</td>
+<td>4.27 ms</td>
+<td>2.257 GB</td>
+<td><strong>3,888 元</strong></td>
+<td><strong>0.0545</strong></td>
+<td>+2 卡、−1,944 元、TTFT −5.9 ms、$/1M −0.0266</td>
+</tr>
+</tbody></table>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.68em;vertical-align:-0.59em;"></span><span class="mord"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.09em;"><span style="top:-3.68em;"><span class="pstrut" style="height:3.68em;"></span><span class="boxpad"><span class="mord"><span class="mord"><span class="mord text"><span class="mord cjk_fallback">五步总收益：</span></span><span class="mord">7</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">776</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">→</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mord">3</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">888</span><span class="mspace"> </span><span class="mord text"><span class="mord cjk_fallback">元</span><span class="mord">/</span><span class="mord cjk_fallback">月（</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord">50%</span><span class="mord text"><span class="mord cjk_fallback">）</span></span><span class="mpunct">;</span><span class="mspace" style="margin-right:1em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">TTFT</span></span><span class="mord">51.6</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">→</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mord">28.3</span><span class="mspace"> </span><span class="mord text"><span class="mord">ms</span><span class="mord cjk_fallback">（</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord">45%</span><span class="mord text"><span class="mord cjk_fallback">）</span></span></span></span></span></span><span style="top:-3.09em;"><span class="pstrut" style="height:3.68em;"></span><span class="stretchy fbox" style="height:1.68em;border-style:solid;border-width:0.04em;"></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.59em;"><span></span></span></span></span></span></span></span></span></span></p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.68em;vertical-align:-0.59em;"></span><span class="mord"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.09em;"><span style="top:-3.68em;"><span class="pstrut" style="height:3.68em;"></span><span class="boxpad"><span class="mord"><span class="mord"><span class="mord text"><span class="mord cjk_fallback">五步总收益：</span></span><span class="mord">7</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">776</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">→</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mord">3</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">888</span><span class="mspace"> </span><span class="mord text"><span class="mord cjk_fallback">元</span><span class="mord">/</span><span class="mord cjk_fallback">月（</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord">50%</span><span class="mord text"><span class="mord cjk_fallback">）</span></span><span class="mpunct">;</span><span class="mspace" style="margin-right:1em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">TTFT</span></span><span class="mord">51.6</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">→</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mord">28.3</span><span class="mspace"> </span><span class="mord text"><span class="mord">ms</span><span class="mord cjk_fallback">（</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord">45%</span><span class="mord text"><span class="mord cjk_fallback">）</span></span></span></span></span></span><span style="top:-3.09em;"><span class="pstrut" style="height:3.68em;"></span><span class="stretchy fbox" style="height:1.68em;border-style:solid;border-width:0.04em;"></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.59em;"><span></span></span></span></span></span></span></span></span></span></p>
+<h4 id="h-33-为什么是这个顺序三步各有不同的收益类型">3.3 为什么是这个顺序：三步各有不同的&quot;收益类型&quot;<a class="anchor" href="#h-33-为什么是这个顺序三步各有不同的收益类型" aria-label="本节链接">#</a></h4>
+<p><strong>S1（前缀缓存）</strong>：把 S0 降到 S1 的那一步 —— 也是清单里唯一<strong>直接减少卡数</strong>的改动。</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7387em;"></span><span class="mord">Δ</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.7387em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">→</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">3</span><span class="mspace"> </span><span class="mopen">(</span><span class="mord">−</span><span class="mord">2</span><span class="mspace"> </span><span class="mord text"><span class="mord cjk_fallback">卡</span></span><span class="mclose">)</span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">Δ</span><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">−</span><span class="mord">1</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">944</span><span class="mspace"> </span><span class="mord text"><span class="mord cjk_fallback">元</span><span class="mord">/</span><span class="mord cjk_fallback">月</span></span></span></span></span></span></p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7387em;"></span><span class="mord">Δ</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.7387em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">→</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">3</span><span class="mspace"> </span><span class="mopen">(</span><span class="mord">−</span><span class="mord">2</span><span class="mspace"> </span><span class="mord text"><span class="mord cjk_fallback">卡</span></span><span class="mclose">)</span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">Δ</span><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">−</span><span class="mord">1</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">944</span><span class="mspace"> </span><span class="mord text"><span class="mord cjk_fallback">元</span><span class="mord">/</span><span class="mord cjk_fallback">月</span></span></span></span></span></span></p>
+<p>机制是 <strong>C3（prefill 约束）</strong>：关缓存时 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0361em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal">L</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">p</span><span class="mord mtight">99</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">h</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1600</span></span></span></span>，prefill 裕度只有 0.795×；开缓存后有效长度 880，裕度升到 1.445×。<strong>这是四步里唯一&quot;直接省一个副本台阶&quot;的改动</strong>，所以排第一。</p>
+<p><strong>它同时也是风险最低的一步</strong>：前缀缓存只改&quot;要不要复用已算过的 KV&quot;，不改数值（命中的 KV 就是同一份权重算出来的），而且可以按租户/按 key 一键关闭；相比之下 S2（改精度）与 S3（改 KV 数值）都会改变输出。<strong>&quot;省卡最多 + 风险最低&quot;是它排第一的两个独立理由。</strong></p>
+<p><strong>注意它的一个反直觉代价</strong>：TPOT 从 6.83 ms 涨到 7.14 ms（+4.5%）。原因是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span></span></span></span> 从 4 降到 3 后每副本的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">b</span></span></span></span> 更大（48.51 vs 35.23），<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.9012em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">step</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span></span> 上升。<strong>&quot;省卡&quot;与&quot;降延迟&quot;在这一步是冲突的</strong> —— 因为 SLO 有余量（7.14 ms ≪ 30 ms），所以这个交换是划算的。</p>
+<p><strong>S2（权重 FP8）</strong>：不改卡数，但<strong>大幅改善延迟与显存头寸</strong>。</p>
+<table>
+<thead>
+<tr>
+<th>量</th>
+<th>变化</th>
+<th>机制</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>TTFT p99</td>
+<td>51.6 → 36.9 ms（−29%）</td>
+<td>权重读出减半 → prefill 算力项也受益</td>
+</tr>
+<tr>
+<td>TPOT p99</td>
+<td>7.14 → 5.37 ms（−25%）</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0269em;">w</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 从 2.985 → 1.49 ms</td>
+</tr>
+<tr>
+<td>KV 占用</td>
+<td>5.034 → 3.805 GB（−1.23 GB）</td>
+<td>权重占的显存少了，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">b</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">kv</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 从 77.0 → 92.7</td>
+</tr>
+<tr>
+<td>卡数 / 月成本</td>
+<td>不变</td>
+<td><strong>因为卡数由 C1 决定，而 C1 已经满足</strong></td>
+</tr>
+</tbody></table>
+<p><strong>S2 的收益不是成本，而是&quot;头寸&quot;</strong>：它把 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">b</span><span class="mord">/</span><span class="mord"><span class="mord mathnormal">b</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">kv</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 从 0.63 降到 0.40，把 TPOT 余量从 4.2× 扩到 5.6×。<strong>这些余量在 S4 才兑换成钱</strong> —— 这就是&quot;优化有滞后性&quot;，也是为什么优化顺序不能只看单步的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">Δ</span><span class="mord mathnormal" style="margin-right:0.0715em;">C</span></span></span></span>。</p>
+<p><strong>S3（KV 8bit）</strong>：同样是&quot;买头寸&quot;。</p>
+<table>
+<thead>
+<tr>
+<th>量</th>
+<th>变化</th>
+<th>机制</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>KV 占用</td>
+<td>3.805 → 1.739 GB（−54%）</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0359em;">v</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0502em;">B</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 减半 → 每序列 KV 减半</td>
+</tr>
+<tr>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">b</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">kv</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span></td>
+<td>92.7 → 185.4</td>
+<td>显存能放下的序列翻倍</td>
+</tr>
+<tr>
+<td>TPOT</td>
+<td>5.37 → 4.89 ms</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">kv</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 减半</td>
+</tr>
+<tr>
+<td>卡数</td>
+<td>不变</td>
+<td>仍是 C1 决定</td>
+</tr>
+</tbody></table>
+<p><strong>它的条件是&quot;<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">b</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">kv</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 成为 binding&quot;</strong>：在本节的工作点（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">b</span><span class="mord">/</span><span class="mord"><span class="mord mathnormal">b</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">kv</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.40</span></span></span></span>）它不省卡；但当 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.9694em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal">L</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">p</span><span class="mord mtight">99</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span></span> 涨到 3200 或 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">λ</span></span></span></span> 涨到 300 以上时，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">b</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">kv</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 会变成 binding，S3 就变成必需项（第 3 节的容量曲线给出这个转折点）。</p>
+<p><strong>S4（TP=4 重排）</strong>：把前两步买来的头寸兑换成卡数。</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7387em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.7387em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">3</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">→</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8778em;vertical-align:-0.1944em;"></span><span class="mord">2</span><span class="mspace"> </span><span class="mord text"><span class="mord cjk_fallback">副本</span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord cjk_fallback">卡数</span><span class="mord"> </span></span><span class="mord">6</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">→</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8778em;vertical-align:-0.1944em;"></span><span class="mord">8</span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord cjk_fallback">月成本</span><span class="mord"> </span></span><span class="mord">5</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">832</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">→</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8778em;vertical-align:-0.1944em;"></span><span class="mord">3</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">888</span><span class="mspace"> </span><span class="mord text"><span class="mord cjk_fallback">元</span></span></span></span></span></span></p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7387em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.7387em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">3</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">→</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8778em;vertical-align:-0.1944em;"></span><span class="mord">2</span><span class="mspace"> </span><span class="mord text"><span class="mord cjk_fallback">副本</span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord cjk_fallback">卡数</span><span class="mord"> </span></span><span class="mord">6</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">→</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8778em;vertical-align:-0.1944em;"></span><span class="mord">8</span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord cjk_fallback">月成本</span><span class="mord"> </span></span><span class="mord">5</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">832</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">→</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8778em;vertical-align:-0.1944em;"></span><span class="mord">3</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">888</span><span class="mspace"> </span><span class="mord text"><span class="mord cjk_fallback">元</span></span></span></span></span></span></p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.5689em;vertical-align:-0.5344em;"></span><span class="mord"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.0344em;"><span style="top:-3.5689em;"><span class="pstrut" style="height:3.5689em;"></span><span class="boxpad"><span class="mord"><span class="mord"><span class="mord text"><span class="mord">S4 </span><span class="mord cjk_fallback">的月成本下降</span><span class="mord"> 1,944 </span><span class="mord cjk_fallback">元，但卡数上升</span><span class="mord"> 2 </span><span class="mord cjk_fallback">张</span><span class="mord"> —— </span><span class="mord cjk_fallback">这是</span><span class="mord">&quot;</span><span class="mord cjk_fallback">每副本</span><span class="mord"> 4 </span><span class="mord cjk_fallback">卡</span><span class="mord">&quot;</span><span class="mord cjk_fallback">的代价</span></span></span></span></span></span><span style="top:-3.0344em;"><span class="pstrut" style="height:3.5689em;"></span><span class="stretchy fbox" style="height:1.5689em;border-style:solid;border-width:0.04em;"></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.5344em;"><span></span></span></span></span></span></span></span></span></span></p>
+<p><strong>为什么它排最后</strong>：TP=4 有两个高风险项：</p>
+<ol>
+<li><strong>故障域变大</strong>：一副本 4 卡在同一节点，单卡故障 = 损失 50% 容量（vs TP=2 的 33%）。</li>
+<li><strong>通信复杂度</strong>：4 路 all-reduce 的 kernel 数量翻倍，调试与升级难度上升。</li>
+</ol>
+<p><strong>所以 S4 必须在前三步稳定运行一段时间后再做</strong>，而且要有&quot;回到 TP=2&quot;的一键切换。</p>
+<h4 id="h-34-风险与回退每步都要能单独退回去">3.4 风险与回退（每步都要能单独退回去）<a class="anchor" href="#h-34-风险与回退每步都要能单独退回去" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>步骤</th>
+<th>风险类型</th>
+<th>回退方式</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>S1 前缀缓存</td>
+<td>中：命中错会串味（跨租户污染）</td>
+<td>按租户隔离 key + 可一键关</td>
+</tr>
+<tr>
+<td>S2 权重 FP8</td>
+<td>中：数值精度</td>
+<td>保留 bf16 镜像，按副本灰度替换</td>
+</tr>
+<tr>
+<td>S3 KV 8bit</td>
+<td><strong>高</strong>：直接改注意力数值</td>
+<td>逐副本灰度 + 回归集对齐（阈值 1e-3）</td>
+</tr>
+<tr>
+<td>S4 TP=4</td>
+<td>高：拓扑与故障域变化</td>
+<td>一小时内部署到&quot;回滚配置&quot;并验证</td>
+</tr>
+</tbody></table>
+<p><strong>每一步上线前必须给出的三个数</strong>：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:4.32em;vertical-align:-1.91em;"></span><span class="minner"><span class="mopen"><span class="delimsizing mult"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:2.35em;"><span style="top:-2.2em;"><span class="pstrut" style="height:3.15em;"></span><span class="delimsizinginner delim-size4"><span>⎩</span></span></span><span style="top:-2.192em;"><span class="pstrut" style="height:3.15em;"></span><span style="height:0.316em;width:0.8889em;"><svg xmlns="http://www.w3.org/2000/svg" width="0.8889em" height="0.316em" style="width:0.8889em" viewBox="0 0 888.89 316" preserveAspectRatio="xMinYMin"><path d="M384 0 H504 V316 H384z M384 0 H504 V316 H384z"/></svg></span></span><span style="top:-3.15em;"><span class="pstrut" style="height:3.15em;"></span><span class="delimsizinginner delim-size4"><span>⎨</span></span></span><span style="top:-4.292em;"><span class="pstrut" style="height:3.15em;"></span><span style="height:0.316em;width:0.8889em;"><svg xmlns="http://www.w3.org/2000/svg" width="0.8889em" height="0.316em" style="width:0.8889em" viewBox="0 0 888.89 316" preserveAspectRatio="xMinYMin"><path d="M384 0 H504 V316 H384z M384 0 H504 V316 H384z"/></svg></span></span><span style="top:-4.6em;"><span class="pstrut" style="height:3.15em;"></span><span class="delimsizinginner delim-size4"><span>⎧</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.85em;"><span></span></span></span></span></span></span><span class="mord"><span class="mtable"><span class="col-align-l"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:2.41em;"><span style="top:-4.41em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord text"><span class="mord">① </span><span class="mord cjk_fallback">收益</span></span></span></span><span style="top:-2.97em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord text"><span class="mord">② </span><span class="mord cjk_fallback">风险</span></span></span></span><span style="top:-1.53em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord text"><span class="mord">③ </span><span class="mord cjk_fallback">回退</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.91em;"><span></span></span></span></span></span><span class="arraycolsep" style="width:1em;"></span><span class="col-align-l"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:2.41em;"><span style="top:-4.41em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord text"><span class="mord cjk_fallback">卡数</span><span class="mord"> / </span><span class="mord cjk_fallback">月成本</span><span class="mord"> / </span><span class="mord cjk_fallback">分位</span><span class="mord"> </span><span class="mord cjk_fallback">的实测前后差</span></span></span></span><span style="top:-2.97em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord text"><span class="mord cjk_fallback">数值回归集上的最大相对误差（对齐阈值</span><span class="mord"> </span></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">3</span></span></span></span></span></span></span></span></span><span class="mord text"><span class="mord cjk_fallback">）</span></span></span></span><span style="top:-1.53em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord text"><span class="mord cjk_fallback">回退到上一步的耗时与所需副本数</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.91em;"><span></span></span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:4.32em;vertical-align:-1.91em;"></span><span class="minner"><span class="mopen"><span class="delimsizing mult"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:2.35em;"><span style="top:-2.2em;"><span class="pstrut" style="height:3.15em;"></span><span class="delimsizinginner delim-size4"><span>⎩</span></span></span><span style="top:-2.192em;"><span class="pstrut" style="height:3.15em;"></span><span style="height:0.316em;width:0.8889em;"><svg xmlns="http://www.w3.org/2000/svg" width="0.8889em" height="0.316em" style="width:0.8889em" viewBox="0 0 888.89 316" preserveAspectRatio="xMinYMin"><path d="M384 0 H504 V316 H384z M384 0 H504 V316 H384z"/></svg></span></span><span style="top:-3.15em;"><span class="pstrut" style="height:3.15em;"></span><span class="delimsizinginner delim-size4"><span>⎨</span></span></span><span style="top:-4.292em;"><span class="pstrut" style="height:3.15em;"></span><span style="height:0.316em;width:0.8889em;"><svg xmlns="http://www.w3.org/2000/svg" width="0.8889em" height="0.316em" style="width:0.8889em" viewBox="0 0 888.89 316" preserveAspectRatio="xMinYMin"><path d="M384 0 H504 V316 H384z M384 0 H504 V316 H384z"/></svg></span></span><span style="top:-4.6em;"><span class="pstrut" style="height:3.15em;"></span><span class="delimsizinginner delim-size4"><span>⎧</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.85em;"><span></span></span></span></span></span></span><span class="mord"><span class="mtable"><span class="col-align-l"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:2.41em;"><span style="top:-4.41em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord text"><span class="mord">① </span><span class="mord cjk_fallback">收益</span></span></span></span><span style="top:-2.97em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord text"><span class="mord">② </span><span class="mord cjk_fallback">风险</span></span></span></span><span style="top:-1.53em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord text"><span class="mord">③ </span><span class="mord cjk_fallback">回退</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.91em;"><span></span></span></span></span></span><span class="arraycolsep" style="width:1em;"></span><span class="col-align-l"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:2.41em;"><span style="top:-4.41em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord text"><span class="mord cjk_fallback">卡数</span><span class="mord"> / </span><span class="mord cjk_fallback">月成本</span><span class="mord"> / </span><span class="mord cjk_fallback">分位</span><span class="mord"> </span><span class="mord cjk_fallback">的实测前后差</span></span></span></span><span style="top:-2.97em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord text"><span class="mord cjk_fallback">数值回归集上的最大相对误差（对齐阈值</span><span class="mord"> </span></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">3</span></span></span></span></span></span></span></span></span><span class="mord text"><span class="mord cjk_fallback">）</span></span></span></span><span style="top:-1.53em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord text"><span class="mord cjk_fallback">回退到上一步的耗时与所需副本数</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.91em;"><span></span></span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.3744em;vertical-align:-0.34em;"></span><span class="mord"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.0344em;"><span style="top:-3.3744em;"><span class="pstrut" style="height:3.3744em;"></span><span class="boxpad"><span class="mord"><span class="mord"><span class="mord text"><span class="mord cjk_fallback">没有这三个数的改动不许上线</span><span class="mord"> —— </span><span class="mord cjk_fallback">这不是流程规定，是</span><span class="mord">&quot;</span><span class="mord cjk_fallback">账本可复核</span><span class="mord">&quot;</span><span class="mord cjk_fallback">的技术要求</span></span></span></span></span></span><span style="top:-3.0344em;"><span class="pstrut" style="height:3.3744em;"></span><span class="stretchy fbox" style="height:1.3744em;border-style:solid;border-width:0.04em;"></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.34em;"><span></span></span></span></span></span></span></span></span></span></p>
+<h3 id="h-四稳态运营扩容信号与阈值">四、稳态运营：扩容信号与阈值<a class="anchor" href="#h-四稳态运营扩容信号与阈值" aria-label="本节链接">#</a></h3>
+<h4 id="h-41-五个信号按是否可归因排序">4.1 五个信号（按&quot;是否可归因&quot;排序）<a class="anchor" href="#h-41-五个信号按是否可归因排序" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>信号</th>
+<th>阈值</th>
+<th>动作</th>
+<th>误报代价</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>单卡吞吐 / 上限 &lt; 0.85</td>
+<td>0.85</td>
+<td>先查 KV 压缩/量化，再扩副本</td>
+<td>多备 1 副本</td>
+</tr>
+<tr>
+<td>稳态批 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">b</span><span class="mord">/</span><span class="mord"><span class="mord mathnormal">b</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">kv</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&gt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.9</span></span></span></span></td>
+<td>0.90</td>
+<td>扩副本（KV 已贴顶）</td>
+<td>多备 1 节点</td>
+</tr>
+<tr>
+<td>TPOT p99 &gt; 0.7×SLO</td>
+<td>21 ms</td>
+<td>降批或扩副本</td>
+<td>分位抖动</td>
+</tr>
+<tr>
+<td>TTFT p99 &gt; 0.5×SLO</td>
+<td>150 ms</td>
+<td>扩副本 / 提并发槽</td>
+<td>过度扩容</td>
+</tr>
+<tr>
+<td>缓存命中率 &lt; 0.30</td>
+<td>0.30</td>
+<td><strong>查 key 设计，不是扩副本</strong></td>
+<td>调错旋钮</td>
+</tr>
+</tbody></table>
+<p><strong>第一条最有诊断力</strong>：如果&quot;单卡吞吐 / 上限&quot;掉到 0.85 以下，说明<strong>卡的工作点变差了</strong>（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">b</span></span></span></span> 变小或被打断变多），此时扩副本只在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">ρ</span></span></span></span> 高时有效；如果 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">ρ</span></span></span></span> 低，正确动作是<strong>改配置</strong>（提高 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0359em;">q</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mop mtight"><span class="mtight">m</span><span class="mtight">a</span><span class="mtight">x</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>、修 KV 配额）。</p>
+<p><strong>最后一条是一个常见错误</strong>：缓存命中率掉了，第一反应往往是&quot;扩容&quot;。但命中率是<strong>配置量</strong>（key 设计、TTL、隔离策略），扩副本不会提高它。<strong>这就是第 5 章&quot;诊断与动作一对一&quot;的运营侧版本。</strong></p>
+<h4 id="h-42-扩多少math63-的算式">4.2 扩多少：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">Δ</span><span class="mord mathnormal" style="margin-right:0.109em;">N</span></span></span></span> 的算式<a class="anchor" href="#h-42-扩多少math63-的算式" aria-label="本节链接">#</a></h4>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">Δ</span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.4221em;vertical-align:-0.9721em;"></span><span class="minner"><span class="mopen delimcenter" style="top:0em;"><span class="delimsizing size3">⌈</span></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.427em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord text"><span class="mord">thr</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">gpu</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">λ</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">out</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord"><span class="mord text"><span class="mord">thr</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">gpu</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.9721em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mclose delimcenter" style="top:0em;"><span class="delimsizing size3">⌉</span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.109em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">new</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.4em;vertical-align:-0.95em;"></span><span class="minner"><span class="mopen delimcenter" style="top:0em;"><span class="delimsizing size3">⌈</span></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3603em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord text"><span class="mord cjk_fallback">副本</span><span class="mord">/</span><span class="mord cjk_fallback">节点</span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord">Δ</span><span class="mord mathnormal" style="margin-right:0.109em;">N</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.936em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mclose delimcenter" style="top:0em;"><span class="delimsizing size3">⌉</span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord cjk_fallback">副本</span><span class="mord">/</span><span class="mord cjk_fallback">节点</span></span></span></span></span></span></p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">Δ</span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.4221em;vertical-align:-0.9721em;"></span><span class="minner"><span class="mopen delimcenter" style="top:0em;"><span class="delimsizing size3">⌈</span></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.427em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord text"><span class="mord">thr</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">gpu</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">λ</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">out</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord"><span class="mord text"><span class="mord">thr</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">gpu</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.9721em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mclose delimcenter" style="top:0em;"><span class="delimsizing size3">⌉</span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.109em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">new</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.4em;vertical-align:-0.95em;"></span><span class="minner"><span class="mopen delimcenter" style="top:0em;"><span class="delimsizing size3">⌈</span></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3603em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord text"><span class="mord cjk_fallback">副本</span><span class="mord">/</span><span class="mord cjk_fallback">节点</span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord">Δ</span><span class="mord mathnormal" style="margin-right:0.109em;">N</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.936em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mclose delimcenter" style="top:0em;"><span class="delimsizing size3">⌉</span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord cjk_fallback">副本</span><span class="mord">/</span><span class="mord cjk_fallback">节点</span></span></span></span></span></span></p>
+<table>
+<thead>
+<tr>
+<th><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">λ</span></span></span></span></th>
+<th><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6887em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6887em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span></span></span></span></span></span></span></span></th>
+<th>卡</th>
+<th>节点</th>
+<th><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">b</span></span></span></span></th>
+<th>吞吐裕度</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>200</td>
+<td>3</td>
+<td>6</td>
+<td>2</td>
+<td>48.51</td>
+<td>1.02×</td>
+</tr>
+<tr>
+<td>300</td>
+<td>4</td>
+<td>8</td>
+<td>2</td>
+<td>55.89</td>
+<td>1.02×</td>
+</tr>
+<tr>
+<td>400</td>
+<td>5</td>
+<td>10</td>
+<td>3</td>
+<td>60.50</td>
+<td>1.02×</td>
+</tr>
+<tr>
+<td>500</td>
+<td>6</td>
+<td>12</td>
+<td>3</td>
+<td>63.64</td>
+<td>1.02×</td>
+</tr>
+</tbody></table>
+<p><strong>注意 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.109em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">new</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 的取整</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">6</span></span></span></span> 时 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">⌈</span><span class="mord">6/2</span><span class="mclose">⌉</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">6</span></span></span></span> ✓；但 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">5</span></span></span></span> 时 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">⌈</span><span class="mord">5/2</span><span class="mclose">⌉</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">6</span></span></span></span> —— <strong>要占满节点，否则会出现&quot;有卡但用不上&quot;</strong>。这正是第 3 节说的&quot;节点粒度&quot;在运营里的体现。</p>
+<h4 id="h-43-什么时候不扩">4.3 什么时候<strong>不</strong>扩<a class="anchor" href="#h-43-什么时候不扩" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>现象</th>
+<th>别扩，先做这个</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>吞吐够、p99 涨</td>
+<td>查排队（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">ρ</span></span></span></span>）与并发槽，改 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0359em;">q</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mop mtight"><span class="mtight">m</span><span class="mtight">a</span><span class="mtight">x</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span></td>
+</tr>
+<tr>
+<td>单卡吞吐掉</td>
+<td>查 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">b</span><span class="mord">/</span><span class="mord"><span class="mord mathnormal">b</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">kv</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 与抢占，改 KV 配额</td>
+</tr>
+<tr>
+<td>缓存命中率掉</td>
+<td>查 key 设计</td>
+</tr>
+<tr>
+<td>只有某个 endpoint 慢</td>
+<td>查该 endpoint 的 prompt 长度分布</td>
+</tr>
+<tr>
+<td>流量涨但输出短</td>
+<td>算 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0077em;">R</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:-0.0077em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">out</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord mathnormal">λ</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">out</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>，可能不需要扩</td>
+</tr>
+</tbody></table>
+<p><strong>最后一条最容易误判</strong>：容量需求是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord mathnormal">λ</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">out</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>（输出 token 速率），不是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">λ</span></span></span></span>。<strong>如果流量涨了但平均输出变短，总 token 速率可能没变</strong> —— 此时扩副本是纯浪费。</p>
+<h3 id="h-代码">代码<a class="anchor" href="#h-代码" aria-label="本节链接">#</a></h3>
+<blockquote>
+<p>这段程序产出本节的四块：灰度的样本量与错误预算、回滚的容量核算、优化阶梯的量化前后、扩容信号与阈值。</p>
+<p><strong>⚠️ 合成数据</strong>：价格、流量、错误预算参数是设定值；优化阶梯的每一步都是模型计算，<strong>必须用第 3 节的压测方法逐项验证后再上线</strong>。</p>
+</blockquote>
+<pre data-lang="python"><code class="language-python">&quot;&quot;&quot;第 6 章第 4 节：上线与迭代。
+
+纯标准库。四块：
+  ① 灰度：金丝雀要多少样本、要看多久、消耗多少错误预算（第 5 章口径）
+  ② 回滚：回滚窗口的容量代价，以及&quot;回滚也要能回得去&quot;的判据
+  ③ 优化顺序：按&quot;收益/风险&quot;排序的 5 步，每步给量化前后对比
+  ④ 稳态运营：容量按什么信号扩、扩多少、什么时候不扩
+&quot;&quot;&quot;
+import math
+
+GB = 1024 ** 3
+P = 7.0e9
+LAYERS, D_MODEL, KV_HEADS, HEAD_DIM = 32, 4096, 8, 128
+PEAK, MFU = 989e12, 0.60
+BW, BW_EFF = 3.35e12, 0.70
+T0 = 3.0
+VGPU = 24 * GB
+ACT = 1.5 * GB
+KV_B = 2 * LAYERS * KV_HEADS * HEAD_DIM * 2
+LOG50 = math.log(50.0)
+CFG = dict(lam=200.0, lp50=800.0, lp99=1600.0, pout=100.0,
+           ttft=300.0, tpot=30.0, qmax=128, h=0.45,
+           price=2.70, usd=0.74, node_gpus=4)
+
+
+class Svc:
+    def __init__(self, tp=2, wq=2, dtype_bytes=2.0, h=0.45, kv_scale=1.0, **kw):
+        self.__dict__.update(CFG)
+        for k, v in kw.items():
+            setattr(self, k, v)
+        self.tp, self.wq, self.dtype_bytes, self.h = tp, wq, dtype_bytes, h
+        self.kv_scale = kv_scale
+        self.w_gpu = P * self.dtype_bytes / self.wq
+        self.kv_budget = VGPU - self.w_gpu - ACT
+        self.seq_max = self.lp99 + self.pout
+        self.b_kv = self.kv_budget / (self.seq_max * KV_B * self.kv_scale)
+        self.r_pref = self.tp * PEAK * MFU / (2 * P)
+        self.Lkv = self.lp50 + self.pout / 2
+        self.c_w = self.w_gpu / (BW * BW_EFF) * 1e3
+        self.c_kv = self.Lkv * KV_B * self.kv_scale / (self.tp * BW * BW_EFF) * 1e3
+        self.thr_req = self.lam * self.pout
+        self.b_cap = min(self.b_kv, self.qmax)
+        self.thr_max = self.b_cap / (self.t_step(self.b_cap) / 1e3)
+
+    def tp_comm_ms(self, b):
+        act = b * D_MODEL * self.dtype_bytes / 2
+        attn = self.tp * self.seq_max * HEAD_DIM * self.dtype_bytes / 2
+        return 4.0 * (act + attn) / 450e9 * 1e3
+
+    def t_step(self, b):
+        return (max(self.c_w + b * self.c_kv, 2 * P * b / (self.tp * PEAK * MFU) * 1e3)
+                + self.tp_comm_ms(b) + T0)
+
+    def t_prefill(self, L):
+        return (2 * P * L / (self.tp * PEAK * MFU) * 1e3
+                + self.tp_comm_ms(self.b_cap) + T0)
+
+    @property
+    def T_pref(self):
+        return self.t_prefill(self.lp99 * (1 - self.h))
+
+    def solve(self, N):
+        lam_r = self.lam / N
+        cap = self.b_cap
+        s = self.T_pref / 1e3 + self.pout * self.t_step(cap) / 1e3
+        for _ in range(800):
+            b = min(lam_r * s, cap)
+            s_new = self.T_pref / 1e3 + self.pout * self.t_step(b) / 1e3
+            if abs(s_new - s) &lt; 1e-13:
+                s = s_new
+                break
+            s = 0.5 * (s + s_new)
+        b = min(lam_r * s, cap)
+        t = self.t_step(b)
+        thr = b / (t / 1e3)
+        mu = self.qmax / s
+        rho = lam_r / mu
+        tq = LOG50 / (mu - lam_r) * 1e3 if rho &lt; 1 else float(&quot;inf&quot;)
+        ttft = tq + self.T_pref
+        margin = thr * N / self.thr_req
+        pref_m = self.r_pref * N / (self.lam * self.lp99 * (1 - self.h))
+        why = []
+        if margin &lt; 1.0:
+            why.append(f&quot;C1吞吐{margin:.2f}×&quot;)
+        if lam_r * s &gt; cap + 1e-9:
+            why.append(&quot;C2显存&quot;)
+        if t &gt; self.tpot:
+            why.append(f&quot;C4 TPOT{t:.1f}&quot;)
+        if ttft &gt; self.ttft:
+            why.append(f&quot;C5 TTFT{ttft:.0f}&quot;)
+        if rho &gt;= 1:
+            why.append(f&quot;C5 ρ{rho:.2f}&quot;)
+        if pref_m &lt; 1:
+            why.append(f&quot;C3prefill{pref_m:.2f}×&quot;)
+        return dict(N=N, gpus=N * self.wq, nodes=math.ceil(N * self.wq / self.node_gpus),
+                    b=b, cap=cap, b_kv=self.b_kv, b_dem=lam_r * s, t=t, thr_gpu=thr,
+                    thr_tot=thr * N, margin=margin, rho=rho, tq=tq, ttft=ttft,
+                    kv_used=b * self.seq_max * KV_B * self.kv_scale / self.tp,
+                    pref_m=pref_m, T_pref=self.T_pref, s=s, ok=not why, why=&quot; &quot;.join(why))
+
+    def best(self):
+        for N in range(1, 200):
+            r = self.solve(N)
+            if r[&quot;ok&quot;]:
+                return r
+        return None
+
+    def money(self, r, price=None, days=30):
+        price = self.price if price is None else price
+        rev_h = r[&quot;N&quot;] * price
+        return dict(month=rev_h * 24 * days, rev_h=rev_h,
+                    usd_M=rev_h * self.usd / (r[&quot;thr_tot&quot;] * 3600) * 1e6)
+
+
+print(&quot;=&quot; * 100)
+print(&quot;(1) 灰度：金丝雀的样本量、观察时长与错误预算&quot;)
+print(&quot;=&quot; * 100)
+tot = 200.0
+print(f&quot;  {&#39;流量比例&#39;:&gt;8}{&#39;λ_canary&#39;:&gt;11}{&#39;检出 1% 需请求&#39;:&gt;16}{&#39;观察时长&#39;:&gt;10}&quot;
+      f&quot;{&#39;检出 0.1% 需请求&#39;:&gt;18}{&#39;观察时长&#39;:&gt;10}&quot;)
+for frac in (0.01, 0.02, 0.05, 0.10, 0.25):
+    lam_c = tot * frac
+    n1 = math.ceil(10.0 / 0.01)
+    n01 = math.ceil(10.0 / 0.001)
+    print(f&quot;  {frac:&gt;8.0%}{lam_c:&gt;11.1f}{n1:&gt;16,}{n1/lam_c:&gt;9.1f}s{n01:&gt;18,}{n01/lam_c:&gt;9.1f}s&quot;)
+print(&quot;  读法：**观察时长 = 样本量 / 金丝雀流量**，样本量由要检出的退化幅度决定：&quot;)
+print(&quot;        检出 1% 要 ~1,000 个请求、检出 0.1% 要 ~10,000 个（第 5 章 SPRT 口径）。&quot;)
+print(&quot;        1% 流量（2 req/s）下，前者要 500 s、后者要 5,000 s（83 min）——&quot;)
+print(&quot;        所以检出 0.1% 必须靠 25% 流量（50 req/s，200 s），而不是靠「多看一会儿」。&quot;)
+print()
+print(&quot;  错误预算账（可用性 99.9%/月）：&quot;)
+budget_min = 30 * 24 * 60 * (1 - 0.999)
+budget_req = budget_min * 60 * tot
+print(f&quot;    月错误预算 = {budget_min:.1f} min = {budget_req:,.0f} 个请求&quot;
+      f&quot;（按 λ={tot:.0f} req/s 折算）&quot;)
+print(f&quot;  {&#39;场景&#39;:&lt;30}{&#39;坏请求率&#39;:&gt;9}{&#39;持续&#39;:&gt;7}{&#39;坏请求&#39;:&gt;10}{&#39;占月预算&#39;:&gt;11}{&#39;折合预算秒&#39;:&gt;12}&quot;)
+for tag, pfail, T in [(&quot;健康版本（纯误报，无坏请求）&quot;, 0.0, 600),
+                      (&quot;真退化 1%，120 s 内发现&quot;, 0.01, 120),
+                      (&quot;真退化 1%，30 min 才发现&quot;, 0.01, 1800),
+                      (&quot;真退化 10%，60 s 内发现&quot;, 0.10, 60),
+                      (&quot;真退化 10%，30 min 才发现&quot;, 0.10, 1800)]:
+    bad = pfail * tot * T
+    print(f&quot;    {tag:&lt;30}{pfail:&gt;9.1%}{T:&gt;6.0f}s{bad:&gt;10,.0f}{bad/budget_req*100:&gt;10.3f}%&quot;
+          f&quot;{bad/budget_req*budget_min*60:&gt;11.2f}s&quot;)
+print(&quot;  读法：消耗错误预算的是**检测时间**，不是灰度本身。&quot;)
+print(&quot;        同一 1% 退化：120 s 内发现用掉预算的 0.046%，30 min 才发现用掉 0.694%；&quot;)
+print(&quot;        退化 10% 且 30 min 才发现，直接吃掉 6.94%。**检测时间是最划算的投入。**&quot;)
+
+print()
+print(&quot;=&quot; * 100)
+print(&quot;(2) 回滚：窗口代价与「回得去」的判据&quot;)
+print(&quot;=&quot; * 100)
+sp = Svc()
+r3 = sp.solve(3)
+print(f&quot;  当前舰队 N*={r3[&#39;N&#39;]}（{r3[&#39;gpus&#39;]} 卡），吞吐裕 {r3[&#39;margin&#39;]:.2f}×&quot;)
+print(f&quot;  {&#39;回滚方式&#39;:&lt;26}{&#39;窗口内可用副本&#39;:&gt;16}{&#39;容量损失&#39;:&gt;12}{&#39;窗口需求&#39;:&gt;12}{&#39;判定&#39;:&gt;10}&quot;)
+for tag, keep in [(&quot;原地重启（不可用）&quot;, 0), (&quot;双跑（新旧并存）&quot;, 6), (&quot;滚动（每次 1 副本）&quot;, 2)]:
+    avail = keep if keep else 0
+    print(f&quot;  {tag:&lt;26}{avail:&gt;16}{1-avail/6:&gt;11.0%}{1.0:&gt;11.1f}×&quot;
+          f&quot;{&#39;✓&#39; if avail &gt;= 4 else &#39;✗&#39; if avail == 0 else &#39;△&#39;:&gt;10}&quot;)
+print()
+print(&quot;  回滚窗口的双跑成本：6 卡 × 单价 2.70 元 ⇒&quot;)
+for hours in (1, 4, 8, 24):
+    print(f&quot;    {hours:&gt;2} h 双跑 = 6 卡×{hours} h×2.70 = {6*hours*2.70:&gt;7,.0f} 元&quot;)
+print(&quot;  判据（三条同时成立才允许「只备份不双跑」）：&quot;)
+print(&quot;    ① 旧版本镜像仍可拉起（含权重、CUDA、依赖）；&quot;)
+print(&quot;    ② 回滚决策到生效 ≤ 检测时间（通常 2~5 min）；&quot;)
+print(&quot;    ③ 回滚窗口内剩余容量仍满足 SLO（本题：≥3 副本）。&quot;)
+
+print()
+print(&quot;=&quot; * 100)
+print(&quot;(3) 优化顺序：按收益/风险排序的 5 步（每步给量化前后）&quot;)
+print(&quot;=&quot; * 100)
+STEPS = [
+    (&quot;S0 基线（关缓存）&quot;, dict(h=0.0)),
+    (&quot;S1 +前缀缓存 h=0.45&quot;, dict()),
+    (&quot;S2 +权重 FP8&quot;, dict(dtype_bytes=1.0)),
+    (&quot;S3 +KV 8bit 量化&quot;, dict(dtype_bytes=1.0, kv_scale=0.5)),
+    (&quot;S4 +TP=4 重排&quot;, dict(dtype_bytes=1.0, tp=4, wq=4)),
+]
+print(f&quot;  {&#39;步骤&#39;:&lt;24}{&#39;N*&#39;:&gt;4}{&#39;卡&#39;:&gt;4}{&#39;节点&#39;:&gt;5}{&#39;TTFT&#39;:&gt;8}{&#39;TPOT&#39;:&gt;8}{&#39;KVGB&#39;:&gt;8}&quot;
+      f&quot;{&#39;月(元)&#39;:&gt;9}{&#39;$/1M&#39;:&gt;9}&quot;)
+prev = None
+for tag, kw in STEPS:
+    s2 = Svc(**kw)
+    rr = s2.best()
+    m = s2.money(rr)
+    print(f&quot;  {tag:&lt;24}{rr[&#39;N&#39;]:&gt;4}{rr[&#39;gpus&#39;]:&gt;4}{rr[&#39;nodes&#39;]:&gt;5}{rr[&#39;ttft&#39;]:&gt;7.1f}ms&quot;
+          f&quot;{rr[&#39;t&#39;]:&gt;7.2f}ms{rr[&#39;kv_used&#39;]/GB:&gt;8.3f}{m[&#39;month&#39;]:&gt;9,.0f}{m[&#39;usd_M&#39;]:&gt;9.4f}&quot;)
+    if prev:
+        print(f&quot;  {&#39;&#39;:&lt;24}Δ卡={rr[&#39;gpus&#39;]-prev[&#39;g&#39;]:+d}  ΔTTFT={rr[&#39;ttft&#39;]-prev[&#39;t&#39;]:+.1f} ms  &quot;
+              f&quot;Δ月={m[&#39;month&#39;]-prev[&#39;m&#39;]:+,.0f} 元  Δ$/1M={m[&#39;usd_M&#39;]-prev[&#39;u&#39;]:+.4f}&quot;)
+    prev = dict(g=rr[&quot;gpus&quot;], t=rr[&quot;ttft&quot;], m=m[&quot;month&quot;], u=m[&quot;usd_M&quot;])
+print()
+print(&quot;  风险与回滚（每一步都要能单独退回去）：&quot;)
+RISK = [(&quot;S1 前缀缓存&quot;, &quot;中：命中错会串味&quot;, &quot;按租户隔离 key + 可一键关&quot;),
+        (&quot;S2 权重 FP8&quot;, &quot;中：数值精度&quot;, &quot;保留 bf16 镜像，按副本灰度替换&quot;),
+        (&quot;S3 KV 8bit&quot;, &quot;高：直接改注意力数值&quot;, &quot;逐副本灰度 + 回归集对齐&quot;),
+        (&quot;S4 TP=4&quot;, &quot;高：故障域与拓扑变化&quot;, &quot;一小时内部署回滚配置并验证&quot;)]
+for a, b_, c in RISK:
+    print(f&quot;    {a:&lt;14}风险：{b_:&lt;22}回退：{c}&quot;)
+print()
+print(&quot;  验收判据（每一步上线前必须给出的三个数）：&quot;)
+print(&quot;    ① 收益：卡数 / 月成本 / 分位 的实测前后差；&quot;)
+print(&quot;    ② 风险：数值回归集上的最大相对误差（对齐阈值 1e-3）；&quot;)
+print(&quot;    ③ 回退：回退到上一步的耗时与所需副本数。&quot;)
+
+print()
+print(&quot;=&quot; * 100)
+print(&quot;(4) 稳态运营：扩缩容信号与阈值&quot;)
+print(&quot;=&quot; * 100)
+print(f&quot;  {&#39;信号&#39;:&gt;22}{&#39;阈值&#39;:&gt;12}{&#39;动作&#39;:&gt;26}{&#39;误报代价&#39;:&gt;14}&quot;)
+sig = [(&quot;单卡吞吐/上限 &lt; 0.85&quot;, &quot;0.85&quot;, &quot;先查 KV 压缩/量化，再扩副本&quot;, &quot;多备 1 副本&quot;),
+       (&quot;稳态批 b/b_kv &gt; 0.9&quot;, &quot;0.90&quot;, &quot;扩副本（KV 已贴顶）&quot;, &quot;多备 1 节点&quot;),
+       (&quot;TPOT p99 &gt; 0.7×SLO&quot;, &quot;21 ms&quot;, &quot;降批或扩副本&quot;, &quot;分位抖动&quot;),
+       (&quot;TTFT p99 &gt; 0.5×SLO&quot;, &quot;150 ms&quot;, &quot;扩副本 / 提并发槽&quot;, &quot;过度扩容&quot;),
+       (&quot;缓存命中率 &lt; 0.30&quot;, &quot;0.30&quot;, &quot;查 key 设计，不是扩副本&quot;, &quot;调错旋钮&quot;)]
+for a, b_, c, d in sig:
+    print(f&quot;  {a:&gt;22}{b_:&gt;12}{c:&gt;26}{d:&gt;14}&quot;)
+print()
+print(&quot;  扩多少：ΔN = ceil((λ·P_out·(1+τ) − N·thr_gpu)/thr_gpu)，离散到节点粒度&quot;)
+sp = Svc()
+for lam in (200.0, 300.0, 400.0, 500.0):
+    s2 = Svc(lam=lam)
+    rr = s2.best()
+    print(f&quot;    λ={lam:&gt;5.0f} → N*={rr[&#39;N&#39;]}（{rr[&#39;gpus&#39;]} 卡 / {rr[&#39;nodes&#39;]} 节点），&quot;
+          f&quot;b={rr[&#39;b&#39;]:.2f}，吞吐裕 {rr[&#39;margin&#39;]:.2f}×&quot;)</code></pre>
+<p>运行结果：</p>
+<pre data-lang="text"><code class="language-text">====================================================================================================
+(1) 灰度：金丝雀的样本量、观察时长与错误预算
+====================================================================================================
+      流量比例   λ_canary       检出 1% 需请求      观察时长       检出 0.1% 需请求      观察时长
+        1%        2.0           1,000    500.0s            10,000   5000.0s
+        2%        4.0           1,000    250.0s            10,000   2500.0s
+        5%       10.0           1,000    100.0s            10,000   1000.0s
+       10%       20.0           1,000     50.0s            10,000    500.0s
+       25%       50.0           1,000     20.0s            10,000    200.0s
+  读法：**观察时长 = 样本量 / 金丝雀流量**，样本量由要检出的退化幅度决定：
+        检出 1% 要 ~1,000 个请求、检出 0.1% 要 ~10,000 个（第 5 章 SPRT 口径）。
+        1% 流量（2 req/s）下，前者要 500 s、后者要 5,000 s（83 min）——
+        所以检出 0.1% 必须靠 25% 流量（50 req/s，200 s），而不是靠「多看一会儿」。
+
+  错误预算账（可用性 99.9%/月）：
+    月错误预算 = 43.2 min = 518,400 个请求（按 λ=200 req/s 折算）
+  场景                                 坏请求率     持续       坏请求       占月预算       折合预算秒
+    健康版本（纯误报，无坏请求）                     0.0%   600s         0     0.000%       0.00s
+    真退化 1%，120 s 内发现                   1.0%   120s       240     0.046%       1.20s
+    真退化 1%，30 min 才发现                  1.0%  1800s     3,600     0.694%      18.00s
+    真退化 10%，60 s 内发现                  10.0%    60s     1,200     0.231%       6.00s
+    真退化 10%，30 min 才发现                10.0%  1800s    36,000     6.944%     180.00s
+  读法：消耗错误预算的是**检测时间**，不是灰度本身。
+        同一 1% 退化：120 s 内发现用掉预算的 0.046%，30 min 才发现用掉 0.694%；
+        退化 10% 且 30 min 才发现，直接吃掉 6.94%。**检测时间是最划算的投入。**
+
+====================================================================================================
+(2) 回滚：窗口代价与「回得去」的判据
+====================================================================================================
+  当前舰队 N*=3（6 卡），吞吐裕 1.02×
+  回滚方式                               窗口内可用副本        容量损失        窗口需求        判定
+  原地重启（不可用）                                0       100%        1.0×         ✗
+  双跑（新旧并存）                                 6         0%        1.0×         ✓
+  滚动（每次 1 副本）                              2        67%        1.0×         △
+
+  回滚窗口的双跑成本：6 卡 × 单价 2.70 元 ⇒
+     1 h 双跑 = 6 卡×1 h×2.70 =      16 元
+     4 h 双跑 = 6 卡×4 h×2.70 =      65 元
+     8 h 双跑 = 6 卡×8 h×2.70 =     130 元
+    24 h 双跑 = 6 卡×24 h×2.70 =     389 元
+  判据（三条同时成立才允许「只备份不双跑」）：
+    ① 旧版本镜像仍可拉起（含权重、CUDA、依赖）；
+    ② 回滚决策到生效 ≤ 检测时间（通常 2~5 min）；
+    ③ 回滚窗口内剩余容量仍满足 SLO（本题：≥3 副本）。
+
+====================================================================================================
+(3) 优化顺序：按收益/风险排序的 5 步（每步给量化前后）
+====================================================================================================
+  步骤                        N*   卡   节点    TTFT    TPOT    KVGB     月(元)     $/1M
+  S0 基线（关缓存）                 4   8    2   51.6ms   6.83ms   3.655    7,776   0.1076
+  S1 +前缀缓存 h=0.45            3   6    2   49.2ms   7.14ms   5.034    5,832   0.0817
+                          Δ卡=-2  ΔTTFT=-2.4 ms  Δ月=-1,944 元  Δ$/1M=-0.0258
+  S2 +权重 FP8                 3   6    2   36.9ms   5.37ms   3.805    5,832   0.0812
+                          Δ卡=+0  ΔTTFT=-12.3 ms  Δ月=+0 元  Δ$/1M=-0.0005
+  S3 +KV 8bit 量化             3   6    2   34.2ms   4.89ms   1.739    5,832   0.0810
+                          Δ卡=+0  ΔTTFT=-2.7 ms  Δ月=+0 元  Δ$/1M=-0.0002
+  S4 +TP=4 重排                2   8    2   28.3ms   4.27ms   2.257    3,888   0.0545
+                          Δ卡=+2  ΔTTFT=-5.9 ms  Δ月=-1,944 元  Δ$/1M=-0.0266
+
+  风险与回滚（每一步都要能单独退回去）：
+    S1 前缀缓存       风险：中：命中错会串味              回退：按租户隔离 key + 可一键关
+    S2 权重 FP8     风险：中：数值精度                回退：保留 bf16 镜像，按副本灰度替换
+    S3 KV 8bit    风险：高：直接改注意力数值            回退：逐副本灰度 + 回归集对齐
+    S4 TP=4       风险：高：故障域与拓扑变化            回退：一小时内部署回滚配置并验证
+
+  验收判据（每一步上线前必须给出的三个数）：
+    ① 收益：卡数 / 月成本 / 分位 的实测前后差；
+    ② 风险：数值回归集上的最大相对误差（对齐阈值 1e-3）；
+    ③ 回退：回退到上一步的耗时与所需副本数。
+
+====================================================================================================
+(4) 稳态运营：扩缩容信号与阈值
+====================================================================================================
+                      信号          阈值                        动作          误报代价
+          单卡吞吐/上限 &lt; 0.85        0.85          先查 KV 压缩/量化，再扩副本       多备 1 副本
+        稳态批 b/b_kv &gt; 0.9        0.90               扩副本（KV 已贴顶）       多备 1 节点
+      TPOT p99 &gt; 0.7×SLO       21 ms                    降批或扩副本          分位抖动
+      TTFT p99 &gt; 0.5×SLO      150 ms                扩副本 / 提并发槽          过度扩容
+            缓存命中率 &lt; 0.30        0.30            查 key 设计，不是扩副本          调错旋钮
+
+  扩多少：ΔN = ceil((λ·P_out·(1+τ) − N·thr_gpu)/thr_gpu)，离散到节点粒度
+    λ=  200 → N*=3（6 卡 / 2 节点），b=48.51，吞吐裕 1.02×
+    λ=  300 → N*=4（8 卡 / 2 节点），b=55.89，吞吐裕 1.02×
+    λ=  400 → N*=5（10 卡 / 3 节点），b=60.50，吞吐裕 1.02×
+    λ=  500 → N*=6（12 卡 / 3 节点），b=63.64，吞吐裕 1.02×</code></pre>
+<p><strong>五处关键设计决策</strong>：</p>
+<ol>
+<li><strong>金丝雀的&quot;通过判据&quot;用 ±5% 验收带</strong>（第 3 节 §4.4）：它把&quot;看起来没问题&quot;变成&quot;落在模型预测的区间内&quot;。<strong>没有验收带的灰度只是在看仪表盘。</strong></li>
+<li><strong>错误预算按&quot;请求数&quot;而不是&quot;时间&quot;折算</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0502em;">B</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0502em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">err</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">43.2</span></span></span></span> min 换成 518,400 个请求后，才能与&quot;坏请求数&quot;直接相除。<strong>按时间折算会把&quot;高流量下的一次小故障&quot;算得过于轻微。</strong></li>
+<li><strong>优化阶梯的第一步是&quot;关缓存&quot;而不是&quot;加缓存&quot;</strong>：这样每一步都是&quot;增加一个机制&quot;，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">Δ</span></span></span></span> 有明确符号。如果基线已经开缓存，S1 就变成&quot;关掉它&quot;—— 那是另一个实验（第 2 节的敏感性表）。</li>
+<li><strong>S2/S3 的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">Δ</span></span></span></span> 月成本是 0，但仍然要排在 S4 前面</strong>：它们买的是<strong>头寸</strong>（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">b</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">kv</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 从 77 → 185），而 S4 才是把 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">b</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">kv</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 兑换成卡数。<strong>优化顺序不能只看单步 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">Δ</span><span class="mord mathnormal" style="margin-right:0.0715em;">C</span></span></span></span>，要看&quot;谁为谁铺路&quot;。</strong></li>
+<li><strong>S0 用&quot;关缓存&quot;而不是&quot;朴素实现&quot;</strong>：如果 S0 定义成&quot;没有连续批处理&quot;（batch=1），它的成本会比 7,776 元高两个数量级（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.9012em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">step</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span></span> 里的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0269em;">w</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 与 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 完全无法摊销），清单的第一行就会是&quot;上连续批处理&quot;而不是&quot;开缓存&quot;。本节把连续批处理当作<strong>框架的默认能力</strong>（不在优化清单里），所以 S0 从&quot;有批处理、无缓存&quot;开始 —— <strong>清单的基线必须写清楚它已经包含什么</strong>，否则每一步的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">Δ</span></span></span></span> 都不可比。</li>
+<li><strong>扩容做的是&quot;节点取整&quot;而不是&quot;卡数取整&quot;</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.109em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">new</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">⌈(</span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">Δ</span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mclose">)</span><span class="mord">/2</span><span class="mclose">⌉</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2</span></span></span></span>。否则会出现&quot;有卡但拼不成副本&quot;的浪费。</li>
+</ol>
+<p><strong>读输出的三处要点</strong>：</p>
+<ul>
+<li><strong>(1) 段的&quot;检出 0.1% 要 83 min&quot;</strong>：这是灰度设计里最容易被忽略的约束。它的推论是<strong>&quot;检出精度&quot;是一个要买的资源（流量）</strong>，不是&quot;耐心&quot;。</li>
+<li><strong>(3) 段的&quot;S1 的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">Δ</span></span></span></span>TTFT 是 −2.4 ms 而 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">Δ</span></span></span></span>TPOT 是 +0.31 ms&quot;</strong>（由 6.83 → 7.14 推得）：<strong>省卡与降 TPOT 在这一步冲突</strong>。写清单时必须显式标出这种&quot;负项&quot;，否则上线后 TPOT 报警会让人以为出了问题。</li>
+<li><strong>(4) 段的&quot;<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">b</span><span class="mord">/</span><span class="mord"><span class="mord mathnormal">b</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">kv</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&gt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.9</span></span></span></span> 就扩&quot;</strong>：这条阈值比&quot;延迟报警&quot;早得多。<strong>用容量指标做预警，比用延迟指标做报警能提前一个数量级的时间。</strong></li>
+</ul>
+<p><figure><img class="md-img" src="content/courses/distributed-inference/assets/chapter-6-figure-04.svg" alt="灰度观察时长随流量比例下降" loading="lazy" decoding="async"><figcaption>灰度观察时长随流量比例下降</figcaption></figure>
+</p>
+<h3 id="h-练习">练习<a class="anchor" href="#h-练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><p><strong>灰度的排期</strong>。给定 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">λ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">200</span></span></span></span>、要检出 1% 的退化、允许消耗错误预算 0.5%。请给出金丝雀的流量比例与时长，并验证预算不超。然后回答：<strong>如果要检出 0.3%，需要改动什么？</strong></p>
+</li>
+<li><p><strong>错误预算的另一种口径</strong>。把 §1.2 的表按&quot;时间&quot;折算（把坏请求数换成&quot;等效停机分钟&quot;），与按请求数折算的结果对比。然后说明<strong>为什么&quot;按请求数&quot;更适合高流量服务</strong>。</p>
+</li>
+<li><p><strong>回滚时长的实测设计</strong>。设计一个回滚演练，量出&quot;决策 → 生效&quot;的实测时间。给出要观测的四个时刻、判据，以及在演练中发现&quot;实测 12 min&quot;（而非假设的 2 min）时，对 §1.2 表的影响。</p>
+</li>
+<li><p><strong><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">Δ</span><span class="mord mathnormal" style="margin-right:0.109em;">N</span></span></span></span> 的取整代价</strong>。对 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">λ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">250</span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">350</span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">450</span></span></span></span> 三个值算出 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6887em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6887em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span></span></span></span></span></span></span></span> 与&quot;节点取整&quot;后的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.109em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">new</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>，并算出取整带来的额外成本。然后回答：<strong>如果按卡数（而不是节点）扩，会省多少？为什么不能这么做？</strong></p>
+</li>
+<li><p><strong>优化顺序的反例</strong>。假设先做 S4（TP=4），再做 S1/S2/S3，请重排清单并算出每步的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">Δ</span></span></span></span>。然后回答：<strong>为什么&quot;先做代价最高的那步&quot;会导致总收益下降？</strong>（提示：S4 需要 S2/S3 腾出的显存头寸。）</p>
+</li>
+<li><p><strong>KV 8bit 的条件</strong>。在什么条件下 S3 会<strong>减少卡数</strong>？请用 §3.3 的机制（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">b</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">kv</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 是否 binding）构造一个具体参数集（改 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.9694em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal">L</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">p</span><span class="mord mtight">99</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span></span> 或 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">λ</span></span></span></span>），并算出 S3 前后的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6887em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6887em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span></span></span></span></span></span></span></span>。</p>
+</li>
+<li><p><strong>验收带的校准</strong>。S2（FP8）上线前，数值回归集在 10,000 条样本上测出最大相对误差 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">2</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">3</span></span></span></span></span></span></span></span></span></span></span></span>，超过阈值 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">3</span></span></span></span></span></span></span></span></span></span></span></span>。请给出三种处理方式（含各自的代价），并说明<strong>哪一种可以用&quot;分位指标验收&quot;替代数值回归</strong>。</p>
+</li>
+<li><p><strong>端到端上线清单</strong>。为本节的五步写一份上线清单：① 每步的前置条件；② 灰度参数（流量/时长/判据）；③ 回滚触发条件与动作；④ 需要预先采集的基线数据；⑤ 上线后的观察项与阈值。要求每一项都带具体数字。</p>
+</li>
+</ol>
+<h3 id="h-小结">小结<a class="anchor" href="#h-小结" aria-label="本节链接">#</a></h3>
+<ul>
+<li><strong>观察时长是算出来的</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">obs</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.0361em;vertical-align:-0.2861em;"></span><span class="mord mathnormal">n</span><span class="mopen">(</span><span class="mord mathnormal">ε</span><span class="mclose">)</span><span class="mord">/</span><span class="mord"><span class="mord mathnormal">λ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">canary</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span></span>，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4831em;"></span><span class="mord mathnormal">n</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">10/</span><span class="mord mathnormal">ε</span></span></span></span>。1% 流量下检出 1% 要 500 s、检出 0.1% 要 83 min。<strong>要更小的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">ε</span></span></span></span> 只能靠更大的流量。</strong></li>
+<li><strong>错误预算花的是检测时间</strong>：同一 1% 退化，120 s 发现用 0.046%、30 min 发现用 0.694%（差 15 倍）；10% 退化拖 30 min 吃掉 6.94%。<strong>自动化检测比&quot;多看一会儿&quot;有效一个数量级。</strong></li>
+<li><strong>回滚的判据是代数</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.109em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">left</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≥</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6887em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6887em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span></span></span></span></span></span></span></span>。本项目滚动只剩 2 副本 &lt; 3，所以<strong>必须双跑</strong>；双跑 24 h 只要 389 元 —— <strong>&quot;资源不够&quot;是容量规划问题，不是回滚的借口。</strong></li>
+<li><strong>&quot;只备份不双跑&quot;要三条同时成立</strong>：镜像可拉起、决策到生效 ≤ 检测时间、窗口容量够。<strong>没有演练过的回滚等于没有回滚。</strong></li>
+<li><strong>优化清单五步</strong>：S0 基线（8 卡 / 7,776 元）→ S1 前缀缓存（−2 卡、−1,944 元）→ S2 FP8（−12.3 ms TTFT）→ S3 KV 8bit（KV −54%）→ S4 TP=4（−1,944 元）。<strong>总收益：月成本 −50%、TTFT −45%。</strong></li>
+<li><strong>S2/S3 的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">Δ</span><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0</span></span></span></span> 但必须排在 S4 前面</strong>：它们买的是<strong>显存头寸</strong>（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">b</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">kv</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 77 → 185），S4 才把它兑换成卡数。<strong>优化顺序看的是&quot;谁为谁铺路&quot;，不是单步收益。</strong></li>
+<li><strong>省卡与降 TPOT 会冲突</strong>：S1 让 TPOT 从 6.83 → 7.14 ms。<strong>清单必须显式标出负项</strong>，否则上线后会被误解为故障。</li>
+<li><strong>用容量指标做预警，比用延迟报警早一个数量级</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">b</span><span class="mord">/</span><span class="mord"><span class="mord mathnormal">b</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">kv</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&gt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.9</span></span></span></span>、单卡吞吐/上限 &lt; 0.85 都比 p99 报警更早。</li>
+<li><strong>什么时候不扩</strong>：吞吐够而 p99 涨（改并发槽）、单卡吞吐掉（改 KV 配额）、命中率掉（改 key）、流量涨但输出变短（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0077em;">R</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:-0.0077em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">out</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 没变）——<strong>四条都不是扩容能解决的</strong>。</li>
+<li><strong>一句话</strong>：<strong>上线的每一步都要能回答&quot;怎么发现它坏了、多快能退回去、退了之后容量够不够&quot;</strong>；而优化的顺序要看&quot;哪一步在为下一步腾出空间&quot;，不是看单步省了多少钱。</li>
+</ul>
+<blockquote>
+<p>下一节：本章到此结束。四节合起来给出了一条从&quot;需求&quot;到&quot;可上线、可迭代的服务&quot;的完整链路：第 1 节把 SLO/流量/预算换算成并行策略、副本数与缓存决策；第 2 节把每个量拆成逐项可复核的账本；第 3 节用受控压测验证这些量并定位瓶颈层；第 4 节把变更、回滚与优化顺序也变成算式。它们与第 1–5 章共用同一组输入量（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6887em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6887em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span></span></span></span></span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">λ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mop mtight"><span class="mtight">m</span><span class="mtight">a</span><span class="mtight">x</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">h</span></span></span></span>、错误预算），所以任何一节的结论都可以用其余章节的约束复核 —— 这也是整门课从 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span>-<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0528em;">β</span></span></span></span> 模型一路推到&quot;成本优化清单&quot;的那条线。</p>
+</blockquote>

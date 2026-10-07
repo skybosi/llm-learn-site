@@ -1,0 +1,165 @@
+<h2 id="h-完整项目">完整项目<a class="anchor" href="#h-完整项目" aria-label="本节链接">#</a></h2>
+<p>前两课我们学会了造图、载数据、跑训练。但一个&quot;能交差&quot;的项目，不只是把训练循环跑通——它需要<strong>清晰的工程结构、可复现的实验协议、合理的模型选择、以及能自圆其说的结果分析</strong>。本课把一个完整的图分类项目从头到尾串起来：从数据探查、基线建模，到调参评估、结果落盘，最后复盘每一步背后的考量。</p>
+<h3 id="h-一项目设计">一、项目设计<a class="anchor" href="#h-一项目设计" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-选题与目标">1. 选题与目标<a class="anchor" href="#h-1-选题与目标" aria-label="本节链接">#</a></h4>
+<p>本项目做 <strong>PROTEINS 蛋白质图分类</strong>（来自 <code>TUDataset</code>）：每张图是一个蛋白质，节点是氨基酸残基（二级结构），边是空间相邻关系，标签是&quot;是否是酶&quot;（二分类）。选它的理由：</p>
+<ul>
+<li>比 MUTAG 规模稍大（1113 张图）、方差更可控，适合演示完整流程；</li>
+<li>是 GNN 论文里的标准基准，结果可与文献对照；</li>
+<li>二分类问题，能同时演示准确率与 ROC-AUC 两类指标。</li>
+</ul>
+<p><strong>目标</strong>：训练一个 GIN 模型，在&quot;多种子 + 早停&quot;协议下，报告测试准确率与 AUC 的均值±标准差，并可视化训练曲线。</p>
+<h4 id="h-2-工程结构">2. 工程结构<a class="anchor" href="#h-2-工程结构" aria-label="本节链接">#</a></h4>
+<p>把代码拆成清晰的函数，而不是一大段脚本：</p>
+<pre><code>1. 数据加载与探查        load_data(), inspect_data()
+2. 模型定义              GIN()
+3. 训练/验证/测试一个 epoch  train_one_epoch(), evaluate()
+4. 早停逻辑              EarlyStopping 或内联判断
+5. 多种子实验协议        run_experiment(seed)
+6. 结果汇总与落盘        main()</code></pre>
+<p>每个函数职责单一，便于调试和复用。</p>
+<h4 id="h-3-关键技术决策">3. 关键技术决策<a class="anchor" href="#h-3-关键技术决策" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>模型</strong>：GIN（求和聚合 + MLP），配<strong>求和读出</strong>——第 5 章证明过它是图分类表达力最强的标准选择。</li>
+<li><strong>评估协议</strong>：10 折随机划分（或用 <code>random_split</code> 固定比例），每折跑多个种子，报告均值±标准差。</li>
+<li><strong>优化器</strong>：Adam，<code>weight_decay=1e-4</code> 做 L2 正则。</li>
+<li><strong>早停</strong>：验证集 AUC 连续 50 epoch 不提升即停止，防止过拟合。</li>
+<li><strong>可复现</strong>：显式 <code>seed_everything(seed)</code>，固定 PyTorch、numpy、random 三个随机源。</li>
+</ul>
+<p><figure><img class="md-img" src="content/courses/graph-neural-networks/assets/chapter-6-figure-03.svg" alt="完整项目训练流程示意：一张纵向流程图，从上到下依次为&quot;数据加载与探查 → 划分 train/val/test → 定义 GIN 模型 → 训练循环（含早停监控验证集）→ 测试集评估 → 多种子重复 → 汇总均值±标准差&quot;；每个方块旁边标注对应函数名，右侧用绿色对勾强调&quot;可复现：固定随机种子&quot;与&quot;报告多种子均值±标准差&quot;两个工程要点" loading="lazy" decoding="async"><figcaption>完整项目训练流程示意：一张纵向流程图，从上到下依次为&quot;数据加载与探查 → 划分 train/val/test → 定义 GIN 模型 → 训练循环（含早停监控验证集）→ 测试集评估 → 多种子重复 → 汇总均值±标准差&quot;；每个方块旁边标注对应函数名，右侧用绿色对勾强调&quot;可复现：固定随机种子&quot;与&quot;报告多种子均值±标准差&quot;两个工程要点</figcaption></figure>
+</p>
+<h3 id="h-二可运行示例">二、可运行示例<a class="anchor" href="#h-二可运行示例" aria-label="本节链接">#</a></h3>
+<p><strong>示例：PROTEINS 图分类完整项目</strong></p>
+<pre data-lang="python"><code class="language-python">import random
+import numpy as np
+import torch
+import torch.nn.functional as F
+from torch_geometric.nn import GINConv, global_add_pool
+from torch_geometric.datasets import TUDataset
+from torch_geometric.loader import DataLoader
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, roc_auc_score
+
+# ---------- 0. 可复现 ----------
+def seed_everything(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+# ---------- 1. 数据加载与探查 ----------
+def load_data():
+    ds = TUDataset(root=&#39;./data/PROTEINS&#39;, name=&#39;PROTEINS&#39;)
+    print(f&#39;图数量 {len(ds)} | 特征维 {ds.num_features} | 类别数 {ds.num_classes}&#39;)
+    print(&#39;类别分布:&#39;, np.bincount([int(d.y) for d in ds]))   # 检查是否不平衡
+    return ds
+
+# ---------- 2. 模型定义 ----------
+class GIN(torch.nn.Module):
+    def __init__(self, in_ch, hidden_ch, out_ch):
+        super().__init__()
+        def mlp(in_c, out_c):
+            return torch.nn.Sequential(
+                torch.nn.Linear(in_c, out_c), torch.nn.ReLU(),
+                torch.nn.Linear(out_c, out_c))
+        self.conv1 = GINConv(mlp(in_ch, hidden_ch))
+        self.conv2 = GINConv(mlp(hidden_ch, hidden_ch))
+        self.conv3 = GINConv(mlp(hidden_ch, hidden_ch))
+        self.lin = torch.nn.Linear(hidden_ch, out_ch)
+
+    def forward(self, x, edge_index, batch):
+        x = F.relu(self.conv1(x, edge_index))
+        x = F.relu(self.conv2(x, edge_index))
+        x = F.relu(self.conv3(x, edge_index))
+        x = global_add_pool(x, batch)      # 求和读出
+        return self.lin(x)                 # 返回 logits
+
+# ---------- 3. 训练 / 评估 ----------
+def train_one_epoch(model, loader, opt):
+    model.train()
+    total_loss, total = 0.0, 0
+    for data in loader:
+        opt.zero_grad()
+        out = model(data.x, data.edge_index, data.batch)
+        loss = F.cross_entropy(out, data.y)
+        loss.backward()
+        opt.step()
+        total_loss += loss.item() * data.num_graphs
+        total += data.num_graphs
+    return total_loss / total
+
+@torch.no_grad()
+def evaluate(model, loader):
+    model.eval()
+    probs, ys = [], []
+    for data in loader:
+        out = model(data.x, data.edge_index, data.batch)
+        probs.append(torch.softmax(out, dim=1)[:, 1])   # 取&quot;正类&quot;概率
+        ys.append(data.y)
+    probs = torch.cat(probs).cpu().numpy()
+    ys = torch.cat(ys).cpu().numpy()
+    pred = (probs &gt; 0.5).astype(int)
+    return accuracy_score(ys, pred), roc_auc_score(ys, probs)
+
+# ---------- 4. 单次实验：划分 + 训练 + 早停 ----------
+def run_experiment(dataset, seed, hidden=64, epochs=300):
+    seed_everything(seed)
+    # 按&quot;图&quot;划分（绝不按节点）
+    idx = list(range(len(dataset)))
+    tr_idx, te_idx = train_test_split(idx, test_size=0.2,
+                                      random_state=seed, stratify=[int(dataset[i].y) for i in idx])
+    tr_idx, va_idx = train_test_split(tr_idx, test_size=0.2,
+                                      random_state=seed, stratify=[int(dataset[i].y) for i in tr_idx])
+    tr_loader = DataLoader(dataset[tr_idx], batch_size=64, shuffle=True)
+    va_loader = DataLoader(dataset[va_idx], batch_size=64)
+    te_loader = DataLoader(dataset[te_idx], batch_size=64)
+
+    model = GIN(dataset.num_features, hidden, dataset.num_classes)
+    opt = torch.optim.Adam(model.parameters(), lr=0.01, weight_decay=1e-4)
+
+    best_va_auc, best_state, patience = 0.0, None, 0
+    for epoch in range(epochs):
+        train_one_epoch(model, tr_loader, opt)
+        va_acc, va_auc = evaluate(model, va_loader)
+        if va_auc &gt; best_va_auc:          # 早停：以验证 AUC 为准
+            best_va_auc = va_auc
+            best_state = {k: v.clone() for k, v in model.state_dict().items()}
+            patience = 0
+        else:
+            patience += 1
+            if patience &gt;= 50:
+                break
+
+    model.load_state_dict(best_state)     # 恢复最优 checkpoint
+    te_acc, te_auc = evaluate(model, te_loader)
+    return te_acc, te_auc
+
+# ---------- 5. 多种子汇总 ----------
+if __name__ == &#39;__main__&#39;:
+    dataset = load_data()
+    accs, aucs = [], []
+    for seed in range(5):                 # 跑 5 个种子
+        acc, auc = run_experiment(dataset, seed)
+        accs.append(acc); aucs.append(auc)
+        print(f&#39;seed={seed} | Test Acc {acc:.4f} | Test AUC {auc:.4f}&#39;)
+
+    print(f&#39;\n最终报告：&#39;)
+    print(f&#39;Accuracy = {np.mean(accs):.4f} ± {np.std(accs):.4f}&#39;)
+    print(f&#39;ROC-AUC  = {np.mean(aucs):.4f} ± {np.std(aucs):.4f}&#39;)</code></pre>
+<p>运行结果参考：GIN 在 PROTEINS 上的测试准确率约 0.73–0.76、AUC 约 0.78–0.80（因随机划分而略有波动）。这个脚本已经具备完整项目的骨架，你可以直接把 <code>TUDataset</code> 换成 MUTAG、ENZYMES，或把 <code>GIN</code> 换成第 4 章的 SAGE/GAT，复用同一套协议。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>换成别的数据集</strong>：把项目里的 <code>PROTEINS</code> 换成 <code>ENZYMES</code>（多分类），只改数据集名和指标（多分类 AUC 需 <code>average=&#39;macro&#39;</code> 或 <code>multi_class</code> 参数），跑通完整流程。</li>
+<li><strong>消融实验</strong>：把 <code>global_add_pool</code> 换成 <code>global_mean_pool</code>、<code>global_max_pool</code>，各跑一遍，记录准确率与 AUC 的变化，验证&quot;求和读出&quot;的优势。</li>
+<li><strong>模型对比</strong>：把 <code>GIN</code> 换成 <code>GCNConv</code>/<code>SAGEConv</code>/<code>GATConv</code> 组成的编码器（同样 3 层 + 求和读出），在同一协议下对比，写成一个小表格。</li>
+<li><strong>调参练习</strong>：固定划分，分别改变 <code>hidden</code>（32/64/128）和 <code>weight_decay</code>（0/1e-4/1e-3），观察验证 AUC 的变化，总结哪个超参最敏感。</li>
+<li><strong>曲线可视化</strong>：改造 <code>run_experiment</code>，记录每个 epoch 的训练损失与验证 AUC，用 matplotlib 画出学习曲线，判断模型是否过拟合、早停是否生效。</li>
+</ol>
+<h3 id="h-四参考来源">四、参考来源<a class="anchor" href="#h-四参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>GIN 原论文：Xu 等. &quot;How Powerful are Graph Neural Networks?&quot; (ICLR 2019)：<a href="https://arxiv.org/abs/1810.00826" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1810.00826</a></li>
+<li>PyG 官方文档 · GINConv：<a href="https://pytorch-geometric.readthedocs.io/en/latest/generated/torch_geometric.nn.conv.GINConv.html" target="_blank" rel="noopener noreferrer">https://pytorch-geometric.readthedocs.io/en/latest/generated/torch_geometric.nn.conv.GINConv.html</a></li>
+<li>PyG 官方文档 · TUDataset：<a href="https://pytorch-geometric.readthedocs.io/en/latest/generated/torch_geometric.datasets.TUDataset.html" target="_blank" rel="noopener noreferrer">https://pytorch-geometric.readthedocs.io/en/latest/generated/torch_geometric.datasets.TUDataset.html</a></li>
+<li>scikit-learn 官方文档 · train_test_split / roc_auc_score：<a href="https://scikit-learn.org/stable/modules/classes.html#module-sklearn.model_selection" target="_blank" rel="noopener noreferrer">https://scikit-learn.org/stable/modules/classes.html#module-sklearn.model_selection</a></li>
+</ul>
+<p>恭喜你完成《图神经网络》！</p>

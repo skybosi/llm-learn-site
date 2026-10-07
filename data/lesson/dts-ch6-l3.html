@@ -1,0 +1,225 @@
+<h2 id="h-混合精度--fp8-训练数值与工程要点">混合精度 / FP8 训练：数值与工程要点<a class="anchor" href="#h-混合精度--fp8-训练数值与工程要点" aria-label="本节链接">#</a></h2>
+<p>上一课的两笔账（显存、算力）里，最省事的杠杆其实是&quot;每个数用几个字节&quot;。把 fp32 换成 16 位，显存与带宽立刻减半，矩阵乘的吞吐也往往翻倍——听起来是纯赚。但真实训练里，这一半的收益经常被两个小问题吃掉：<strong>小梯度在低精度格式里下溢成 0</strong>，以及<strong>参数更新量被低精度的尾数舍掉</strong>，训练于是静默地不再前进。这一课把这两件事的判据变成可算的数字。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-两种-16-位格式范围与精度是两笔不同的账">1. 两种 16 位格式：范围与精度是两笔不同的账<a class="anchor" href="#h-1-两种-16-位格式范围与精度是两笔不同的账" aria-label="本节链接">#</a></h4>
+<p>计算机里的浮点数由「指数位决定范围、尾数位决定精度」两部分构成。两种 16 位格式把 16 个比特分配得完全不同：</p>
+<table>
+<thead>
+<tr>
+<th>格式</th>
+<th>指数位</th>
+<th>尾数位</th>
+<th>最小规格化数</th>
+<th>最小次正规数</th>
+<th>机器 epsilon</th>
+<th>有效十进制位</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>fp16</td>
+<td>5</td>
+<td>10</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">6.1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">5</span></span></span></span></span></span></span></span></span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">6.0</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">8</span></span></span></span></span></span></span></span></span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">9.8</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">4</span></span></span></span></span></span></span></span></span></span></span></span></td>
+<td>≈3.0</td>
+</tr>
+<tr>
+<td>bf16</td>
+<td>8</td>
+<td>7</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1.2</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">38</span></span></span></span></span></span></span></span></span></span></span></span></td>
+<td>—</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">7.8</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">3</span></span></span></span></span></span></span></span></span></span></span></span></td>
+<td>≈2.1</td>
+</tr>
+</tbody></table>
+<p>读法：<strong>fp16 精度高、范围窄</strong>（下限 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">6</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">5</span></span></span></span></span></span></span></span></span></span></span></span> 量级、上限 65504）；<strong>bf16 范围与 fp32 相同</strong>（8 位指数），代价是相对精度只有 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord"><span class="mord">2</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">8</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">0.4%</span></span></span></span>。这也解释了为什么 bf16 训练几乎不需要损失缩放，而 fp16 不加就要崩。</p>
+<h4 id="h-2-fp16-的下溢与动态损失缩放">2. fp16 的下溢与动态损失缩放<a class="anchor" href="#h-2-fp16-的下溢与动态损失缩放" aria-label="本节链接">#</a></h4>
+<p>若某次反向产生梯度 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">9</span></span></span></span></span></span></span></span></span></span></span></span>，它在 fp16 里连最小次正规数（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">6.0</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">8</span></span></span></span></span></span></span></span></span></span></span></span>）都不到，直接变成 0。损失缩放的机制是：把 loss 乘上 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span></span></span></span>，反向得到的梯度就整体放大 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span></span></span></span> 倍，更新前再除以 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span></span></span></span>。对 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">9</span></span></span></span></span></span></span></span></span></span></span></span> 的梯度：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord"><span class="mord">2</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">8</span></span></span></span></span></span></span></span></span></span></span></span> 后是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">2.56</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">7</span></span></span></span></span></span></span></span></span></span></span></span>（可表示），<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord"><span class="mord">2</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">16</span></span></span></span></span></span></span></span></span></span></span></span> 后是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">6.55</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">5</span></span></span></span></span></span></span></span></span></span></span></span>（落在规格化区间）。但 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span></span></span></span> 不能一味调大：fp16 上限是 65504，梯度过大时会被推成 <code>inf</code>。所以工程上用的是<strong>动态损失缩放</strong>——先试一个 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span></span></span></span>，一旦出现 <code>inf</code>/<code>NaN</code> 就跳过该步并把 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span></span></span></span> 减半，连续若干步无异常再把 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span></span></span></span> 翻倍。</p>
+<h4 id="h-3-主权重master-weight为什么必须是-fp32">3. 主权重（master weight）为什么必须是 fp32<a class="anchor" href="#h-3-主权重master-weight为什么必须是-fp32" aria-label="本节链接">#</a></h4>
+<p>第二个陷阱更隐蔽。假设权重 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0269em;">w</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.1</span></span></span></span>，单步更新量是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">5</span></span></span></span></span></span></span></span></span></span></span></span>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">Δ</span><span class="mord mathnormal" style="margin-right:0.0269em;">w</span></span></span></span> 在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0269em;">w</span></span></span></span> 上属于第 5~6 位有效数字，而 bf16 只有约 2.1 位十进制有效数字。用&quot;该精度下 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0269em;">w</span></span></span></span> 附近的绝对分辨率&quot;衡量：</p>
+<ul>
+<li>bf16：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">0.1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord"><span class="mord">2</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">7</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">7.8</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">4</span></span></span></span></span></span></span></span></span></span></span></span></li>
+<li>fp16：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">0.1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord"><span class="mord">2</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">10</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">9.8</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">5</span></span></span></span></span></span></span></span></span></span></span></span></li>
+</ul>
+<p>两者都<strong>大于</strong> <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">5</span></span></span></span></span></span></span></span></span></span></span></span> 的更新量——也就是说，直接把权重存在 16 位格式里，更新会被整个舍掉。混合精度的标准做法因此是：<strong>保留一份 fp32 主权重</strong>，优化器更新只作用在 fp32 副本上，每次前向再把 fp32 权重<strong>量化</strong>成 bf16/fp16 供矩阵乘使用。这就是 ZeRO 账本里那 4 B/参数&quot;主权重&quot;的来历。</p>
+<h4 id="h-4-一次迭代里各张量该用什么精度">4. 一次迭代里各张量该用什么精度<a class="anchor" href="#h-4-一次迭代里各张量该用什么精度" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>张量 / 操作</th>
+<th>精度</th>
+<th>理由</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>前向/反向的矩阵乘输入</td>
+<td>fp16 / bf16</td>
+<td>吞吐与带宽的主要收益来源</td>
+</tr>
+<tr>
+<td>矩阵乘的累加器</td>
+<td>fp32</td>
+<td>低精度累加会放大舍入误差</td>
+</tr>
+<tr>
+<td>权重主副本、优化器状态（m、v）</td>
+<td>fp32</td>
+<td>更新量比权重小好几个数量级</td>
+</tr>
+<tr>
+<td>梯度（AllReduce 前）</td>
+<td>fp16 / bf16</td>
+<td>通信字节数减半：第 1 课那条 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">2Ψ</span></span></span></span> 账直接减半</td>
+</tr>
+<tr>
+<td>归一化（LayerNorm/RMSNorm）与 loss</td>
+<td>fp32</td>
+<td>数值敏感，低精度容易炸</td>
+</tr>
+</tbody></table>
+<p>注意第 4 行：<strong>混合精度同时是通信优化</strong>——梯度换成 16 位后，AllReduce 的字节数直接减半。</p>
+<h4 id="h-5-fp8把一个张量拆成值--缩放因子">5. FP8：把一个张量拆成&quot;值 + 缩放因子&quot;<a class="anchor" href="#h-5-fp8把一个张量拆成值--缩放因子" aria-label="本节链接">#</a></h4>
+<p>FP8 只有 8 个比特，主流两种格式是 <strong>E4M3</strong>（4 位指数、3 位尾数，范围小而精度相对好）与 <strong>E5M2</strong>（5 位指数、2 位尾数，范围大而精度差）。8 个比特意味着<strong>单独一个数无法同时容纳大范围与小精度</strong>，所以 FP8 训练的核心工程是<strong>缩放（scaling）</strong>：per-tensor scaling（整个张量共用一个因子，实现最简单）与 per-block / per-channel scaling（张量切块、每块自己的因子，能适配&quot;同一张量里不同通道量级差很多&quot;）。与损失缩放同理，FP8 的缩放因子也必须动态维护，否则同样会下溢或溢出；另外梯度要用高精度累加，主权重仍留高精度，FP8 只用在张量乘的输入上。</p>
+<p><figure><img class="md-img" src="content/courses/distributed-training-systems/assets/chapter-6-figure-04.svg" alt="一次迭代里各张量分别用什么精度" loading="lazy" decoding="async"><figcaption>一次迭代里各张量分别用什么精度</figcaption></figure>
+</p>
+<h4 id="h-6-常见坑">6. 常见坑<a class="anchor" href="#h-6-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>bf16 与 fp16 混着换</strong>：bf16 通常不需损失缩放，fp16 需要；混用会出现&quot;本来好好的突然全 NaN&quot;。</li>
+<li><strong>关掉动态缩放只留固定 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span></span></span></span></strong>：loss 尺度一变就溢出或下溢。</li>
+<li><strong>在低精度里做归约/累加</strong>：AllReduce 用 fp16 传输可以，但累加要用 fp32，否则小梯度被大梯度吃掉。</li>
+<li><strong>只看吞吐不看收敛</strong>：换 FP8 后必须对照 loss 曲线，否则可能只是&quot;更快地训练坏了&quot;。</li>
+<li><strong>忽略软硬件支持前提</strong>：FP8 需要相应代际的 GPU 与框架/库支持，不具备时退到 bf16。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>纯 Python，不需要 GPU。第一段把两种 16 位格式的范围与损失缩放的算术打印出来，第二段说明&quot;更新被吃掉&quot;。</p>
+<pre data-lang="python"><code class="language-python"># ===== 示例：bf16 / fp16 的范围、损失缩放与更新被&quot;吃掉&quot;的问题 =====
+print(&quot;两种 16 位格式（IEEE 754 二进制）：&quot;)
+print(f&quot;  {&#39;格式&#39;:&lt;6}{&#39;指数位&#39;:&gt;6}{&#39;尾数位&#39;:&gt;6}{&#39;最小规格化数&#39;:&gt;14}{&#39;最小次正规数&#39;:&gt;14}{&#39;机器 epsilon&#39;:&gt;14}&quot;)
+for n, (e, m) in ((&quot;fp16&quot;, (5, 10)), (&quot;bf16&quot;, (8, 7))):
+    mn = 2.0 ** (1 - (2 ** (e - 1) - 1))
+    print(f&quot;  {n:&lt;6}{e:&gt;6}{m:&gt;6}{mn:&gt;14.3e}{mn * 2.0 ** -m:&gt;14.3e}{2.0 ** (-m):&gt;14.3e}&quot;)
+
+def fp16_ok(x):
+    &quot;&quot;&quot;fp16 的下限取最小次正规数（6e-8 量级），上限 65504。&quot;&quot;&quot;
+    return 6.0e-8 &lt;= abs(x) &lt;= 65504.0
+
+print(&quot;\n损失缩放：loss 乘 S → 反向梯度整体放大 S 倍 → 更新前再除回 S&quot;)
+g = 1e-9
+for expo in (0, 8, 16, 24):
+    S = 2 ** expo
+    print(f&quot;  S=2^{expo:&lt;3} 缩放后梯度 {g*S:9.3e}  &quot;
+          f&quot;{&#39;可表示&#39; if fp16_ok(g * S) else &#39;下溢为 0&#39;}&quot;)
+print(&quot;  另一头：缩放也会把大梯度推到溢出（fp16 上限 65504），所以 S 必须动态调&quot;)
+
+print(&quot;\n为什么 bf16 通常不需要缩放：它的指数范围与 fp32 一致（8 位指数）&quot;)
+for v in (1e-30, 1e-9, 1e5, 1e30):
+    print(f&quot;  {v:&gt;9.0e}   fp16 {&#39;可表示&#39; if fp16_ok(v) else &#39;不可表示&#39;:&lt;10}  bf16 可表示（1.2e-38 ~ 3.4e+38）&quot;)
+
+print(&quot;\n低精度存权重时更新会被吃掉：绝对分辨率 vs 单步更新量&quot;)
+for mant_bits, name in ((7, &quot;bf16&quot;), (10, &quot;fp16&quot;)):
+    for w, upd in ((0.1, 1e-5), (0.1, 1e-3), (1.0, 1e-4)):
+        res = w * 2.0 ** (-mant_bits)
+        verdict = &quot;更新被舍掉&quot; if res &gt; upd else &quot;还能表示，但有量化噪声&quot;
+        print(f&quot;  {name:&lt;5} w={w:&lt;5} 单步更新 {upd:.0e}：分辨率 {res:.2e} → {verdict}&quot;)
+print(&quot;  主权重留 fp32 的意义就在这里：更新量发生在 fp32 里，再量化到 bf16 做前向&quot;)</code></pre>
+<p>在 Python 3.14.5（仅标准库）下实际运行结果：</p>
+<pre data-lang="text"><code class="language-text">两种 16 位格式（IEEE 754 二进制）：
+  格式       指数位   尾数位        最小规格化数        最小次正规数    机器 epsilon
+  fp16       5    10     6.104e-05     5.960e-08     9.766e-04
+  bf16       8     7     1.175e-38     9.184e-41     7.812e-03
+
+损失缩放：loss 乘 S → 反向梯度整体放大 S 倍 → 更新前再除回 S
+  S=2^0   缩放后梯度 1.000e-09  下溢为 0
+  S=2^8   缩放后梯度 2.560e-07  可表示
+  S=2^16  缩放后梯度 6.554e-05  可表示
+  S=2^24  缩放后梯度 1.678e-02  可表示
+  另一头：缩放也会把大梯度推到溢出（fp16 上限 65504），所以 S 必须动态调
+
+为什么 bf16 通常不需要缩放：它的指数范围与 fp32 一致（8 位指数）
+      1e-30   fp16 不可表示        bf16 可表示（1.2e-38 ~ 3.4e+38）
+      1e-09   fp16 不可表示        bf16 可表示（1.2e-38 ~ 3.4e+38）
+      1e+05   fp16 不可表示        bf16 可表示（1.2e-38 ~ 3.4e+38）
+      1e+30   fp16 不可表示        bf16 可表示（1.2e-38 ~ 3.4e+38）
+
+低精度存权重时更新会被吃掉：绝对分辨率 vs 单步更新量
+  bf16  w=0.1   单步更新 1e-05：分辨率 7.81e-04 → 更新被舍掉
+  bf16  w=0.1   单步更新 1e-03：分辨率 7.81e-04 → 还能表示，但有量化噪声
+  bf16  w=1.0   单步更新 1e-04：分辨率 7.81e-03 → 更新被舍掉
+  fp16  w=0.1   单步更新 1e-05：分辨率 9.77e-05 → 更新被舍掉
+  fp16  w=0.1   单步更新 1e-03：分辨率 9.77e-05 → 还能表示，但有量化噪声
+  fp16  w=1.0   单步更新 1e-04：分辨率 9.77e-04 → 更新被舍掉
+  主权重留 fp32 的意义就在这里：更新量发生在 fp32 里，再量化到 bf16 做前向</code></pre>
+<p>两个可以直接拿去用的判据：<strong>梯度小于 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">6</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">8</span></span></span></span></span></span></span></span></span></span></span></span> 时 fp16 会归零（需要缩放），bf16 不需要</strong>；<strong>权重附近的绝对分辨率一旦大于单步更新量，那一维就再也学不动了（所以必须留 fp32 主权重）</strong>。</p>
+<pre data-lang="python"><code class="language-python"># ===== 补充：FP8 缩放的粒度与梯度累加精度（纯 Python 数值演示） =====
+import math
+def e4m3_round(a):
+    &quot;&quot;&quot;模拟 E4M3：尾数 3 位 → [1,2) 区间 8 个格点，可表示上限约 448。&quot;&quot;&quot;
+    if a == 0: return 0.0
+    if abs(a) &gt; 448: a = math.copysign(448, a)
+    e = math.floor(math.log2(abs(a)))
+    step = 2.0 ** (e - 3)
+    return math.copysign(round(abs(a) / step) * step, a)
+
+# 一个张量里两组通道量级差 100 倍：per-tensor 缩放 vs 按块缩放
+vals = []
+for i in range(2048):
+    scale = 1e-2 if (i // 128) % 2 == 0 else 1e-4
+    vals.append(scale * (1.0 + 0.5 * ((i * 37) % 11) / 11))
+
+def rel_err(chunk, s):
+    q = [e4m3_round(v / s) * s for v in chunk]
+    rms = math.sqrt(sum((a - b) ** 2 for a, b in zip(chunk, q)) / len(chunk))
+    ref = math.sqrt(sum(v * v for v in chunk) / len(chunk))
+    return rms / ref
+
+print(&quot;张量内两组通道量级差 100:1，E4M3 量化后的相对误差：&quot;)
+gt = max(abs(v) for v in vals)                       # per-tensor 用全局最大值
+errs = [rel_err(vals[i:i + 128], gt) for i in range(0, len(vals), 128)]
+print(f&quot;  per-tensor 缩放：小通道 {sum(errs[1::2])/len(errs[1::2]):.3e}，&quot;
+      f&quot;大通道 {sum(errs[0::2])/len(errs[0::2]):.3e}&quot;)
+for blk in (128, 32):
+    errs = []
+    for i in range(0, len(vals), 128):
+        ch = vals[i:i + 128]
+        for j in range(0, len(ch), blk):
+            errs.append(rel_err(ch[j:j + blk], max(abs(v) for v in ch[j:j + blk])))
+    print(f&quot;  每 {blk:&gt;3} 元素一块：小通道 {sum(errs[1::2])/len(errs[1::2]):.3e}，&quot;
+          f&quot;大通道 {sum(errs[0::2])/len(errs[0::2]):.3e}&quot;)
+
+print(&quot;\n梯度累加：1000 个贡献（1 个 1.0 + 999 个 1e-5）&quot;)
+contribs = [1.0] + [1e-5] * 999
+print(f&quot;  Python float（fp64 展示）：{sum(contribs):.6f}（真值 {1.0 + 999*1e-5:.6f}）&quot;)
+print(&quot;  低精度累加的病根：循环里每次只加 1e-5，一旦累加器量级到 1，&quot;
+      &quot;相对精度 0.4%（bf16）就足以把这些增量全部舍掉&quot;)</code></pre>
+<p>实测输出：</p>
+<pre data-lang="text"><code class="language-text">张量内两组通道量级差 100:1，E4M3 量化后的相对误差：
+  per-tensor 缩放：小通道 2.658e-02，大通道 2.482e-02
+  每 128 元素一块：小通道 2.476e-02，大通道 2.482e-02
+  每  32 元素一块：小通道 2.479e-02，大通道 2.479e-02
+
+梯度累加：1000 个贡献（1 个 1.0 + 999 个 1e-5）
+  Python float（fp64 展示）：1.009990（真值 1.009990）
+  低精度累加的病根：循环里每次只加 1e-5，一旦累加器量级到 1，相对精度 0.4%（bf16）就足以把这些增量全部舍掉</code></pre>
+<p>注意第二段的读数：<strong>per-block 缩放把小通道的误差从 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">2.66</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span></span> 降到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">2.48</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span></span></strong>——收益不大，因为 E4M3 的 3 位尾数本身就把相对误差钉在 3% 量级。这提示 FP8 精度的真正瓶颈是尾数位宽，而不是缩放粒度；缩放解决的是<strong>范围</strong>问题（溢出/下溢），不是精度问题。</p>
+<p><strong>可选，需要自备或云上按需 1~2 卡</strong>（无卡也能完成本课）：想看真实混合精度行为，用 1 张卡跑一个玩具模型，分别记录 loss 曲线与显存：</p>
+<pre data-lang="bash"><code class="language-bash">nvidia-smi                                # 确认显卡代际与显存
+# 单卡即可：用 torch.amp 的 autocast(GradScaler) 跑 bf16 与 fp16 两条曲线
+#   fp16 分支务必用 GradScaler；bf16 分支通常不需要
+# torchrun --standalone --nproc_per_node=1 train_amp.py
+# 观察：fp16 分支的 scale 值会随训练动态变化；出现 inf 的步会被跳过</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：写一个函数，给定梯度幅值分布（例如对数正态取样 10 万个值），计算&quot;需要多大的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span></span></span></span> 才能让 99% 的梯度在 fp16 里可表示但不过 65504&quot;，并说明为什么这个 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span></span></span></span> 只能靠动态调整。</li>
+<li><strong>解释</strong>：为什么 bf16 不需要损失缩放，却仍需要 fp32 主权重？分别从&quot;指数位决定范围&quot;与&quot;尾数位决定精度&quot;两条线回答。</li>
+<li><strong>对比/验证</strong>：把示例里的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0269em;">w</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.1</span></span></span></span>、更新量 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">5</span></span></span></span></span></span></span></span></span></span></span></span> 换成 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0269em;">w</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span>、更新量 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">3</span></span></span></span></span></span></span></span></span></span></span></span>，重新判断 bf16 与 fp16 是否&quot;能学到&quot;；再算一下 Adam 的一阶/二阶动量若存成 bf16 会怎样。</li>
+<li><strong>思考</strong>：把梯度 AllReduce 从 fp32 换成 bf16，第 1 课里的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">2Ψ</span></span></span></span> 通信账会变成多少？若精度带来的收益不稳定，列出两个必须做的对照实验。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>P. Micikevicius et al., <em>FP8 Formats for Deep Learning</em>（E4M3 与 E5M2 两种 8 位格式的位宽分配、动态范围与缩放需求；本课第 5 节的依据）：<a href="https://arxiv.org/abs/2209.05433" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2209.05433</a></li>
+<li>PyTorch, <em>Automatic Mixed Precision (AMP)</em>（<code>torch.amp.autocast</code> 与 <code>GradScaler</code> 的官方口径：bf16 与 fp16 的差异、<code>GradScaler</code> 的动态缩放与 inf/NaN 跳过逻辑；本课第 2 节）：<a href="https://pytorch.org/docs/stable/amp.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/docs/stable/amp.html</a></li>
+<li>NVIDIA, <em>NCCL User Guide</em>（第 1 课已用它作为集合通信的权威来源；本课用来说明&quot;梯度换 bf16 后 AllReduce 字节数减半&quot;这条与通信账的衔接）：<a href="https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html</a></li>
+</ul>
+<p><a href="lesson-04.md">下一课：Offload 与异构存储：什么时候值得用</a></p>

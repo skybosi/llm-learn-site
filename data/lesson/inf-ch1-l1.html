@@ -1,0 +1,73 @@
+<h2 id="h-prefill-与-decode">prefill 与 decode<a class="anchor" href="#h-prefill-与-decode" aria-label="本节链接">#</a></h2>
+<p>一次大模型推理请求，从&quot;输入一段 prompt&quot;到&quot;输出完整回答&quot;，内部并不是一个均匀的过程，而是被切成了<strong>两个性质截然不同的阶段</strong>：<code>prefill</code>（预填充，也叫提示处理）和 <code>decode</code>（解码，也叫生成）。理解这两个阶段，是理解 TTFT/TPOT、吞吐/延迟权衡、以及 KV Cache 为什么要存在的第一块基石。学完本课，你应当能画出一次推理的完整时序，并说出两个阶段各自的算力特征。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-自回归生成是一次并行--多次串行">1. 自回归生成是&quot;一次并行 + 多次串行&quot;<a class="anchor" href="#h-1-自回归生成是一次并行--多次串行" aria-label="本节链接">#</a></h4>
+<p>大模型的文本生成是<strong>自回归</strong>的：每产生一个 token，都要把它拼回输入，再产生下一个 token，直到吐出结束符。因此一次推理在时间轴上会这样展开：</p>
+<ol>
+<li><strong>prefill 阶段</strong>：把用户输入的整段 prompt（假设 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span></span></span></span> 个 token）一次性送进模型，<strong>并行</strong>算出这 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span></span></span></span> 个 token 的隐状态和注意力结果。这一步顺带产生了第一个新 token 的概率分布，从中采样得到第一个输出 token。</li>
+<li><strong>decode 阶段</strong>：此后每生成一个新 token，就把&quot;全部历史 + 这个新 token&quot;再跑一遍模型。由于历史 token 的注意力结果（KV）已经被缓存，每步<strong>只新算 1 个 token</strong>，直到结束。</li>
+</ol>
+<p>一句话概括：<strong>prefill 一次性&quot;看懂&quot;整个 prompt，decode 一个 token 一个 token 地&quot;吐字&quot;</strong>。</p>
+<h4 id="h-2-两个阶段的计算瓶颈完全不同">2. 两个阶段的计算瓶颈完全不同<a class="anchor" href="#h-2-两个阶段的计算瓶颈完全不同" aria-label="本节链接">#</a></h4>
+<p>这是整个推理优化的核心事实，务必记住：</p>
+<ul>
+<li><strong>prefill 是计算密集（compute-bound）</strong>。它要并行处理 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span></span></span></span> 个 token，矩阵运算的规模是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span><span class="mord">×</span></span></span></span> 隐藏维度，GPU 的算力（FLOPS）会被打满，显存带宽反而用不满。</li>
+<li><strong>decode 是访存密集（memory-bound）</strong>。每步只处理 1 个 token，乘法运算量很小，但要把<strong>整个模型的权重从显存里读一遍</strong>。因此 decode 的耗时几乎由&quot;权重总字节数 ÷ 显存带宽&quot;决定，与算力关系不大。</li>
+</ul>
+<p>这个差异直接决定了两件事：一是 decode 的每个 token 都很&quot;贵&quot;（要读几十 GB 权重）；二是当用户 prompt 很长时，prefill 会成为延迟的大头，而当回答很长时，decode 成为大头。</p>
+<h4 id="h-3-计算量对比">3. 计算量对比<a class="anchor" href="#h-3-计算量对比" aria-label="本节链接">#</a></h4>
+<p>设 prompt 长度 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span></span></span></span>、生成长度 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span></span></span></span>、模型隐藏维度 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">d</span></span></span></span>。粗略地：</p>
+<ul>
+<li>prefill 的计算量与 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord"><span class="mord mathnormal">d</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span> 成正比——一次并行；</li>
+<li>decode 每一步的计算量与 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord"><span class="mord mathnormal">d</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span> 成正比，共 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span></span></span></span> 步，总计 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord"><span class="mord mathnormal">d</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span>。</li>
+</ul>
+<p>如果 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span></span></span></span> 和 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span></span></span></span> 都是几千 token，两阶段的计算量在同一数量级；但如果用户只问一句话（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span></span></span></span> 很小）而让模型写一篇长文（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span></span></span></span> 很大），那么 decode 主导；反之，给模型贴一大段文档做摘要（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span></span></span></span> 很大、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span></span></span></span> 较小），prefill 就主导了。</p>
+<h3 id="h-二可运行示例">二、可运行示例<a class="anchor" href="#h-二可运行示例" aria-label="本节链接">#</a></h3>
+<p>下面的 Python 用简化参数模拟一次推理的 prefill/decode 时序，让你直观看到两阶段耗时如何随 prompt/生成长度变化。</p>
+<pre data-lang="python"><code class="language-python"># -*- coding: utf-8 -*-
+# 模拟 prefill 与 decode 两阶段耗时，观察瓶颈如何随长度转移
+
+def simulate(prompt_len, gen_len, d=4096, compute_ops=3.5e14,   # 模拟算力 (FLOPs/s)
+             bandwidth=1.5e12,                                  # 显存带宽 (B/s)
+             weights_bytes=14e9):                               # 权重字节数 (7B, FP16)
+    &quot;&quot;&quot;返回 (prefill 秒, decode 每token秒, decode 总秒)。&quot;&quot;&quot;
+    # prefill：并行算 S 个 token，计算量 ~ S*d^2，计算密集，受算力限制
+    prefill_flops = prompt_len * d * d * 2      # 一次矩阵乘约 2*S*d^2（粗估）
+    prefill_time = prefill_flops / compute_ops
+    # decode：每步算 1 个 token，访存密集，受带宽限制（读全部权重）
+    per_token_time = weights_bytes / bandwidth
+    decode_time = per_token_time * gen_len
+    return prefill_time, per_token_time, decode_time
+
+cases = [
+    (&quot;短问长答：prompt=64, 生成=512&quot;, 64, 512),
+    (&quot;长文摘要：prompt=4096, 生成=256&quot;, 4096, 256),
+    (&quot;均衡：prompt=512, 生成=512&quot;, 512, 512),
+]
+for name, s, n in cases:
+    pf, pt, dec = simulate(s, n)
+    total = pf + dec
+    print(f&quot;{name}&quot;)
+    print(f&quot;  prefill={pf*1000:6.1f} ms | decode={pt*1000:5.1f} ms/token | &quot;
+          f&quot;decode总={dec:5.2f} s | 合计={total:5.2f} s | prefill占比={pf/total*100:4.1f}%&quot;)</code></pre>
+<p>运行后你会发现：</p>
+<ul>
+<li><strong>短问长答</strong>：prefill 占比只有个位数百分比，decode 是绝对大头——这时候优化 decode 吞吐最划算；</li>
+<li><strong>长文摘要</strong>：prefill 占比可能过半——这时候要优化 prefill，甚至用前缀缓存（后面章节会讲）来跳过重复计算。</li>
+</ul>
+<p><figure><img class="md-img" src="content/courses/llm-inference-optimization/assets/chapter-1-figure-01.svg" alt="prefill 与 decode 两阶段时序图：左侧画一个 prompt 方块（内写&quot;S 个 token&quot;），箭头指向中间一个宽大的 GPU 方块，标注&quot;prefill：并行处理整段 prompt（计算密集）&quot;；从 GPU 方块向右延伸出一串小方块，逐个标注 token1、token2、token3……，每两个小方块之间的箭头旁写&quot;decode：每步 1 个 token（访存密集）&quot;，最后一个 token 上方画一个红色的 EOS 结束标记；图底部用一句话标注&quot;一次并行 + 多次串行&quot;" loading="lazy" decoding="async"><figcaption>prefill 与 decode 两阶段时序图：左侧画一个 prompt 方块（内写&quot;S 个 token&quot;），箭头指向中间一个宽大的 GPU 方块，标注&quot;prefill：并行处理整段 prompt（计算密集）&quot;；从 GPU 方块向右延伸出一串小方块，逐个标注 token1、token2、token3……，每两个小方块之间的箭头旁写&quot;decode：每步 1 个 token（访存密集）&quot;，最后一个 token 上方画一个红色的 EOS 结束标记；图底部用一句话标注&quot;一次并行 + 多次串行&quot;</figcaption></figure>
+</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>改 prompt 长度</strong>：把 <code>长文摘要</code> 的 prompt 改成 8192、生成保持 256，观察 prefill 占比怎么变，说明为什么&quot;长上下文&quot;场景对 prefill 优化特别敏感。</li>
+<li><strong>改带宽</strong>：把 <code>bandwidth</code> 从 1.5e12 改成 3.35e12（H100 的 HBM 带宽），看 decode 每 token 时间怎么变，验证&quot;decode 受带宽限制&quot;的结论。</li>
+<li><strong>改权重</strong>：把 <code>weights_bytes</code> 改成 70e9（70B FP16），重跑三个 case，体会模型越大 decode 每 token 越贵。</li>
+<li><strong>思考</strong>：如果一个在线服务的用户大多只发一句话、模型回复两三句，从 prefill/decode 的角度，这个服务的延迟瓶颈最可能在哪一端？为什么？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>vLLM 文档：Prefill 与 Decode 阶段说明：<a href="https://docs.vllm.ai/en/latest/design/arch_overview.html" target="_blank" rel="noopener noreferrer">https://docs.vllm.ai/en/latest/design/arch_overview.html</a></li>
+<li>Hugging Face：LLM 推理性能分析（KV Cache 与两阶段）：<a href="https://huggingface.co/blog/optimize-llm" target="_blank" rel="noopener noreferrer">https://huggingface.co/blog/optimize-llm</a></li>
+<li>vLLM 论文《Efficient Memory Management for Large Language Model Serving with PagedAttention》：<a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2309.06180</a></li>
+</ul>
+<p><a href="#/l/inf-ch1-l2">下一课：TTFT 与 TPOT</a></p>

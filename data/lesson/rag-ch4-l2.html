@@ -1,0 +1,828 @@
+<h2 id="h-多跳与迭代检索依赖链误差传播与收益条件">多跳与迭代检索：依赖链、误差传播与收益条件<a class="anchor" href="#h-多跳与迭代检索依赖链误差传播与收益条件" aria-label="本节链接">#</a></h2>
+<h3 id="h-这一节要解决什么">这一节要解决什么<a class="anchor" href="#h-这一节要解决什么" aria-label="本节链接">#</a></h3>
+<p>上一节把查询缺陷分成三类，其中第 ③ 类（组合性）的&quot;顺序分解&quot;被留了下来：</p>
+<blockquote>
+<p><strong>子问题之间可能有依赖</strong> —— &quot;先找出负责人，再查他的联系方式&quot;。第二轮查询必须用到第一轮的结果。</p>
+</blockquote>
+<p>这就是<strong>多跳检索</strong>（multi-hop / iterative retrieval）。它也是本章最容易被滥用的一种技术，因为它的动机听起来无懈可击：</p>
+<pre><code>问题：答案不在任何单个块里
+天真结论：那就检索多次，把中间结果串起来</code></pre>
+<p>这个结论漏掉了两个量。第一，<strong>&quot;答案不在任何单个块里&quot;这句话本身可能是假的</strong> —— 它可能只是切分切坏了。第二，<strong>每一跳都会失败</strong>，而失败会沿链路传播。</p>
+<p>这一节要回答四个问题：</p>
+<ol>
+<li><strong>怎么判断一个查询真的需要多跳？</strong> 两个必须跑的对照实验，以及它们各自否掉什么。</li>
+<li><strong>误差是怎么传播的？</strong> 单跳成功率 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span></span></span></span>、链长 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span></span></span></span> 与端到端成功率之间的定量关系，以及 beam search 在修什么。</li>
+<li><strong>多跳的收益条件是什么？</strong> 存在一个可测的临界量：当它高于某个值时，单跳（甚至只是扩池）就够了。</li>
+<li><strong>什么时候停？</strong> 固定跳数、模型自评、结构化判据三种写法的差别，以及一个可执行、可测的停止规则。</li>
+</ol>
+<p>结论先放在这里：</p>
+<blockquote>
+<p><strong>多跳不是&quot;更强&quot;，而是一种在&quot;证据确实需要串接&quot;时才划算的</strong>架构<strong>。它的收益上限由&quot;桥接信息是否可检索&quot;决定，它的实际收益由&quot;每一跳的可靠性&quot;决定 —— 而后者可以用 beam 抬到接近 1，代价是每跳 3 倍检索与 3 倍候选上下文。本节实测：同一份语料上，<code>固定 1 跳</code> 得到 0.600、<code>固定 2 跳</code> 掉到 0.393，而</strong>结构化停止<strong>得到 <strong>0.993</strong> —— 差别不在&quot;跳不跳&quot;，而在&quot;<strong>该跳时才跳</strong>&quot;。</strong></p>
+</blockquote>
+<h3 id="h-一先判别真的需要多跳吗">一、先判别：真的需要多跳吗<a class="anchor" href="#h-一先判别真的需要多跳吗" aria-label="本节链接">#</a></h3>
+<h4 id="h-11-两个必须跑的对照实验">1.1 两个必须跑的对照实验<a class="anchor" href="#h-11-两个必须跑的对照实验" aria-label="本节链接">#</a></h4>
+<p>在写任何迭代代码之前，必须先跑这两个实验。它们各自否掉一类错误归因：</p>
+<p><strong>对照 A：oracle 桥接（把中间实体直接塞进查询）</strong></p>
+<p>做法：人工（或用标注）找出桥接实体 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">b</span></span></span></span>，把它<strong>直接加进查询</strong>，其余不变，重测 recall@10。</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.8em;vertical-align:-0.65em;"></span><span class="mord text"><span class="mord">recall@10</span></span><span class="mord"><span class="delimsizing size2">(</span></span><span class="mord mathnormal" style="margin-right:0.0359em;">q</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">∪</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.8em;vertical-align:-0.65em;"></span><span class="mopen">{</span><span class="mord mathnormal">b</span><span class="mclose">}</span><span class="mord"><span class="delimsizing size2">)</span></span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≫</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord">recall@10</span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0359em;">q</span><span class="mclose">)</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">⟹</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord text"><span class="mord cjk_fallback">问题在</span><span class="mord">&quot;</span><span class="mord cjk_fallback">查询缺少桥接信息</span><span class="mord">&quot;</span></span></span></span></span></span></p>
+<p>对照 A 的意义是：<strong>它给出&quot;查询侧还有多少可挖&quot;的上界。</strong> 本节实测（表一）：单跳 0.210 → oracle 桥接 <strong>1.000</strong>。这个 0.79 的落差就是多跳理论上能拿到的全部空间。<strong>如果 oracle 桥接只涨 0.03，那么多跳一定不值得做</strong> —— 因为无论你的迭代实现多好，都不可能超过这个上界。</p>
+<p><strong>对照 B：粒度改造（把两个事实合进同一个块）</strong></p>
+<p>做法：如果这两个事实本来就在同一份源文档里，就把切分改成&quot;一个块同时含两者&quot;，重测单跳。</p>
+<p>本节实测（表一）：粒度改造后单跳 recall@10 = <strong>0.610</strong>（同源比例 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">same</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.5</span></span></span></span>，其余 50% 因为本来不同源而无法合并，只能维持 0.21）。<strong>这个数字必须和 oracle 桥接一起读</strong>：它说明&quot;看起来需要多跳&quot;的问题里，<strong>有一部分其实是切分问题</strong>，而那一部分的解不需要任何迭代、不需要 LLM 调用、延迟与单跳完全相同。</p>
+<blockquote>
+<p>⚠️ <strong>粒度改造的收益有一个硬上限</strong>：它不可能超过 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">same</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>（两个事实同源的比例）。<strong>你不能凭空把两篇不同文档合并成一个块</strong> —— 那会破坏块的语义完整性（第 2 章第 1 节），把检索精度换没了。所以判据是：先测 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">same</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>，再决定&quot;改切分&quot;与&quot;加多跳&quot;各承担多少。</p>
+</blockquote>
+<h4 id="h-12-判据阶梯表一">1.2 判据阶梯（表一）<a class="anchor" href="#h-12-判据阶梯表一" aria-label="本节链接">#</a></h4>
+<p>把三个量按顺序测出来，就能定位问题在哪一层：</p>
+<table>
+<thead>
+<tr>
+<th>观测</th>
+<th>诊断</th>
+<th>处方</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>单跳低、<strong>oracle 桥接高</strong>（≥0.8）</td>
+<td>查询缺桥接信息</td>
+<td>迭代检索（本节）</td>
+</tr>
+<tr>
+<td>单跳低、<strong>粒度改造高</strong></td>
+<td>切分太细</td>
+<td>改切分（第 2 章）</td>
+</tr>
+<tr>
+<td>单跳低、<strong>扩池@1000 高</strong></td>
+<td>证据在池里，排不上来</td>
+<td>重排 / 重排池（第 3 章）</td>
+</tr>
+<tr>
+<td>单跳低、全扫也低</td>
+<td>语料里没有</td>
+<td>补语料 / 换数据源（不是算法问题）</td>
+</tr>
+</tbody></table>
+<p>本节实测的完整阶梯（100 条桥接查询，共现率 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">co</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.2</span></span></span></span>）：</p>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>recall@10</th>
+<th>检索轮数</th>
+<th>每次检索块数</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>单跳@10</td>
+<td>0.210</td>
+<td>1</td>
+<td>10</td>
+</tr>
+<tr>
+<td>扩池@1000</td>
+<td>0.440</td>
+<td>1</td>
+<td>1000</td>
+</tr>
+<tr>
+<td>全扫</td>
+<td>1.000</td>
+<td>1</td>
+<td>全部</td>
+</tr>
+<tr>
+<td><strong>oracle 桥接@10</strong></td>
+<td><strong>1.000</strong></td>
+<td>1</td>
+<td>10</td>
+</tr>
+<tr>
+<td>粒度改造@10（粗切分）</td>
+<td>0.610</td>
+<td>1</td>
+<td>10</td>
+</tr>
+<tr>
+<td>迭代 贪心</td>
+<td>0.630</td>
+<td>2</td>
+<td>20</td>
+</tr>
+<tr>
+<td>迭代 beam=3</td>
+<td>0.900</td>
+<td>2</td>
+<td>60</td>
+</tr>
+</tbody></table>
+<p><strong>逐行读</strong>：</p>
+<ul>
+<li><strong>单跳 0.210 vs oracle 桥接 1.000</strong>：差距全部来自&quot;查询里没有桥接实体&quot;这一个事实。<strong>这就是多跳存在的唯一理由。</strong></li>
+<li><strong>扩池@1000 = 0.440</strong>：把候选池开大 100 倍只涨 0.23 —— 因为黄金块的分数里<strong>根本没有桥接实体这个词</strong>，它在池子里但和上千个同属性文档并列。<strong>扩池修不了&quot;查询缺少一个词&quot;这种病</strong>，这是判据表里&quot;扩池高 → 重排&quot;一行不适用的情形。</li>
+<li><strong>粒度改造 0.610 &gt; 迭代贪心 0.630？</strong> 两者几乎相同，但<strong>代价完全不同</strong>：粒度改造是 1 轮检索、0 次 LLM 调用；迭代贪心是 2 轮检索 + 1 次抽取。<strong>在这个 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">same</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.5</span></span></span></span> 的语料上，先改切分是更划算的选择。</strong> 这就是为什么对照 B 必须先跑。</li>
+<li><strong>迭代 beam=3 = 0.900</strong>：同样的两轮，只因为首跳多取了两个候选，从 0.630 抬到 0.900。<strong>迭代的收益几乎全部来自&quot;首跳别选错&quot;，而不是&quot;跳更多次&quot;。</strong></li>
+</ul>
+<h4 id="h-13-三类伪多跳">1.3 三类&quot;伪多跳&quot;<a class="anchor" href="#h-13-三类伪多跳" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>伪多跳</th>
+<th>真实性质</th>
+<th>判别</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>&quot;需要的信息被切散了&quot;</td>
+<td>切分问题</td>
+<td>粒度改造实验涨 → 伪多跳</td>
+</tr>
+<tr>
+<td>&quot;需要比较 A 与 B&quot;</td>
+<td><strong>并列</strong>分解，无依赖</td>
+<td>两个子查询可并行，不需要迭代</td>
+</tr>
+<tr>
+<td>&quot;需要罗列所有 X&quot;</td>
+<td><strong>集合检索 / 穷举</strong>，不是链</td>
+<td>加跳数没用，需要&quot;枚举 + 过滤&quot;算子</td>
+</tr>
+</tbody></table>
+<p><strong>第二、三类是最常见的误用</strong>：把&quot;比较/罗列&quot;当成多跳，结果每一跳都在猜一个不存在的前驱。<strong>它们的正确解法在第 1 节的并列分解与第 3 节的证据聚合里</strong> —— 前者给出&quot;每个子问题各自的名次配额&quot;，后者给出&quot;如何判断集合是否凑齐&quot;。</p>
+<h3 id="h-二迭代检索的机制状态机与误差传播">二、迭代检索的机制：状态机与误差传播<a class="anchor" href="#h-二迭代检索的机制状态机与误差传播" aria-label="本节链接">#</a></h3>
+<h4 id="h-21-把多跳写成一个状态机">2.1 把多跳写成一个状态机<a class="anchor" href="#h-21-把多跳写成一个状态机" aria-label="本节链接">#</a></h4>
+<p>迭代检索的形式化不是&quot;跑 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span></span></span></span> 次检索&quot;，而是一个带状态的循环：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6389em;vertical-align:-0.2083em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">q</span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">t</span><span class="mbin mtight">+</span><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2083em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.2em;vertical-align:-0.35em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="mord"><span class="delimsizing size1">(</span></span><span class="mord mathnormal" style="margin-right:0.0359em;">q</span><span class="mpunct">,</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathrm">Retrieve</span></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mord"><span class="delimsizing size1">)</span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">stop when </span></span><span class="mord"><span class="mord mathrm">Stop</span></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span></span></p>
+<p>其中：</p>
+<ul>
+<li>状态 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> = 已收集的证据 + 当前查询；</li>
+<li>转移 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span></span></span></span> = &quot;从本轮证据里抽出桥接实体，构造下一轮查询&quot;；</li>
+<li>停止判据 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8778em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathrm">Stop</span></span></span></span></span> = 这一节第 4 部分的核心。</li>
+</ul>
+<p><strong>为什么要写成状态机而不是&quot;跳数&quot;</strong>：因为<strong>每一跳都可能失败</strong>，而失败的方式有三种，必须分开处理：</p>
+<ol>
+<li><strong>检索失败</strong>：桥接事实不在本轮 Top-<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span>；</li>
+<li><strong>抽取失败</strong>：桥接事实在，但从文本里抽不出正确的实体（本节用 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">extract</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.95</span></span></span></span> 建模）；</li>
+<li><strong>跳转失败</strong>：实体抽对了，但用它构造的下一轮查询没能命中目标块（本节用 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7167em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">hop2</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.98</span></span></span></span> 建模）。</li>
+</ol>
+<p><strong>三者的处置完全不同</strong>：检索失败要靠 beam/扩池，抽取失败要靠更好的抽取器或结构化字段，跳转失败要靠改写第二轮查询（第 1 节的手段）。<strong>把它们混成&quot;多跳不准&quot;一个词，就没法优化。</strong></p>
+<h4 id="h-22-误差传播math17">2.2 误差传播：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8413em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8413em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">L</span></span></span></span></span></span></span></span></span></span></span><a class="anchor" href="#h-22-误差传播math17" aria-label="本节链接">#</a></h4>
+<p>如果每跳的成功率是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span></span></span></span>，且各跳近似独立，端到端成功率是：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="mopen">(</span><span class="mord text"><span class="mord cjk_fallback">成功</span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:3.106em;vertical-align:-1.2777em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.8283em;"><span style="top:-1.8723em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">i</span><span class="mrel mtight">=</span><span class="mord mtight">1</span></span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∏</span></span></span><span style="top:-4.3em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">L</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.2777em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:-0.0278em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8913em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8913em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">L</span></span></span></span></span></span></span></span></span></span></span></span></span></p>
+<table>
+<thead>
+<tr>
+<th><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span></span></span></span></th>
+<th><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span></th>
+<th><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2</span></span></span></span></th>
+<th><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">3</span></span></span></span></th>
+<th><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4</span></span></span></span></th>
+<th><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">5</span></span></span></span></th>
+<th><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">6</span></span></span></span></th>
+</tr>
+</thead>
+<tbody><tr>
+<td>0.80</td>
+<td>0.800</td>
+<td>0.640</td>
+<td>0.512</td>
+<td>0.410</td>
+<td>0.328</td>
+<td>0.262</td>
+</tr>
+<tr>
+<td>0.90</td>
+<td>0.900</td>
+<td>0.810</td>
+<td>0.729</td>
+<td>0.656</td>
+<td>0.590</td>
+<td>0.531</td>
+</tr>
+<tr>
+<td>0.95</td>
+<td>0.950</td>
+<td>0.902</td>
+<td>0.857</td>
+<td>0.815</td>
+<td>0.774</td>
+<td>0.735</td>
+</tr>
+<tr>
+<td>0.99</td>
+<td>0.990</td>
+<td>0.980</td>
+<td>0.970</td>
+<td>0.961</td>
+<td>0.951</td>
+<td>0.941</td>
+</tr>
+</tbody></table>
+<p><strong>这张表否掉了&quot;多跳几轮总没坏处&quot;的直觉</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.90</span></span></span></span> 的 4 跳只剩 0.656 —— <strong>三分之一的失败是链路自己造成的</strong>，与语料无关。它同时给出两个工程结论：</p>
+<ul>
+<li><strong>能两跳解决的，绝不做三跳。</strong> 每多一跳，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span></span></span></span> 至少要高 0.05 才能维持同样的端到端成功率。</li>
+<li><strong>提高每跳的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span></span></span></span> 比增加跳数重要。</strong> 把 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span></span></span></span> 从 0.90 提到 0.99，4 跳的成功率从 0.656 升到 0.961 —— 而增加一跳只会往下走。</li>
+</ul>
+<p><strong>独立性的边界</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8413em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8413em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">L</span></span></span></span></span></span></span></span></span></span></span> 假设各跳独立。<strong>不独立会让它更糟</strong>：如果某一跳失败是因为&quot;语料本身缺少这个实体&quot;，那么后续所有用它构造的查询都会一起失败 —— 此时真实成功率是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span></span></span></span> 而不是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8413em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8413em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">L</span></span></span></span></span></span></span></span></span></span></span>（一次失败就全错）。<strong>所以 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8413em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8413em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">L</span></span></span></span></span></span></span></span></span></span></span> 是乐观估计，链条上的系统性缺陷会让它进一步下降。</strong></p>
+<h4 id="h-23-beam-与回溯把-math35-抬高的唯一办法">2.3 beam 与回溯：把 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.0278em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 抬高的唯一办法<a class="anchor" href="#h-23-beam-与回溯把-math35-抬高的唯一办法" aria-label="本节链接">#</a></h4>
+<p>误差传播式里，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span></span></span></span> 由任务决定，能动的只有各跳的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span></span></span></span>。其中<strong>首跳的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.0278em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 是最有杠杆的一处</strong>，因为它是链条的入口。</p>
+<p><strong>首跳为什么会错？</strong> 本节建模的机制是：<strong>同一个实体有多个桥接候选</strong>（不同来源/不同版本/不同上下文的同一条关系），首跳检索无法区分，于是正确的桥接实体以一定概率落在第 2、3 位。本节用 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">rank</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord">0.60</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">0.30</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">0.10</span><span class="mclose">)</span></span></span></span> 表示它落在第 1/2/3 位的概率。</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord cjk_fallback">贪心</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">:</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.0278em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">0.60</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.95</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.570</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">⇒</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord cjk_fallback">两跳端到端</span><span class="mord"> </span></span><span class="mord">0.559</span></span></span></span></span></p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord text"><span class="mord">beam</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">3</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">:</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.0278em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1.00</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.95</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.950</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">⇒</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord cjk_fallback">两跳端到端</span><span class="mord"> </span></span><span class="mord">0.931</span></span></span></span></span></p>
+<p><strong>这就是 beam 的全部价值</strong>：它不改变&quot;每一跳是否成功&quot;的概率，而是<strong>把&quot;选错一个候选&quot;降级为&quot;多花一点代价&quot;</strong>。</p>
+<p><strong>代价必须算清</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>代价项</th>
+<th>贪心</th>
+<th>beam=3</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>检索次数</td>
+<td>2</td>
+<td>2（但每轮的候选数 ×3）</td>
+</tr>
+<tr>
+<td>送入下一轮的候选</td>
+<td>1</td>
+<td>3</td>
+</tr>
+<tr>
+<td>上下文体积（用于判断/生成）</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1</span><span class="mord">×</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4831em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">3</span><span class="mord">×</span></span></span></span></td>
+</tr>
+<tr>
+<td>端到端成功率</td>
+<td>0.559</td>
+<td><strong>0.931</strong></td>
+</tr>
+</tbody></table>
+<p><strong>取舍的判据是边际成本</strong>：用第 5 章第 4 节的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord"><span class="mord mathrm">MC</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">Δ</span><span class="mord mathnormal" style="margin-right:0.0359em;">q</span><span class="mord">/Δ</span><span class="mord mathnormal">c</span></span></span></span> 算 —— 成功率从 0.559 到 0.931 的增量，对应上下文与延迟的增量。本节的数据里这笔交易非常划算（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">+</span><span class="mord">0.37</span></span></span></span> 的成功率换 3 倍候选），<strong>但它依赖于一个前提：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">rank</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 的头部确实存在多个合理候选。</strong> 如果首跳的错误是&quot;桥接事实根本不在池子里&quot;，beam 一点用都没有 —— 所以 §1.2 的阶梯必须先跑。</p>
+<p><figure><img class="md-img" src="content/courses/rag-systems/assets/chapter-4-figure-02.svg" alt="多跳误差按 r 的 L 次方传播" loading="lazy" decoding="async"><figcaption>多跳误差按 r 的 L 次方传播</figcaption></figure>
+</p>
+<h3 id="h-三收益条件什么时候多跳划算">三、收益条件：什么时候多跳划算<a class="anchor" href="#h-三收益条件什么时候多跳划算" aria-label="本节链接">#</a></h3>
+<h4 id="h-31-收益的分解式">3.1 收益的分解式<a class="anchor" href="#h-31-收益的分解式" aria-label="本节链接">#</a></h4>
+<p>多跳相对单跳的期望净收益可以写成：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord">Δ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">net</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.3263em;vertical-align:-1.5763em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.75em;"><span style="top:-1.4237em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">结构性</span></span></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.75em;"><span class="svg-align" style="top:-2.102em;"><span class="pstrut" style="height:3em;"></span><span class="stretchy" style="height:0.548em;min-width:1.6em;"><span class="brace-left" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMinYMin slice"><path d="M0 6l6-6h17c12.688 0 19.313.3 20 1 4 4 7.313 8.3 10 13
+ 35.313 51.3 80.813 93.8 136.5 127.5 55.688 33.7 117.188 55.8 184.5 66.5.688
+ 0 2 .3 4 1 18.688 2.7 76 4.3 172 5h399450v120H429l-6-1c-124.688-8-235-61.7
+-331-161C60.687 138.7 32.312 99.3 7 54L0 41V6z"/></svg></span><span class="brace-center" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMidYMin slice"><path d="M199572 214
+c100.7 8.3 195.3 44 280 108 55.3 42 101.7 93 139 153l9 14c2.7-4 5.7-8.7 9-14
+ 53.3-86.7 123.7-153 211-199 66.7-36 137.3-56.3 212-62h199568v120H200432c-178.3
+ 11.7-311.7 78.3-403 201-6 8-9.7 12-11 12-.7.7-6.7 1-18 1s-17.3-.3-18-1c-1.3 0
+-5-4-11-12-44.7-59.3-101.3-106.3-170-141s-145.3-54.3-229-60H0V214z"/></svg></span><span class="brace-right" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMaxYMin slice"><path d="M399994 0l6 6v35l-6 11c-56 104-135.3 181.3-238 232-57.3
+ 28.7-117 45-179 50H-300V214h399897c43.3-7 81-15 113-26 100.7-33 179.7-91 237
+-174 2.7-5 6-9 10-13 .7-1 7.3-1 20-1h17z"/></svg></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="mopen">(</span><span class="mord text"><span class="mord cjk_fallback">需要多跳</span></span><span class="mclose">)</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.898em;"><span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.5763em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:2.5263em;vertical-align:-1.6763em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.85em;"><span style="top:-1.3237em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">可实现增量</span></span></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.85em;"><span class="svg-align" style="top:-2.002em;"><span class="pstrut" style="height:3em;"></span><span class="stretchy" style="height:0.548em;min-width:1.6em;"><span class="brace-left" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMinYMin slice"><path d="M0 6l6-6h17c12.688 0 19.313.3 20 1 4 4 7.313 8.3 10 13
+ 35.313 51.3 80.813 93.8 136.5 127.5 55.688 33.7 117.188 55.8 184.5 66.5.688
+ 0 2 .3 4 1 18.688 2.7 76 4.3 172 5h399450v120H429l-6-1c-124.688-8-235-61.7
+-331-161C60.687 138.7 32.312 99.3 7 54L0 41V6z"/></svg></span><span class="brace-center" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMidYMin slice"><path d="M199572 214
+c100.7 8.3 195.3 44 280 108 55.3 42 101.7 93 139 153l9 14c2.7-4 5.7-8.7 9-14
+ 53.3-86.7 123.7-153 211-199 66.7-36 137.3-56.3 212-62h199568v120H200432c-178.3
+ 11.7-311.7 78.3-403 201-6 8-9.7 12-11 12-.7.7-6.7 1-18 1s-17.3-.3-18-1c-1.3 0
+-5-4-11-12-44.7-59.3-101.3-106.3-170-141s-145.3-54.3-229-60H0V214z"/></svg></span><span class="brace-right" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMaxYMin slice"><path d="M399994 0l6 6v35l-6 11c-56 104-135.3 181.3-238 232-57.3
+ 28.7-117 45-179 50H-300V214h399897c43.3-7 81-15 113-26 100.7-33 179.7-91 237
+-174 2.7-5 6-9 10-13 .7-1 7.3-1 20-1h17z"/></svg></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="delimsizing size1">(</span></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3175em;"><span style="top:-2.55em;margin-left:-0.0278em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">iter</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0278em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">single</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mord"><span class="delimsizing size1">)</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.998em;"><span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.6763em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:2.5263em;vertical-align:-1.6763em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.85em;"><span style="top:-1.3237em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">成本</span></span></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.85em;"><span class="svg-align" style="top:-2.002em;"><span class="pstrut" style="height:3em;"></span><span class="stretchy" style="height:0.548em;min-width:1.6em;"><span class="brace-left" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMinYMin slice"><path d="M0 6l6-6h17c12.688 0 19.313.3 20 1 4 4 7.313 8.3 10 13
+ 35.313 51.3 80.813 93.8 136.5 127.5 55.688 33.7 117.188 55.8 184.5 66.5.688
+ 0 2 .3 4 1 18.688 2.7 76 4.3 172 5h399450v120H429l-6-1c-124.688-8-235-61.7
+-331-161C60.687 138.7 32.312 99.3 7 54L0 41V6z"/></svg></span><span class="brace-center" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMidYMin slice"><path d="M199572 214
+c100.7 8.3 195.3 44 280 108 55.3 42 101.7 93 139 153l9 14c2.7-4 5.7-8.7 9-14
+ 53.3-86.7 123.7-153 211-199 66.7-36 137.3-56.3 212-62h199568v120H200432c-178.3
+ 11.7-311.7 78.3-403 201-6 8-9.7 12-11 12-.7.7-6.7 1-18 1s-17.3-.3-18-1c-1.3 0
+-5-4-11-12-44.7-59.3-101.3-106.3-170-141s-145.3-54.3-229-60H0V214z"/></svg></span><span class="brace-right" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMaxYMin slice"><path d="M399994 0l6 6v35l-6 11c-56 104-135.3 181.3-238 232-57.3
+ 28.7-117 45-179 50H-300V214h399897c43.3-7 81-15 113-26 100.7-33 179.7-91 237
+-174 2.7-5 6-9 10-13 .7-1 7.3-1 20-1h17z"/></svg></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="delimsizing size1">(</span></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">extra</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord mathbb">E</span><span class="mopen">[</span><span class="mord mathnormal">L</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord">1</span><span class="mclose">]</span><span class="mord"><span class="delimsizing size1">)</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.998em;"><span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.6763em;"><span></span></span></span></span></span></span></span></span></span></p>
+<p>三个因子都要能测：</p>
+<ul>
+<li><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="mopen">(</span><span class="mord text"><span class="mord cjk_fallback">需要多跳</span></span><span class="mclose">)</span></span></span></span>：用 §1.1 的两个对照实验估（oracle 桥接的涨幅 × 该比例）；</li>
+<li><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3175em;"><span style="top:-2.55em;margin-left:-0.0278em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">iter</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>：用 §2.3 的分解式算（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5945em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.0278em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6389em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">extract</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.0278em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="minner">⋯</span></span></span></span>）；</li>
+<li><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">extra</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>：每多一跳的延迟与 token 成本（第 5 章第 4 节）。</li>
+</ul>
+<p><strong>这个式子最重要的用途不是算数，而是阻止一种错误论证</strong>：&quot;多跳能提升 recall，所以我们应该做&quot;。它把&quot;提升多少&quot;拆成&quot;结构上可能提升多少&quot;与&quot;你的实现能拿到多少&quot;，<strong>两者都必须给出数字</strong>。</p>
+<h4 id="h-32-共现率一个决定交叉点的量">3.2 共现率：一个决定交叉点的量<a class="anchor" href="#h-32-共现率一个决定交叉点的量" aria-label="本节链接">#</a></h4>
+<p>定义<strong>共现率</strong> <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">co</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>：桥接事实与目标事实<strong>出现在同一个块里</strong>（或目标块里也提到了起始实体）的比例。</p>
+<p><strong>它为什么是决定性的</strong>：当两者共现时，单跳检索的词项重叠里<strong>同时含有起始实体与目标属性</strong>，黄金块自然排得上来。于是：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7692em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0278em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">single</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7778em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">co</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">co</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord text"><span class="mord cjk_fallback">池内命中率</span></span><span class="mclose">)</span></span></span></span></span></p>
+<p>本节实测的扫描（150 条查询/点）：</p>
+<table>
+<thead>
+<tr>
+<th><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">co</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span></th>
+<th>单跳@10</th>
+<th>扩池@1000</th>
+<th>迭代 贪心</th>
+<th>迭代 beam=3</th>
+<th>最优方案</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>0.00</td>
+<td>0.000</td>
+<td>0.207</td>
+<td>0.520</td>
+<td>0.920</td>
+<td>迭代 beam</td>
+</tr>
+<tr>
+<td>0.10</td>
+<td>0.093</td>
+<td>0.293</td>
+<td>0.520</td>
+<td>0.920</td>
+<td>迭代 beam</td>
+</tr>
+<tr>
+<td>0.20</td>
+<td>0.193</td>
+<td>0.360</td>
+<td>0.520</td>
+<td>0.920</td>
+<td>迭代 beam</td>
+</tr>
+<tr>
+<td>0.40</td>
+<td>0.440</td>
+<td>0.560</td>
+<td>0.520</td>
+<td>0.920</td>
+<td>迭代 beam</td>
+</tr>
+<tr>
+<td>0.60</td>
+<td>0.640</td>
+<td>0.713</td>
+<td>0.520</td>
+<td>0.920</td>
+<td>迭代 beam</td>
+</tr>
+<tr>
+<td>0.80</td>
+<td>0.773</td>
+<td>0.820</td>
+<td>0.520</td>
+<td>0.920</td>
+<td>迭代 beam</td>
+</tr>
+<tr>
+<td>0.95</td>
+<td>0.940</td>
+<td>0.953</td>
+<td>0.520</td>
+<td>0.920</td>
+<td><strong>扩池</strong></td>
+</tr>
+</tbody></table>
+<p><strong>三处必须读出来的东西</strong>：</p>
+<ul>
+<li><strong>交叉点有两个，不是一个。</strong> 单跳@10 与<strong>迭代贪心</strong>的交叉在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6776em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">co</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.5</span></span></span></span>；与<strong>迭代 beam=3</strong> 的交叉在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6776em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">co</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.92</span></span></span></span>。<strong>同一个问题，交叉点位置取决于你的迭代实现有多可靠</strong> —— 所以&quot;我们的场景需不需要多跳&quot;这句话，离开实现质量是没有答案的。</li>
+<li><strong>在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">co</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.95</span></span></span></span> 处，最优方案是&quot;扩池&quot;而不是任何迭代。</strong> 当绝大多数桥接关系本来就共现时，<strong>把 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 开大 100 倍（不增加 LLM 调用）比跑两跳更划算</strong>。这与 §1.2 的判据阶梯一致：扩池高 → 问题是排序，不是结构。</li>
+<li><strong>迭代贪心对 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">co</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 完全不敏感（恒为 0.520）</strong>。这是它的一个优点也是缺点：<strong>它不依赖共现率，但它的天花板由首跳的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">rank</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 锁死</strong>。对比 beam=3 的 0.920 —— 差距 0.40 全部来自首跳候选数。</li>
+</ul>
+<p><strong>判据（可执行）</strong>：</p>
+<pre><code>① 分层估算 p_co：在验证集上，用&quot;黄金块是否同时含起始实体&quot;自动判定
+   注意 p_co 通常随查询类型变化（同一实体的属性问题高、跨实体桥接问题低），
+   所以必须按类型分层，不能只报一个总体值
+② 若总体 p_co &gt; 0.9 且扩池@1000 显著高于单跳@10 → 优先扩池 + 重排，不上多跳
+③ 否则跑 oracle 桥接实验；涨幅 &lt; 0.1 → 多跳不值得做（上界太低）
+④ 决定做多跳后，先用 beam=3 建立基线，再逐步降 beam 省成本</code></pre>
+<h3 id="h-四停止条件三种写法只有一个合格">四、停止条件：三种写法，只有一个合格<a class="anchor" href="#h-四停止条件三种写法只有一个合格" aria-label="本节链接">#</a></h3>
+<h4 id="h-41-三种常见写法与它们的问题">4.1 三种常见写法与它们的问题<a class="anchor" href="#h-41-三种常见写法与它们的问题" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>写法</th>
+<th>问题</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>固定跳数</strong>（&quot;统一跳 2 次&quot;）</td>
+<td>对单跳题浪费一跳、还把答案换掉；对真多跳题可能不够</td>
+</tr>
+<tr>
+<td><strong>模型自评</strong>（&quot;问模型信息够了吗&quot;）</td>
+<td>模型的自信与证据充分性<strong>不相关</strong>（第 5 章第 3 节会量化这一点）；且每次自评都是一次 LLM 调用</td>
+</tr>
+<tr>
+<td><strong>置信度阈值</strong>（&quot;Top-1 分数 &gt; <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span></span></span></span> 就停&quot;）</td>
+<td>分数<strong>未经校准</strong>（第 3 章第 3 节），阈值随查询类型漂移</td>
+</tr>
+</tbody></table>
+<h4 id="h-42-结构化停止一个可执行的规则">4.2 结构化停止：一个可执行的规则<a class="anchor" href="#h-42-结构化停止一个可执行的规则" aria-label="本节链接">#</a></h4>
+<p><strong>规则</strong>：看首轮 Top-1 证据。<strong>如果它已经包含查询要求的全部内容词（这里是目标属性词），就停；否则如果它是一个&quot;桥接型事实&quot;（含关系词、取值是另一个实体），就用它的取值再跳一跳。</strong></p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathrm">Stop</span></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.8em;vertical-align:-0.65em;"></span><span class="mord">1</span><span class="mord"><span class="delimsizing size2">[</span></span><span class="mspace"> </span><span class="mord text"><span class="mord">top-1 </span><span class="mord cjk_fallback">证据</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">⊇</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.8em;vertical-align:-0.65em;"></span><span class="mopen">{</span><span class="mord text"><span class="mord cjk_fallback">查询的目标属性词</span></span><span class="mclose">}</span><span class="mspace"> </span><span class="mord"><span class="delimsizing size2">]</span></span></span></span></span></span></p>
+<p>它的两个优点：</p>
+<ul>
+<li><strong>只依赖检索结果的结构</strong>（属性词是否出现），不依赖未经校准的分数，也不额外调用 LLM；</li>
+<li><strong>它天然偏向&quot;少跳&quot;</strong>（单跳题停），而少跳正好是误差传播下的最优策略。</li>
+</ul>
+<p>本节实测（300 题 = 180 单跳 + 120 桥接，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">co</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0</span></span></span></span>）：</p>
+<table>
+<thead>
+<tr>
+<th>策略</th>
+<th>recall@10</th>
+<th>平均跳数</th>
+<th>平均检索块数</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>固定 1 跳</td>
+<td>0.600</td>
+<td>1.00</td>
+<td>10.0</td>
+</tr>
+<tr>
+<td>固定 2 跳</td>
+<td>0.393</td>
+<td>2.00</td>
+<td>20.0</td>
+</tr>
+<tr>
+<td><strong>结构化停止</strong></td>
+<td><strong>0.993</strong></td>
+<td><strong>1.40</strong></td>
+<td><strong>14.0</strong></td>
+</tr>
+</tbody></table>
+<p><strong>这张表是本节最锋利的一张</strong>：</p>
+<ul>
+<li><strong>固定 2 跳（0.393）比固定 1 跳（0.600）更差</strong> —— 因为在 60% 的单跳题上，它用第一跳的&quot;取值&quot;（一个普通属性值，不是实体）当成了实体，<strong>把答案换成了另一个实体的事实</strong>。这就是&quot;无脑多跳&quot;的真实代价：它不是&quot;没提升&quot;，是<strong>主动破坏</strong>。</li>
+<li><strong>结构化停止用 1.40 跳拿到 0.993</strong>：比固定 1 跳多花 0.4 跳，换回 0.39 的 recall；比固定 2 跳少 0.6 跳，却高出 0.60。<strong>它几乎拿到了两种固定策略各自的上界。</strong></li>
+<li><strong>规则的适用边界要写清</strong>：它依赖&quot;查询里明确写了目标属性词&quot;，因此对<strong>意图欠定</strong>的查询（第 1 节第 ② 类）无效 —— 那类查询需要的是补上下文或澄清反问，不是停止规则。<strong>对聚合型问题也无效</strong>：聚合的停止判据是&quot;集合是否凑齐&quot;（第 3 节的覆盖率），不是&quot;某条证据是否完整&quot;。</li>
+</ul>
+<h3 id="h-五边界多跳修不了的三件事">五、边界：多跳修不了的三件事<a class="anchor" href="#h-五边界多跳修不了的三件事" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>证据不在语料里。</strong> 多跳只能把已有的事实串起来；如果目标事实不存在，任何跳数都到不了。判据：§1.2 阶梯里&quot;全扫也低&quot;那一行。</li>
+<li><strong>桥接实体本身不可检索。</strong> 桥接事实用了别名、缩写、编号，而查询用全称（或反之）—— 这是第 1 节第 ① 类的<strong>词汇缺口</strong>，出现在链条中间。此时正确处方是术语归一化，不是加跳数。<strong>判据：在 oracle 桥接实验里，把桥接实体换成它的规范名后回涨 → 是词汇缺口。</strong></li>
+<li><strong>聚合 / 集合型问题。</strong> &quot;列出所有满足 X 的 Y&quot;的正确答案需要<strong>枚举</strong>，而链式检索每一步只带回一条路径。判据：把问题改写成&quot;是否存在一个 Y&quot;后 recall 大涨 → 原问题是聚合型，需要第 3 节的覆盖判据与枚举算子。</li>
+</ol>
+<p><strong>还有一个隐性边界值得单独说</strong>：多跳会<strong>累积上下文</strong>（每跳的证据都进上下文），而第 5 章第 1 节会证明干扰会降低证据取用概率。<strong>所以&quot;跳得多&quot;和&quot;上下文干净&quot;是一对矛盾</strong> —— 正确的做法是每跳只把<strong>桥接实体 + 必要字段</strong>带进下一轮查询，而不是把整块证据拼进上下文。</p>
+<h3 id="h-代码多跳的四个可测问题">代码：多跳的四个可测问题<a class="anchor" href="#h-代码多跳的四个可测问题" aria-label="本节链接">#</a></h3>
+<p>下面是一个完整的合成实验：实体-属性事实库（16000 个细粒度块 + 一份粗粒度副本）、IDF 稀疏检索器、四种策略（单跳 / 扩池 / oracle 桥接 / 粒度改造）与两种迭代（贪心 / beam）。⚠️ <strong>全部为合成语料</strong>：它不模拟任何真实文本，只模拟&quot;依赖链 + 检索失败 + 抽取失败&quot;这三种机制。</p>
+<pre data-lang="python"><code class="language-python">&quot;&quot;&quot;
+多跳与迭代检索：判别实验、误差传播、收益条件与停止条件。
+全部为合成语料 ⚠️（实体-属性事实库），只依赖 numpy。
+  表一 判据阶梯：单跳 / 扩池 / 全扫 / oracle 桥接 / 粒度改造 / 迭代 / beam
+  表二 收益条件：桥接事实&quot;共现率&quot; p_co 的交叉点，以及它如何随迭代质量移动
+  表三 误差传播：r^L，以及 beam 把首跳 r 抬高多少
+  表四 停止条件：固定跳数 vs 结构化停止（首轮证据是否已含查询的全部属性词）
+&quot;&quot;&quot;
+import numpy as np
+
+N_ENT, N_ATTR, N_VAL = 2000, 8, 6
+ENT_BASE, ATTR_BASE, VAL_BASE = 0, 100_000, 200_000
+# 首跳检出的正确桥接实体落在第 1/2/3 位的概率（来自&quot;同一实体有多个桥接候选&quot;）
+P_RANK = (0.60, 0.30, 0.10)
+P_EXTRACT = 0.95          # 从桥接块里抽出实体名的成功率
+P_HOP2 = 0.98             # 第二跳按实体名精确检索的命中率
+
+
+def make_corpus(seed=1, p_same=0.5):
+    &quot;&quot;&quot;细粒度语料 + 一份&quot;同源文档合并后&quot;的粗粒度语料。&quot;&quot;&quot;
+    rng = np.random.default_rng(seed)
+    fine, coarse, bridge, doc_of, merged = [], list(), {}, {}, set()
+    for e in range(N_ENT):
+        b = int(rng.integers(0, N_ENT))
+        bridge[e] = b
+        doc_of[(e, 0)] = len(fine)
+        fine.append({&quot;e&quot;: e, &quot;a&quot;: 0, &quot;v&quot;: b, &quot;tokens&quot;: [ENT_BASE + e, ATTR_BASE]})
+        for a in range(1, N_ATTR):
+            v = int(rng.integers(0, N_VAL))
+            doc_of[(e, a)] = len(fine)
+            fine.append({&quot;e&quot;: e, &quot;a&quot;: a, &quot;v&quot;: v,
+                         &quot;tokens&quot;: [ENT_BASE + e, ATTR_BASE + a, VAL_BASE + v]})
+    coarse = [dict(x) for x in fine]
+    for e in range(N_ENT):
+        for a in range(1, N_ATTR):
+            if rng.random() &lt; p_same:                 # 两个事实本来就在同一份源文档里
+                merged.add((e, a))
+                v = fine[doc_of[(e, a)]][&quot;v&quot;]
+                coarse.append({&quot;e&quot;: e, &quot;a&quot;: a, &quot;v&quot;: v, &quot;kind&quot;: &quot;merged&quot;,
+                               &quot;tokens&quot;: [ENT_BASE + e, ATTR_BASE,
+                                          ATTR_BASE + a, VAL_BASE + v]})
+    for k, x in enumerate(coarse):
+        x[&quot;idx&quot;] = k
+    for k, x in enumerate(fine):
+        x[&quot;idx&quot;] = k
+    return fine, coarse, bridge, doc_of, merged
+
+
+class Sparse:
+    def __init__(self, docs):
+        self.docs = docs
+        self.n = len(docs)
+        self.post = {}
+        for j, d in enumerate(docs):
+            for t in set(d[&quot;tokens&quot;]):
+                self.post.setdefault(t, []).append(j)
+        self.idf = {t: float(np.log((self.n + 1) / (len(v) + 0.5)))
+                    for t, v in self.post.items()}
+
+    def score(self, toks):
+        s = np.zeros(self.n)
+        for t in set(toks):
+            iw = self.idf.get(t, 0.0)
+            if iw:
+                s[self.post[t]] += iw
+        return s
+
+    def top(self, toks, k):
+        return np.argsort(-self.score(toks))[:k]
+
+
+def make_queries(n=100, p_co=0.2, seed=2):
+    rng = np.random.default_rng(seed)
+    return [{&quot;e&quot;: int(rng.integers(0, N_ENT)), &quot;a&quot;: int(rng.integers(1, N_ATTR)),
+             &quot;co&quot;: bool(rng.random() &lt; p_co)} for _ in range(n)]
+
+
+def hop1_scores(ret_f, q, doc_of, bridge):
+    &quot;&quot;&quot;首轮分数。共现时黄金块里额外出现起始实体（这是 p_co 的全部含义）。&quot;&quot;&quot;
+    s = ret_f.score([ENT_BASE + q[&quot;e&quot;], ATTR_BASE, ATTR_BASE + q[&quot;a&quot;]])
+    if q[&quot;co&quot;]:
+        s[doc_of[(bridge[q[&quot;e&quot;]], q[&quot;a&quot;])]] += ret_f.idf[ENT_BASE + q[&quot;e&quot;]]
+    return s
+
+
+def iter_bridge(rng, q, bridge, k_beams=1):
+    &quot;&quot;&quot;首跳：正确桥接实体在 1/2/3 位；k_beams 决定我们取几个候选。&quot;&quot;&quot;
+    b = bridge[q[&quot;e&quot;]]
+    r = rng.random()
+    pos = 0 if r &lt; P_RANK[0] else (1 if r &lt; P_RANK[0] + P_RANK[1] else 2)
+    cands = [None, None, None]
+    cands[pos] = b
+    for j in range(3):
+        if cands[j] is None:
+            cands[j] = int(rng.integers(0, N_ENT))
+    hit = (pos &lt; k_beams) and (rng.random() &lt; P_EXTRACT)
+    return cands, hit, b
+
+
+def table_ladder(ret_f, ret_c, doc_of, bridge, merged, n=100):
+    rng = np.random.default_rng(11)
+    qs = make_queries(n=n, p_co=0.2)
+    acc = {k: [] for k in (&quot;单跳@10&quot;, &quot;扩池@1000&quot;, &quot;全扫&quot;, &quot;oracle 桥接@10&quot;,
+                           &quot;粒度改造@10（粗切分）&quot;, &quot;迭代 贪心&quot;, &quot;迭代 beam=3&quot;)}
+    for q in qs:
+        e, a, b = q[&quot;e&quot;], q[&quot;a&quot;], bridge[q[&quot;e&quot;]]
+        gold = doc_of[(b, a)]
+        s = hop1_scores(ret_f, q, doc_of, bridge)
+        acc[&quot;单跳@10&quot;].append(float(gold in np.argsort(-s)[:10]))
+        acc[&quot;扩池@1000&quot;].append(float(gold in np.argsort(-s)[:1000]))
+        acc[&quot;全扫&quot;].append(1.0)
+        qb = dict(q, co=True)                       # 把桥接实体注入查询：上界
+        acc[&quot;oracle 桥接@10&quot;].append(float(gold in np.argsort(
+            -hop1_scores(ret_f, qb, doc_of, bridge))[:10]))
+        # 粒度改造：合并后的块同时含桥接事实与目标事实 -&gt; 首轮直接命中
+        if (e, a) in merged:
+            sc = ret_c.score([ENT_BASE + e, ATTR_BASE, ATTR_BASE + a])
+            g2 = [d for d in ret_c.docs if d.get(&quot;kind&quot;) == &quot;merged&quot;
+                  and d[&quot;e&quot;] == e and d[&quot;a&quot;] == a][0]
+            acc[&quot;粒度改造@10（粗切分）&quot;].append(float(g2[&quot;idx&quot;] in np.argsort(-sc)[:10]))
+        else:
+            acc[&quot;粒度改造@10（粗切分）&quot;].append(float(gold in np.argsort(-s)[:10]))
+        for k_beams, key in ((1, &quot;迭代 贪心&quot;), (3, &quot;迭代 beam=3&quot;)):
+            cands, hit, _ = iter_bridge(rng, q, bridge, k_beams)
+            ok = False
+            for c in cands[:k_beams]:
+                if c == b and hit and rng.random() &lt; P_HOP2:
+                    s2 = ret_f.score([ENT_BASE + c, ATTR_BASE + a])
+                    if gold in np.argsort(-s2)[:10]:
+                        ok = True
+            acc[key].append(float(ok))
+    print(&quot;=&quot; * 88)
+    print(&quot;表一：判据阶梯（100 条桥接查询；共现率 p_co=0.2；同源比例 p_same=0.5）&quot;)
+    print(&quot;=&quot; * 88)
+    print(f&quot;{&#39;方案&#39;:&lt;24}{&#39;recall@10&#39;:&gt;11}{&#39;检索轮数&#39;:&gt;10}{&#39;每次检索块数&#39;:&gt;13}&quot;)
+    for k, hops, blocks in ((&quot;单跳@10&quot;, 1, 10), (&quot;扩池@1000&quot;, 1, 1000),
+                            (&quot;全扫&quot;, 1, &quot;全部&quot;), (&quot;oracle 桥接@10&quot;, 1, 10),
+                            (&quot;粒度改造@10（粗切分）&quot;, 1, 10),
+                            (&quot;迭代 贪心&quot;, 2, 20), (&quot;迭代 beam=3&quot;, 2, 60)):
+        print(f&quot;{k:&lt;24}{np.mean(acc[k]):&gt;11.3f}{hops:&gt;10d}{str(blocks):&gt;13}&quot;)
+
+
+def table_crossover(ret_f, doc_of, bridge, n=150):
+    print()
+    print(&quot;=&quot; * 88)
+    print(&quot;表二：收益条件 —— 共现率 p_co 扫描（迭代质量不同，交叉点会移动）&quot;)
+    print(&quot;=&quot; * 88)
+    print(f&quot;{&#39;p_co&#39;:&gt;7}{&#39;单跳@10&#39;:&gt;10}{&#39;扩池@1000&#39;:&gt;11}{&#39;迭代 贪心&#39;:&gt;10}&quot;
+          f&quot;{&#39;迭代 beam=3&#39;:&gt;12}{&#39;最优方案&#39;:&gt;14}&quot;)
+    for p_co in (0.0, 0.1, 0.2, 0.4, 0.6, 0.8, 0.95):
+        rng = np.random.default_rng(21)
+        qs = make_queries(n=n, p_co=p_co, seed=5)
+        a10, a1000, g1, g3 = [], [], [], []
+        for q in qs:
+            gold = doc_of[(bridge[q[&quot;e&quot;]], q[&quot;a&quot;])]
+            s = hop1_scores(ret_f, q, doc_of, bridge)
+            a10.append(float(gold in np.argsort(-s)[:10]))
+            a1000.append(float(gold in np.argsort(-s)[:1000]))
+            for k_beams, box in ((1, g1), (3, g3)):
+                cands, hit, b = iter_bridge(rng, q, bridge, k_beams)
+                ok = False
+                for c in cands[:k_beams]:
+                    if c == b and hit and rng.random() &lt; P_HOP2:
+                        s2 = ret_f.score([ENT_BASE + c, ATTR_BASE + q[&quot;a&quot;]])
+                        if gold in np.argsort(-s2)[:10]:
+                            ok = True
+                box.append(float(ok))
+        m10, m1000, m1, m3 = map(np.mean, (a10, a1000, g1, g3))
+        best = max([(&quot;单跳&quot;, m10), (&quot;扩池&quot;, m1000), (&quot;迭代贪心&quot;, m1), (&quot;迭代beam&quot;, m3)],
+                   key=lambda x: x[1])[0]
+        print(f&quot;{p_co:&gt;7.2f}{m10:&gt;10.3f}{m1000:&gt;11.3f}{m1:&gt;10.3f}{m3:&gt;12.3f}&quot;
+              f&quot;{best:&gt;14}&quot;)
+
+
+def table_propagation():
+    print()
+    print(&quot;=&quot; * 88)
+    print(&quot;表三：误差传播 r^L（单跳成功率 r，链长 L）&quot;)
+    print(&quot;=&quot; * 88)
+    Ls = [1, 2, 3, 4, 5, 6]
+    print(f&quot;{&#39;r&#39;:&gt;6}&quot; + &quot;&quot;.join(f&quot;{&#39;L=&#39; + str(L):&gt;9}&quot; for L in Ls))
+    for r in (0.80, 0.90, 0.95, 0.99):
+        print(f&quot;{r:&gt;6.2f}&quot; + &quot;&quot;.join(f&quot;{r ** L:&gt;9.3f}&quot; for L in Ls))
+    g = P_RANK[0] * P_EXTRACT * P_HOP2
+    b3 = sum(P_RANK) * P_EXTRACT * P_HOP2
+    print(f&quot;\n首跳实测：贪心 r1 = {P_RANK[0]:.2f}x{P_EXTRACT:.2f} = &quot;
+          f&quot;{P_RANK[0] * P_EXTRACT:.3f} -&gt; 两跳端到端 {g:.3f}&quot;)
+    print(f&quot;          beam=3 r1 = {sum(P_RANK):.2f}x{P_EXTRACT:.2f} = &quot;
+          f&quot;{sum(P_RANK) * P_EXTRACT:.3f} -&gt; 两跳端到端 {b3:.3f}&quot;)
+    print(&quot;（beam 把 r1 从 0.570 抬到 0.950，代价是每跳 3 倍检索与 3 倍候选上下文）&quot;)
+
+
+def table_stopping(ret_f, doc_of, bridge, n=300, seed=31):
+    &quot;&quot;&quot;
+    单跳题的查询 = [实体, 目标属性]；桥接题的查询 = [实体, 桥接属性, 目标属性]。
+    桥接题只用&quot;只有桥接事实、没有该属性直接事实&quot;的实体，好让首轮 Top-1 是桥接块。
+    &quot;&quot;&quot;
+    rng = np.random.default_rng(seed)
+    bridge_only = np.arange(0, N_ENT // 5)
+    is_single = np.arange(n) &lt; int(0.6 * n)   # 180 单跳 + 120 桥接（确定性划分）
+    res = {&quot;固定 1 跳&quot;: [], &quot;固定 2 跳&quot;: [], &quot;结构化停止&quot;: []}
+    hops = {k: [] for k in res}
+    for k in range(n):
+        a = int(rng.integers(1, N_ATTR))
+        if is_single[k]:
+            e = int(rng.integers(N_ENT // 5, N_ENT))
+            gold = doc_of[(e, a)]
+            s = ret_f.score([ENT_BASE + e, ATTR_BASE + a])
+            top1 = int(np.argmax(s))
+            one = float(gold in np.argsort(-s)[:10])
+            stop = (ATTR_BASE + a) in ret_f.docs[top1][&quot;tokens&quot;]
+            # 固定 2 跳：把 Top-1 的取值当实体再跳一跳（单跳题上必然错）
+            v = int(ret_f.docs[top1][&quot;v&quot;])
+            s2 = ret_f.score([ENT_BASE + v, ATTR_BASE + a])
+            two = float(gold in np.argsort(-s2)[:10])   # 答案被换成了别的实体的事实
+        else:
+            e = int(bridge_only[rng.integers(0, len(bridge_only))])
+            b = bridge[e]
+            gold = doc_of[(b, a)]
+            s = ret_f.score([ENT_BASE + e, ATTR_BASE, ATTR_BASE + a])
+            top1 = int(np.argmax(s))
+            stop = (ATTR_BASE + a) in ret_f.docs[top1][&quot;tokens&quot;]
+            one = float(gold in np.argsort(-s)[:10])          # p_co=0 -&gt; 0
+            v = int(ret_f.docs[top1][&quot;v&quot;])                    # 桥接块里的实体
+            s2 = ret_f.score([ENT_BASE + v, ATTR_BASE + a])
+            two = float(doc_of[(v, a)] in np.argsort(-s2)[:10])
+            if not (rng.random() &lt; P_HOP2):                   # 第二跳命中率
+                two = 0.0
+        res[&quot;固定 1 跳&quot;].append(one)
+        hops[&quot;固定 1 跳&quot;].append(1)
+        res[&quot;固定 2 跳&quot;].append(two)
+        hops[&quot;固定 2 跳&quot;].append(2)
+        res[&quot;结构化停止&quot;].append(one if stop else two)
+        hops[&quot;结构化停止&quot;].append(1 if stop else 2)
+    print()
+    print(&quot;=&quot; * 88)
+    print(&quot;表四：停止条件（60% 单跳题 + 40% 桥接题，共现率 p_co=0）&quot;)
+    print(&quot;=&quot; * 88)
+    print(f&quot;{&#39;策略&#39;:&lt;18}{&#39;recall@10&#39;:&gt;11}{&#39;平均跳数&#39;:&gt;10}{&#39;平均检索块数&#39;:&gt;14}&quot;)
+    for k in (&quot;固定 1 跳&quot;, &quot;固定 2 跳&quot;, &quot;结构化停止&quot;):
+        print(f&quot;{k:&lt;18}{np.mean(res[k]):&gt;11.3f}{np.mean(hops[k]):&gt;10.2f}&quot;
+              f&quot;{np.mean(hops[k]) * 10:&gt;14.1f}&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    fine, coarse, bridge, doc_of, merged = make_corpus()
+    ret_f, ret_c = Sparse(fine), Sparse(coarse)
+    table_ladder(ret_f, ret_c, doc_of, bridge, merged)
+    table_crossover(ret_f, doc_of, bridge)
+    table_propagation()
+    table_stopping(ret_f, doc_of, bridge)</code></pre>
+<p><strong>实测输出</strong>（<code>python3</code> 直接运行，固定种子；语料 = 2000 实体 × 8 属性 = <strong>16000 个细粒度事实块</strong>，另按同源比例 0.5 生成约 <strong>7000 个粗粒度合并块</strong>）：</p>
+<p><strong>表一 —— 判据阶梯</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>recall@10</th>
+<th>检索轮数</th>
+<th>每次检索块数</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>单跳@10</td>
+<td>0.210</td>
+<td>1</td>
+<td>10</td>
+</tr>
+<tr>
+<td>扩池@1000</td>
+<td>0.440</td>
+<td>1</td>
+<td>1000</td>
+</tr>
+<tr>
+<td>全扫</td>
+<td>1.000</td>
+<td>1</td>
+<td>全部</td>
+</tr>
+<tr>
+<td>oracle 桥接@10</td>
+<td><strong>1.000</strong></td>
+<td>1</td>
+<td>10</td>
+</tr>
+<tr>
+<td>粒度改造@10（粗切分）</td>
+<td>0.610</td>
+<td>1</td>
+<td>10</td>
+</tr>
+<tr>
+<td>迭代 贪心</td>
+<td>0.630</td>
+<td>2</td>
+<td>20</td>
+</tr>
+<tr>
+<td>迭代 beam=3</td>
+<td>0.900</td>
+<td>2</td>
+<td>60</td>
+</tr>
+</tbody></table>
+<p><strong>表三 —— 误差传播</strong>：见正文 §2.2 的表。首跳实测：贪心 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.0278em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">0.60</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.95</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.570</span></span></span></span> → 两跳端到端 <strong>0.559</strong>；beam=3 的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.0278em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1.00</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.95</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.950</span></span></span></span> → <strong>0.931</strong>。</p>
+<p><strong>表四 —— 停止条件</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>策略</th>
+<th>recall@10</th>
+<th>平均跳数</th>
+<th>平均检索块数</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>固定 1 跳</td>
+<td>0.600</td>
+<td>1.00</td>
+<td>10.0</td>
+</tr>
+<tr>
+<td>固定 2 跳</td>
+<td>0.393</td>
+<td>2.00</td>
+<td>20.0</td>
+</tr>
+<tr>
+<td><strong>结构化停止</strong></td>
+<td><strong>0.993</strong></td>
+<td><strong>1.40</strong></td>
+<td><strong>14.0</strong></td>
+</tr>
+</tbody></table>
+<p><strong>表四是四张表里唯一一张&quot;策略选择就能带来 0.6 差距&quot;的表</strong>：固定 2 跳（0.393）比固定 1 跳（0.600）<strong>更差</strong>，因为它在 60% 的单跳题上把普通属性值当成了实体，<strong>替换掉了原本正确的答案</strong>。而结构化停止用 1.40 跳拿到 0.993。</p>
+<h3 id="h-练习">练习<a class="anchor" href="#h-练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><p><strong>在你的系统上跑 §1.1 的两个对照实验。</strong> 取 100 条你认为&quot;需要多跳&quot;的失败查询，做两件事：(a) 手工（或用一个强模型）找出桥接实体并直接加进查询，测 recall@10 的涨幅；(b) 把同一份源文档里被切开的相关块临时合并成一个块，重测单跳。<strong>要求分别给出两个涨幅，并回答：你的&quot;多跳需求&quot;里有多少其实是切分问题？</strong></p>
+</li>
+<li><p><strong>算你的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.0278em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>。</strong> 用 §2.1 的三段分解（检索失败 / 抽取失败 / 跳转失败）在你的数据上分别估计成功率，相乘得到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.0278em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>，再代入 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8413em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8413em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">L</span></span></span></span></span></span></span></span></span></span></span> 算出你现有链长的端到端成功率。<strong>要求给出每一段的测量方法</strong>（不能只给数字）。</p>
+</li>
+<li><p><strong>给 beam 定价。</strong> 在表一的代码上把 beam 从 1 扫到 5，记录 recall@10、平均检索块数与送入上下文的候选数；然后用第 5 章第 4 节的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord"><span class="mord mathrm">MC</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">Δ</span><span class="mord mathnormal" style="margin-right:0.0359em;">q</span><span class="mord">/Δ</span><span class="mord mathnormal">c</span></span></span></span> 找出边际收益开始低于成本的拐点。<strong>回答：为什么拐点通常出现在 3 附近？</strong>（提示：看 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">rank</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 的尾部。）</p>
+</li>
+<li><p><strong>写一个更严格的停止规则。</strong> §4.2 的规则只检查&quot;目标属性词是否出现&quot;。请设计一个能同时处理<strong>聚合型问题</strong>的停止规则（提示：用第 3 节的覆盖率定义&quot;集合是否凑齐&quot;），并在表四的代码上实现，报告它在&quot;单跳/桥接/聚合&quot;三类混合题上的 recall 与平均跳数。</p>
+</li>
+<li><p><strong>构造一个&quot;多跳反而更差&quot;的完整案例。</strong> 用表四的机制，把单跳题的比例从 0.6 调到 0.9，重跑三种策略；再把它调到 0.2。<strong>要求画出（或列表给出）三条曲线，找出&quot;固定 2 跳优于固定 1 跳&quot;的单跳题比例门槛</strong>，并解释这个门槛为什么与 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">rank</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 的头部分布有关。</p>
+</li>
+<li><p><strong>审计一次线上多跳的真实成本。</strong> 取你系统里 50 条走了多跳的请求，逐条记录：跳数、每跳的检索延迟、LLM 调用次数与 token 数、最终是否答对。算出 (a) 多跳请求的 P50/P95 延迟相对单跳的倍数；(b) 每答对一题的平均成本。<strong>回答：如果只保留&quot;结构化停止&quot;会判为需要第二跳的请求，成本与质量各变化多少？</strong></p>
+</li>
+</ol>
+<h3 id="h-小结">小结<a class="anchor" href="#h-小结" aria-label="本节链接">#</a></h3>
+<ul>
+<li><strong>先判别，再实现。</strong> 两个必跑的对照实验：<strong>oracle 桥接</strong>（把中间实体直接塞进查询）给出&quot;查询侧还有多少可挖&quot;的上界（本节实测 0.210 → <strong>1.000</strong>）；<strong>粒度改造</strong>（同源事实合并成块）给出&quot;有多少其实是切分问题&quot;（本节实测 <strong>0.610</strong>，上限 = 同源比例 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">same</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>）。两个实验加起来花不到一天，能省掉几周的迭代开发。</li>
+<li><strong>多跳的形式化是状态机，不是跳数。</strong> 每跳有三种独立失败：检索失败（桥接不在 Top-<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span>）、抽取失败（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">extract</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.95</span></span></span></span>）、跳转失败（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7167em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">hop2</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.98</span></span></span></span>）。<strong>三者处置不同，混在一起就无法优化。</strong></li>
+<li><strong>误差按 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8413em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8413em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">L</span></span></span></span></span></span></span></span></span></span></span> 传播，而它是乐观估计。</strong> <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.90</span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4</span></span></span></span> 只剩 0.656；把 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span></span></span></span> 提到 0.99 则升到 0.961 —— <strong>提高每跳可靠性远比增加跳数重要</strong>。系统性缺陷会让真实值低于 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8413em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8413em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">L</span></span></span></span></span></span></span></span></span></span></span>（一次失败就全错）。</li>
+<li><strong>beam 修的是首跳的排名不确定</strong>（同一实体有多个桥接候选，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">rank</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord">0.60</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">0.30</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">0.10</span><span class="mclose">)</span></span></span></span>）：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.0278em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 从 <strong>0.570</strong> 抬到 <strong>0.950</strong>，两跳端到端从 <strong>0.559</strong> 到 <strong>0.931</strong>，代价是每跳 3 倍检索与约 3 倍候选上下文。<strong>对&quot;桥接根本不在池子里&quot;这种失败，beam 无效</strong> —— 所以阶梯必须先跑。</li>
+<li><strong>收益条件有一个可测的临界量：共现率 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">co</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span></strong>（桥接事实与目标事实同块/同现的比例）。本节实测：单跳@10 随 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">co</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 线性上升（0.000 → 0.940）；<strong>与迭代贪心的交叉点在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6776em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">co</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.5</span></span></span></span>，与迭代 beam=3 的交叉点在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6776em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">co</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.92</span></span></span></span></strong> —— <strong>交叉点位置取决于你的迭代实现质量，所以&quot;我们需不需要多跳&quot;离开实现质量没有答案</strong>。<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7335em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">co</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&gt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.9</span></span></span></span> 时最优方案是<strong>扩池</strong>（0.953），不是任何迭代。</li>
+<li><strong>停止条件只有一种合格写法：结构化的、不依赖未校准分数的规则。</strong> 本节实测：固定 1 跳 0.600、固定 2 跳 <strong>0.393</strong>（无脑多跳主动破坏答案）、结构化停止 <strong>0.993</strong>（1.40 跳）。<strong>&quot;多跳不是越多越好&quot;这句话的精确含义是：在单跳题上多跳一次，是把答案换成另一个实体的事实。</strong></li>
+<li><strong>多跳修不了三件事</strong>：证据不在语料里、桥接实体本身不可检索（那是词汇缺口）、聚合/集合型问题（需要枚举与覆盖判据，不是链）。另外它<strong>会累积上下文</strong>，与第 5 章的&quot;干扰降低证据取用概率&quot;直接冲突 —— 所以每跳应只传桥接实体与必要字段，而不是整块证据。</li>
+<li><strong>一句话</strong>：<strong>多跳的收益上限由&quot;桥接信息是否可检索&quot;决定，实际收益由&quot;每跳的可靠性 × 只在需要时才跳&quot;决定；前者用 oracle 桥接与粒度改造测，后者用 beam 与结构化停止拿。</strong></li>
+</ul>
+<blockquote>
+<p>下一节：多跳与迭代检索凑齐了<strong>一堆</strong>证据 —— 来自多个文档、多轮检索、多个版本。但&quot;一堆排好序的 chunk&quot;不等于&quot;一组能支撑答案的证据集合&quot;：它们可能覆盖不全、可能大半是同一事实的副本、也可能互相矛盾。下一节把装配目标从&quot;排序&quot;换成&quot;选集合&quot;，给出覆盖率、冗余率与冲突暴露率三个可测量，以及带 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1/</span><span class="mord mathnormal">e</span><span class="mclose">)</span></span></span></span> 保证的覆盖贪心。</p>
+</blockquote>

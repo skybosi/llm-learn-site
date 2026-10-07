@@ -1,0 +1,209 @@
+<h2 id="h-布局与内存格式变换为什么-layout-能决定性能">布局与内存格式变换：为什么 layout 能决定性能<a class="anchor" href="#h-布局与内存格式变换为什么-layout-能决定性能" aria-label="本节链接">#</a></h2>
+<p>先看一个能立刻量化的现象：同样 8 个 float32，如果它们在线程间是<strong>连续</strong>的，一次 32 字节访存事务就够；如果它们沿 stride=8 散布，就需要 4 次。数据量一个字节没变，硬件订单数翻了两番。<strong>layout（内存格式 / 数据布局）</strong> 说的就是这件事：一个逻辑张量的元素在物理内存里按什么顺序摆。本课把 layout 写成 <code>shape + stride</code> 的坐标映射，用可打印的数字回答三个问题：换 stride 能不能当零拷贝视图？什么时候必须真的搬数据？编译器怎样把转换的代价降到最小？</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-layout-就是一组-stride">1. layout 就是一组 stride<a class="anchor" href="#h-1-layout-就是一组-stride" aria-label="本节链接">#</a></h4>
+<p>一个 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span> 维张量的逻辑坐标 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">c</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="minner">…</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">n</span><span class="mbin mtight">−</span><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2083em;"><span></span></span></span></span></span></span><span class="mclose">)</span></span></span></span> 到物理偏移的映射是</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathrm" style="margin-right:0.0778em;">off</span></span><span class="mopen">(</span><span class="mord mathnormal">c</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:3.0788em;vertical-align:-1.2777em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.8011em;"><span style="top:-1.8723em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">i</span><span class="mrel mtight">=</span><span class="mord mtight">0</span></span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∑</span></span></span><span style="top:-4.3em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">n</span><span class="mbin mtight">−</span><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.2777em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span></span></p>
+<p><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 就是第 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6595em;"></span><span class="mord mathnormal">i</span></span></span></span> 维的 <strong>stride（步长）</strong>。行优先（row-major / C order）取 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord">3</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">1</span><span class="mclose">)</span></span></span></span>（对 <code>shape=(2,3)</code>）；列优先取 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord">1</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">2</span><span class="mclose">)</span></span></span></span>。同一个 <code>shape=(2,3)</code>，两组 stride 都能做到&quot;每个坐标恰好一个格子&quot;——实测两种排布的偏移集合都是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">{</span><span class="mord">0</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">1</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">2</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">3</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">4</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">5</span><span class="mclose">}</span></span></span></span>。</p>
+<p><strong>dtype 与 layout 是两件正交的事</strong>：物理字节 = 元素数 × dtype 大小，与怎么摆无关。<code>(1,3,224,224)</code> 的 NCHW 与 <code>(1,224,224,3)</code> 的 NHWC 元素数都是 150528，fp32 下都是 0.574 MiB。<strong>layout 转换不改数据量，只改访问顺序</strong>——这正是它便宜又值钱的原因。</p>
+<h4 id="h-2-换个-stride-就能当视图吗">2. 换个 stride 就能当视图吗<a class="anchor" href="#h-2-换个-stride-就能当视图吗" aria-label="本节链接">#</a></h4>
+<p>如果一次转置只改 stride，那就是 O(1) 的元数据操作；如果需要重排物理数据，才是 O(N) 的搬运。MLIR 的 <code>memref</code> 类型本身就带 strided layout（<code>memref&lt;4x8xf32, strided&lt;[8,1]&gt;&gt;</code> 这类写法），所以&quot;视图&quot;在 IR 层面是一等公民。</p>
+<p>判据可以逐坐标核对：源 <code>shape=(3,4)</code>、stride <code>(4,1)</code>，希望目标 <code>shape=(4,3)</code> 复用同一块存储。把源 stride 按同一置换搬过去得到 <code>(1,4)</code>，于是视图访问的偏移序列是 <code>[0,4,8,1,5,9,2,6,10,3,7,11]</code>，而目标连续布局要求的序列是 <code>[0,1,…,11]</code>——<strong>两者不同</strong>。差异来自目标坐标 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord">0</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">1</span><span class="mclose">)</span></span></span></span>：视图把它映射到偏移 4，连续布局要求它落在偏移 1。</p>
+<p>结论要分清：<strong>不带 strides 的框架里，转置是一次真搬运；带 strides 的 IR 里，它可以是一个视图</strong>。但这只是&quot;不用搬&quot;，不等于&quot;性能就好了&quot;——视图把非连续访问推迟给了下游算子，下一节讲的正是这个账。</p>
+<h4 id="h-3-一次访存事务数由沿哪个轴连续决定">3. 一次访存事务数由&quot;沿哪个轴连续&quot;决定<a class="anchor" href="#h-3-一次访存事务数由沿哪个轴连续决定" aria-label="本节链接">#</a></h4>
+<p>把 4×8 的 float32 张量交给 32 个线程，两次分配的差别极大（实测）：</p>
+<table>
+<thead>
+<tr>
+<th>线程轴</th>
+<th>前 8 个访问偏移</th>
+<th>碰到几条 32B 事务</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>沿最后一维（行优先遍历）</td>
+<td><code>[0,1,2,3,4,5,6,7]</code></td>
+<td><strong>1</strong></td>
+</tr>
+<tr>
+<td>内层变动第一维（列优先遍历）</td>
+<td><code>[0,8,16,24,1,9,17,25]</code></td>
+<td><strong>4</strong></td>
+</tr>
+</tbody></table>
+<p>这就是 CNN 里 NCHW↔NHWC 之争的全部技术内容：<strong>卷积的某个核函数实现要求&quot;通道&quot;这一维在访存时连续</strong>，于是要么把激活转成 NHWC，要么接受 4 倍的事务数。layout 决定的不是&quot;对不对&quot;，而是&quot;每次访存打几个包&quot;。</p>
+<h4 id="h-4-三种处理方式以及该选哪种">4. 三种处理方式，以及该选哪种<a class="anchor" href="#h-4-三种处理方式以及该选哪种" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>方式</th>
+<th>做法</th>
+<th>代价</th>
+<th>适用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>编译期改写权重</strong></td>
+<td>权重是常量，直接在编译期转好并固化</td>
+<td>0（离线一次）</td>
+<td>所有权重</td>
+</tr>
+<tr>
+<td><strong>吸收进相邻算子</strong></td>
+<td>把转换与生产者/消费者的循环融合</td>
+<td>省掉一次完整读写</td>
+<td>转换夹在两个可融合算子之间</td>
+</tr>
+<tr>
+<td><strong>插入显式转换节点</strong></td>
+<td>在图中留一个 <code>convert_layout</code></td>
+<td>一次 O(N) 读写</td>
+<td>无法避免的边界（输入输出、跨设备）</td>
+</tr>
+</tbody></table>
+<p>实测的规模感：一层 <code>(3,3,64,64)</code> 卷积权重 36864 个元素 = 0.141 MiB，一个 <code>768×768</code> 线性层权重 589824 个元素 = 2.25 MiB。权重这类常量<strong>转多少次都不进运行时预算</strong>；激活来自输入，转换只能塞进图里。</p>
+<p><figure><img class="md-img" src="content/courses/ml-compilers/assets/chapter-4-figure-03.svg" alt="布局转换的三种处理方式：编译期改写权重、吸收进相邻算子、插入显式转换节点" loading="lazy" decoding="async"><figcaption>布局转换的三种处理方式：编译期改写权重、吸收进相邻算子、插入显式转换节点</figcaption></figure>
+</p>
+<h4 id="h-5-常见坑">5. 常见坑<a class="anchor" href="#h-5-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>把&quot;视图&quot;当成&quot;免费&quot;</strong>：零拷贝转置把非连续访问推给下游，下游可能因此多打 4 倍事务。</li>
+<li><strong>在热路径反复转</strong>：<code>convert → op → convert_back</code> 成对出现时，先问能不能把两次转换合成一次或吸收掉。</li>
+<li><strong>只改 stride 不改消费方</strong>：下游 kernel 假定输入连续（例如按 <code>row*N+col</code> 直接索引）时，stride 视图会读到错数据——这类 bug 在正确性测试里经常&quot;数值看着差不多&quot;。</li>
+<li><strong>忽略对齐与 padding</strong>：为了向量化，编译器可能给行宽补到 16/32 的倍数；这会让&quot;元素数&quot;和&quot;占用字节数&quot;不再成正比。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面这段纯 Python（无第三方依赖）把上面四张表都算出来：坐标→偏移映射、物理字节、转置的视图 vs 连续布局、事务数对比、权重转换的规模感。</p>
+<pre data-lang="python"><code class="language-python"># ---- 第 2 课示例：layout 只是 shape/stride 的一种选择（纯 Python，无第三方依赖）----
+# 坐标 → 物理偏移：off(c) = Σ c_i · stride_i。layout 变换 = 换一组 stride（换不出才真的搬数据）
+
+def enumerate_coords(shape):
+    def walk(coord, i):
+        if i == len(shape):
+            yield tuple(coord); return
+        for c in range(shape[i]):
+            yield from walk(coord + [c], i + 1)
+    return list(walk([], 0))
+
+def rowmajor_strides(shape):
+    st, acc = [0] * len(shape), 1
+    for i in range(len(shape) - 1, -1, -1):
+        st[i] = acc; acc *= shape[i]
+    return tuple(st)
+
+def offset(coord, strides):
+    return sum(c * s for c, s in zip(coord, strides))
+
+def coalesce_groups(offs, words_per_line=8):
+    &quot;&quot;&quot;把一次 warp 的访问偏移按 32 字节（8 个 float32）一行切分，数出碰到几条行。&quot;&quot;&quot;
+    return len({o // words_per_line for o in offs}) if offs else 0
+
+print(&#39;=== 1. 同一逻辑张量，两种 layout：坐标 → 偏移 ===&#39;)
+sh = (2, 3)
+row_major = rowmajor_strides(sh)          # (3, 1)：最后一维最连续
+col_major = rowmajor_strides(sh[::-1])[::-1]  # (1, 2)：第一维最连续（&quot;通道在后&quot;的缩影）
+print(f&#39;  shape={sh}  行优先 stride={row_major}  列优先 stride={col_major}&#39;)
+for c in enumerate_coords(sh):
+    print(f&#39;  坐标 {c}：行优先偏移 {offset(c, row_major)}   列优先偏移 {offset(c, col_major)}&#39;)
+print(&#39;  两者都让&quot;每个坐标恰好占一个格子&quot;：偏移集合分别是&#39;,
+      sorted(offset(c, row_major) for c in enumerate_coords(sh)), &#39;与&#39;,
+      sorted(offset(c, col_major) for c in enumerate_coords(sh)))
+
+print(&#39;\n=== 2. 物理字节只由&quot;元素数 × dtype&quot;决定，与 layout 无关 ===&#39;)
+nchw, nhwc = (1, 3, 224, 224), (1, 224, 224, 3)
+elems = 1
+for s in nchw: elems *= s
+for name, b in ((&#39;float32&#39;, 4), (&#39;float16&#39;, 2), (&#39;int8&#39;, 1)):
+    print(f&#39;  {name:&lt;8} {elems} 个元素 → {elems * b / 2**20:.3f} MiB&#39;)
+print(f&#39;  NCHW {nchw} 与 NHWC {nhwc} 的元素数都是 {elems}：转换不改变&quot;有多少个数&quot;&#39;)
+
+print(&#39;\n=== 3. 转置：换 stride 能不能当视图？看两个坐标是否撞同一格子 ===&#39;)
+src_shape = (3, 4)                       # 源逻辑 (M, N)
+src_st = rowmajor_strides(src_shape)
+# 目标逻辑 shape=(4,3)，希望它复用源的物理存储（零拷贝视图）
+view_st = (src_st[1], src_st[0])         # 把源 stride 按同一置换摆到新 shape 上
+print(f&#39;  源 shape={src_shape} stride={src_st}；目标 shape=(4,3) 视图 stride={view_st}&#39;)
+view_offs = [offset(c, view_st) for c in enumerate_coords((4, 3))]
+mat_offs = [offset(c, rowmajor_strides((4, 3))) for c in enumerate_coords((4, 3))]
+print(f&#39;  视图访问的偏移（按目标行优先顺序）: {view_offs}&#39;)
+print(f&#39;  目标连续布局应有的偏移        : {mat_offs}&#39;)
+print(f&#39;  视图顺序与目标连续顺序相同吗？{view_offs == mat_offs}&#39;
+      f&#39;  ← 视图把 (0,1) 映射到偏移 {offset((0, 1), view_st)}（&quot;沿列跳 {view_st[1]}&quot;），&#39;
+      f&#39;目标连续布局要求 (0,1) 在偏移 {offset((0, 1), rowmajor_strides((4, 3)))}&#39;)
+
+print(&#39;\n=== 4. 一次 warp 的访问沿哪个轴连续，决定碰到几条 32 字节事务 ===&#39;)
+shape = (4, 8); st = rowmajor_strides(shape); n = shape[1]
+row_order = [(i, j) for i in range(shape[0]) for j in range(shape[1])]
+col_order = [(i, j) for j in range(n) for i in range(shape[0])]
+for label, order in ((&#39;沿最后一维连续（行优先遍历）&#39;, row_order),
+                     (&#39;内层变动第一维（列优先遍历）&#39;, col_order)):
+    offs = [offset(c, st) for c in order[:n]]
+    print(f&#39;  {label:&lt;26} 偏移 {offs}&#39;)
+    print(f&#39;  {&quot;&quot;:&lt;26} → {coalesce_groups(offs)} 条 32B 事务/32 线程&#39;
+          f&#39;（全连续时理论下界 {(n * 4 + 31) // 32} 条）&#39;)
+print(&#39;  8 个 float32 = 32 字节：连续 8 个元素占一行；跳 stride 时同一批线程散在多行里。&#39;)
+
+print(&#39;\n=== 5. 权重是编译期常量 → 转换可以在编译期做完 ===&#39;)
+for (shape, name) in (((3, 3, 64, 64), &#39;一层 3×3 卷积权重&#39;), ((768, 768), &#39;一个 768×768 线性层权重&#39;)):
+    e = 1
+    for s in shape: e *= s
+    print(f&#39;  {name:&lt;22} shape={shape} → {e:&gt;7} 个元素 = {e * 4 / 2**20:.3f} MiB (fp32)&#39;)
+print(&#39;  激活来自输入、编译期拿不到值，它的 layout 转换只能塞进图里 ——&#39;)
+print(&#39;  所以图优化的目标不是&quot;消灭所有转换&quot;，而是&quot;让转换能被相邻算子吸收或只在边界发生一次&quot;。&#39;)</code></pre>
+<p>实际运行结果：</p>
+<pre data-lang="text"><code class="language-text">=== 1. 同一逻辑张量，两种 layout：坐标 → 偏移 ===
+  shape=(2, 3)  行优先 stride=(3, 1)  列优先 stride=(1, 2)
+  坐标 (0, 0)：行优先偏移 0   列优先偏移 0
+  坐标 (0, 1)：行优先偏移 1   列优先偏移 2
+  坐标 (0, 2)：行优先偏移 2   列优先偏移 4
+  坐标 (1, 0)：行优先偏移 3   列优先偏移 1
+  坐标 (1, 1)：行优先偏移 4   列优先偏移 3
+  坐标 (1, 2)：行优先偏移 5   列优先偏移 5
+  两者都让&quot;每个坐标恰好占一个格子&quot;：偏移集合分别是 [0, 1, 2, 3, 4, 5] 与 [0, 1, 2, 3, 4, 5]
+
+=== 2. 物理字节只由&quot;元素数 × dtype&quot;决定，与 layout 无关 ===
+  float32  150528 个元素 → 0.574 MiB
+  float16  150528 个元素 → 0.287 MiB
+  int8     150528 个元素 → 0.144 MiB
+  NCHW (1, 3, 224, 224) 与 NHWC (1, 224, 224, 3) 的元素数都是 150528：转换不改变&quot;有多少个数&quot;
+
+=== 3. 转置：换 stride 能不能当视图？看两个坐标是否撞同一格子 ===
+  源 shape=(3, 4) stride=(4, 1)；目标 shape=(4,3) 视图 stride=(1, 4)
+  视图访问的偏移（按目标行优先顺序）: [0, 4, 8, 1, 5, 9, 2, 6, 10, 3, 7, 11]
+  目标连续布局应有的偏移        : [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+  视图顺序与目标连续顺序相同吗？False  ← 视图把 (0,1) 映射到偏移 4（&quot;沿列跳 4&quot;），目标连续布局要求 (0,1) 在偏移 1
+
+=== 4. 一次 warp 的访问沿哪个轴连续，决定碰到几条 32 字节事务 ===
+  沿最后一维连续（行优先遍历）             偏移 [0, 1, 2, 3, 4, 5, 6, 7]
+                             → 1 条 32B 事务/32 线程（全连续时理论下界 1 条）
+  内层变动第一维（列优先遍历）             偏移 [0, 8, 16, 24, 1, 9, 17, 25]
+                             → 4 条 32B 事务/32 线程（全连续时理论下界 1 条）
+  8 个 float32 = 32 字节：连续 8 个元素占一行；跳 stride 时同一批线程散在多行里。
+
+=== 5. 权重是编译期常量 → 转换可以在编译期做完 ===
+  一层 3×3 卷积权重            shape=(3, 3, 64, 64) →   36864 个元素 = 0.141 MiB (fp32)
+  一个 768×768 线性层权重       shape=(768, 768) →  589824 个元素 = 2.250 MiB (fp32)
+  激活来自输入、编译期拿不到值，它的 layout 转换只能塞进图里 ——
+  所以图优化的目标不是&quot;消灭所有转换&quot;，而是&quot;让转换能被相邻算子吸收或只在边界发生一次&quot;。</code></pre>
+<p>三处可核对的结论：<strong>stride 是布局的全部信息</strong>（两种排布偏移集合完全相同，说明&quot;逻辑张量&quot;没变，变的只是映射）；<strong>转置在 stride 模型下是一个视图、在连续布局下是一次搬运</strong>（视图偏移序列与目标连续序列不同）；<strong>同一份数据的访问顺序能让事务数差 4 倍</strong>（1 vs 4），这是 layout 影响性能的最短因果链。</p>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选，需自备 GPU 或云上按需开一台：在真实框架里看 layout 的代价 ----
+# PyTorch 里 .contiguous() 就是一次显式搬运，转置后接 .contiguous() 会触发全量拷贝：
+#   python3 -c &quot;import torch; x=torch.randn(3,4); y=x.t(); print(y.is_contiguous(), y.stride()); \
+#               print(y.contiguous().stride())&quot;
+# 想看编译器的 layout 决策（需 torch.compile 环境）：
+#   TORCH_LOGS=output_code python3 your_model.py    # 打印生成代码，观察其中的 stride/索引写法
+# 没有 GPU 也能完成本课：上面的 Python 已经把坐标映射、事务数与权重规模全部算出来了。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：给 <code>enumerate_coords</code> 加一个 <code>slices</code> 参数，模拟 <code>x[:, ::2]</code> 这类切片：写出它的 <code>shape</code> 与 <code>stride</code>，并验证&quot;切片是视图、不搬数据&quot;（偏移集合是原集合的子集）。</li>
+<li><strong>解释</strong>：为什么&quot;沿最后一维连续&quot;能省事务，而&quot;沿第一维连续&quot;不能？用第 1 节的 <code>off(c)</code> 公式说明这跟哪一个 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 有关。</li>
+<li><strong>对比/验证</strong>：把第 4 节的行优先/列优先遍历改成 stride <code>(8, 1)</code> 与 <code>(1, 4)</code> 两组，重跑并记录事务数；再用第 3 章的 bank conflict 结论解释两者的差别。</li>
+<li><strong>思考</strong>：如果某个算子的最优 layout 与它上游一致、却与下游冲突，而两者都可以融合，编译器应该把转换放在哪一侧？给出你的判据（提示：算哪一侧的读写量更大）。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>MLIR 官方文档（<code>memref</code> 类型的 strided layout 与 <code>memref.transpose</code> / <code>memref.reinterpret_cast</code> 等视图操作——&quot;layout 变换可以是零拷贝视图&quot;的一手依据）：<a href="https://mlir.llvm.org/docs/Dialects/MemRef/" target="_blank" rel="noopener noreferrer">https://mlir.llvm.org/docs/Dialects/MemRef/</a></li>
+<li>Tianqi Chen et al., <em>TVM: An Automated End-to-End Optimizing Compiler for Deep Learning</em>（OSDI&#39;18；图级优化把 layout 变换与算子融合、内存规划放在同一层处理）：<a href="https://www.usenix.org/conference/osdi18/presentation/chen" target="_blank" rel="noopener noreferrer">https://www.usenix.org/conference/osdi18/presentation/chen</a></li>
+<li>Lianmin Zheng et al., <em>The Deep Learning Compiler: A Comprehensive Survey</em>（第 5 节对 layout 与数据格式相关优化的归类，以及&quot;编译期常量转换&quot;这一思路）：<a href="https://arxiv.org/abs/2002.03794" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2002.03794</a></li>
+<li>OpenXLA 官方文档（XLA 的 shape/layout 语义与后端如何消费布局信息）：<a href="https://openxla.org/xla" target="_blank" rel="noopener noreferrer">https://openxla.org/xla</a></li>
+</ul>
+<p><a href="#/l/mlc-ch4-l3">下一课：内存规划与复用：生命周期分析与显存峰值</a></p>

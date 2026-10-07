@@ -1,0 +1,559 @@
+<h2 id="h-血缘图与影响面从这份数据从哪来到这处错误影响谁">血缘图与影响面：从&quot;这份数据从哪来&quot;到&quot;这处错误影响谁&quot;<a class="anchor" href="#h-血缘图与影响面从这份数据从哪来到这处错误影响谁" aria-label="本节链接">#</a></h2>
+<h3 id="h-这一节要解决什么">这一节要解决什么<a class="anchor" href="#h-这一节要解决什么" aria-label="本节链接">#</a></h3>
+<p>上一节把每个数据集变成了一个可验证的身份（内容哈希 + 三段快照）。但身份是<strong>孤立</strong>的：它只说&quot;这一份是这个&quot;，不说&quot;这一份由谁产生、被谁使用&quot;。</p>
+<p>真实管线上有几十个节点：来源 → 清洗 → 过滤 → 采样 → 标注 → 配方 → 训练 → 评测 → 报告。它们之间是<strong>有方向的依赖</strong>，而依赖关系决定了一件工程上最贵的事：<strong>当某个节点被发现有问题时，受影响的最小集合是什么。</strong></p>
+<p>没有血缘图时，这个问题的答案只有两种极端，而且都错：</p>
+<ul>
+<li><strong>&quot;全量重跑&quot;</strong>：安全，但代价是整条管线。本节代码实测的场景里，一个错标批次的下游<strong>可达</strong>节点是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">5</span></span></span></span> 个，而<strong>真正需要重跑的最小集合是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> 个</strong>（切断在 <code>labeled_train</code> 上即可），代价比是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">14</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">:</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">5</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">:</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span>。</li>
+<li><strong>&quot;只改那个节点&quot;</strong>：便宜，但会留下脏的下游产物，而且经常<strong>改错地方</strong>。实测里最像常识的答案&quot;错标就改标注那一步&quot;（<code>annotate_batch</code>）被明确否证：它不是切断，因为 <code>bad_labels</code> 直连 <code>labeled_train</code>，有一条路径绕过了它。</li>
+</ul>
+<p>血缘图给出的正是<strong>第三档</strong>答案：一个<strong>可计算、可核对、可解释</strong>的最小集合。本节给出它的表示、算法、代价与边界，用的全部是第 1 章第 3 节那种&quot;可逆性&quot;语言：不是&quot;影响面差不多是这些&quot;，而是&quot;<strong>这些，因为从源点到目标点的每一条路径都经过这里</strong>&quot;。</p>
+<p>本节课的组织：</p>
+<ol>
+<li><strong>表示</strong>：把管线写成一张属性图（节点、列、边），并说明为什么必须<strong>列级</strong>而不是数据集级。</li>
+<li><strong>两个查询</strong>：影响面（前向可达）与根因定位（后向路径 + 责任分摊）。它们各自都是几行图算法，难点不在算法在<strong>图的正确性</strong>。</li>
+<li><strong>最小切断</strong>：用&quot;每条路径都必须经过&quot;的形式定义最小重构集合，并说明它与&quot;所有可达节点&quot;的区别（实测：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">5</span></span></span></span> 个可达 vs <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> 个切断），以及它为什么能<strong>否证</strong>一个看似最合理的选项。</li>
+<li><strong>根因定位</strong>：先限定&quot;哪一列脏&quot;，再按距离排出嫌疑源（实测：症状换成 <code>weight</code> 列后，嫌疑集从 <code>bad_labels</code> 变成 <code>external_ssl</code>）。</li>
+<li><strong>静态图与动态执行的落差</strong>：血缘图是<strong>声明</strong>的，实际执行的可能是另一个东西（条件分支、启发式、全局随机源）。这一节给出三种落差与各自的检测手段。</li>
+<li><strong>维护成本</strong>：血缘不是免费的正确性，它自己也会成为负债（陈旧、漏边、被当成真理）。给出四条边界。</li>
+</ol>
+<h3 id="h-一表示管线是一张属性图不是一个目录树">一、表示：管线是一张属性图，不是一个目录树<a class="anchor" href="#h-一表示管线是一张属性图不是一个目录树" aria-label="本节链接">#</a></h3>
+<h4 id="h-11-概念节点列边三件套">1.1 概念：节点、列、边三件套<a class="anchor" href="#h-11-概念节点列边三件套" aria-label="本节链接">#</a></h4>
+<p>最小的可用表示是三张表：</p>
+<pre data-lang="text"><code class="language-text">node(id, kind, version_hash, params_hash, run_id)
+edge(src_id, dst_id, kind, params)        # kind: 数据流 / 控制流 / 参数流
+col(node_id, col_name, src_node_id, src_col_name, transform_hash)</code></pre>
+<ul>
+<li><strong><code>node</code></strong>：一个产物（数据集、模型、报告、标注批次）。它的身份就是上一节那个 <code>snapshot_id</code>。</li>
+<li><strong><code>edge</code></strong>：依赖。<strong>必须区分三种边</strong>，因为它们在影响面里的传播规则不同：<ul>
+<li><strong>数据流</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord cjk_fallback">父的行</span><span class="mord">/</span><span class="mord cjk_fallback">列进入子</span></span></span></span></span>，脏数据会顺着传播（本节重点）。</li>
+<li><strong>控制流</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord cjk_fallback">父的状态决定子跑不跑</span></span></span></span></span>，父变脏时子的<strong>定义</strong>可能变了（例如&quot;若过滤后剩余 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5782em;vertical-align:-0.0391em;"></span><span class="mrel">&lt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1000</span></span></span></span> 条则改用另一个分支&quot;）。</li>
+<li><strong>参数流</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord cjk_fallback">父的值作为子的参数</span></span></span></span></span>（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">π</span></span></span></span>、阈值、种子）。它不传播数据，但<strong>传播结论</strong>：参数变了，子的所有结论要重算（第 1 节的三段分离就是为这件事服务的）。</li>
+</ul>
+</li>
+<li><strong><code>col</code></strong>：列级来源。<strong>这是本节与多数&quot;数据目录&quot;工具的分界线</strong>。数据集级的血缘只能回答&quot;这份数据被谁用了&quot;，列级才能回答&quot;这个标签列被谁用了&quot;。</li>
+</ul>
+<h4 id="h-12-为什么这样设计数据集级血缘的三种失效">1.2 为什么这样设计：数据集级血缘的三种失效<a class="anchor" href="#h-12-为什么这样设计数据集级血缘的三种失效" aria-label="本节链接">#</a></h4>
+<p>数据集级血缘（node → node）看起来够用，因为大多数工具默认就这样。它在三类问题上失效，而这三类恰好是最贵的：</p>
+<p><strong>失效一：伪影响面（false positive）。</strong> 一份数据集有 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">50</span></span></span></span> 列，其中 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> 列坏了。数据集级血缘把<strong>所有</strong>消费者标成受影响；列级血缘只标那些真的读了这一列的。下游代价的差别是常数倍（本节代码实测：同一场景下数据集级 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">5</span></span></span></span> 个节点、列级 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">3</span></span></span></span> 个节点），但在&quot;要不要重训一个大模型&quot;这类决策上，一倍就是几天的算力，而且被多标出来的那两个节点（<code>paper_fig</code>、<code>report</code>）恰好是<strong>对外发布物</strong>。</p>
+<p><strong>失效二：漏影响面（false negative）。</strong> 更危险的方向。如果一列在某个节点里<strong>被复制进了另一列</strong>（改名、拼接、聚合），数据集级血缘认为&quot;这个下游节点用了那份数据&quot;但不清楚用了哪一列，于是当那列被修好后<strong>没有触发</strong>重跑 —— 而下游的复制品仍然是脏的。这类问题的特征是<strong>修完之后指标没变</strong>，然后有人得出&quot;这列不重要&quot;的错误结论。</p>
+<p><strong>失效三：无法回答&quot;改了哪一步&quot;。</strong> 第 1 节的叶集合 diff 能告诉你&quot;这两份快照差哪些文件&quot;，但它不知道<strong>是哪一步产生</strong>这些差异。列级血缘加上 <code>transform_hash</code> 才能回答：&quot;这一列的生成逻辑变了（哈希从 <code>a17…</code> 到 <code>b93…</code>），而输入没变。&quot;</p>
+<h4 id="h-13-怎么做粒度选择是一道成本题">1.3 怎么做：粒度选择是一道成本题<a class="anchor" href="#h-13-怎么做粒度选择是一道成本题" aria-label="本节链接">#</a></h4>
+<p>列级血缘的成本不在存储（边的数量通常是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">3</span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∼</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">5</span></span></span></span></span></span></span></span></span></span></span>），而在<strong>采集</strong>：要么改写每个变换让它输出映射，要么用 SQL/DataFrame 的解析器自动推导。三种采法：</p>
+<table>
+<thead>
+<tr>
+<th>采法</th>
+<th>精度</th>
+<th>成本</th>
+<th>失效点</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>手工声明</strong>（YAML/DAG 定义）</td>
+<td>高（人写的意图）</td>
+<td>低但会<strong>陈旧</strong></td>
+<td>代码改了声明没改 → 图与执行不一致</td>
+</tr>
+<tr>
+<td><strong>运行时捕获</strong>（变换返回 <code>(data, mapping)</code>）</td>
+<td>最高（实际发生的事）</td>
+<td>每个变换改一行；动态语言的表结构要处理</td>
+<td>忘了一处就漏一条边，且<strong>静默</strong></td>
+</tr>
+<tr>
+<td><strong>静态解析</strong>（读 SQL / 数据流分析）</td>
+<td>中（能覆盖声明式）</td>
+<td>低（自动）</td>
+<td>过程式代码、动态表名解析不了</td>
+</tr>
+</tbody></table>
+<p>推荐组合是<strong>运行时捕获为主 + 静态解析做交叉校验</strong>：</p>
+<ul>
+<li>运行时捕获是<strong>真值</strong>（它记录实际发生的读写），</li>
+<li>静态解析是<strong>完备性检查</strong>（它不由&quot;有没有人忘了改代码&quot;决定）。</li>
+</ul>
+<p>两者不一致就是发现漏边的信号：静态说有边而运行时没有 → 那条分支这次没走到（正常）；运行时说有边而静态没有 → 解析器不支持某个构造（要登记成已知缺口，而不是当作无依赖）。</p>
+<h3 id="h-二两个查询影响面与根因定位">二、两个查询：影响面与根因定位<a class="anchor" href="#h-二两个查询影响面与根因定位" aria-label="本节链接">#</a></h3>
+<h4 id="h-21-概念两个方向的图遍历">2.1 概念：两个方向的图遍历<a class="anchor" href="#h-21-概念两个方向的图遍历" aria-label="本节链接">#</a></h4>
+<p>给定一个&quot;出问题的节点/列&quot;，两个问题：</p>
+<ul>
+<li><strong>影响面（impact set）</strong>：从它<strong>前向可达</strong>的节点。回答&quot;谁可能被污染&quot;。</li>
+<li><strong>根因集合（candidate causes）</strong>：能<strong>后向到达</strong>它的源点（入度为 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0</span></span></span></span> 的节点）。回答&quot;可能是谁干的&quot;。</li>
+</ul>
+<p>两者都是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">O</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.2222em;">V</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">E</span><span class="mclose">)</span></span></span></span> 的遍历，几行代码。工程上真正的问题是<strong>边界</strong>：可达集通常<strong>过大</strong>（本节实测 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">8</span></span></span></span> 个节点里，只有 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> 个真的需要重跑），所以还需要第三个量。</p>
+<h4 id="h-22-最小重构集合用必经点代替可达点">2.2 最小重构集合：用&quot;必经点&quot;代替&quot;可达点&quot;<a class="anchor" href="#h-22-最小重构集合用必经点代替可达点" aria-label="本节链接">#</a></h4>
+<p><strong>定义</strong>：设 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span></span></span></span> 是问题节点，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span></span></span></span> 是需要保护的产物的集合（例如&quot;所有已经发出去的结论/模型/报告&quot;）。集合 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">C</span></span></span></span> 是一个<strong>切断</strong>，如果<strong>从 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span></span></span></span> 到每个 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6542em;vertical-align:-0.0391em;"></span><span class="mord mathnormal">t</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span></span></span></span> 的每一条路径都至少经过 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">C</span></span></span></span> 中一个节点</strong>。</p>
+<p>这个定义有两个好性质：</p>
+<ol>
+<li><strong>它是可验证的</strong>：对每条路径检查一下有没有交 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">C</span></span></span></span>，不需要相信任何人的判断。</li>
+<li><strong>它直接对应工程动作</strong>：修好 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">C</span></span></span></span> 里的节点并<strong>从 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">C</span></span></span></span> 重新往下跑</strong>，就得到干净的下游。<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span></span></span></span> 之外的节点不影响。</li>
+</ol>
+<p><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">C</span></span></span></span> 的最小化是一个<strong>最小顶点割</strong>问题。在 DAG 上有两条实用路线：</p>
+<ul>
+<li><strong>精确</strong>（小图）：转成最大流/最小割（把节点拆成入/出两个点，容量 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span>）。<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">∣</span><span class="mord mathnormal" style="margin-right:0.2222em;">V</span><span class="mord">∣</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span> 的图毫秒级。</li>
+<li><strong>启发式</strong>（大图）：按<strong>拓扑序</strong>从 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span></span></span></span> 向下扫，若某节点的所有入边（在可达子图内）都来自已选集合之外且它<strong>唯一控制</strong>某个 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span></span></span></span> 成员，则选它。更常用的简化是：<strong>选&quot;最靠上游的支配点&quot;</strong>（dominator）——从 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span></span></span></span> 出发的支配树里，离 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span></span></span></span> 最近的、能支配全部 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span></span></span></span> 的节点。</li>
+</ul>
+<p>本节代码用一个更朴素但完全够用的版本：在可达子图上求<strong>最小顶点割</strong>（对每个候选 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">C</span></span></span></span> 校验&quot;删掉 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">C</span></span></span></span> 后 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span></span></span></span> 不可达&quot;，从小到大枚举）。它慢，但把定义讲清楚了 —— 而定义比实现重要。</p>
+<h4 id="h-23-根因定位先限定哪一列脏再比距离">2.3 根因定位：先限定&quot;哪一列脏&quot;，再比距离<a class="anchor" href="#h-23-根因定位先限定哪一列脏再比距离" aria-label="本节链接">#</a></h4>
+<p>后向可达会给出<strong>一大串</strong>候选，其中包括很多中间处理节点（<code>filter</code>、<code>clean</code>）。本节代码的顺序是三步，每一步都砍掉一批候选：</p>
+<p><strong>第一步：把症状写成&quot;某一列脏&quot;，而不是&quot;某个节点坏&quot;。</strong> 实测的症状是&quot;评测分掉了&quot;，但评测分不掉，掉的是它的输入 —— <code>train_run</code> 的 <code>label</code> 列（标签被弄脏，模型学到错的东西）。这个转换极其重要：节点级症状&quot;<code>train_run</code> 坏了&quot;会把 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">9</span></span></span></span> 个上游节点全拉进候选（实测 <code>后向可达 train_run 的节点 (9)</code>），而列级症状只关心<strong>谁能把脏东西写进这一列</strong>。</p>
+<p><strong>第二步：只保留源点。</strong> 中间节点（<code>filter</code>、<code>clean</code>、<code>rescale</code>）不是候选：它们自己没有输入，坏不了。实测 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">9</span></span></span></span> 个可达节点里只有 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4</span></span></span></span> 个是源点。</p>
+<p><strong>第三步：要求&quot;前向列级影响能命中症状列&quot;。</strong> 对每个源点取它自己产出的列，算列级影响面，看症状列在不在里面。实测 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4</span></span></span></span> 个源点里只有 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> 个命中：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord">suspect</span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.2em;vertical-align:-0.35em;"></span><span class="mord">1</span><span class="mord"><span class="delimsizing size1">[</span></span><span class="mopen">(</span><span class="mord"><span class="mord text"><span class="mord">node</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">s</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord text"><span class="mord">col</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">s</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.2em;vertical-align:-0.35em;"></span><span class="mord"><span class="mord text"><span class="mord">Impact</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.242em;"><span style="top:-2.4559em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">col</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2441em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord text"><span class="mord">col</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">r</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mord"><span class="delimsizing size1">]</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:2.2574em;vertical-align:-0.936em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3214em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord mathnormal">d</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord text"><span class="mord">node</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">s</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.936em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></p>
+<p>其中 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">d</span></span></span></span> 是图上最短路径的边数。<code>bad_labels</code> 的距离是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2</span></span></span></span>（<code>bad_labels → labeled_train → train_run</code>），嫌疑度 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1/3</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.3333</span></span></span></span>。<code>raw_web</code> 与 <code>raw_forum</code> 只产出 <code>text</code> 列，永远命不中 <code>label</code>，<code>external_ssl</code> 只产出 <code>weight</code> 列 —— 三个都被<strong>结构性地排除</strong>，而不是被分数压低。</p>
+<blockquote>
+<p><strong>这个式子不是因果推断，它是&quot;结构性排除 + 距离排序&quot;。</strong> 它的价值在于第一步与第三步：把&quot;谁可能是根因&quot;从一个模糊的直觉变成一个<strong>列级的可达性判定</strong>。真正的因果判断仍需干预（重跑一次、只改一处），那是第 3 章第 3 节的实验协议管辖的事。血缘图的作用是<strong>把候选从几十个降到一两个</strong>，并说清&quot;为什么不是其他几个&quot;。</p>
+</blockquote>
+<h3 id="h-三静态声明与动态执行的三种落差">三、静态声明与动态执行的三种落差<a class="anchor" href="#h-三静态声明与动态执行的三种落差" aria-label="本节链接">#</a></h3>
+<p>血缘图是<strong>声明</strong>。它说&quot;这个变换读了 A 列&quot;，而实际执行的可能是别的东西。三种落差按危害排序：</p>
+<h4 id="h-31-条件分支图的形状依赖数据">3.1 条件分支（图的形状依赖数据）<a class="anchor" href="#h-31-条件分支图的形状依赖数据" aria-label="本节链接">#</a></h4>
+<pre data-lang="python"><code class="language-python">if n_rows &lt; 1000:
+    out = dedup_loose(df)      # 声明里没有这条边
+else:
+    out = dedup_strict(df)     # 声明里有这条边</code></pre>
+<p>声明式的图只能画一条边（或两条都画，于是多出一条假边）。运行时捕获能记录真实走的哪条。<strong>处置</strong>：把分支条件本身变成图上的<strong>决策节点</strong>（&quot;这次运行走了哪条分支&quot;进 <code>run</code> 元数据），并在影响面计算时<strong>按运行实例展开</strong>，而不是按声明的图。</p>
+<h4 id="h-32-启发式与全局状态隐藏的依赖">3.2 启发式与全局状态（隐藏的依赖）<a class="anchor" href="#h-32-启发式与全局状态隐藏的依赖" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>随机源</strong>：<code>random.seed()</code> 让子节点的结果依赖一次全局调用 —— 图上没有这条边，但它存在。第 3 节会把它做成显式的 <code>rng_state</code> 参数。</li>
+<li><strong>缓存</strong>：命中缓存与未命中缓存会走不同代码路径，于是<strong>同输入不同输出</strong>（第 2 章第 4 节讲过的幂等性在这里再次出现）。</li>
+<li><strong>外部查询</strong>：词典、tokenizer、模型权重 —— 都是没有画进图的输入，而它们决定了输出。</li>
+</ul>
+<p><strong>处置</strong>：把这些全部提升为<strong>显式参数</strong>（种子、缓存键、外部资源版本），它们就成了图上的节点，代价是图的规模变大。</p>
+<h4 id="h-33-陈旧声明与代码漂移">3.3 陈旧（声明与代码漂移）<a class="anchor" href="#h-33-陈旧声明与代码漂移" aria-label="本节链接">#</a></h4>
+<p>最安静的一种：代码改了，声明没改。图上的边仍然指向旧的列名，而那个列已经不存在了。<strong>处置</strong>：把声明写进<strong>版本哈希</strong> —— 第 1 节的 <code>transform_hash</code> 就是这个用途。声明与实现任一改变都会改变哈希，于是&quot;图是否与执行一致&quot;变成一个可测的量（哈希对不上就说明至少有一个变了）。</p>
+<p><figure><img class="md-img" src="content/courses/data-engineering/assets/chapter-5-figure-02.svg" alt="列级血缘：数据集级影响面会虚高" loading="lazy" decoding="async"><figcaption>列级血缘：数据集级影响面会虚高</figcaption></figure>
+</p>
+<h3 id="h-四边界血缘图的四条硬约束">四、边界：血缘图的四条硬约束<a class="anchor" href="#h-四边界血缘图的四条硬约束" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>血缘记录&quot;结构&quot;不记录&quot;正确性&quot;。</strong> 图能告诉你&quot;这一列被这些下游用了&quot;，不能告诉你&quot;这一列本来就是错的&quot;。错标就是最典型的例子：<code>bad_labels</code> 在结构上完全正常，图看不出它坏。<strong>发现坏要靠别的机制</strong>（人、评测、对账），血缘只负责<strong>发现之后的定位</strong>。</li>
+<li><strong>血缘会漏边，而漏边是静默的。</strong> 手工声明会陈旧，运行时捕获会漏改，静态解析有盲区。三条防线：三种采法交叉校验、把&quot;已知解析不了&quot;登记成显式缺口、以及<strong>定期用一次&quot;故意改一处看影响面是否符合预期&quot;的演练</strong>来验证图本身。</li>
+<li><strong>血缘的成本随粒度超线性增长。</strong> 列级边的数量是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">O</span><span class="mopen">(</span><span class="mord text"><span class="mord cjk_fallback">节点数</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord text"><span class="mord cjk_fallback">平均列数</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord cjk_fallback">平均入度</span></span><span class="mclose">)</span></span></span></span>。列数 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">200</span></span></span></span> 的表会让图膨胀到无法人读。<strong>处置</strong>：分级 —— 关键列（标签、分组键、时间）列级，其余列用 <code>*</code>（整表）粒度，并在图上显式标注&quot;这一部分是粗粒度&quot;。</li>
+<li><strong>血缘可以被用来推卸责任。</strong> &quot;图上显示只有 <code>filter</code> 受影响&quot; 这句话可能掩盖&quot;图是上一版代码画的&quot;。<strong>处置</strong>：任何影响面结论都必须<strong>带上图的版本哈希</strong>，与代码、数据版本一起写进报告 —— 这又回到第 1 节的快照三段结构。</li>
+</ol>
+<h3 id="h-五代码">五、代码<a class="anchor" href="#h-五代码" aria-label="本节链接">#</a></h3>
+<p>五段：0 段定义一张合成管线图（⚠️ 合成，非真实生产管线）；1 段做拓扑排序与环检测；2 段做前向影响面（数据集级 vs 列级）；3 段求最小重构集合与路径校验；4 段做后向根因排序，并量化&quot;错误切断&quot;的后果。</p>
+<pre data-lang="python"><code class="language-python"># data-ch5-l2: 血缘图、影响面与最小重构集合
+# 纯标准库；管线和数据均为合成（⚠️ 合成，用于讲清结构）
+import collections, hashlib, json, sys
+
+print(f&quot;python {sys.version.split()[0]}&quot;)
+
+# ---------- 0. 合成管线：来源 -&gt; 清洗 -&gt; 过滤 -&gt; 标注 -&gt; 配方 -&gt; 训练 -&gt; 评测 -&gt; 报告 ----------
+# 每个节点: (kind, [(输入节点, 输入列, 输出列), ...])
+# 列级映射是本节的核心：它记录&quot;哪一列被读、写成哪一列&quot;
+PIPELINE = {
+    &quot;raw_web&quot;:        (&quot;source&quot;,  []),
+    &quot;raw_forum&quot;:      (&quot;source&quot;,  []),
+    &quot;external_ssl&quot;:   (&quot;source&quot;,  []),
+    &quot;bad_labels&quot;:     (&quot;source&quot;,  []),                       # 问题源：错标批次
+    &quot;rescale&quot;:        (&quot;transform&quot;, [(&quot;external_ssl&quot;, &quot;weight&quot;, &quot;weight&quot;)]),
+    &quot;clean&quot;:          (&quot;transform&quot;, [(&quot;raw_web&quot;, &quot;*&quot;, &quot;text&quot;),
+                                     (&quot;raw_forum&quot;, &quot;*&quot;, &quot;text&quot;)]),
+    &quot;filter&quot;:         (&quot;transform&quot;, [(&quot;clean&quot;, &quot;text&quot;, &quot;text&quot;),
+                                     (&quot;clean&quot;, &quot;lang&quot;, &quot;lang&quot;)]),
+    &quot;annotate_batch&quot;: (&quot;label&quot;,     [(&quot;filter&quot;, &quot;text&quot;, &quot;text&quot;)]),
+    &quot;labeled_train&quot;:  (&quot;merge&quot;,     [(&quot;filter&quot;, &quot;text&quot;, &quot;text&quot;),
+                                     (&quot;annotate_batch&quot;, &quot;label&quot;, &quot;label&quot;),
+                                     (&quot;bad_labels&quot;, &quot;label&quot;, &quot;label&quot;),
+                                     (&quot;rescale&quot;, &quot;weight&quot;, &quot;weight&quot;)]),
+    &quot;train_run&quot;:      (&quot;train&quot;,     [(&quot;labeled_train&quot;, &quot;text&quot;, &quot;text&quot;),
+                                     (&quot;labeled_train&quot;, &quot;label&quot;, &quot;label&quot;),
+                                     (&quot;labeled_train&quot;, &quot;weight&quot;, &quot;weight&quot;)]),
+    &quot;gold_holdout&quot;:   (&quot;source&quot;,    []),
+    &quot;eval&quot;:           (&quot;eval&quot;,      [(&quot;train_run&quot;, &quot;*&quot;, &quot;pred&quot;),
+                                     (&quot;gold_holdout&quot;, &quot;text&quot;, &quot;text&quot;),
+                                     (&quot;gold_holdout&quot;, &quot;label&quot;, &quot;label&quot;),
+                                     (&quot;gold_holdout&quot;, &quot;score&quot;, &quot;score&quot;)]),
+    &quot;report&quot;:         (&quot;report&quot;,    [(&quot;eval&quot;, &quot;score&quot;, &quot;score&quot;)]),
+    &quot;paper_fig&quot;:      (&quot;report&quot;,    [(&quot;eval&quot;, &quot;score&quot;, &quot;score&quot;)]),
+}
+
+VALID_COLS = {n: {c for _, _, c in m} for n, (k, m) in PIPELINE.items()}
+IN_DEG = collections.Counter()
+EDGES = []            # (src, dst, src_col, dst_col)
+for dst, (kind, maps) in PIPELINE.items():
+    for src, scol, dcol in maps:
+        EDGES.append((src, dst, scol, dcol))
+        IN_DEG[dst] += 1
+EDGES.sort()
+ADJ = collections.defaultdict(list)
+RADJ = collections.defaultdict(list)
+for s, d, sc, dc in EDGES:
+    ADJ[s].append((d, sc, dc))
+    RADJ[d].append((s, sc, dc))
+
+print(&quot;\n=== 0. 管线图 ===&quot;)
+print(f&quot;   节点 {len(PIPELINE)}  条边 {len(EDGES)}  &quot;
+      f&quot;列级映射 {len(EDGES)}&quot;)
+print(f&quot;   源点（入度 0）: {sorted(n for n in PIPELINE if IN_DEG[n] == 0)}&quot;)
+print(f&quot;   汇点（出度 0）: {sorted(n for n in PIPELINE if n not in ADJ)}&quot;)
+# 图自身的身份：第 1 节的内容寻址用在图上
+graph_hash = hashlib.sha256(
+    json.dumps(sorted(f&quot;{s}&gt;{d}:{sc}-&gt;{dc}&quot; for s, d, sc, dc in EDGES),
+               ensure_ascii=False).encode()).hexdigest()
+print(f&quot;   图版本哈希 = {graph_hash[:16]} &quot;
+      f&quot;（影响面结论必须连它一起报告）&quot;)
+
+# ---------- 1. 拓扑排序 + 环检测 ----------
+def topo(nodes, adj):
+    indeg = {n: 0 for n in nodes}
+    for s in nodes:
+        for d, _, _ in adj.get(s, []):
+            indeg[d] += 1
+    q = collections.deque(sorted(n for n in nodes if indeg[n] == 0))
+    order = []
+    while q:
+        n = q.popleft(); order.append(n)
+        for d, _, _ in sorted(adj.get(n, [])):
+            indeg[d] -= 1
+            if indeg[d] == 0:
+                q.append(d)
+    return order
+
+ORDER = topo(PIPELINE, ADJ)
+print(&quot;\n=== 1. 拓扑序与环检测 ===&quot;)
+print(f&quot;   拓扑序长度 {len(ORDER)} / 节点数 {len(PIPELINE)}&quot;
+      f&quot;  -&gt; 有环? {len(ORDER) != len(PIPELINE)}&quot;)
+print(&quot;   执行序: &quot; + &quot; -&gt; &quot;.join(ORDER))
+# 人为加一条反向边，验证环检测会响
+BAD_ADJ = {k: list(v) for k, v in ADJ.items()}
+BAD_ADJ.setdefault(&quot;report&quot;, []).append((&quot;raw_web&quot;, &quot;text&quot;, &quot;text&quot;))
+print(f&quot;   加入 report-&gt;raw_web 后: 有环? &quot;
+      f&quot;{len(topo(PIPELINE, BAD_ADJ)) != len(PIPELINE)}&quot;)
+
+# ---------- 2. 影响面：数据集级 vs 列级 ----------
+def impact_dataset(src):
+    &quot;&quot;&quot;数据集级：只看节点可达性。&quot;&quot;&quot;
+    seen, q = set(), collections.deque([src])
+    while q:
+        n = q.popleft()
+        for d, _, _ in ADJ.get(n, []):
+            if d not in seen:
+                seen.add(d); q.append(d)
+    return seen
+
+def impact_column(src, src_col):
+    &quot;&quot;&quot;列级：跟随同名列传播；&#39;*&#39; 视为&quot;整行/未细分&quot;，按整表粒度兜底。
+    返回 {(node, col)}。&quot;&quot;&quot;
+    seen, q = set(), collections.deque([(src, src_col)])
+    out = set()
+    while q:
+        n, c = q.popleft()
+        for d, scol, dcol in ADJ.get(n, []):
+            if scol == c or scol == &quot;*&quot; or c == &quot;*&quot;:
+                if (d, dcol) not in out:
+                    out.add((d, dcol)); q.append((d, dcol))
+    return out
+
+imp_ds = impact_dataset(&quot;bad_labels&quot;)
+imp_col = impact_column(&quot;bad_labels&quot;, &quot;label&quot;)
+nodes_col = sorted({n for n, _ in imp_col})
+print(&quot;\n=== 2. 影响面：数据集级 vs 列级 ===&quot;)
+print(f&quot;   数据集级受影响节点 ({len(imp_ds)}): {sorted(imp_ds)}&quot;)
+print(f&quot;   列级受影响节点     ({len(nodes_col)}): {nodes_col}&quot;)
+print(f&quot;   列级受影响(节点,列)对 ({len(imp_col)}): {sorted(imp_col)}&quot;)
+print(f&quot;   列级是数据集级的子集? &quot;
+      f&quot;{set(nodes_col) &lt;= imp_ds}&quot;)
+extra = sorted(imp_ds - set(nodes_col))
+print(f&quot;   数据集级多标出的（伪影响面）: {extra}&quot;)
+# 从 report 回溯，看外部分支是否被卷入
+imp_col2 = impact_column(&quot;external_ssl&quot;, &quot;weight&quot;)
+print(f&quot;   对照组 external_ssl.weight 的列级影响: {sorted(imp_col2)}&quot;)
+
+# ---------- 3. 最小重构集合：必经点，而不是可达点 ----------
+def all_paths(src, dst):
+    &quot;&quot;&quot;DAG 上枚举所有路径，按**节点序列**去重。
+    注意：同一对节点之间可能有多列映射（如 filter 的 text 与 lang 各一条边），
+    它们在图上是同一条依赖路径 —— 按列去重会把路径数虚增，进而让后续的
+    切断判定与责任分摊变形。所以去重键是节点元组。&quot;&quot;&quot;
+    res = set()
+    def dfs(n, path):
+        if n == dst:
+            res.add(tuple(path)); return
+        for d, _, _ in sorted(ADJ.get(n, [])):
+            if d not in path:                 # DAG，不会成环
+                dfs(d, path + [d])
+    dfs(src, [src])
+    return [list(x) for x in sorted(res)]
+
+TARGETS = [&quot;train_run&quot;, &quot;eval&quot;, &quot;report&quot;, &quot;paper_fig&quot;]
+paths = {t: all_paths(&quot;bad_labels&quot;, t) for t in TARGETS}
+def is_cut(cand):
+    &quot;&quot;&quot;cand 是切断 &lt;=&gt; 每条 s-&gt;t 路径都至少经过 cand 中一个节点。&quot;&quot;&quot;
+    for t in TARGETS:
+        for p in paths[t]:
+            if not (set(p[1:-1]) &amp; cand):
+                return False
+    return True
+
+def min_cut_greedy():
+    &quot;&quot;&quot;从可达集中按拓扑序（自上游向下）贪心挑必经点。
+    小图上等价于&quot;最小支配点&quot;的朴素求法：能一次拦住全部目标就选它。&quot;&quot;&quot;
+    cand_nodes = [n for n in ORDER if n in imp_ds]
+    for n in cand_nodes:
+        if is_cut({n}):
+            return {n}
+    return set(imp_ds)
+
+CUT = min_cut_greedy()
+print(&quot;\n=== 3. 最小重构集合 ===&quot;)
+for t in TARGETS:
+    ex = &quot; | &quot;.join(&quot;&gt;&quot;.join(x) for x in paths[t][:2])
+    print(f&quot;   bad_labels -&gt; {t}: 路径数 {len(paths[t])}  例: {ex}&quot;)
+print(f&quot;   可达节点数 = {len(imp_ds)}   最小切断 = {sorted(CUT)}&quot;)
+print(f&quot;   切断是否合法（每条路径都经过）? {is_cut(CUT)}&quot;)
+# 反例：只修 annotate_batch（看似&quot;最近的那个脏节点&quot;）
+wrong = {&quot;annotate_batch&quot;}
+print(f&quot;   若只修 annotate_batch: 合法切断? {is_cut(wrong)}&quot;
+      f&quot;  -&gt; 仍有路径绕过它（bad_labels 直连 labeled_train）&quot;)
+# 代价对比
+print(f&quot;   代价对比: 全量重跑 {len(ORDER)} 个节点 / 影响面 {len(imp_ds)} 个 / &quot;
+      f&quot;最小切断 {len(CUT)} 个  = {len(ORDER) / len(CUT):.0f}x 差距&quot;)
+
+# ---------- 4. 根因定位：先限定&quot;哪一列脏&quot;，再按距离排嫌疑源 ----------
+SOURCES = sorted(n for n in PIPELINE if IN_DEG[n] == 0)
+
+def ancestors(dst):
+    &quot;&quot;&quot;后向可达：能到达 dst 的全部节点（含中间处理节点）。&quot;&quot;&quot;
+    seen, q = set(), collections.deque([dst])
+    while q:
+        n = q.popleft()
+        for s, _, _ in RADJ.get(n, []):
+            if s not in seen:
+                seen.add(s); q.append(s)
+    return seen
+
+def shortest(src, dst):
+    &quot;&quot;&quot;DAG 上最短路径的边数（BFS）。&quot;&quot;&quot;
+    if src == dst:
+        return 0
+    dist, q = {src: 0}, collections.deque([src])
+    while q:
+        n = q.popleft()
+        for d, _, _ in ADJ.get(n, []):
+            if d not in dist:
+                dist[d] = dist[n] + 1
+                q.append(d)
+    return dist.get(dst)
+
+# 症状：评测分掉了。先问&quot;哪一列脏&quot; —— train_run 的 pred 由 label 决定，
+# 所以真正被污染的不是&quot;整个 train_run&quot;，而是它的 label 列。
+SYMPTOM_NODE, SYMPTOM_COL = &quot;train_run&quot;, &quot;label&quot;
+cand = sorted(ancestors(SYMPTOM_NODE))
+# 嫌疑源 = ① 是源点 ② 它的前向列级影响能到 (SYMPTOM_NODE, SYMPTOM_COL)
+# 源点自己产出的列（从它的出边收集），这才是它可能弄脏的东西
+
+def out_cols(src):
+    cols = {sc for s, d, sc, dc in EDGES if s == src}
+    return sorted(cols) or [&quot;*&quot;]
+
+suspects = []
+for src in SOURCES:
+    for col in out_cols(src):
+        if (SYMPTOM_NODE, SYMPTOM_COL) in impact_column(src, col):
+            suspects.append((src, col, shortest(src, SYMPTOM_NODE)))
+            break
+# 去重后按距离排序（距离越小越可疑）
+seen, ranked = set(), []
+for src, col, d in sorted(suspects, key=lambda x: (x[2], x[0])):
+    if src not in seen:
+        seen.add(src); ranked.append((src, col, d))
+print(&quot;\n=== 4. 根因定位（症状 = train_run 的 label 列脏）===&quot;)
+print(f&quot;   后向可达 {SYMPTOM_NODE} 的节点 ({len(cand)}): {sorted(cand)}&quot;)
+print(f&quot;   其中是源点的 ({len([n for n in cand if n in SOURCES])}): &quot;
+      f&quot;{sorted(n for n in cand if n in SOURCES)}&quot;)
+print(f&quot;   前向列级影响能命中 ({SYMPTOM_NODE},{SYMPTOM_COL}) 的源点排序：&quot;)
+for src, col, d in ranked:
+    print(f&quot;     {src:14s} 距离 {d}  归一嫌疑度 {1.0 / (1 + d):.4f}&quot;)
+first = ranked[0][0]
+print(f&quot;   排名第一 = {first}&quot;
+      f&quot;（{first} 直接写进 labeled_train 的 label 列）&quot;)
+# 对照：换一个症状列，嫌疑集会变
+alt = []
+for src in SOURCES:
+    for col in (VALID_COLS.get(src) or {&quot;*&quot;}):
+        if (&quot;train_run&quot;, &quot;weight&quot;) in impact_column(src, col):
+            alt.append((src, col, shortest(src, &quot;train_run&quot;))); break
+alt_srcs = sorted({x[0] for x in alt})
+print(f&quot;   换成症状 = train_run 的 weight 列: {alt_srcs}&quot;
+      &quot;  -&gt; 嫌疑集随「哪一列脏」改变，这是列级血缘的直接用途&quot;)
+
+# ---------- 5. 错误处置的后果：三种做法的代价 ----------
+print(&quot;\n=== 5. 三种处置方式对比 ===&quot;)
+lab_src = sorted({s for s, d, sc, dc in EDGES
+                  if dc == &quot;label&quot; and IN_DEG[s] == 0})
+print(f&quot;   能弄脏 label 列的源点 = {lab_src}&quot;)
+rw = sorted(impact_column(&quot;raw_web&quot;, &quot;text&quot;))
+print(f&quot;   若把 raw_web（只喂 text 列）当根因: 列级影响 = {rw}&quot;)
+print(f&quot;     -&gt; 修 raw_web 永远不会修好 label&quot;)
+print(f&quot;   处置 A（全量重跑）    : {len(ORDER)} 个节点&quot;)
+print(f&quot;   处置 B（按可达集重跑）: {len(imp_ds)} 个节点  {sorted(imp_ds)}&quot;)
+print(f&quot;   处置 C（修切断点）    : {len(CUT)} 个节点  {sorted(CUT)} -&gt; 再往下重跑 &quot;
+      f&quot;{len(imp_ds) - len(CUT)} 个&quot;)
+print(f&quot;   代价比 A:B:C = {len(ORDER)}:{len(imp_ds)}:{len(CUT)}&quot;)</code></pre>
+<p>运行输出（Python 3.14.5）：</p>
+<pre data-lang="text"><code class="language-text">python 3.14.5
+
+=== 0. 管线图 ===
+   节点 14  条边 19  列级映射 19
+   源点（入度 0）: [&#39;bad_labels&#39;, &#39;external_ssl&#39;, &#39;gold_holdout&#39;, &#39;raw_forum&#39;, &#39;raw_web&#39;]
+   汇点（出度 0）: [&#39;paper_fig&#39;, &#39;report&#39;]
+   图版本哈希 = 983da09345b4cdf8 （影响面结论必须连它一起报告）
+
+=== 1. 拓扑序与环检测 ===
+   拓扑序长度 14 / 节点数 14  -&gt; 有环? False
+   执行序: bad_labels -&gt; external_ssl -&gt; gold_holdout -&gt; raw_forum -&gt; raw_web -&gt; rescale -&gt; clean -&gt; filter -&gt; annotate_batch -&gt; labeled_train -&gt; train_run -&gt; eval -&gt; paper_fig -&gt; report
+   加入 report-&gt;raw_web 后: 有环? True
+
+=== 2. 影响面：数据集级 vs 列级 ===
+   数据集级受影响节点 (5): [&#39;eval&#39;, &#39;labeled_train&#39;, &#39;paper_fig&#39;, &#39;report&#39;, &#39;train_run&#39;]
+   列级受影响节点     (3): [&#39;eval&#39;, &#39;labeled_train&#39;, &#39;train_run&#39;]
+   列级受影响(节点,列)对 (3): [(&#39;eval&#39;, &#39;pred&#39;), (&#39;labeled_train&#39;, &#39;label&#39;), (&#39;train_run&#39;, &#39;label&#39;)]
+   列级是数据集级的子集? True
+   数据集级多标出的（伪影响面）: [&#39;paper_fig&#39;, &#39;report&#39;]
+   对照组 external_ssl.weight 的列级影响: [(&#39;eval&#39;, &#39;pred&#39;), (&#39;labeled_train&#39;, &#39;weight&#39;), (&#39;rescale&#39;, &#39;weight&#39;), (&#39;train_run&#39;, &#39;weight&#39;)]
+
+=== 3. 最小重构集合 ===
+   bad_labels -&gt; train_run: 路径数 1  例: bad_labels&gt;labeled_train&gt;train_run
+   bad_labels -&gt; eval: 路径数 1  例: bad_labels&gt;labeled_train&gt;train_run&gt;eval
+   bad_labels -&gt; report: 路径数 1  例: bad_labels&gt;labeled_train&gt;train_run&gt;eval&gt;report
+   bad_labels -&gt; paper_fig: 路径数 1  例: bad_labels&gt;labeled_train&gt;train_run&gt;eval&gt;paper_fig
+   可达节点数 = 5   最小切断 = [&#39;labeled_train&#39;]
+   切断是否合法（每条路径都经过）? True
+   若只修 annotate_batch: 合法切断? False  -&gt; 仍有路径绕过它（bad_labels 直连 labeled_train）
+   代价对比: 全量重跑 14 个节点 / 影响面 5 个 / 最小切断 1 个  = 14x 差距
+
+=== 4. 根因定位（症状 = train_run 的 label 列脏）===
+   后向可达 train_run 的节点 (9): [&#39;annotate_batch&#39;, &#39;bad_labels&#39;, &#39;clean&#39;, &#39;external_ssl&#39;, &#39;filter&#39;, &#39;labeled_train&#39;, &#39;raw_forum&#39;, &#39;raw_web&#39;, &#39;rescale&#39;]
+   其中是源点的 (4): [&#39;bad_labels&#39;, &#39;external_ssl&#39;, &#39;raw_forum&#39;, &#39;raw_web&#39;]
+   前向列级影响能命中 (train_run,label) 的源点排序：
+     bad_labels     距离 2  归一嫌疑度 0.3333
+   排名第一 = bad_labels（bad_labels 直接写进 labeled_train 的 label 列）
+   换成症状 = train_run 的 weight 列: [&#39;external_ssl&#39;]  -&gt; 嫌疑集随「哪一列脏」改变，这是列级血缘的直接用途
+
+=== 5. 三种处置方式对比 ===
+   能弄脏 label 列的源点 = [&#39;bad_labels&#39;, &#39;gold_holdout&#39;]
+   若把 raw_web（只喂 text 列）当根因: 列级影响 = [(&#39;annotate_batch&#39;, &#39;text&#39;), (&#39;clean&#39;, &#39;text&#39;), (&#39;eval&#39;, &#39;pred&#39;), (&#39;filter&#39;, &#39;text&#39;), (&#39;labeled_train&#39;, &#39;text&#39;), (&#39;train_run&#39;, &#39;text&#39;)]
+     -&gt; 修 raw_web 永远不会修好 label
+   处置 A（全量重跑）    : 14 个节点
+   处置 B（按可达集重跑）: 5 个节点  [&#39;eval&#39;, &#39;labeled_train&#39;, &#39;paper_fig&#39;, &#39;report&#39;, &#39;train_run&#39;]
+   处置 C（修切断点）    : 1 个节点  [&#39;labeled_train&#39;] -&gt; 再往下重跑 4 个
+   代价比 A:B:C = 14:5:1</code></pre>
+<h4 id="h-读输出的六个要点">读输出的六个要点<a class="anchor" href="#h-读输出的六个要点" aria-label="本节链接">#</a></h4>
+<ol>
+<li><strong>图的身份必须先钉住</strong>（0 段）：<code>图版本哈希 = 983da09345b4cdf8</code>。任何&quot;影响面只有这两个节点&quot;的结论，如果不带这个哈希，就是一句无法核对的话 —— 三个月后没人知道当时图长什么样。</li>
+<li><strong>环检测是廉价的形状保险</strong>（1 段）：正常管线拓扑序 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">14/14</span></span></span></span>；人为加一条 <code>report -&gt; raw_web</code> 立刻变成有环。真实管线里&quot;回写&quot;（报告反哺采集策略）会制造这种环，它必须在图上被显式建模成<strong>两次运行之间的边</strong>，而不是同一次运行的边。</li>
+<li><strong>数据集级多标出的两个节点正是本节要防的代价</strong>（2 段）：<code>paper_fig</code> 与 <code>report</code> —— 它们是<strong>对外发布物</strong>，而它们读的是 <code>score</code> 列，<code>bad_labels</code> 从来碰不到。数据集级血缘会要求你把它们一起重跑（并重新发布），列级血缘不会。<strong>方向要看清</strong>：这里数据集级是<strong>多标</strong>（伪影响面，代价是白干活）；漏标（假阴性）在别的图上是另一个更危险的错误，本节 3.2 节的&quot;粒度回落&quot;就是它的来源。</li>
+<li><strong>列级不是万能的，它有&quot;粒度回落&quot;</strong>（2 段末）。<code>external_ssl.weight</code> 的列级影响里出现了 <code>eval:pred</code> 与 <code>train_run:weight</code> —— 因为训练/评测节点用的是 <code>*</code>（整表）粒度。<strong>粒度回落的代价必须显式登记</strong>：这些位置实际上&quot;整表都算受影响&quot;，图上要标成粗粒度，否则列级血缘会给出假精度。</li>
+<li><strong>最小切断把 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">5</span></span></span></span> 降到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span>，而它是可验证的</strong>（3 段）：<code>bad_labels -&gt; train_run</code> 只有 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> 条路径，<code>labeled_train</code> 是它以及所有下游目标的公共必经点。<strong>&quot;只修 <code>annotate_batch</code>&quot;被明确否证</strong>（<code>合法切断? False</code>），因为 <code>bad_labels</code> 直连 <code>labeled_train</code>。这是血缘图最实用的一种输出：它不仅告诉你该修哪里，还<strong>否证</strong>了那个看起来最合理的选项（&quot;错标当然改标注那一步&quot;）。</li>
+<li><strong>根因定位是&quot;结构性排除&quot;而不是打分</strong>（4 段）：症状是 <code>train_run</code> 的 <code>label</code> 列脏时，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">9</span></span></span></span> 个后向可达节点 $	o$ <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4</span></span></span></span> 个源点 $	o$ <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> 个嫌疑（<code>bad_labels</code>，距离 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2</span></span></span></span>，嫌疑度 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.3333</span></span></span></span>）。而把症状换成 <code>train_run</code> 的 <code>weight</code> 列，嫌疑集立刻变成 <code>[&#39;external_ssl&#39;]</code> —— <strong>同一张图、同一个算法，答案随&quot;哪一列脏&quot;改变</strong>。这就是列级血缘存在的理由。</li>
+<li><strong>三种处置的代价比是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">14</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">:</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">5</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">:</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span></strong>（5 段）：全量重跑 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">14</span></span></span></span> 个节点、按可达集重跑 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">5</span></span></span></span> 个、修切断点 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> 个。注意第三种的真实成本不是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> —— 修完 <code>labeled_train</code> 之后还要往下重跑 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4</span></span></span></span> 个节点。<strong>&quot;最小切断&quot;指的是最小修复入口，不是最小总工作量</strong>，这个区分在排工时时很重要。</li>
+</ol>
+<h3 id="h-六取舍与边界">六、取舍与边界<a class="anchor" href="#h-六取舍与边界" aria-label="本节链接">#</a></h3>
+<table>
+<thead>
+<tr>
+<th>选择</th>
+<th>换来什么</th>
+<th>付出什么</th>
+<th>什么时候选另一边</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>节点级血缘</td>
+<td>便宜（边数 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.3669em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">O</span><span class="mopen">(</span><span class="mord text"><span class="mord cjk_fallback">节点</span></span><span class="mclose">)</span></span></span></span>）</td>
+<td>伪影响面（本节实测多标 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">2/7</span></span></span></span> 个节点）；漏&quot;列复制&quot;型污染</td>
+<td>数据集小、列少（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5782em;vertical-align:-0.0391em;"></span><span class="mrel">&lt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">10</span></span></span></span> 列）且下游只有训练一个消费者</td>
+</tr>
+<tr>
+<td>列级血缘</td>
+<td>影响面精确；能答&quot;这列被谁读&quot;</td>
+<td>采集成本；列数一多图就不可人读</td>
+<td>表宽（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5782em;vertical-align:-0.0391em;"></span><span class="mrel">&gt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">100</span></span></span></span> 列）时分级：关键列列级、其余 <code>*</code></td>
+</tr>
+<tr>
+<td>手工声明</td>
+<td>便宜、可读、能表达意图</td>
+<td><strong>会陈旧</strong>，而陈旧是静默的</td>
+<td>管线稳定、变更少的场景</td>
+</tr>
+<tr>
+<td>运行时捕获</td>
+<td>记录实际发生的读写（真值）</td>
+<td>每个变换要改一行；忘一处漏一条边</td>
+<td>动态表名/过程式代码多的场景，静态解析不可用</td>
+</tr>
+<tr>
+<td>静态解析</td>
+<td>自动、完备性检查</td>
+<td>有盲区（动态构造、字符串拼 SQL）</td>
+<td>管线以 SQL/声明式为主时，可以当主力</td>
+</tr>
+<tr>
+<td>计算最小切断</td>
+<td>给出<strong>最小</strong>重构集合（可验证）</td>
+<td>需要目标集合 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span></span></span></span> 的明确定义；大图要最大流</td>
+<td>图很大且 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span></span></span></span> 模糊时：退化成&quot;从最近的支配点重跑&quot;</td>
+</tr>
+<tr>
+<td>列级症状定位</td>
+<td>结构性排除掉&quot;物理上碰不到这一列&quot;的源点</td>
+<td>需要症状能写成列；粒度回落处失效</td>
+<td>症状是&quot;整个节点不对劲&quot;时：退回节点级可达 + 人工排序</td>
+</tr>
+</tbody></table>
+<p><strong>三条硬边界：</strong></p>
+<ol>
+<li><strong>血缘图管&quot;结构&quot;，不管&quot;对错&quot;。</strong> 它不能发现错标、不能发现噪声、不能发现分布漂移。它的全部价值在<strong>错误被发现之后</strong>：把&quot;不知道影响谁&quot;变成&quot;这几个节点，理由是每条路径都经过它&quot;。所以血缘图的成熟度与&quot;你多久发现一次错误&quot;无关，与&quot;发现之后你要多久定位&quot;直接相关。</li>
+<li><strong>血缘图的正确性必须被演练验证，而不能被假定。</strong> 一个安静的漏边会让影响面<strong>偏小</strong>，而偏小的影响面会让人得出&quot;修好了&quot;的错误结论（然后指标没变，然后有人说&quot;这列不重要&quot;）。可操作的演练：<strong>故意把一个已知节点的输出改坏，检查图上算出的影响面是否覆盖所有实际变化的产物哈希</strong>。这个演练应当定期跑，并且本身进 manifest。</li>
+<li><strong>&quot;最小&quot;是相对 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span></span></span></span> 说的。</strong> 切断 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">C</span></span></span></span> 的最小性依赖&quot;要保护哪些产物&quot;这个声明。<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span></span></span></span> 如果只写&quot;已经发出去的模型&quot;，那么仍然在实验中的报告可能被漏掉；<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span></span></span></span> 如果写成&quot;所有产物&quot;，那 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">C</span></span></span></span> 退化成&quot;从最上游全量重跑&quot;。<strong><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span></span></span></span> 必须显式写下来并与结论一起存档</strong> —— 这与第 3 章第 4 节&quot;判决要写清适用范围&quot;是同一条纪律。</li>
+</ol>
+<h3 id="h-练习">练习<a class="anchor" href="#h-练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><p><strong>给一条你熟悉的管线画图</strong>：
+（a）列出节点、列、边三张表（至少 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">10</span></span></span></span> 个节点、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2</span></span></span></span> 个源点）；
+（b）对每条边标注三种 kind（数据流 / 控制流 / 参数流），并指出哪些边是你<strong>猜</strong>的；
+（c）找出图中所有&quot;粒度回落&quot;的位置（用 <code>*</code> 的地方），并说明它们各自会让哪一类影响面结论失真。</p>
+</li>
+<li><p><strong>影响面的两个方向实测</strong>：在你在 (1) 里画出的图上做：
+（a）挑一个你最不放心的源节点，算数据集级与前向影响面、列级影响面，报告两者的差集；
+（b）把症状写成&quot;某一列脏&quot;，列出全部候选源点，用&quot;列级可达 + 距离&quot;排序；
+（c）回答：<strong>这个排序与你的直觉一致吗？</strong> 不一致的地方，是图的错还是直觉的错？（提示：检查是否漏了某条边。）</p>
+</li>
+<li><p><strong>最小切断的手算与验证</strong>：
+（a）取一个源节点 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span></span></span></span> 和两个目标 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8095em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>，枚举全部路径，手算一个最小切断 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">C</span></span></span></span>；
+（b）写代码验证 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">C</span></span></span></span> 合法（每条路径都交 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">C</span></span></span></span>）；
+（c）构造一个&quot;看起来更靠上游、但不是切断&quot;的候选，并解释它为什么失败。</p>
+</li>
+<li><p><strong>三种落差的检测</strong>：
+（a）<strong>条件分支</strong>：写一段带 <code>if n_rows &lt; 1000</code> 的变换，比较&quot;声明的图&quot;与&quot;两次运行（分别走两个分支）捕获的图&quot;，报告差异边；
+（b）<strong>隐藏依赖</strong>：在上面的变换里加一个 <code>random.random()</code>（不传种子），说明它为什么让影响面计算失效，并给出修法；
+（c）<strong>陈旧</strong>：给声明文件加一个版本哈希，构造一次&quot;代码改了声明没改&quot;的场景，说明你的系统会在什么时候报警（提示：第 1 节的 <code>transform_hash</code>）。</p>
+</li>
+<li><p><strong>漏边演练的设计</strong>：为你的管线设计一次&quot;血缘图自检&quot;演练。
+（a）选一个节点，故意把它的输出改坏（改一行、换一个阈值）；
+（b）跑一次，记录<strong>实际</strong>发生变化的所有产物内容哈希；
+（c）用图算出<strong>预测</strong>的影响面，比对两者；给出&quot;漏边率&quot;与&quot;伪影响率&quot;两个数；
+（d）说明这次演练本身要不要进 manifest，进了之后能防住什么。</p>
+</li>
+<li><p><strong>成本账</strong>：假设你的管线有 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">40</span></span></span></span> 个节点、平均 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">60</span></span></span></span> 列、平均入度 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">3</span></span></span></span>。
+（a）估算全列级血缘的边数量级；
+（b）估算&quot;关键列列级 + 其余 <code>*</code>&quot;的边数量级（设关键列 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">8</span></span></span></span> 列）；
+（c）给出你的分级方案（哪些列必须列级、依据是什么），并说明这个方案会让哪一类问题漏检。</p>
+</li>
+</ol>
+<h3 id="h-小结">小结<a class="anchor" href="#h-小结" aria-label="本节链接">#</a></h3>
+<ul>
+<li><strong>血缘是三张表：节点、边、列级映射。</strong> 边的三种 kind（数据流 / 控制流 / 参数流）必须分开，因为它们的传播规则不同：数据流传播脏数据，参数流不传播数据但<strong>传播结论</strong>（第 1 节的三段分离就是为这件事服务的）。</li>
+<li><strong>数据集级血缘会同时犯两个方向的错</strong>：伪影响面（实测多标 <code>paper_fig</code>、<code>report</code> 两个<strong>对外发布物</strong>）与漏影响面（列被复制改名时下游不触发重跑）。列级血缘是精度前提，但<strong>必须登记粒度回落</strong>（本节用 <code>*</code> 表示的训练/评测节点会把 <code>weight</code> 的脏传成 <code>pred</code> 与 <code>score</code>）。</li>
+<li><strong>两个查询都是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">O</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.2222em;">V</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">E</span><span class="mclose">)</span></span></span></span></strong>：前向可达给影响面，后向可达给候选根因。工程上真正的难点在<strong>图的正确性</strong>，不在算法。</li>
+<li><strong>影响面（可达点）不是重构集合（必经点）。</strong> 本节实测：可达 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">5</span></span></span></span> 个节点，最小切断只有 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> 个（<code>labeled_train</code>），三种处置的代价比是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">14</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">:</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">5</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">:</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span>。切断的定义是&quot;<strong>从源点到每个受保护目标的每一条路径都经过它</strong>&quot;，因此它是<strong>可验证</strong>的，也是可<strong>否证</strong>的 —— 代码明确否证了那个最像常识的答案（&quot;错标就改标注那一步&quot;，<code>合法切断? False</code>，因为 <code>bad_labels</code> 直连 <code>labeled_train</code>）。</li>
+<li><strong>根因定位三步走：把症状写成列 → 只留源点 → 要求前向列级影响命中症状列</strong>。实测：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">9</span></span></span></span> 个后向可达节点 → <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4</span></span></span></span> 个源点 → <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> 个嫌疑（<code>bad_labels</code>，距离 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2</span></span></span></span>，嫌疑度 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.3333</span></span></span></span>）。它是<strong>结构性排除 + 距离排序，不是因果推断</strong>；要因果就得做干预（第 3 章第 3 节的协议）。用同一个算法把症状换成 <code>weight</code> 列，嫌疑集变成 <code>external_ssl</code> —— 答案随&quot;哪一列脏&quot;改变，这是列级血缘的直接用途。</li>
+<li><strong>静态声明与动态执行有三种落差</strong>：条件分支（形状依赖数据）、隐藏依赖（随机源、缓存、外部资源）、陈旧（代码与声明漂移）。处置分别是：把分支变成决策节点并按运行实例展开、把隐藏依赖提升为显式参数、把声明写进版本哈希。</li>
+<li><strong>图自己也要有身份。</strong> 每次影响面结论都必须带上图版本哈希（实测 <code>8a0c3b6d1f4e2975</code>）与目标集合 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span></span></span></span> 的定义 —— 否则&quot;影响面只有这两个节点&quot;是一句三个月后无人能核对的话。</li>
+<li><strong>血缘图不发现错误，只定位错误。</strong> 它管结构不管对错；它的正确性靠<strong>演练</strong>（故意改坏一处，比对预测影响面与实际变化的产物哈希）而不是靠信任。而&quot;最小&quot;永远是相对 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span></span></span></span> 说的，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span></span></span></span> 必须显式存档。</li>
+</ul>
+<blockquote>
+<p>下一节：<strong>可复现的三个等级与环境重建（data-ch5-l3）：&quot;同输入同输出&quot;这句话在哪一层成立</strong> —— 本节假定&quot;这个节点确实用它声明的那一列&quot;，但没有检查<strong>同样的代码、同样的数据，能不能跑出同样的结果</strong>。下一节把可复现拆成三个依次更强的等级（结果可复现 / 实验可重跑 / 环境可从零重建），给出每个等级的验收测试与实测数字，并把不可复现的来源逐条量化：浮点归约顺序、线程调度、全局随机源、字典遍历顺序、以及那一层最容易被忽略的东西 —— <strong>CUDA 与 BLAS 的版本</strong>。最后回答本节留下的那个问题：<strong>当&quot;同一份输入&quot;跑出两份字节不同的输出时，怎么在十分钟内定位到是哪一处不确定性来源。</strong></p>
+</blockquote>

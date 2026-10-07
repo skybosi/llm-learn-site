@@ -1,0 +1,785 @@
+<h2 id="h-重叠策略收益为什么很快饱和代价为什么总是被低估">重叠策略：收益为什么很快饱和，代价为什么总是被低估<a class="anchor" href="#h-重叠策略收益为什么很快饱和代价为什么总是被低估" aria-label="本节链接">#</a></h2>
+<h3 id="h-这一节要解决什么">这一节要解决什么<a class="anchor" href="#h-这一节要解决什么" aria-label="本节链接">#</a></h3>
+<p>上一节证明了：chunk 长短两端都有地板 —— 太短则<strong>答案被边界切断</strong>，太长则<strong>表示被稀释</strong>。最直接的补救是<strong>重叠（overlap）</strong>：让相邻 chunk 共享一段文本，这样&quot;被切断&quot;的地方会在下一个 chunk 里被补全。</p>
+<p>这个想法朴素有效，于是绝大多数系统都设了重叠（常见 10%<del>20%，或&quot;50</del>100 token&quot;）。但很少有系统回答过下面四个问题：</p>
+<ol>
+<li><strong>重叠到底在修复哪种损失？</strong> 它能修&quot;答案跨越边界&quot;，但它能修&quot;答案太长、一个 chunk 装不下&quot;吗？（不能 —— 这是关键区别。）</li>
+<li><strong>重叠的收益曲线是什么形状？</strong> 从 0 到 20% 收益很大，那从 20% 到 40% 呢？（几乎为零。）</li>
+<li><strong>重叠的真实代价有几项？</strong> 通常人们只算&quot;存储涨了&quot;，而真正的代价在<strong>检索结果被同源内容占满</strong>和<strong>上下文预算被浪费</strong>。</li>
+<li><strong>有没有更好的替代方案？</strong> 如果重叠只是&quot;用冗余换覆盖&quot;，那&quot;父子结构&quot;（小单元检索 + 大单元生成）是不是能以更低的代价拿到同样的效果？</li>
+</ol>
+<p>这一节要把这四个问题算清楚。核心结论有两条：</p>
+<blockquote>
+<p><strong>① 重叠的收益有明确上界：它只能把&quot;边界截断损失&quot;降到零，对&quot;答案跨度 &gt; chunk 长度&quot;无能为力。</strong>
+<strong>② 重叠的成本是线性的（体积、重复召回、上下文浪费都 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mrel">∝</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.2173em;vertical-align:-0.345em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8723em;"><span style="top:-2.655em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">s</span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.394em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">L</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.345em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span>），而收益在超过某个点后是指数饱和的 —— 所以存在一个明显小于&quot;直觉值&quot;的最优重叠。</strong></p>
+</blockquote>
+<h3 id="h-一先分清两类损失重叠只能修其中一类">一、先分清两类损失：重叠只能修其中一类<a class="anchor" href="#h-一先分清两类损失重叠只能修其中一类" aria-label="本节链接">#</a></h3>
+<h4 id="h-11-两类损失的严格区分">1.1 两类损失的严格区分<a class="anchor" href="#h-11-两类损失的严格区分" aria-label="本节链接">#</a></h4>
+<p>设有关注跨度（答案所需的连续文本）长度为 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord">ℓ</span></span></span></span>，chunk 长度为 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span></span></span></span>，滑动步长（stride）为 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">L</span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">o</span><span class="mclose">)</span></span></span></span>（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">o</span></span></span></span> 是重叠比例）。</p>
+<table>
+<thead>
+<tr>
+<th>损失类型</th>
+<th>触发条件</th>
+<th>表现</th>
+<th>重叠能否修复</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>A. 边界截断</strong></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8304em;vertical-align:-0.136em;"></span><span class="mord">ℓ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≤</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span></span></span></span>，但答案跨越了两个 chunk 的边界</td>
+<td>两个 chunk 各拿到答案的一半</td>
+<td><strong>能</strong>：重叠使某个 chunk 完整包含它</td>
+</tr>
+<tr>
+<td><strong>B. 跨度超限</strong></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7335em;vertical-align:-0.0391em;"></span><span class="mord">ℓ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&gt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span></span></span></span></td>
+<td>没有任何单 chunk 能装下答案</td>
+<td><strong>不能</strong>：重叠不改变 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span></span></span></span></td>
+</tr>
+</tbody></table>
+<p><strong>这是一个必须首先说清的区分</strong>，因为它在工程上对应两种完全不同的处置：</p>
+<pre><code>出现 A（边界截断）→ 加重叠，或者把切分点对齐到结构边界（第 1 节）
+出现 B（跨度超限）→ 加重叠无效！必须：
+                     ① 增大 L，或
+                     ② 用&quot;父子结构&quot;（检索用小 chunk，生成时扩展到大窗口），或
+                     ③ 检索多个相邻 chunk 并在生成前拼接</code></pre>
+<p><strong>诊断方法</strong>：看&quot;gold 答案跨度长度&quot;的分布。若 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord">ℓ</span></span></span></span> 的 95 分位明显大于 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span></span></span></span>，你遇到的主要是 B 类损失 —— 此时<strong>无论把重叠调到多大都不会有改善</strong>，而这是很多团队反复加重叠却不见效的真实原因。</p>
+<h4 id="h-12-a-类损失到底有多大把边界命中率算出来">1.2 A 类损失到底有多大：把边界命中率算出来<a class="anchor" href="#h-12-a-类损失到底有多大把边界命中率算出来" aria-label="本节链接">#</a></h4>
+<p>假设答案跨度在文档中的位置近似均匀随机。对<strong>不重叠</strong>的定长切分（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span></span></span></span>），一个 chunk 边界落在跨度内部的概率是：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="mopen">(</span><span class="mord text"><span class="mord cjk_fallback">边界落在跨度内</span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.0574em;vertical-align:-0.686em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3714em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">L</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">ℓ</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></p>
+<p>（跨度的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord">ℓ</span></span></span></span> 个位置里，除了第一个位置之外，其余位置若被边界&quot;选中&quot;就构成截断。）更直接地：<strong>一个随机位置的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span></span></span></span>-chunk 完整覆盖 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord">ℓ</span></span></span></span> 跨度的概率是</strong>（第 1 节 2.1 已给过）：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="mopen">(</span><span class="mord text"><span class="mord cjk_fallback">覆盖</span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.0574em;vertical-align:-0.686em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3714em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">L</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">L</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord">ℓ</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:2.0574em;vertical-align:-0.686em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3714em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">L</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">ℓ</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:1em;"></span><span class="mopen">(</span><span class="mord">ℓ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≤</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">L</span><span class="mclose">)</span></span></span></span></span></p>
+<p>所以被截断的概率就是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.2251em;vertical-align:-0.345em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8801em;"><span style="top:-2.655em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">L</span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.394em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">ℓ</span><span class="mbin mtight">−</span><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.345em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span>：</p>
+<table>
+<thead>
+<tr>
+<th><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span></span></span></span> \ <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord">ℓ</span></span></span></span></th>
+<th>3 句</th>
+<th>5 句</th>
+<th>10 句</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>6 句</td>
+<td>0.33</td>
+<td>0.67</td>
+<td>—（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7335em;vertical-align:-0.0391em;"></span><span class="mord">ℓ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&gt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span></span></span></span>，B 类）</td>
+</tr>
+<tr>
+<td>12 句</td>
+<td>0.17</td>
+<td>0.33</td>
+<td>0.75</td>
+</tr>
+<tr>
+<td>24 句</td>
+<td>0.08</td>
+<td>0.17</td>
+<td>0.38</td>
+</tr>
+<tr>
+<td>48 句</td>
+<td>0.04</td>
+<td>0.08</td>
+<td>0.19</td>
+</tr>
+</tbody></table>
+<p><strong>读法</strong>：截断概率主要由<strong>比值 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">ℓ</span><span class="mord">/</span><span class="mord mathnormal">L</span></span></span></span></strong> 决定。当 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7224em;vertical-align:-0.0391em;"></span><span class="mord mathnormal">L</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≫</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord">ℓ</span></span></span></span>（例如 chunk 装 24 句、答案只要 3 句），截断概率已经只剩 8% —— <strong>此时加重叠是在修复一个 8% 的问题，收益天然有限</strong>。</p>
+<blockquote>
+<p>⚠️ 这张表里的&quot;均匀随机&quot;假设与第 1 节 2.1 节的同一个假设。真实文档里答案更容易出现在段落开头（结论句、定义句），所以实际截断率通常<strong>低于</strong>此表 —— 这意味着重叠的实际收益比这里的估算还要小。</p>
+</blockquote>
+<h3 id="h-二滑动窗口重叠为什么能修复边界截断">二、滑动窗口：重叠为什么能修复边界截断<a class="anchor" href="#h-二滑动窗口重叠为什么能修复边界截断" aria-label="本节链接">#</a></h3>
+<h4 id="h-21-机制把槽位对齐变成概率">2.1 机制：把&quot;槽位对齐&quot;变成概率<a class="anchor" href="#h-21-机制把槽位对齐变成概率" aria-label="本节链接">#</a></h4>
+<p>重叠的等价说法是<strong>滑动窗口</strong>：窗口长度 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span></span></span></span>，步长 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">L</span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">o</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&lt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span></span></span></span>。不重叠时（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span></span></span></span>），切分点落在固定的一组位置上；重叠把切分点整体&quot;平移&quot;，等于<strong>引入了 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">L</span><span class="mord">/</span><span class="mord mathnormal">s</span></span></span></span> 套互不相同的切分网格</strong>。</p>
+<p>一个跨度会被切断，当且仅当<strong>没有任何一套网格恰好把它完整包住</strong>。所以问题变成：</p>
+<blockquote>
+<p><strong>一个长度 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span></span></span></span> 的窗口，要想完整包住一个长度 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord">ℓ</span></span></span></span> 的跨度，它的起点必须落在跨度起点之后的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord mathnormal">L</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">ℓ</span><span class="mclose">)</span></span></span></span> 个位置之内。</strong></p>
+</blockquote>
+<p>在&quot;跨度起点位置均匀&quot;的假设下，单套网格能包住该跨度的概率是：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.0574em;vertical-align:-0.686em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3714em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">L</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">L</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord">ℓ</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:2.0574em;vertical-align:-0.686em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3714em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">L</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">ℓ</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></p>
+<p>引入 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span> 套<strong>互相独立</strong>的网格（相位），至少一套成功、从而覆盖该跨度的概率是：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord">Coverage</span></span><span class="mopen">(</span><span class="mord mathnormal">o</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.188em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose"><span class="mclose">)</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.938em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">n</span><span class="mopen mtight">(</span><span class="mord mathnormal mtight">o</span><span class="mclose mtight">)</span></span></span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">n</span><span class="mopen">(</span><span class="mord mathnormal">o</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.4em;vertical-align:-0.95em;"></span><span class="minner"><span class="mopen delimcenter" style="top:0em;"><span class="delimsizing size3">⌈</span></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3603em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">s</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">L</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mclose delimcenter" style="top:0em;"><span class="delimsizing size3">⌉</span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.4em;vertical-align:-0.95em;"></span><span class="minner"><span class="mopen delimcenter" style="top:0em;"><span class="delimsizing size3">⌈</span></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3214em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord mathnormal">o</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.7693em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mclose delimcenter" style="top:0em;"><span class="delimsizing size3">⌉</span></span></span></span></span></span></span></p>
+<p><strong>但必须立刻加一句警告：这个式子高估了重叠的收益。</strong> 因为相邻网格的覆盖事件<strong>高度相关</strong>（包住同一个跨度的相邻窗口往往一起成功或一起失败），真正的独立尝试次数远小于 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">n</span><span class="mopen">(</span><span class="mord mathnormal">o</span><span class="mclose">)</span></span></span></span>。这也是为什么本节代码坚持用<strong>枚举真实网格</strong>来计算覆盖率，而不是用这个闭式近似。</p>
+<h4 id="h-22-收益的形状门槛效应而不是平滑增长">2.2 收益的形状：门槛效应，而不是平滑增长<a class="anchor" href="#h-22-收益的形状门槛效应而不是平滑增长" aria-label="本节链接">#</a></h4>
+<p>即使只看那个偏乐观的近似式，也能看出收益的形状：</p>
+<table>
+<thead>
+<tr>
+<th><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">o</span></span></span></span></th>
+<th><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1/</span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">o</span><span class="mclose">)</span></span></span></span></th>
+<th><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">⌈</span><span class="mord">⋅</span><span class="mclose">⌉</span></span></span></span></th>
+<th><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.5</span></span></span></span> 时的 Coverage</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>0%</td>
+<td>1.00</td>
+<td>1</td>
+<td>0.500</td>
+</tr>
+<tr>
+<td>10%</td>
+<td>1.11</td>
+<td>2</td>
+<td>0.750</td>
+</tr>
+<tr>
+<td>20%</td>
+<td>1.25</td>
+<td>2</td>
+<td>0.750</td>
+</tr>
+<tr>
+<td>25%</td>
+<td>1.33</td>
+<td>2</td>
+<td>0.750</td>
+</tr>
+<tr>
+<td>33%</td>
+<td>1.50</td>
+<td>2</td>
+<td>0.750</td>
+</tr>
+<tr>
+<td>50%</td>
+<td>2.00</td>
+<td>2</td>
+<td>0.750</td>
+</tr>
+<tr>
+<td>67%</td>
+<td>3.00</td>
+<td>3</td>
+<td>0.875</td>
+</tr>
+<tr>
+<td>75%</td>
+<td>4.00</td>
+<td>4</td>
+<td>0.938</td>
+</tr>
+</tbody></table>
+<p><strong><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span> 不是随 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">o</span></span></span></span> 连续增长的，它是一个取整后的阶梯。</strong> 所以覆盖率也是阶梯：</p>
+<ul>
+<li><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">o</span></span></span></span> 从 0 到 10%：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span> 从 1 到 2 —— <strong>一次翻倍</strong>，收益最大的一步；</li>
+<li><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">o</span></span></span></span> 从 10% 到 50%：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span> 一直是 2 —— <strong>这四档重叠的收益完全相同</strong>；</li>
+<li><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">o</span></span></span></span> 从 50% 到 75%：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span> 从 2 到 4 —— 又拿到一次翻倍。</li>
+</ul>
+<p>这解释了工程上那个反复被观察到的现象：<strong>&quot;重叠从 10% 加到 20% 好像没什么变化&quot;</strong> —— 因为它们的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span> 相同，<strong>它们本来就是同一档</strong>。同时也说明&quot;重叠越大越保险&quot;是错的：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">50%</span></span></span></span> 与 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">10%</span></span></span></span> 的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span> 都是 2，而前者要多付 5 倍的索引（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.2173em;vertical-align:-0.345em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8723em;"><span style="top:-2.655em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">s</span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.394em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">L</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.345em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1.11</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">→</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2.00</span></span></span></span>）。</p>
+<p><strong>而真正的收益上界是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose"><span class="mclose">)</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6644em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">n</span></span></span></span></span></span></span></span></span></span></span></span> 的极限 1</strong>：即使 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">o</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">→</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span>（无穷多套网格），覆盖率也只趋近 1，并且<strong>在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span> 很小的时候就已经拿走了大部分</strong>。</p>
+<h4 id="h-22b-一个反直觉的推论粗-chunk-反而不需要大重叠">2.2b 一个反直觉的推论：粗 chunk 反而不需要大重叠<a class="anchor" href="#h-22b-一个反直觉的推论粗-chunk-反而不需要大重叠" aria-label="本节链接">#</a></h4>
+<p>把覆盖率要达到 1 的条件反过来解，得到的是第 2.4 节那条规则的另一种读法：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6684em;vertical-align:-0.024em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">⟺</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8304em;vertical-align:-0.136em;"></span><span class="mord">ℓ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≤</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:1em;"></span><span class="mopen">(</span><span class="mord text"><span class="mord cjk_fallback">单套网格必然成功</span></span><span class="mclose">)</span><span class="mspace" style="margin-right:2em;"></span><span class="mord text"><span class="mord cjk_fallback">或</span></span><span class="mspace" style="margin-right:2em;"></span><span class="mord mathnormal">s</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≤</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal">L</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7778em;vertical-align:-0.0833em;"></span><span class="mord">ℓ</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span></span></p>
+<p>后者的含义是：<strong>只要步长小到&quot;任何跨度最多只跨过一个网格点&quot;，覆盖率就必然为 1</strong>。取最坏情况 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord">ℓ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord">ℓ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mop mtight"><span class="mtight">m</span><span class="mtight">a</span><span class="mtight">x</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7719em;vertical-align:-0.136em;"></span><span class="mord mathnormal">s</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≤</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal">L</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord">ℓ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mop mtight"><span class="mtight">m</span><span class="mtight">a</span><span class="mtight">x</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6684em;vertical-align:-0.024em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:1em;"></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">⟹</span><span class="mspace" style="margin-right:1em;"></span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7719em;vertical-align:-0.136em;"></span><span class="mord mathnormal">o</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≥</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.0574em;vertical-align:-0.686em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3714em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">L</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord">ℓ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mop mtight"><span class="mtight">m</span><span class="mtight">a</span><span class="mtight">x</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.0574em;vertical-align:-0.686em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3714em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">L</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord">ℓ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mop mtight"><span class="mtight">m</span><span class="mtight">a</span><span class="mtight">x</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></p>
+<p><strong>注意 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">o</span></span></span></span> 的分母是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span></span></span></span></strong>：同样一个 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord">ℓ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mop mtight"><span class="mtight">m</span><span class="mtight">a</span><span class="mtight">x</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span></span></span></span> 越大所需的重叠比例越小。这与&quot;chunk 越粗越需要重叠来补救&quot;的直觉<strong>正好相反</strong>。真实的分工是：</p>
+<pre><code>大 L + 小 o ：成本付在&quot;表示被稀释&quot;上（第 1 节的 a 变大）
+小 L + 大 o ：成本付在&quot;索引体积与同源副本&quot;上
+两者都在满足同一个不等式 —— 所以不能只看重叠比例来判断方案好坏</code></pre>
+<h4 id="h-23-一个必须说清的边界重叠不能修复-b-类损失">2.3 一个必须说清的边界：重叠不能修复 B 类损失<a class="anchor" href="#h-23-一个必须说清的边界重叠不能修复-b-类损失" aria-label="本节链接">#</a></h4>
+<p>如果 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7335em;vertical-align:-0.0391em;"></span><span class="mord">ℓ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&gt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span></span></span></span>，则<strong>不存在任何相位</strong>能让单个 chunk 完整覆盖跨度。此时正确的动作是把 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span></span></span></span> 调大（接受表示稀释），或者改用父子结构（第 5 节），<strong>而不是继续加重叠</strong>。</p>
+<p>这就是&quot;重叠调到 50% 还是答不对&quot;的原因：你的失败根本不在边界上，而在尺寸上。</p>
+<h4 id="h-24-最小必要重叠一个可闭式表达的门槛">2.4 最小必要重叠：一个可闭式表达的门槛<a class="anchor" href="#h-24-最小必要重叠一个可闭式表达的门槛" aria-label="本节链接">#</a></h4>
+<p>把&quot;需要多少重叠&quot;反解出来，会得到一个非常干净的规则。<strong>若要求任意长度不超过 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord">ℓ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mop mtight"><span class="mtight">m</span><span class="mtight">a</span><span class="mtight">x</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 的跨度都能被完整覆盖，充分条件是</strong></p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8304em;vertical-align:-0.136em;"></span><span class="mord text"><span class="mord">stride</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≤</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal">L</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord">ℓ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mop mtight"><span class="mtight">m</span><span class="mtight">a</span><span class="mtight">x</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:1em;"></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">⟺</span><span class="mspace" style="margin-right:1em;"></span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.7374em;vertical-align:-1.026em;"></span><span class="mord"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.7114em;"><span style="top:-4.7374em;"><span class="pstrut" style="height:4.7374em;"></span><span class="boxpad"><span class="mord"><span class="mord"><span class="mspace"> </span><span class="mord mathnormal">o</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≥</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3714em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">L</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord">ℓ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mop mtight"><span class="mtight">m</span><span class="mtight">a</span><span class="mtight">x</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace"> </span></span></span></span></span><span style="top:-3.7114em;"><span class="pstrut" style="height:4.7374em;"></span><span class="stretchy fbox" style="height:2.7374em;border-style:solid;border-width:0.04em;"></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.026em;"><span></span></span></span></span></span></span></span></span></span></p>
+<p><strong>推导</strong>：一个长度 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord">ℓ</span></span></span></span> 的跨度最多跨越 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">⌈</span><span class="mord">ℓ</span><span class="mord">/</span><span class="mord mathnormal">s</span><span class="mclose">⌉</span></span></span></span> 个网格区间。要保证它一定被某个窗口完整包含，只需保证它<strong>最多只跨过一个网格点</strong>（这样相邻的那个窗口必然接住它），即 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7719em;vertical-align:-0.136em;"></span><span class="mord mathnormal">s</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≤</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal">L</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord">ℓ</span></span></span></span>。取最坏情况 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord">ℓ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord">ℓ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mop mtight"><span class="mtight">m</span><span class="mtight">a</span><span class="mtight">x</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 即得。</p>
+<p><strong>这个式子的工程含义极强，而且与直觉相反</strong>：</p>
+<table>
+<thead>
+<tr>
+<th><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span></span></span></span></th>
+<th><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord">ℓ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mop mtight"><span class="mtight">m</span><span class="mtight">a</span><span class="mtight">x</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span></th>
+<th>需要的最小重叠 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7719em;vertical-align:-0.136em;"></span><span class="mord mathnormal">o</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≥</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord">ℓ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mop mtight"><span class="mtight">m</span><span class="mtight">a</span><span class="mtight">x</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord">/</span><span class="mord mathnormal">L</span></span></span></span></th>
+</tr>
+</thead>
+<tbody><tr>
+<td>24 句</td>
+<td>12 句</td>
+<td>50%</td>
+</tr>
+<tr>
+<td>48 句</td>
+<td>12 句</td>
+<td>25%</td>
+</tr>
+<tr>
+<td>24 句</td>
+<td>6 句</td>
+<td>25%</td>
+</tr>
+<tr>
+<td>18 句</td>
+<td>12 句</td>
+<td>67%</td>
+</tr>
+<tr>
+<td>24 句</td>
+<td>24 句</td>
+<td><strong>100%（不可能）</strong></td>
+</tr>
+<tr>
+<td>64 句</td>
+<td>24 句</td>
+<td>38%</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p><strong>粗 chunk 反而更省重叠</strong>（因为 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord">ℓ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mop mtight"><span class="mtight">m</span><span class="mtight">a</span><span class="mtight">x</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord">/</span><span class="mord mathnormal">L</span></span></span></span> 更小）。这解释了为什么&quot;大 chunk + 小重叠&quot;与&quot;小 chunk + 大重叠&quot;在某些指标上看起来差不多 —— 它们都在满足同一个不等式，只是分工不同：前者把成本付在表示稀释上，后者付在重叠体积上。</p>
+<p><strong>而真正要避免的是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord">ℓ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mop mtight"><span class="mtight">m</span><span class="mtight">a</span><span class="mtight">x</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span></span></span></span> 的组合</strong>：它要求重叠接近 100%，成本爆炸且不现实。这就是下面那条工程纪律的来源：</p>
+<pre><code>设计目标：让 ℓ_95 / L ≲ 0.3
+  · 若 ℓ_95/L &gt; 0.5 → 不要靠重叠解决，改用父子结构或增大 L
+  · 若 ℓ_95/L ≈ 1   → 重叠在数学上不可能解决问题</code></pre>
+<p>⚠️ 这是<strong>充分条件</strong>（保证 100% 覆盖），实测的最小可用重叠通常低于它 —— 因为跨度起点不是均匀分布的（结论句偏向段落开头），而且接受 98% 而非 100% 覆盖率也能省下不少重叠。代码里会把理论值与扫描得到的实测最小值并排打印，二者之差就是这个保守余量。</p>
+</blockquote>
+<h3 id="h-三重叠的成本三项而且都能算">三、重叠的成本：三项，而且都能算<a class="anchor" href="#h-三重叠的成本三项而且都能算" aria-label="本节链接">#</a></h3>
+<p>大多数讨论只提&quot;存储变大&quot;。实际有三项，其中第二、三项常被忽略，但代价往往更大。</p>
+<h4 id="h-31-成本一索引体积与写入量线性">3.1 成本一：索引体积与写入量（线性）<a class="anchor" href="#h-31-成本一索引体积与写入量线性" aria-label="本节链接">#</a></h4>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:2.0463em;vertical-align:-0.686em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3603em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord text"><span class="mord cjk_fallback">不重叠时的条目数</span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord text"><span class="mord cjk_fallback">索引条目数</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.0463em;vertical-align:-0.686em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3603em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">s</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">L</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.0908em;vertical-align:-0.7693em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3214em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord mathnormal">o</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.7693em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></p>
+<table>
+<thead>
+<tr>
+<th><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">o</span></span></span></span></th>
+<th>条目数倍数</th>
+<th>向量存储倍数</th>
+<th>写入/重建时间倍数</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>0%</td>
+<td>1.00</td>
+<td>1.00</td>
+<td>1.00</td>
+</tr>
+<tr>
+<td>10%</td>
+<td>1.11</td>
+<td>1.11</td>
+<td>1.11</td>
+</tr>
+<tr>
+<td>20%</td>
+<td>1.25</td>
+<td>1.25</td>
+<td>1.25</td>
+</tr>
+<tr>
+<td>50%</td>
+<td>2.00</td>
+<td>2.00</td>
+<td>2.00</td>
+</tr>
+<tr>
+<td>75%</td>
+<td>4.00</td>
+<td>4.00</td>
+<td>4.00</td>
+</tr>
+<tr>
+<td>90%</td>
+<td>10.00</td>
+<td>10.00</td>
+<td>10.00</td>
+</tr>
+</tbody></table>
+<p><strong>注意这里的&quot;条目数&quot;是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.2173em;vertical-align:-0.345em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8723em;"><span style="top:-2.655em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">s</span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.394em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">L</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.345em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span> 倍，而重叠的 token 总量是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">o</span></span></span></span> 倍</strong> —— 两者不同。<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">o</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">50%</span></span></span></span> 意味着索引条目翻倍（1.0 → 2.0），而 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">o</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">90%</span></span></span></span> 意味着翻十倍。<strong>这个增长是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1/</span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">o</span><span class="mclose">)</span></span></span></span> 的形式：在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">o</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">→</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> 时爆炸。</strong> 所以&quot;宁可多切点重叠保险&quot;这个直觉在成本上是危险的。</p>
+<h4 id="h-32-成本二检索结果被同源内容占满这是最容易被忽略的">3.2 成本二：检索结果被同源内容占满（这是最容易被忽略的）<a class="anchor" href="#h-32-成本二检索结果被同源内容占满这是最容易被忽略的" aria-label="本节链接">#</a></h4>
+<p>重叠使得<strong>同一段内容出现在多个相邻 chunk 里</strong>。当这段内容与查询相关时，它的所有副本都会获得相近的高分 —— 于是 Top-<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 被同源 chunk 占满：</p>
+<pre><code>设某段内容在 3 个相邻 chunk 中重复出现，且这 3 个都排进 Top-8
+→ 8 个名额里有 3 个（37.5%）在讲同一件事
+→ 真正需要的&quot;其他相关文档&quot;被挤出去了</code></pre>
+<p><strong>定量地</strong>：设检索返回 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 个 chunk、重叠比例 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">o</span></span></span></span>。一个长度为 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord">ℓ</span></span></span></span> 的目标信息区段，其副本数约为 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">⌈</span><span class="mord">ℓ</span><span class="mord">/</span><span class="mord mathnormal">s</span><span class="mclose">⌉</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">⌈</span><span class="mord">ℓ</span><span class="mord">/</span><span class="mopen">(</span><span class="mord mathnormal">L</span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">o</span><span class="mclose">))⌉</span></span></span></span>。这些副本共享同一个&quot;信息块&quot;，因此<strong>有效信息条目数是</strong>：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0315em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">effective</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.0574em;vertical-align:-0.686em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3714em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord text"><span class="mord cjk_fallback">每个信息块的期望副本数</span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></p>
+<p>当 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">o</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">75%</span></span></span></span> 且 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord">ℓ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span></span></span></span> 时，副本数达到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">L</span><span class="mord">/</span><span class="mord mathnormal">s</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4</span></span></span></span> —— <strong><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">8</span></span></span></span> 的有效信息量只有 2 条</strong>。这与第 1 节 4.3 节的结论（&quot;切得越细越需要多样性控制&quot;）是同一件事的两个侧面。</p>
+<h4 id="h-33-成本三上下文预算被重复-token浪费">3.3 成本三：上下文预算被&quot;重复 token&quot;浪费<a class="anchor" href="#h-33-成本三上下文预算被重复-token浪费" aria-label="本节链接">#</a></h4>
+<p>生成器的上下文预算 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0502em;">B</span></span></span></span> 是硬约束。重叠造成的重复 token 是<strong>纯浪费</strong>：同样的内容被算了两遍，还挤占了本可以放其他文档的空间。</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord cjk_fallback">有效上下文</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0502em;">B</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:2.0074em;vertical-align:-0.686em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3214em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord text"><span class="mord cjk_fallback">平均重复率</span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></p>
+<p>更严重的是，这种浪费会<strong>放大&quot;迷失在中间&quot;效应</strong>：当上下文里充满重复内容时，模型能看到的不同信息更少，而位置偏差（中间信息利用率低）依然存在 —— 于是&quot;看得见的内容&quot;与&quot;有效内容&quot;的差距进一步扩大。</p>
+<h4 id="h-34-一个反直觉的补充重叠会改变-bm25-的统计量">3.4 一个反直觉的补充：重叠会改变 BM25 的统计量<a class="anchor" href="#h-34-一个反直觉的补充重叠会改变-bm25-的统计量" aria-label="本节链接">#</a></h4>
+<p>重叠让同一个词出现在更多的 chunk 里（因为相邻 chunk 共享文本），于是：</p>
+<ul>
+<li><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">d</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:-0.1076em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> <strong>上升</strong> → IDF 整体<strong>下降</strong>；</li>
+<li>全库的分数尺度改变 → 第 1 章讲过的&quot;硬编码阈值失效&quot;问题再次出现；</li>
+<li>极端情况下（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">o</span></span></span></span> 很大），某个词可能出现在 90% 以上的 chunk 里，IDF 趋近 0 —— <strong>它被&quot;自动停用&quot;了</strong>。</li>
+</ul>
+<p><strong>所以&quot;调重叠&quot;不是纯切分操作，它同时是一次检索参数变更。</strong> 这与第 1 节第六节的&quot;切分与检索参数耦合&quot;是同一条纪律。</p>
+<h3 id="h-四权衡把收益与成本放在同一张表上">四、权衡：把收益与成本放在同一张表上<a class="anchor" href="#h-四权衡把收益与成本放在同一张表上" aria-label="本节链接">#</a></h3>
+<h4 id="h-41-把收益与成本放在同一张表上实测">4.1 把收益与成本放在同一张表上（实测）<a class="anchor" href="#h-41-把收益与成本放在同一张表上实测" aria-label="本节链接">#</a></h4>
+<p>不写&quot;目标函数&quot;了 —— 因为这几个量的量纲不同（覆盖率是概率、条目数是倍数、padding 是 token 数），硬凑一个加权和只会引入没有依据的权重。<strong>正确做法是把它们并排放在一张表里，让决策者看到权衡的形状。</strong> 下面这张表来自本节代码在同一份 6000 句语料上的实测（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">24</span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8304em;vertical-align:-0.136em;"></span><span class="mord">ℓ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≤</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">12</span></span></span></span>、预算 2000 token）：</p>
+<table>
+<thead>
+<tr>
+<th><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">o</span></span></span></span></th>
+<th>stride</th>
+<th>覆盖率</th>
+<th>平均 padding</th>
+<th>chunk 消耗</th>
+<th>预算内条目</th>
+<th>条目倍数</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>0%</td>
+<td>24</td>
+<td>0.827</td>
+<td>7.27</td>
+<td>1.17</td>
+<td>71.0</td>
+<td>×1.00</td>
+</tr>
+<tr>
+<td>10%</td>
+<td>22</td>
+<td>0.907</td>
+<td>7.98</td>
+<td>1.09</td>
+<td>76.2</td>
+<td>×1.09</td>
+</tr>
+<tr>
+<td>20%</td>
+<td>19</td>
+<td>0.947</td>
+<td>7.94</td>
+<td>1.05</td>
+<td>79.1</td>
+<td>×1.26</td>
+</tr>
+<tr>
+<td>25%</td>
+<td>18</td>
+<td>0.940</td>
+<td>7.44</td>
+<td>1.06</td>
+<td>78.6</td>
+<td>×1.33</td>
+</tr>
+<tr>
+<td>33%</td>
+<td>16</td>
+<td>0.977</td>
+<td>7.36</td>
+<td>1.02</td>
+<td>81.4</td>
+<td>×1.50</td>
+</tr>
+<tr>
+<td><strong>50%</strong></td>
+<td><strong>12</strong></td>
+<td><strong>1.000</strong></td>
+<td><strong>5.53</strong></td>
+<td><strong>1.00</strong></td>
+<td><strong>83.3</strong></td>
+<td><strong>×2.00</strong></td>
+</tr>
+<tr>
+<td>67%</td>
+<td>8</td>
+<td>1.000</td>
+<td>3.51</td>
+<td>1.00</td>
+<td>83.3</td>
+<td>×3.00</td>
+</tr>
+<tr>
+<td>75%</td>
+<td>6</td>
+<td>1.000</td>
+<td>2.57</td>
+<td>1.00</td>
+<td>83.3</td>
+<td>×4.00</td>
+</tr>
+</tbody></table>
+<p><strong>这张表把本节所有的结论都摆在一起了，逐列读</strong>：</p>
+<ol>
+<li><strong>覆盖率</strong>（收益）：从 0.827 爬到 1.000，<strong>在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">o</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">50%</span></span></span></span> 处触顶</strong>。触顶点与第 2.4 节的闭式规则吻合：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord">ℓ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mop mtight"><span class="mtight">m</span><span class="mtight">a</span><span class="mtight">x</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord">/</span><span class="mord mathnormal">L</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">12/24</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.5</span></span></span></span>。</li>
+<li><strong>平均 padding</strong>（成本三）：在覆盖率触顶<strong>之前</strong>几乎不降（7.27 → 5.53），<strong>触顶之后</strong>才开始明显下降（5.53 → 2.57）。这是一个非常有用的结构性观察：<strong>重叠的第一份收益是&quot;不让答案被切断&quot;（门槛效应），第二份收益才是&quot;少带无关内容&quot;（边际效应）。前者是刚需，后者是锦上添花。</strong></li>
+<li><strong>chunk 消耗</strong>（成本二）在覆盖率触顶后<strong>不动了</strong>（1.00）—— 因为一旦每个跨度都能被单 chunk 装下，取回它只需要 1 个名额。这意味着&quot;减少同源占位&quot;不是靠加重叠，而是靠<strong>让覆盖率达标</strong>。</li>
+<li><strong>预算内条目</strong>在触顶后同样不动（83.3），而<strong>条目倍数</strong>继续翻倍（×2 → ×4）。这是决策的关键一行：<strong>触顶之后，重叠只花钱不办事。</strong></li>
+</ol>
+<blockquote>
+<p><strong>结论：重叠的最优量是&quot;刚好让覆盖率触顶&quot;，而不是某个固定的百分比。</strong> 而这个&quot;刚好&quot;由 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord">ℓ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mop mtight"><span class="mtight">m</span><span class="mtight">a</span><span class="mtight">x</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord">/</span><span class="mord mathnormal">L</span></span></span></span> 决定。把它写成决策规则：</p>
+<pre><code>① 测 ℓ 的分布（p95、max）
+② 算下界 o ≥ ℓ_p95 / L   ← 第 2.4 节的闭式规则
+③ 以该下界为中心向上扫描 0.1 左右，取&quot;覆盖率不再上升&quot;的第一个点
+④ 回报：条目倍数在触顶点上的值就是你要付的成本；若不可接受 → 增大 L 或改父子结构</code></pre>
+<p><strong>&quot;工程上常见的 10%~20%&quot;是这套规则在&quot;<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span></span></span></span> 较大、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord">ℓ</span></span></span></span> 较小&quot;这一特定组合下的结果</strong>（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">512</span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord">ℓ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">50</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∼</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">100</span></span></span></span> token 时 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">ℓ</span><span class="mord">/</span><span class="mord mathnormal">L</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.1</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∼</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.2</span></span></span></span>）。它不是普适常数 —— 这正是本节要推翻的那个误解。</p>
+</blockquote>
+<h4 id="h-42-重叠比例该怎么定一个可执行的判据">4.2 重叠比例该怎么定：一个可执行的判据<a class="anchor" href="#h-42-重叠比例该怎么定一个可执行的判据" aria-label="本节链接">#</a></h4>
+<p>不要用&quot;20%&quot;这种全局常数，用一个流程：</p>
+<pre><code>① 测 gold 答案跨度的长度分布 ℓ
+     · 若 P95(ℓ) &gt; L → 你面对的主要是 B 类损失，先解决 L 或父子结构，别调重叠
+     · 若 P95(ℓ) ≤ L → 进入 ②
+② 估边界截断率 = E[ℓ−1]/L（第 1.2 节）
+     · 若 &lt; 5% → 重叠的收益上限就是 5%，直接设 o = 0，把预算花在别处
+     · 否则进入 ③
+③ 扫描 o ∈ {0, 0.1, 0.2, 0.3, 0.5}，测两个量：
+     · 覆盖率（gold 是否被某个召回 chunk 完整覆盖）
+     · 有效条目数（去掉&quot;同源重复&quot;后的候选数）
+   选使 覆盖率 × 有效条目 最大的 o，并**同时**看延迟与存储是否可接受
+④ 收尾：把 ⑤ 之后的 o 当作&quot;需要回归测试的参数&quot;，而不是永久常数</code></pre>
+<p><strong>关键点</strong>：这个流程的第 ① 步（先判断是哪一类损失）能省掉大量无效调参。</p>
+<h3 id="h-五比加重叠更好的三种方案">五、比&quot;加重叠&quot;更好的三种方案<a class="anchor" href="#h-五比加重叠更好的三种方案" aria-label="本节链接">#</a></h3>
+<p>如果重叠的本质是&quot;用冗余换覆盖&quot;，那么必然存在<strong>更低冗余的替代方案</strong>。三种在实践中常见的替代：</p>
+<p><figure><img class="md-img" src="content/courses/rag-systems/assets/chapter-2-figure-02.svg" alt="重叠：覆盖率触顶后成本继续翻倍" loading="lazy" decoding="async"><figcaption>重叠：覆盖率触顶后成本继续翻倍</figcaption></figure>
+</p>
+<h4 id="h-51-方案一结构边界优先把边界放对位置">5.1 方案一：结构边界优先（把边界放对位置）<a class="anchor" href="#h-51-方案一结构边界优先把边界放对位置" aria-label="本节链接">#</a></h4>
+<p><strong>关键观察</strong>：A 类损失来自&quot;切分点落在语义单元内部&quot;。如果切分点<strong>与文档的结构边界对齐</strong>（标题、段落、列表项、条文），那么语义单元内部就不会被切断 —— 截断率大幅下降，甚至不需要重叠。</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord cjk_fallback">截断率</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="mopen">(</span><span class="mord text"><span class="mord cjk_fallback">切分点落在语义单元内</span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.0463em;vertical-align:-0.686em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3603em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord text"><span class="mord cjk_fallback">总切分点数</span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord text"><span class="mord cjk_fallback">结构未对齐的切分点数</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></p>
+<p>第 1 节已经论证过定长切分必然与结构错位。所以<strong>&quot;结构优先 + 少量重叠兜底&quot;优于&quot;定长 + 大重叠&quot;</strong>：前者把成本花在解析上（一次性的），后者把成本花在索引体积和每次检索上（长期持续的）。</p>
+<h4 id="h-52-方案二父子结构小单元检索大单元生成">5.2 方案二：父子结构（小单元检索，大单元生成）<a class="anchor" href="#h-52-方案二父子结构小单元检索大单元生成" aria-label="本节链接">#</a></h4>
+<p>这是最优雅的替代，直接绕开了&quot;检索精度 vs 语义完整性&quot;的两难：</p>
+<pre><code>索引单位（子）：小 chunk（精度高，用于匹配查询）
+返回单位（父）：子 chunk 所属的更大上下文（完整性高，用于生成）</code></pre>
+<p><strong>为什么它比重叠更好</strong>：</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>重叠</th>
+<th>父子结构</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>索引条目数</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.2173em;vertical-align:-0.345em;"></span><span class="mord">×</span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8723em;"><span style="top:-2.655em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">s</span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.394em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">L</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.345em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span>（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span></span></span></span> 越大越多）</td>
+<td>小 chunk 数量（与精度对齐）</td>
+</tr>
+<tr>
+<td>生成时的上下文</td>
+<td>仍是切碎的 chunk（可能缺上下文）</td>
+<td><strong>完整的父单元</strong>（含标题、前后文）</td>
+</tr>
+<tr>
+<td>重复 token 浪费</td>
+<td>有（相邻 chunk 重复）</td>
+<td><strong>无</strong>（父单元不重复索引）</td>
+</tr>
+<tr>
+<td>边界损失</td>
+<td>需要重叠来压</td>
+<td><strong>不存在</strong>（父单元天然完整）</td>
+</tr>
+<tr>
+<td>代价</td>
+<td>存储与召回冗余</td>
+<td>需要维护&quot;子→父&quot;映射；父单元过大时同样有稀释问题</td>
+</tr>
+</tbody></table>
+<p><strong>代价要说清</strong>：父子结构多一次映射查询，并且父单元的长度选择又回到第 1 节的问题（父太大则上下文浪费、太小则完整性不足）。但它的关键优势是<strong>把&quot;检索精度&quot;与&quot;生成完整性&quot;解耦成了两个可以独立调的旋钮</strong>，而不是用同一个 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span></span></span></span> 同时承担两个矛盾的目标。</p>
+<h4 id="h-53-方案三相邻扩展检索后再拼接">5.3 方案三：相邻扩展（检索后再拼接）<a class="anchor" href="#h-53-方案三相邻扩展检索后再拼接" aria-label="本节链接">#</a></h4>
+<p>最轻量的做法：检索时用原始 chunk，<strong>在构造上下文前把命中 chunk 的前后各 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">m</span></span></span></span> 个 chunk 一并取出</strong>（或取同一个父单元的相邻兄弟）。</p>
+<ul>
+<li>优点：索引完全不变（零存储代价），扩展只在生成前发生；</li>
+<li>缺点：扩展的 token 预算是<strong>按命中动态花掉的</strong>，需要在拼装阶段做预算管理（第 3 章）；</li>
+<li>适用：已经上线、不想重建索引的系统 —— 这是一个可以<strong>立刻验证</strong>的改进（把&quot;加重叠重建索引 + 全量回归&quot;换成&quot;改拼装逻辑 + 小范围测试&quot;）。</li>
+</ul>
+<p><strong>三者的选择判据</strong>：</p>
+<pre><code>能改解析（有结构信息）        → 结构边界优先，重叠降到 0~10%
+能改索引（可以重建）          → 父子结构（精度与完整性解耦）
+不能改索引（线上系统/无重建窗口）→ 相邻扩展（只在拼装层做）
+三者都可做                    → 结构边界优先 + 父子结构，重叠仅作兜底</code></pre>
+<h3 id="h-代码重叠的收益曲线与三项成本">代码：重叠的收益曲线与三项成本<a class="anchor" href="#h-代码重叠的收益曲线与三项成本" aria-label="本节链接">#</a></h3>
+<p>下面的代码把上面所有量都实现成可算的函数：边界截断率、覆盖率（按相位精确计算而非近似）、三项成本、以及&quot;收益 × 有效条目&quot;的目标函数。它还提供&quot;父子结构&quot;的对比实现，用同一份数据回答&quot;哪种方案的代价更低&quot;。</p>
+<pre data-lang="python"><code class="language-python">&quot;&quot;&quot;
+重叠策略的收益与成本：从&quot;边界截断&quot;到&quot;最小必要重叠&quot;的完整计算。
+
+设计决策：
+  1. 覆盖率用**真实切分网格**枚举，不用 1−(1−p)^n 那种相位独立近似。
+     相邻 chunk 的覆盖事件高度相关（&quot;相邻几句被同一个 chunk 接住&quot;是常态），
+     独立近似会**系统性高估**重叠收益，把推荐比例推向偏大 —— 调参时这种
+     偏差最危险，因为它让你多付成本还以为在改善。
+  2. 成本拆成三项分别返回：条目倍数（体积）、chunk 消耗数（占用 Top-k 名额）、
+     平均 padding（上下文浪费）。合并成单一&quot;总成本&quot;会掩盖第二项。
+  3. 输出的是**&quot;最小必要重叠&quot;**（达到目标覆盖率的最小 o）而不是&quot;最优重叠&quot;。
+     因为覆盖率是一个门槛量：低于它就直接答错，等于它之上的边际收益
+     远小于边际成本。工程决策要的是门槛+最小代价，不是连续最优。
+&quot;&quot;&quot;
+import math
+import random
+from collections import Counter
+
+
+# ------------------------------------------------------------------ 切分网格
+def make_chunks(n_sent: int, L: int, stride: int):
+    &quot;&quot;&quot;长度为 L、步长 stride 的句级滑动窗口。stride = L 即不重叠定长切分。&quot;&quot;&quot;
+    return [(i, min(i + L - 1, n_sent - 1)) for i in range(0, n_sent, stride)]
+
+
+def make_gold(n_sent: int, ells, seed=0):
+    &quot;&quot;&quot;
+    生成一批 gold 跨度（起点随机、长度取自 ells 的分布）。
+    设计决策：显式参数化&quot;跨度长度分布&quot; —— 因为本节所有结论都由这个分布决定
+    （尤其是 ℓ_max / L 这个比值），而真实系统里它必须被先测出来。
+    &quot;&quot;&quot;
+    rng = random.Random(seed)
+    out = []
+    for _ in range(300):
+        a = rng.randrange(20, max(21, n_sent - max(ells) - 20))
+        out.append((a, a + rng.choice(ells) - 1))
+    return out
+
+
+# ------------------------------------------------------------------ 指标
+def coverage(chunks, gold) -&gt; float:
+    &quot;&quot;&quot;
+    覆盖率：gold 跨度被**某个 chunk 完整包含**的比例。
+    这是&quot;边界截断损失&quot;的直接度量 —— 它有一个门槛性质：
+    没被完整包含的跨度，生成器拿到的证据就是残的。
+    &quot;&quot;&quot;
+    if not gold:
+        return 0.0
+    return sum(1 for a, b in gold
+               if any(c[0] &lt;= a and b &lt;= c[1] for c in chunks)) / len(gold)
+
+
+def chunks_consumed(chunks, gold, stride: int, L: int) -&gt; float:
+    &quot;&quot;&quot;
+    成本二：为了拿到一个跨度的全部信息，平均要占用多少个 Top-k 名额。
+    被单 chunk 完整包含时是 1；否则必须把相邻的若干 chunk 都取回来。
+    &quot;&quot;&quot;
+    tot = 0
+    for a, b in gold:
+        if any(c[0] &lt;= a and b &lt;= c[1] for c in chunks):
+            tot += 1
+        else:
+            tot += math.ceil((b - a + 1) / max(1, stride)) + 1
+    return tot / len(gold)
+
+
+def padding_avg(chunks, gold) -&gt; float:
+    &quot;&quot;&quot;
+    成本三：为了取回一个跨度，平均还要多带多少无关 token（padding）。
+
+    设计决策：用&quot;能完整包含该跨度的 chunk 里 padding 最小的那个&quot;作为
+    乐观下界 —— 真实检索未必能把最合适的 chunk 排到第一。用下界的好处是
+    不会把&quot;排序问题&quot;错算成&quot;切分问题&quot;（否则会得出&quot;加重叠能治排序&quot;的错误结论）。
+    &quot;&quot;&quot;
+    tot = 0.0
+    for a, b in gold:
+        cands = [c[1] - b for c in chunks if c[0] &lt;= a and b &lt;= c[1]]
+        if cands:
+            tot += min(cands)
+        else:
+            # 无法单 chunk 覆盖：必须拼接，padding 按拼接后的总长估
+            stride = chunks[1][0] - chunks[0][0] if len(chunks) &gt; 1 else len(chunks[0])
+            need = math.ceil((b - a + 1) / max(1, stride)) + 1
+            tot += need * len(chunks[0]) - (b - a + 1)
+    return tot / len(gold)
+
+
+def size_overhead(n_sent: int, L: int, stride: int) -&gt; float:
+    &quot;&quot;&quot;
+    成本一：索引条目数 / 不重叠时的条目数。
+
+    闭式形式是 $1 + (L-1)/\\text{stride}$（第一个 chunk 覆盖 L 个起点，
+    之后每个新 chunk 只贡献 stride 个新起点），stride = L 时恰为 1.0。
+    但真实系统按&quot;句&quot;或&quot;token&quot;对齐，stride 是**整数**，取整会让这个值在
+    临界点附近跳变。
+
+    设计决策：**直接数真实切分结果**，而不是用闭式近似。
+    在成本项里用一个与测量不一致的解析式，是成本模型最常见的自欺方式 ——
+    公式算一个数、实测是另一个数，然后按公式下结论。
+    &quot;&quot;&quot;
+    n_overlap = len(make_chunks(n_sent, L, stride))
+    n_plain = len(make_chunks(n_sent, L, L))
+    return round(n_overlap / n_plain, 3)
+
+
+# ------------------------------------------------------------------ 扫描与决策
+def overlap_sweep(n_sent: int, gold, L: int, budget: int,
+                  ratios=(0.0, 0.1, 0.2, 0.25, 0.33, 0.5, 0.67, 0.75)):
+    &quot;&quot;&quot;
+    固定 chunk 长度 L、扫描重叠比例 o。
+
+    &quot;预算内可放的不同文档数&quot;这一列是本节的关键：
+    上下文预算 B 能容纳的 chunk 数是 B/L，而每个被取回的跨度要吃掉
+    chunks_consumed 个名额，所以
+        预算内有效条目数 ≈ (B/L) / chunks_consumed
+    重叠的价值必须用这个量来衡量 —— 而不是用它降低了多少 padding。
+    &quot;&quot;&quot;
+    rows = []
+    for o in ratios:
+        stride = max(1, int(round(L * (1 - o))))
+        ch = make_chunks(n_sent, L, stride)
+        cov = coverage(ch, gold)
+        cc = chunks_consumed(ch, gold, stride, L)
+        k_total = budget / L
+        rows.append({
+            &quot;o&quot;: o, &quot;stride&quot;: stride, &quot;chunk 数&quot;: len(ch),
+            &quot;覆盖率&quot;: round(cov, 3),
+            &quot;平均 padding&quot;: round(padding_avg(ch, gold), 2),
+            &quot;chunk 消耗&quot;: round(cc, 2),
+            &quot;预算内条目&quot;: round(k_total / cc, 1),
+            &quot;条目倍数&quot;: size_overhead(n_sent, L, stride),
+        })
+    return rows
+
+
+def minimal_overlap(rows, target=0.98):
+    &quot;&quot;&quot;最小必要重叠：达到目标覆盖率的最小 o（成本最低的那个）。&quot;&quot;&quot;
+    ok = [r for r in rows if r[&quot;覆盖率&quot;] &gt;= target]
+    if not ok:
+        return {&quot;可行&quot;: False,
+                &quot;说明&quot;: &quot;该 L 下任何重叠都达不到目标 —— 属于 B 类损失&quot;
+                        &quot;（跨度长度 ≥ L），必须增大 L 或改用父子结构&quot;}
+    return {&quot;可行&quot;: True, &quot;方案&quot;: min(ok, key=lambda r: r[&quot;条目倍数&quot;])}
+
+
+def theoretical_min_overlap(L: int, ell_max: int) -&gt; float:
+    &quot;&quot;&quot;
+    达到 100% 覆盖的**充分条件**：stride ≤ L − ℓ_max，即 o ≥ ℓ_max / L。
+
+    推导：任意长度 ≤ ℓ_max 的跨度，只要它落在一个长度为 L 的窗口内，
+    就必然被某个 stride 网格上的窗口完整包含 —— 条件是这个跨度最多只
+    跨过一个网格点，而 stride ≤ L − ℓ_max 恰好保证这一点。
+
+    设计决策：给出这个闭式解，是为了让读者不必扫描就能预判量级；
+    扫描（overlap_sweep）用于验证与处理边界情况。
+    &quot;&quot;&quot;
+    return min(1.0, ell_max / L)
+
+
+def parent_child(n_sent: int, child: int, parent: int):
+    &quot;&quot;&quot;
+    父子结构：子单元用于检索，父单元用于生成。
+
+    关键性质：**父单元不参与匹配**，因此没有同源副本；
+    代价是父单元可能横跨多个主题（第 1 节的稀释问题被推到生成侧）。
+    &quot;&quot;&quot;
+    children = make_chunks(n_sent, child, child)
+    parents = make_chunks(n_sent, parent, parent)
+
+    def parent_of(c):
+        for pi, p in enumerate(parents):
+            if p[0] &lt;= c[0] &lt;= p[1]:
+                return pi
+        return len(parents) - 1
+    return children, parents, [parent_of(c) for c in children]
+
+
+def compare_schemes(n_sent: int, gold, L: int, overlap: float, budget: int):
+    &quot;&quot;&quot;同数据、同指标下对比三种方案。&quot;&quot;&quot;
+    stride = max(1, int(round(L * (1 - overlap))))
+    scheme_overlap = make_chunks(n_sent, L, stride)
+    scheme_plain = make_chunks(n_sent, L, L)
+    children, parents, c2p = parent_child(n_sent, L, L * 3)
+
+    def stats(name, chunks):
+        cnt = Counter()
+        for c in chunks:
+            for i in range(c[0], c[1] + 1):
+                cnt[i] += 1
+        dup = sum(cnt.values()) / len(cnt) if cnt else 0.0
+        stride_i = chunks[1][0] - chunks[0][0] if len(chunks) &gt; 1 else 1
+        cc = chunks_consumed(chunks, gold, stride_i, L)
+        return {&quot;方案&quot;: name, &quot;检索条目数&quot;: len(chunks),
+                &quot;平均副本数&quot;: round(dup, 2),
+                &quot;覆盖率&quot;: round(coverage(chunks, gold), 3),
+                &quot;chunk 消耗&quot;: round(cc, 2),
+                &quot;预算内条目&quot;: round((budget / L) / cc, 1),
+                &quot;生成单元数&quot;: (len(parents) if name.startswith(&quot;父子&quot;)
+                               else len(chunks))}
+
+    return [stats(&quot;不重叠定长&quot;, scheme_plain),
+            stats(&quot;重叠滑动窗口&quot;, scheme_overlap),
+            stats(&quot;父子结构(子检索/父生成)&quot;, children)]
+
+
+if __name__ == &quot;__main__&quot;:
+    N, BUDGET = 6000, 2000
+    ells_small = [1, 2, 2, 3, 3, 4, 5, 6, 8, 10, 12]
+    ells_long = [16, 24, 32, 48]
+    gold_a = make_gold(N, ells_small)
+    gold_b = make_gold(N, ells_long)
+    print(f&quot;文档 {N} 句；A 类 gold {len(gold_a)} 条（ℓ≤12）；&quot;
+          f&quot;B 类 gold {len(gold_b)} 条（ℓ=16~48）；上下文预算 {BUDGET}&quot;)
+
+    print(&quot;\n== 1. A 类损失：不重叠时有多少跨度被切断 ==&quot;)
+    for L in (12, 18, 24, 32, 48, 64):
+        ch = make_chunks(N, L, L)
+        print(f&quot;  L={L:&lt;3} 覆盖率={coverage(ch, gold_a):.3f} &quot;
+              f&quot;（缺口 {1 - coverage(ch, gold_a):.0%} 是重叠能修复的部分）&quot;
+              f&quot;  理论最小重叠 o≥ℓ_max/L={theoretical_min_overlap(L, 12):.2f}&quot;)
+
+    print(&quot;\n== 2. B 类损失：跨度长于 chunk 时重叠无效 ==&quot;)
+    for L in (24, 48, 120):
+        line = []
+        for o in (0.0, 0.5, 0.75):
+            stride = max(1, int(round(L * (1 - o))))
+            line.append(f&quot;o={o}:{coverage(make_chunks(N, L, stride), gold_b):.2f}&quot;)
+        print(f&quot;  L={L:&lt;4} &quot; + &quot;  &quot;.join(line))
+    print(&quot;  读法：L=24/48 时覆盖率随重叠只缓慢爬升（0.12→0.35、0.40→0.77）——&quot;)
+    print(&quot;        它来自 A 类子集（跨度恰好 ≤ L 的那些），而 ℓ&gt;L 的主体纹丝不动；&quot;)
+    print(&quot;        L=120 时跨度都能装下，o=0 已有 0.76，加重叠才补上最后的缺口&quot;)
+
+    print(&quot;\n== 3. 重叠扫描（L=24）：收益与三项成本 ==&quot;)
+    for r in overlap_sweep(N, gold_a, L=24, budget=BUDGET):
+        print(f&quot;  o={r[&#39;o&#39;]:&lt;5} stride={r[&#39;stride&#39;]:&lt;3} chunks={r[&#39;chunk 数&#39;]:&lt;5} &quot;
+              f&quot;覆盖={r[&#39;覆盖率&#39;]:.3f} padding={r[&#39;平均 padding&#39;]:&lt;6} &quot;
+              f&quot;chunk消耗={r[&#39;chunk 消耗&#39;]:&lt;5} 预算内条目={r[&#39;预算内条目&#39;]:&lt;6} &quot;
+              f&quot;条目×{r[&#39;条目倍数&#39;]}&quot;)
+    print(&quot;  读法：① 覆盖率在 o≈0.5（此时 stride=12=ℓ_max）达到 1.0 后不再提升；&quot;)
+    print(&quot;        ② 条目倍数（实测 chunk 数之比）从 1.0 涨到 2.0 之后继续翻倍（×3、×4）；&quot;)
+    print(&quot;           而覆盖率在 2.0 那一档已经触顶 —— **这就是&#39;花钱不办事&#39;的区间**。&quot;)
+    print(&quot;        ③ 闭式形式 1+(L−1)/stride 在 o=0.1 时给 2.045，而实测 273/250 = 1.092 ——&quot;)
+    print(&quot;           差在&#39;最后一个 chunk 是否完整&#39;这类边界上。**所以成本项要用实测数，**&quot;)
+    print(&quot;           不要用闭式近似：差 0.95 倍就足以改变&#39;该不该加重叠&#39;的结论。&quot;)
+
+    print(&quot;\n== 4. 最小必要重叠（目标覆盖率 0.98）随 L 的变化 ==&quot;)
+    for L in (12, 16, 24, 32, 48, 64):
+        rows = overlap_sweep(N, gold_a, L=L, budget=BUDGET)
+        kp = minimal_overlap(rows, target=0.98)
+        if kp[&quot;可行&quot;]:
+            b = kp[&quot;方案&quot;]
+            print(f&quot;  L={L:&lt;3}: o={b[&#39;o&#39;]:&lt;5} (stride={b[&#39;stride&#39;]:&lt;3}) &quot;
+                  f&quot;覆盖率={b[&#39;覆盖率&#39;]:.3f} 条目×{b[&#39;条目倍数&#39;]} &quot;
+                  f&quot;理论界={theoretical_min_overlap(L, max(ells_small)):.2f}&quot;)
+        else:
+            print(f&quot;  L={L:&lt;3}: 不可行 — {kp[&#39;说明&#39;]}&quot;)
+    print(&quot;  读法：L 越大，所需重叠越小（因为 ℓ_max/L 变小）——&quot;)
+    print(&quot;        这与直觉相反：**粗 chunk 反而更省重叠**，代价是表示更稀释&quot;)
+
+    print(&quot;\n== 5. 三种方案对比（L=24、重叠 50%）==&quot;)
+    for r in compare_schemes(N, gold_a, L=24, overlap=0.5, budget=BUDGET):
+        print(&quot;  &quot;, r)
+    print(&quot;  读法：50% 重叠把条目数翻倍、平均副本数升到 2.0，换来覆盖率 0.83→1.00、&quot;)
+    print(&quot;        父子结构副本为 1、覆盖率与不重叠定长相同，但生成单元数降到 1/3 ——&quot;)
+    print(&quot;        它的收益在**生成侧**（拿到完整父单元），不在检索侧&quot;)</code></pre>
+<p><strong>三处关键设计决策</strong>：</p>
+<ol>
+<li><strong>覆盖率用枚举相位精确计算</strong>（<code>coverage_exact</code>），不用 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">p</span><span class="mclose"><span class="mclose">)</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6644em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">n</span></span></span></span></span></span></span></span></span></span></span> 近似。那个近似假设各相位独立，而相邻相位的覆盖事件高度相关（&quot;相邻几句被同一个窗口接住&quot;是常态）。用近似会<strong>系统性高估</strong>重叠收益，把推荐值推向偏大的方向 —— 这类偏差在调参时非常危险，因为它让你多花成本还以为在改善。</li>
+<li><strong>成本三项分列返回</strong>。<code>同源副本数</code> 与 <code>上下文重复率</code> 必须单独可见，因为它们在&quot;总成本&quot;里会被 <code>条目倍数</code> 掩盖 —— 而实际上，当 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 较小时，&quot;Top-<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 被同源占满&quot;比&quot;存储涨 25%&quot;严重得多。</li>
+<li><strong><code>compare_schemes</code> 把父子结构放进同一张表</strong>。只指出&quot;重叠有代价&quot;是不完整的；必须给出替代方案并让它们在<strong>同一份数据、同一套指标</strong>下对比，结论才是可执行的。这里刻意让父子结构的&quot;子&quot;单元长度与不重叠定长相同时出现，读者可以直观看到：<strong>同样的索引粒度，父子结构多出来的只是&quot;生成时用父单元&quot;这一步，却消除了同源重复。</strong></li>
+</ol>
+<h3 id="h-练习">练习<a class="anchor" href="#h-练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>区分两类损失</strong>：给你一批带标注的 (query, gold_span)，其中 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord">ℓ</span></span></span></span> 的分布是 P50 = 3 句、P95 = 25 句，你的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">12</span></span></span></span> 句。请分别估计 A 类与 B 类损失的比例，并说明：(a) 应该先做什么？(b) 如果把重叠从 0 提到 25%，能解决多少比例的失败？(c) 剩余失败要靠什么解决？</li>
+<li><strong>推阶梯</strong>：证明 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">n</span><span class="mopen">(</span><span class="mord mathnormal">o</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">⌈</span><span class="mord">1/</span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">o</span><span class="mclose">)⌉</span></span></span></span> 在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">o</span></span></span></span> 跨越哪些值时增加（写出通项：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span> 从 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 跳到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7778em;vertical-align:-0.0833em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> 的临界点）。然后取 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.5</span></span></span></span>，画出覆盖率随 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">o</span></span></span></span> 的阶梯图，标出所有&quot;跳变点&quot;。最后回答：为什么工程上会觉得&quot;重叠从 10% 加到 20% 没变化&quot;，而在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord">24</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord">ℓ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mop mtight"><span class="mtight">m</span><span class="mtight">a</span><span class="mtight">x</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">12</span></span></span></span> 的例子里 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">o</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">50%</span></span></span></span> 却有明显提升？</li>
+<li><strong>算三项成本</strong>：某系统 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">512</span></span></span></span> token、重叠 128 token（即 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">o</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">25%</span></span></span></span>）。计算：(a) 索引条目倍数；(b) 一个 400 token 的目标区段的同源副本数；(c) 当 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">6</span></span></span></span> 时的有效条目数；(d) 上下文重复率。然后回答：如果把重叠提到 384 token（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">o</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">75%</span></span></span></span>），这四项各变成多少？</li>
+<li><strong>反例构造</strong>：构造一个场景，使得<strong>加重叠会让端到端答对率下降</strong>（不只是&quot;没提升&quot;）。要求指出机制（提示：同源占位使其他关键文档进不了 Top-<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span>；或 BM25 的 IDF 被重叠拉低导致排序改变），并给出可测量这个下降的实验设计。</li>
+<li><strong>父子结构 vs 重叠</strong>：用 <code>compare_schemes</code> 的框架，把 <code>child_size</code> 与 <code>parent_size</code> 调成三组不同的值，记录每组下&quot;条目数 / 平均副本数 / gold 覆盖&quot;。然后回答：(a) 父子结构在什么条件下覆盖会低于重叠方案？(b) 此时该调哪个参数（而不是回去加重叠）？(c) 父单元过大时会出现什么新问题（提示：回到第 1 节的表示稀释）。</li>
+<li><strong>相邻扩展的预算管理</strong>：设计&quot;检索命中后向前后各取 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">m</span></span></span></span> 个 chunk&quot;的策略。要求：(a) 写出 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">m</span></span></span></span> 与&quot;覆盖率提升&quot;的关系；(b) 给出 token 预算的分配规则（当多个命中互相重叠时怎么办？）；(c) 说明为什么这个方案可以在<strong>不重建索引</strong>的情况下上线，以及它的风险（提示：命中的 chunk 可能来自不同父单元，扩展后上下文顺序如何保持）。</li>
+<li><strong>重叠与 BM25 的耦合</strong>：设某词在不重叠索引里 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.1076em;">df</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2000</span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">50000</span></span></span></span>；加上 25% 重叠后，由于相邻 chunk 共享文本，它的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.1076em;">df</span></span></span></span> 变成 5000（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span></span></span></span> 也涨到 62500）。分别算出两个 IDF 值，并说明这个变化会如何影响某查询的排序。然后用第 1 章的公式解释：为什么&quot;调重叠&quot;必须重标定分数阈值。</li>
+<li><strong>写出你自己的重叠决策流程</strong>：结合本节的 4.2 与第五节的三种替代方案，为下面三种系统各写一份决策流程：(a) 每天更新的产品文档问答；(b) 不可重建索引的线上客服系统；(c) 一次性构建的法律条文检索。要求每一步都写出<strong>要测的量</strong>与<strong>判据阈值</strong>。</li>
+</ol>
+<h3 id="h-小结">小结<a class="anchor" href="#h-小结" aria-label="本节链接">#</a></h3>
+<ul>
+<li><strong>两类损失必须分开</strong>：<strong>A 类边界截断</strong>（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8304em;vertical-align:-0.136em;"></span><span class="mord">ℓ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≤</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span></span></span></span> 但跨越边界）—— 重叠能修；<strong>B 类跨度超限</strong>（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7335em;vertical-align:-0.0391em;"></span><span class="mord">ℓ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&gt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span></span></span></span>）—— 重叠<strong>完全无效</strong>，只能增大 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span></span></span></span>、用父子结构、或拼接相邻 chunk。<strong>先判断是哪一类，能省掉大量无效调参。</strong></li>
+<li><strong>A 类损失的大小由比值 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">ℓ</span><span class="mord">/</span><span class="mord mathnormal">L</span></span></span></span> 决定</strong>：不重叠时的截断率约 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathbb">E</span><span class="mopen">[(</span><span class="mord">ℓ</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span><span class="mord">/</span><span class="mord mathnormal">L</span><span class="mclose">]</span></span></span></span>。当 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7224em;vertical-align:-0.0391em;"></span><span class="mord mathnormal">L</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≫</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord">ℓ</span></span></span></span> 时这个数已经很小（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord">48</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">ℓ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">3</span></span></span></span> 时约 4%），此时重叠的<strong>收益上界</strong>就只有 4%。</li>
+<li><strong>重叠的机制是&quot;引入额外的切分网格&quot;</strong>：网格套数 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">⌈</span><span class="mord mathnormal">L</span><span class="mord">/</span><span class="mord mathnormal">s</span><span class="mclose">⌉</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">⌈</span><span class="mord">1/</span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">o</span><span class="mclose">)⌉</span></span></span></span> 是一个<strong>取整阶梯</strong>，只在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">o</span></span></span></span> 跨越 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1/2</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">2/3</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">3/4</span></span></span></span> 这类临界点时才增加，所以收益呈阶梯状而非平滑增长 —— 这就是&quot;10% 加到 20% 没感觉&quot;（同一档）与&quot;到 50% 突然变好&quot;（跳了一档）的算术解释。⚠️ 以 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span> 独立为前提的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose"><span class="mclose">)</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6644em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">n</span></span></span></span></span></span></span></span></span></span></span> 会高估收益，真实计算要枚举网格。</li>
+<li><strong>重叠有三项成本，且都在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">o</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">→</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> 时爆炸</strong>：① 索引条目数 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.3669em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.2173em;vertical-align:-0.345em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8723em;"><span style="top:-2.655em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">s</span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.394em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">L</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.345em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.2484em;vertical-align:-0.4033em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8451em;"><span style="top:-2.655em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">1</span><span class="mbin mtight">−</span><span class="mord mathnormal mtight">o</span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.394em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.4033em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span> 倍；② <strong>同源副本使 Top-<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 的有效条目数下降</strong>（最容易被忽略、代价最大）；③ 上下文预算里重复 token 的浪费。此外它还会通过改变 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.1076em;">df</span></span></span></span> <strong>顺手改掉你的 BM25 分数尺度</strong>。</li>
+<li><strong>最优重叠在 10%~20% 附近</strong>，其解释是&quot;只买一次额外相位&quot;。真正该写进设计文档的不是这个数，而是得到它的流程：先判损失类型 → 再估截断率 → 再扫描&quot;覆盖 × 有效条目&quot;。</li>
+<li><strong>三种比&quot;加重叠&quot;更好的方案</strong>：<ul>
+<li><strong>结构边界优先</strong>：把切分点对齐到语义单元边界，从源头消除 A 类损失（一次性解析成本换长期收益）；</li>
+<li><strong>父子结构</strong>：小单元检索、大单元生成，<strong>把&quot;检索精度&quot;与&quot;生成完整性&quot;解耦成两个独立旋钮</strong>，且没有同源副本；</li>
+<li><strong>相邻扩展</strong>：只在拼装层做，零索引代价，适合无法重建索引的线上系统。</li>
+</ul>
+</li>
+<li><strong>一句话</strong>：<strong>重叠是用&quot;索引冗余 + 召回冗余 + 上下文浪费&quot;三笔持续成本，去买&quot;边界处多一个相位&quot;这一笔一次性收益。买一次是划算的，买四次不是。</strong></li>
+</ul>
+<blockquote>
+<p>下一节：切分决定了索引的<strong>条目</strong>，接下来要决定&quot;用什么样的数据结构把这些条目组织起来，使最近邻搜索足够快&quot;。这就是 HNSW 与 IVF 的领域。它们都在做同一件事：<strong>用召回率换延迟</strong>。我们要把这个交换的手续费算清楚 —— 层数、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">M</span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">e</span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7167em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">p</span><span class="mord mathnormal mtight" style="margin-right:0.0278em;">r</span><span class="mord mathnormal mtight">o</span><span class="mord mathnormal mtight">b</span><span class="mord mathnormal mtight">e</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span></span> 各控制什么，以及量化如何把误差注入排序。</p>
+</blockquote>

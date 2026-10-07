@@ -1,0 +1,160 @@
+<h2 id="h-图分类">图分类<a class="anchor" href="#h-图分类" aria-label="本节链接">#</a></h2>
+<p>节点分类回答&quot;这个<strong>点<strong>是什么&quot;，图分类回答&quot;这张</strong>图<strong>整体是什么&quot;——判断一个分子是否有毒、预测一个蛋白质的功能、识别一张社交网络子图是否异常。它比节点分类多一道坎：模型不再输出每个节点的标签，而是要先把手上一堆</strong>节点嵌入浓缩成一个图级表示</strong>，再交给分类器。这道&quot;浓缩&quot;工序叫 <strong>readout（读出）</strong>，是本课的核心。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-从节点嵌入到图表示readout">1. 从节点嵌入到图表示：readout<a class="anchor" href="#h-1-从节点嵌入到图表示readout" aria-label="本节链接">#</a></h4>
+<p>图分类的模型同样分编码器和分类头，但中间多了一步：</p>
+<pre><code>Z = GNN(X, A)              # ① 编码：得到每个节点的嵌入 Z ∈ R^(N × H)
+g = READOUT( Z )           # ② 读出：把所有节点嵌入聚合成一个向量 g ∈ R^H
+P = softmax( g · W_cls )   # ③ 分类：图级表示过分类器</code></pre>
+<p><code>READOUT</code> 必须满足两个条件：<strong>置换不变</strong>（节点顺序打乱不影响结果）和<strong>可处理变长输入</strong>（不同图的节点数不同）。最常用的三种：</p>
+<ul>
+<li><strong>全局均值池化</strong>：<code>g = (1/N) Σ_i z_i</code>。简单稳定，但会丢失&quot;哪类节点多、哪些节点特殊&quot;的分布信息。</li>
+<li><strong>全局求和池化</strong>：<code>g = Σ_i z_i</code>。保留了&quot;数量/规模&quot;信息，是理论上表达力更强的选择（见下文 GIN）。</li>
+<li><strong>全局最大池化</strong>：<code>g = max_i z_i</code>（逐元素）。对&quot;是否存在某类极端特征&quot;敏感，但容易忽略多数节点。</li>
+</ul>
+<p>PyG 里对应 <code>global_mean_pool</code>、<code>global_add_pool</code>、<code>global_max_pool</code>。</p>
+<h4 id="h-2-为什么求和池化最强与-gin-的联系">2. 为什么求和池化最强：与 GIN 的联系<a class="anchor" href="#h-2-为什么求和池化最强与-gin-的联系" aria-label="本节链接">#</a></h4>
+<p>这是图分类里&quot;知其所以然&quot;的关键。可以证明：<strong>均值/最大池化都可能把两个结构不同的图映射成相同的表示</strong>，从而无法区分它们。</p>
+<ul>
+<li>均值池化：<code>{1,1,1,1}</code> 和 <code>{2,2}</code> 平均后都是 1，区分不了&quot;四个 1&quot;与&quot;两个 2&quot;。</li>
+<li>最大池化：<code>{1,2,3,4}</code> 和 <code>{4,4,4,4}</code> 最大值都是 4，区分不了。</li>
+</ul>
+<p><strong>求和池化</strong>则能保留这些差异。基于这一观察，Xu 等人提出了 <strong>GIN（Graph Isomorphism Network）</strong>，其聚合更新规则是：</p>
+<pre><code>h_v^k = MLP^k( (1 + ε^k) · h_v^(k-1) + Σ_{u ∈ N(v)} h_u^(k-1) )</code></pre>
+<p>其中 <code>ε</code> 是可学习标量，<code>MLP</code> 是多层感知机。GIN 把&quot;邻居求和 + 自身加权&quot;与一个 MLP 结合，配合<strong>求和读出</strong>，被证明在区分图结构的能力上逼近 WL（Weisfeiler-Lehman）图同构测试的上界——这是当前图分类任务里最常用、也最强悍的基线之一。</p>
+<h4 id="h-3-层级池化更精细的浓缩">3. 层级池化：更精细的&quot;浓缩&quot;<a class="anchor" href="#h-3-层级池化更精细的浓缩" aria-label="本节链接">#</a></h4>
+<p>全局池化把所有节点一步压平，对小图够用，但大图会损失层级结构。更精细的做法是<strong>层级池化（hierarchical pooling）</strong>：逐步把节点&quot;合并&quot;成粗粒度节点，形成图的金字塔，最后再读出。代表方法有：</p>
+<ul>
+<li><strong>DiffPool</strong>：学一个软分配矩阵，把节点可微地聚类到更少的超节点。</li>
+<li><strong>Top-K Pooling</strong>：按节点的重要性分数保留 Top-K 个节点，丢弃其余，逐层&quot;剪枝&quot;。</li>
+</ul>
+<p>它们表达力更强，但训练更不稳定、实现更复杂。工程上默认先上全局池化，效果不够再考虑层级池化。</p>
+<h4 id="h-4-变长图的批处理batch-向量">4. 变长图的批处理：batch 向量<a class="anchor" href="#h-4-变长图的批处理batch-向量" aria-label="本节链接">#</a></h4>
+<p>图分类要一次处理多个<strong>大小不同</strong>的图。PyG 的解法是<strong>把多张图沿节点维拼接成一张大图</strong>，边索引做相应偏移，再用一个 <code>batch</code> 向量记录&quot;每个节点属于哪张图&quot;：</p>
+<pre><code>batch = [0, 0, 0, 1, 1, 1, 1, 2, ...]   # 第 1 张图 3 个节点，第 2 张 4 个节点…</code></pre>
+<p>这样 <code>global_mean_pool(z, batch)</code> 就能按 <code>batch</code> 分组做池化，一次算出每个图的 <code>g</code>。这也是 GNN 处理&quot;图里套图&quot;（batch of graphs）的标准范式，务必理解。</p>
+<p><figure><img class="md-img" src="content/courses/graph-neural-networks/assets/chapter-5-figure-02.svg" alt="图分类流程示意：左侧若干大小不一的图（分子）堆叠成一批，经过多层 GNN 得到每个节点的嵌入；中间一个 READOUT 模块按 batch 向量把各图节点分别聚合（均值/求和/最大）成图级向量 g₁、g₂、…；右侧图级向量过分类器 softmax，输出&quot;有毒/无毒&quot;等整图标签" loading="lazy" decoding="async"><figcaption>图分类流程示意：左侧若干大小不一的图（分子）堆叠成一批，经过多层 GNN 得到每个节点的嵌入；中间一个 READOUT 模块按 batch 向量把各图节点分别聚合（均值/求和/最大）成图级向量 g₁、g₂、…；右侧图级向量过分类器 softmax，输出&quot;有毒/无毒&quot;等整图标签</figcaption></figure>
+</p>
+<h4 id="h-5-与节点分类的对照">5. 与节点分类的对照<a class="anchor" href="#h-5-与节点分类的对照" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>节点分类</th>
+<th>图分类</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>预测对象</td>
+<td>每个节点</td>
+<td>每张图</td>
+</tr>
+<tr>
+<td>数据形态</td>
+<td>通常一张大图</td>
+<td>一批互不连通的小图</td>
+</tr>
+<tr>
+<td>关键模块</td>
+<td>编码器 + 节点分类头</td>
+<td>编码器 + readout + 图分类头</td>
+</tr>
+<tr>
+<td>批处理</td>
+<td>整图前向</td>
+<td>batch 向量拼接</td>
+</tr>
+<tr>
+<td>典型数据集</td>
+<td>Cora、PubMed</td>
+<td>MUTAG、PROTEINS、ENZYMES</td>
+</tr>
+</tbody></table>
+<h3 id="h-二可运行示例">二、可运行示例<a class="anchor" href="#h-二可运行示例" aria-label="本节链接">#</a></h3>
+<p><strong>示例：GIN + 求和读出，在 MUTAG 分子数据集上做图分类</strong></p>
+<pre data-lang="python"><code class="language-python">import torch
+import torch.nn.functional as F
+from torch_geometric.nn import GINConv, global_add_pool
+from torch_geometric.datasets import TUDataset
+from torch_geometric.loader import DataLoader
+
+# 1. MUTAG：188 个分子图，标签为&quot;是否诱变&quot;（二分类）
+dataset = TUDataset(root=&#39;./data/MUTAG&#39;, name=&#39;MUTAG&#39;)
+print(f&#39;图数量 {len(dataset)} | 特征维 {dataset.num_features} | 类别数 {dataset.num_classes}&#39;)
+
+# 划分训练/测试（图分类要按&quot;图&quot;划分，不是按节点）
+dataset = dataset.shuffle()
+n_train = int(len(dataset) * 0.8)
+train_ds, test_ds = dataset[:n_train], dataset[n_train:]
+train_loader = DataLoader(train_ds, batch_size=32, shuffle=True)
+test_loader = DataLoader(test_ds, batch_size=32)
+
+# 2. GIN：每一层 = MLP( (1+eps)·h_v + Σ h_u )，两层 + 求和读出
+class GIN(torch.nn.Module):
+    def __init__(self, in_ch, hidden_ch, out_ch):
+        super().__init__()
+        # GINConv 内部要求一个可微的&quot;邻居聚合函数&quot;，这里用两层线性+ReLU 的 MLP
+        nn1 = torch.nn.Sequential(
+            torch.nn.Linear(in_ch, hidden_ch), torch.nn.ReLU(),
+            torch.nn.Linear(hidden_ch, hidden_ch))
+        nn2 = torch.nn.Sequential(
+            torch.nn.Linear(hidden_ch, hidden_ch), torch.nn.ReLU(),
+            torch.nn.Linear(hidden_ch, out_ch))
+        self.conv1 = GINConv(nn1)   # 第一层，输出 hidden_ch 维
+        self.conv2 = GINConv(nn2)   # 第二层，输出 out_ch 维（图嵌入维）
+
+    def forward(self, x, edge_index, batch):
+        x = self.conv1(x, edge_index)
+        x = F.relu(x)
+        x = self.conv2(x, edge_index)
+        x = global_add_pool(x, batch)   # 关键：按 batch 做求和读出
+        return F.log_softmax(x, dim=1)
+
+model = GIN(dataset.num_features, 32, dataset.num_classes)
+optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+
+def train():
+    model.train()
+    total_loss = 0
+    for data in train_loader:       # 每个 data 是一批图
+        optimizer.zero_grad()
+        out = model(data.x, data.edge_index, data.batch)
+        loss = F.nll_loss(out, data.y)   # y 是整图标签
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item() * data.num_graphs
+    return total_loss / len(train_ds)
+
+@torch.no_grad()
+def evaluate(loader):
+    model.eval()
+    correct = total = 0
+    for data in loader:
+        out = model(data.x, data.edge_index, data.batch)
+        correct += (out.argmax(dim=1) == data.y).sum().item()
+        total += data.num_graphs
+    return correct / total
+
+for epoch in range(100):
+    loss = train()
+    if epoch % 10 == 0:
+        print(f&#39;Epoch {epoch:03d} | Loss {loss:.4f} | &#39;
+              f&#39;Train {evaluate(train_loader):.4f} | Test {evaluate(test_loader):.4f}&#39;)</code></pre>
+<p>MUTAG 是经典小数据集，GIN 通常能到 0.85 以上的测试准确率。注意代码里的两个关键点：<code>DataLoader</code> 自动生成 <code>batch</code> 向量，<code>global_add_pool(x, batch)</code> 依赖它分组。</p>
+<p><strong>动手改动</strong>：把 <code>global_add_pool</code> 换成 <code>global_mean_pool</code> 再跑，通常准确率会小幅下降——这正是&quot;求和池化保留数量信息、表达力更强&quot;的实证。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>readout 三选一</strong>：给定两个图，节点嵌入分别为 <code>{1,1,1,1}</code> 和 <code>{2,2}</code>，分别计算均值、求和、最大三种读出结果，指出哪些读出能区分这两张图，哪些不能。</li>
+<li><strong>置换不变性</strong>：把一张图的节点顺序打乱，观察三种全局池化的输出是否改变，说明 readout 为什么必须置换不变。</li>
+<li><strong>batch 向量实验</strong>：打印一个 <code>batch_size=3</code> 的 batch 里 <code>data.batch</code> 的内容，验证它是否正确标记了每个节点所属的图，以及 <code>global_add_pool</code> 的分组逻辑。</li>
+<li><strong>GIN vs GCN</strong>：把 <code>GINConv</code> 换成 <code>GCNConv</code> 加 <code>global_add_pool</code>，对比图分类准确率，结合 GIN 的&quot;求和聚合 + MLP&quot;设计解释差异。</li>
+<li><strong>层级池化前瞻</strong>：查阅 PyG 的 <code>TopKPooling</code> 或 <code>DiffPool</code> 文档，用一段话说明层级池化相对全局池化的优势与代价。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>GIN 原论文：Xu 等. &quot;How Powerful are Graph Neural Networks?&quot; (ICLR 2019)：<a href="https://arxiv.org/abs/1810.00826" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1810.00826</a></li>
+<li>DiffPool 原论文：Ying 等. &quot;Hierarchical Graph Representation Learning&quot; (2018)：<a href="https://arxiv.org/abs/1806.08804" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1806.08804</a></li>
+<li>PyG 官方文档 · 全局池化：<a href="https://pytorch-geometric.readthedocs.io/en/latest/modules/nn.html#global-pooling-layers" target="_blank" rel="noopener noreferrer">https://pytorch-geometric.readthedocs.io/en/latest/modules/nn.html#global-pooling-layers</a></li>
+<li>PyG 官方文档 · TUDataset：<a href="https://pytorch-geometric.readthedocs.io/en/latest/generated/torch_geometric.datasets.TUDataset.html" target="_blank" rel="noopener noreferrer">https://pytorch-geometric.readthedocs.io/en/latest/generated/torch_geometric.datasets.TUDataset.html</a></li>
+</ul>
+<p><a href="#/l/gnn-ch5-l3">下一课：评估</a></p>

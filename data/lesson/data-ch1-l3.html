@@ -1,0 +1,586 @@
+<h2 id="h-泄漏的定义与代价一次因果分析">泄漏的定义与代价：一次因果分析<a class="anchor" href="#h-泄漏的定义与代价一次因果分析" aria-label="本节链接">#</a></h2>
+<h3 id="h-这一节要解决什么">这一节要解决什么<a class="anchor" href="#h-这一节要解决什么" aria-label="本节链接">#</a></h3>
+<p>&quot;数据泄漏&quot;（data leakage）是数据侧最有名也最被低估的概念。有名，是因为每个人都听过；被低估，是因为大多数人的理解停留在&quot;测试集混进了训练集，所以分数不可信&quot;——这句话既没有给出定义，也没有说清代价，更没法指导排查。</p>
+<p>这一节要做三件事，都是严格性的活：</p>
+<ol>
+<li><strong>给泄漏一个因果定义</strong>，而不是一堆例子。定义必须是<strong>可判定的</strong>：给定一条管线，能据此判断某条路径算不算泄漏。据此会得到六个家族，覆盖从基准污染到预处理的全部形态。</li>
+<li><strong>把代价拆成三层</strong>，因为它们的影响机制完全不同：破坏泛化误差的<strong>估计</strong>（于是模型选择被反转）、破坏置信区间的<strong>独立性假设</strong>（于是方差被低估）、破坏决策的<strong>可逆性</strong>（于是历史结论全部作废，且上线后才发现）。</li>
+<li><strong>给出检测与修法，以及修法的代价</strong>。去污染不是&quot;删掉匹配的样本&quot;这么简单：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span>-gram 长度每变一次，误删与漏检的比例就翻转一次，而这件事没有免费的参数。</li>
+</ol>
+<p>本节的核心论点可以先说出来：<strong>泄漏的代价不是&quot;分数偏高&quot;，而是&quot;分数的排序被破坏&quot;。</strong> 分数虚高只是症状；真正的事故是你在虚高的分数上做了模型选择、阈值选择和发布决策，选出了一个真实性能更差的方案 —— 而这件事只有在你已经上线、并且拿到一份新的评测集之后才可能被发现。</p>
+<h3 id="h-一泄漏的定义一条因果路径">一、泄漏的定义：一条因果路径<a class="anchor" href="#h-一泄漏的定义一条因果路径" aria-label="本节链接">#</a></h3>
+<h4 id="h-11-定义">1.1 定义<a class="anchor" href="#h-11-定义" aria-label="本节链接">#</a></h4>
+<blockquote>
+<p><strong>泄漏（leakage）</strong>：在训练或选择过程中，模型/决策获得了一条<strong>在部署时不存在</strong>的信息通路，使得评测指标不再是对&quot;部署时泛化误差&quot;的估计。</p>
+</blockquote>
+<p>三个要件，缺一不可：</p>
+<ol>
+<li><strong>有一条信息通路</strong>：某个量从&quot;评测侧或未来侧&quot;流入了训练或选择过程。通路可以是显式的（复制样本），也可以是统计式的（用全体数据算的均值、用测试集挑的超参）。</li>
+<li><strong>这条通路在部署时不存在</strong>：部署时你只有输入 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">x</span></span></span></span>，没有 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">y</span></span></span></span>，也没有&quot;未来&quot;。</li>
+<li><strong>它影响了指标的解释</strong>：如果它只影响训练速度而不影响指标的含义，那它是个工程优化，不是泄漏。</li>
+</ol>
+<h4 id="h-12-用因果图刻画">1.2 用因果图刻画<a class="anchor" href="#h-12-用因果图刻画" aria-label="本节链接">#</a></h4>
+<p>设真实因果结构是</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6943em;vertical-align:-0.011em;"></span><span class="mord mathnormal" style="margin-right:0.0785em;">X</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">⟶</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.2222em;">Y</span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord cjk_fallback">模型要学</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.2222em;">Y</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∣</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0785em;">X</span><span class="mclose">)</span></span></span></span></span></p>
+<p>再引入三个节点：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathcal" style="margin-right:0.2542em;">T</span></span></span></span>（训练过程，含数据选择与超参选择）、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">Z</span></span></span></span>（任何只有在评测/未来时刻才可得的信息，例如测试标签、未来特征、全体数据的统计量）。<strong>泄漏就是存在一条从 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">Z</span></span></span></span> 到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathcal" style="margin-right:0.2542em;">T</span></span></span></span> 的有向路径，并且在部署时 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">Z</span></span></span></span> 不可得。</strong></p>
+<p>这个刻画比&quot;测试集混入训练集&quot;更宽，原因是它把 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">Z</span></span></span></span> 的定义放开了：</p>
+<ul>
+<li>若 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">Z</span></span></span></span> = 测试样本本身 → 基准污染；</li>
+<li>若 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">Z</span></span></span></span> = 测试集上的标签 → 用测试集选超参、调阈值；</li>
+<li>若 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">Z</span></span></span></span> = 未来的特征值 → 时间泄漏；</li>
+<li>若 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">Z</span></span></span></span> = 全体数据（含测试）的一阶/二阶统计量 → 预处理泄漏；</li>
+<li>若 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">Z</span></span></span></span> = 标签的后验代理（如&quot;催收次数&quot;之于&quot;是否违约&quot;）→ 目标泄漏。</li>
+</ul>
+<p><strong>它们是同一种病的不同表现</strong>，所以可以用同一套排查逻辑处理：问&quot;这次决策用到了哪些信息？这些信息在部署时拿得到吗？&quot;</p>
+<h4 id="h-13-关键区分不是信息多而是信息在部署时不可得">1.3 关键区分：不是&quot;信息多&quot;，而是&quot;信息在部署时不可得&quot;<a class="anchor" href="#h-13-关键区分不是信息多而是信息在部署时不可得" aria-label="本节链接">#</a></h4>
+<p>这一条必须强调，因为它解释了为什么很多看起来像泄漏的东西<strong>不是</strong>泄漏，也解释了很多看起来无害的操作为什么是泄漏。</p>
+<ul>
+<li><strong>从外部数据里加入真实知识</strong>（比如给模型接一个知识库）<strong>不是</strong>泄漏 —— 部署时这个知识库也在。</li>
+<li><strong>在训练集上做数据增强</strong>（同义改写、回译）<strong>不是</strong>泄漏 —— 只要增强只依赖输入与训练标签（注意：用测试集的统计做增强就是泄漏）。</li>
+<li><strong>用测试集调阈值</strong> <strong>是</strong>泄漏 —— 阈值是一个决策参数，它在部署时只能用验证集估。</li>
+<li><strong>用全量数据算归一化参数</strong> <strong>是<strong>泄漏 —— 那个均值在部署时你确实能算（对新数据算），但</strong>评测时算的均值和训练时算的均值是同一个</strong>，这个巧合让评测不再模拟部署。严格说这是一条从测试分布统计量到模型参数的路径。</li>
+</ul>
+<h4 id="h-14-学习器不止是模型">1.4 &quot;学习器&quot;不止是模型<a class="anchor" href="#h-14-学习器不止是模型" aria-label="本节链接">#</a></h4>
+<p>这是最容易被漏掉的一条。<strong>任何根据数据做出选择的环节都是学习器</strong>，都吃泄漏。这类环节在真实管线里至少包括：</p>
+<table>
+<thead>
+<tr>
+<th>环节</th>
+<th>它&quot;学到&quot;了什么</th>
+<th>泄漏的方式</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>参数训练</td>
+<td>模型权重</td>
+<td>测试样本进训练集</td>
+</tr>
+<tr>
+<td>超参选择</td>
+<td>学习率、层数</td>
+<td>用测试集挑</td>
+</tr>
+<tr>
+<td>早停</td>
+<td>训练的终止点</td>
+<td>监控指标用测试集</td>
+</tr>
+<tr>
+<td>阈值/校准</td>
+<td>决策阈值、温度系数</td>
+<td>用测试集拟合</td>
+</tr>
+<tr>
+<td><strong>数据过滤/清洗</strong></td>
+<td>过滤器的阈值、特征选择</td>
+<td>用全体数据（含测试）统计</td>
+</tr>
+<tr>
+<td><strong>配比</strong></td>
+<td>域权重 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0269em;">w</span></span></span></span></td>
+<td>用测试集评测挑 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0269em;">w</span></span></span></span>（第 2 节末尾已提过）</td>
+</tr>
+<tr>
+<td>提示词/模板选择</td>
+<td>提示的措辞</td>
+<td>在测试集上试提示</td>
+</tr>
+</tbody></table>
+<p><strong>推论</strong>：一个团队的流程里，只要&quot;看测试集&quot;这个动作参与了<strong>任何</strong>决策（包括&quot;我觉得这版更好&quot;），那这个测试集就已经被消耗了。这就是为什么&quot;用测试集做开发&quot;在工程上等价于泄漏 —— 你没法把一个已经用于决策的集合，再当成无偏的估计器。</p>
+<h3 id="h-二泄漏的六个家族">二、泄漏的六个家族<a class="anchor" href="#h-二泄漏的六个家族" aria-label="本节链接">#</a></h3>
+<h4 id="h-21-基准污染benchmark-contamination">2.1 基准污染（benchmark contamination）<a class="anchor" href="#h-21-基准污染benchmark-contamination" aria-label="本节链接">#</a></h4>
+<p><strong>定义</strong>：评测数据（或与它高度相似的近邻）出现在训练语料里。这是大模型时代最普遍的一类。</p>
+<p><strong>通路</strong>：预训练语料是从全网爬的，而评测集（或其源题目）本身就在网上 —— 论文附录、GitHub 仓库、数据集的原始发布页、题目讨论帖。于是模型在预训练阶段&quot;见过&quot;了答案。</p>
+<p><strong>为什么它比&quot;背答案&quot;更微妙</strong>：模型不需要逐字记住整道题。它只需要见过<strong>题目形式 + 答案文本的共现</strong>，就能在 few-shot 时给出正确格式并大幅提高命中率。所以污染不是二值的，而是<strong>连续的</strong>：从&quot;完全没见过&quot;到&quot;逐字记住&quot;之间有一条很长的谱。</p>
+<p><strong>检测</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span>-gram 重叠（4.1）、近邻检索（4.2）、以及&quot;测试样本上的损失异常低&quot;（模型对见过的文本给更低的困惑度）。</p>
+<h4 id="h-22-训练-测试同源split-leakage">2.2 训练-测试同源（split leakage）<a class="anchor" href="#h-22-训练-测试同源split-leakage" aria-label="本节链接">#</a></h4>
+<p><strong>定义</strong>：在划分 train/val/test 之前就做去重或聚类，导致同一份内容（或近重复内容）横跨两个集合。</p>
+<p><strong>典型事故</strong>：先在<strong>全量数据</strong>上去重，再随机切分 —— 听起来很严谨，实际上正好相反：去重之后你以为&quot;没有重复了&quot;，但近重复（阈值以下）仍在，它们会随机分布到两个集合里。<strong>正确的顺序永远是：先分组，再切分，最后在组内各自去重（或按组去重）。</strong></p>
+<p><strong>检测</strong>：跨 split 的 MinHash/embedding 近邻检索（第 2 章第 2 节的工具），阈值扫描后人工看一批。</p>
+<h4 id="h-23-时间泄漏temporal-leakage">2.3 时间泄漏（temporal leakage）<a class="anchor" href="#h-23-时间泄漏temporal-leakage" aria-label="本节链接">#</a></h4>
+<p><strong>定义</strong>：训练时用到了预测时刻之后才可得的特征或样本。</p>
+<p><strong>三个子类</strong>，都很常见：</p>
+<ol>
+<li><strong>特征晚于标签</strong>：用&quot;当前余额&quot;预测&quot;上周是否逾期&quot;（余额是逾期的结果）。</li>
+<li><strong>随机切分时序数据</strong>：把 2025 年 12 月的数据放进训练集，用随机切分后&quot;预测&quot;2025 年 6 月 —— 模型可以插值（前后的邻居都在训练集里），于是分数虚高，而部署时只能外推。</li>
+<li><strong>聚合统计用了未来窗口</strong>：计算&quot;用户过去 30 天平均消费&quot;时窗口跨越了标签时刻。</li>
+</ol>
+<p><strong>检测</strong>：审计每条特征的时间戳与标签时间戳的顺序；对每条特征问&quot;这个值在预测时刻真的可得吗&quot;。这是<strong>逐特征</strong>的审计，没有捷径。</p>
+<p><strong>修法</strong>：按时间切分（训练集的所有时间戳早于验证集早于测试集），并在特征层显式声明&quot;可用时刻&quot;。</p>
+<h4 id="h-24-组泄漏group-leakage">2.4 组泄漏（group leakage）<a class="anchor" href="#h-24-组泄漏group-leakage" aria-label="本节链接">#</a></h4>
+<p><strong>定义</strong>：同一实体的多条记录被分到不同的 split，导致模型通过&quot;认出实体&quot;而不是&quot;学到规律&quot;来答题。</p>
+<p><strong>例子</strong>：</p>
+<ul>
+<li>同一个用户的多条行为记录分属 train/test → 模型学到用户 id 的隐表征；</li>
+<li>同一篇文档切成多个段落分属 train/test → 语义高度重叠；</li>
+<li>医疗数据里同一患者多次入院 → 记住患者就够；</li>
+<li>代码补全：同一仓库的多个文件分属 train/test（函数调用、命名风格高度相关）。</li>
+</ul>
+<p><strong>检测</strong>：按实体的 split 一致性检查。<strong>这条错误的特征很好认</strong>：模型在测试集上的表现与&quot;测试实体是否在训练集中出现过&quot;强相关。</p>
+<p><strong>修法</strong>：GroupKFold 式的按实体切分。代价是评测方差变大（测试集里&quot;见过的实体&quot;比例被强制为 0，与真实部署分布不符）——这里有一个<strong>真实的取舍</strong>：如果你的部署场景确实会遇到见过的用户，那把组全分开会<strong>低估</strong>性能；此时正确的做法不是二选一，而是<strong>同时报告两个数字</strong>（见过实体 / 未见过实体）。</p>
+<h4 id="h-25-目标泄漏target-leakage">2.5 目标泄漏（target leakage）<a class="anchor" href="#h-25-目标泄漏target-leakage" aria-label="本节链接">#</a></h4>
+<p><strong>定义</strong>：某个特征在部署时<strong>不可得</strong>，或者它是标签的<strong>后验结果</strong>、是标签生成流程的<strong>一部分</strong>。</p>
+<p><strong>经典例子</strong>：</p>
+<ul>
+<li>&quot;是否已进入催收流程&quot;预测&quot;是否违约&quot; —— 催收是违约之后才发生的；</li>
+<li>&quot;退款金额&quot;预测&quot;是否会退款&quot;；</li>
+<li>&quot;医生开了抗生素&quot;预测&quot;是否有细菌感染&quot; —— 这个特征编码了医生的判断（一个比模型更好的判断）；</li>
+<li>数据标注流程的<strong>中间产物</strong>（标注者批注、审核状态）混入特征。</li>
+</ul>
+<p><strong>为什么它最难发现</strong>：它在离线评测上表现极好（因为特征几乎就是标签），团队会先庆祝，然后在上线时发现这个特征拿不到 —— 或者更糟：拿得到，但它是用别的系统的输出算的，于是模型只是复读了那个系统。</p>
+<p><strong>检测</strong>：对每个特征画一张&quot;因果/时间先后&quot;图，并逐个问三个问题：(a) 部署时可获得吗？(b) 它的取值是否在标签之后确定？(c) 它的定义里是否间接用到了标签？（第三问最容易被忽略：一个&quot;用户风险分&quot;如果是用历史违约标签训出来的，它就是一个标签的代理。）</p>
+<h4 id="h-26-预处理泄漏preprocessing-leakage">2.6 预处理泄漏（preprocessing leakage）<a class="anchor" href="#h-26-预处理泄漏preprocessing-leakage" aria-label="本节链接">#</a></h4>
+<p><strong>定义</strong>：任何&quot;用全体数据（含 test）拟合出的统计量或做出的选择&quot;，被固化成了训练管线的参数。</p>
+<p><strong>清单</strong>（写管线时逐条过）：</p>
+<table>
+<thead>
+<tr>
+<th>操作</th>
+<th>是否泄漏</th>
+<th>正确做法</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>标准化/归一化的均值方差</td>
+<td>在全体数据上算 = 泄漏</td>
+<td>只用训练集算；测试集用同一组参数</td>
+</tr>
+<tr>
+<td>缺失值填充（中位数/均值）</td>
+<td>同上</td>
+<td>只用训练集统计</td>
+</tr>
+<tr>
+<td>特征选择（按与标签的相关性）</td>
+<td>在全量上选 = 泄漏</td>
+<td>只用训练集选，或放进交叉验证循环内</td>
+</tr>
+<tr>
+<td>PCA / 降维</td>
+<td>在全量上 fit = 泄漏</td>
+<td>只用训练集 fit</td>
+</tr>
+<tr>
+<td>目标编码（target encoding）</td>
+<td>在全量上算目标均值 = 严重泄漏</td>
+<td>折内计算（out-of-fold）</td>
+</tr>
+<tr>
+<td>语言模型/分词器训练</td>
+<td>在含测试集的语料上训 = 泄漏</td>
+<td>语料要与评测集去污染</td>
+</tr>
+<tr>
+<td>去重/过滤阈值选择</td>
+<td>在全量上调 = 泄漏</td>
+<td>用独立集合调</td>
+</tr>
+<tr>
+<td>词表构建（BPE 词表）</td>
+<td>用含测试集的语料 = 弱泄漏</td>
+<td>通常可接受，但要记录</td>
+</tr>
+</tbody></table>
+<p>最后一行值得展开：<strong>弱泄漏也是泄漏，问题只是量级。</strong> 用测试集文本训出来的 BPE 词表，会让测试集的 token 序列更&quot;合手&quot;；这个效应通常很小，但<strong>它是可测量的</strong>，而且它会随测试集规模下降而放大（测试集越小，词表对它的拟合越明显）。工程上的纪律是：<strong>记录它，并在需要严格结论时用&quot;词表只从训练语料学&quot;的版本复核一次</strong>。</p>
+<h3 id="h-三代价的因果分析三层机制完全不同">三、代价的因果分析：三层，机制完全不同<a class="anchor" href="#h-三代价的因果分析三层机制完全不同" aria-label="本节链接">#</a></h3>
+<h4 id="h-31-第一层泛化误差的估计被破坏--模型选择被反转">3.1 第一层：泛化误差的估计被破坏 → 模型选择被反转<a class="anchor" href="#h-31-第一层泛化误差的估计被破坏--模型选择被反转" aria-label="本节链接">#</a></h4>
+<p>这是最严重、也最容易讲错的一层。很多人以为泄漏的代价是&quot;数字虚高了一点，减掉就好了&quot;，这是错的。用一个简单的可加模型说明：</p>
+<p>设模型 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">m</span></span></span></span> 的真实泛化性能为 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span><span class="mopen">(</span><span class="mord mathnormal">m</span><span class="mclose">)</span></span></span></span>，它的&quot;记忆化倾向&quot;为 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathrm">Mem</span></span><span class="mopen">(</span><span class="mord mathnormal">m</span><span class="mclose">)</span></span></span></span>（容量、训练轮数、是否见过该样本的函数），泄漏强度为 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8304em;vertical-align:-0.136em;"></span><span class="mord mathnormal">λ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≥</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0</span></span></span></span>。那么在<strong>被污染的评测</strong>上观测到的分数是</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.1968em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.9468em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span></span><span style="top:-3.2523em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.1667em;"><span class="mord">^</span></span></span></span></span></span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0576em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">leak</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord mathnormal">m</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span><span class="mopen">(</span><span class="mord mathnormal">m</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">λ</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathrm">Mem</span></span><span class="mopen">(</span><span class="mord mathnormal">m</span><span class="mclose">)</span></span></span></span></span></p>
+<p>于是</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.6468em;vertical-align:-0.7em;"></span><span class="mop">ar<span style="margin-right:0.0139em;">g</span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.4306em;"><span style="top:-2.4em;margin-left:0em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">m</span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span><span class="mop">max</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.7em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.9468em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span></span><span style="top:-3.2523em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.1667em;"><span class="mord">^</span></span></span></span></span></span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0576em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">leak</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord mathnormal">m</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel"><span class="mrel"><span class="mord vbox"><span class="thinbox"><span class="rlap"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="inner"><span class="mord"><span class="mrel"></span></span></span><span class="fix"></span></span></span></span></span><span class="mspace nobreak"></span><span class="mrel">=</span></span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.45em;vertical-align:-0.7em;"></span><span class="mop">ar<span style="margin-right:0.0139em;">g</span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.4306em;"><span style="top:-2.4em;margin-left:0em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">m</span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span><span class="mop">max</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.7em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span><span class="mopen">(</span><span class="mord mathnormal">m</span><span class="mclose">)</span><span class="mspace" style="margin-right:1em;"></span><span class="mord text"><span class="mord cjk_fallback">只要</span><span class="mord"> </span></span><span class="mord mathnormal">λ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&gt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">0</span><span class="mord text"><span class="mord"> </span><span class="mord cjk_fallback">且</span><span class="mord"> </span></span><span class="mord"><span class="mord mathrm">Mem</span></span><span class="mord text"><span class="mord"> </span><span class="mord cjk_fallback">在各模型间不同</span></span></span></span></span></span></p>
+<p><strong>关键就在这里</strong>：泄漏不是一个与模型无关的常数偏移，它对<strong>记忆化能力强的模型加分更多</strong>。所以泄漏的后果是<strong>系统性偏向&quot;过拟合/大容量/多轮训练&quot;的模型</strong> —— 而在干净评测上，这些模型往往更差。</p>
+<p>这个推论的实证很直接，本节代码的 B 段就是一个最小例子：</p>
+<ul>
+<li>干净管线（特征选择只用独立数据）：报出 0.6871，真实 0.6851，<strong>高估 +0.0020</strong>；</li>
+<li>泄漏管线（特征选择用了 train+test）：报出 0.7885，真实 0.6381，<strong>高估 +0.1504</strong>。</li>
+</ul>
+<p>注意第二行的两个数字：<strong>泄漏管线的真实性能（0.6381）反而比干净管线（0.6851）更差</strong>，而它报出的分数高 10 个点。原因正是上面的公式 —— 泄漏让&quot;对测试集过拟合的配置&quot;（那一组恰好与测试标签相关的噪声特征）在报出分数上胜出，于是选择过程主动挑了一个更差的模型。<strong>这就是&quot;排序被破坏&quot;，它是泄漏的第一层代价，也是唯一一层会让你的选择行为变错的代价。</strong></p>
+<h4 id="h-32-第二层独立性假设被破坏--置信区间被系统性低估">3.2 第二层：独立性假设被破坏 → 置信区间被系统性低估<a class="anchor" href="#h-32-第二层独立性假设被破坏--置信区间被系统性低估" aria-label="本节链接">#</a></h4>
+<p>评测的置信区间建立在&quot;测试样本是独立同分布的样本&quot;这个假设上。泄漏破坏了它：</p>
+<ul>
+<li>若一部分测试样本被模型&quot;记住&quot;，它们的误差方差远小于其余样本。把两者混在一起算方差，会得到一个<strong>偏小</strong>的方差估计 —— 于是置信区间变窄，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span></span></span></span> 值变小，&quot;显著提升&quot;大量出现。</li>
+<li>更隐蔽的是<strong>配对</strong>的问题：评测实践里，配对比较（同一批题上的分差）能压窄置信区间，前提是这批题对两个模型都是&quot;新题&quot;。如果题目被其中一个模型见过，配对结构就被破坏 —— 你会观测到&quot;这个模型在难题上得分异常高&quot;，而这不是能力差异。</li>
+</ul>
+<p><strong>所以在评测报告里，&quot;我们做了 bootstrap 置信区间&quot;并不足以说明结论可信</strong>：如果训练/选择过程与评测集有重叠，置信区间本身就是失效的（它估计的是一个不再有意义的量的方差）。</p>
+<h4 id="h-33-第三层决策不可逆--历史结论作废">3.3 第三层：决策不可逆 + 历史结论作废<a class="anchor" href="#h-33-第三层决策不可逆--历史结论作废" aria-label="本节链接">#</a></h4>
+<p>这一层不是统计问题，是工程与组织问题：</p>
+<ul>
+<li><strong>发现得太晚</strong>：泄漏的表现是&quot;分数很好&quot;，而分数好不会触发任何告警。它通常只在两种时刻暴露：(a) 你换了一个<strong>全新的、从未参与过任何环节</strong>的评测集；(b) 你上线了，线上指标远低于离线。</li>
+<li><strong>历史结论全部作废，而不是打折</strong>：一旦确认某条管线有泄漏，你<strong>无法事后区分</strong>哪些结论是真的。比如同一个团队三年里用这个测试集选过 20 次模型，&quot;哪个版本的提示词最好&quot;&quot;配比 A 还是 B&quot;这些结论全部失效 —— 因为每一个都是在被污染的尺子上量的。<strong>这是泄漏最贵的代价：它摧毁的是积累。</strong></li>
+<li><strong>修一次不便宜</strong>：修泄漏往往意味着重建切分、重跑去污染、重训、重评 —— 因为泄漏常常在切分环节，而切分是管线的根。</li>
+</ul>
+<h4 id="h-34-为什么部分泄漏是最坏的情况">3.4 为什么&quot;部分泄漏&quot;是最坏的情况<a class="anchor" href="#h-34-为什么部分泄漏是最坏的情况" aria-label="本节链接">#</a></h4>
+<p>值得单独说：泄漏率低（比如 3%）比泄漏率高（比如 80%）<strong>更难处理</strong>。</p>
+<ul>
+<li>泄漏率 80% 时，效果太大、太荒谬（测试准确率 99.9%），团队会立刻怀疑并查出问题；</li>
+<li>泄漏率 3% 时，分数只高一点点，恰好落在&quot;看起来是真实进步&quot;的区间。它会<strong>持续误导</strong>：每一轮迭代都在这条虚高的基线上做比较，误差被反复累积进决策。</li>
+</ul>
+<p><strong>因此检测的目标不是&quot;发现明显的泄漏&quot;，而是给&quot;没有泄漏&quot;一个可量化的上界。</strong> 这一点直接决定了下一节的方法论。</p>
+<p><figure><img class="md-img" src="content/courses/data-engineering/assets/chapter-1-figure-03.svg" alt="泄漏把报出的提升放大到 50 倍" loading="lazy" decoding="async"><figcaption>泄漏把报出的提升放大到 50 倍</figcaption></figure>
+</p>
+<h3 id="h-四检测与量化">四、检测与量化<a class="anchor" href="#h-四检测与量化" aria-label="本节链接">#</a></h3>
+<h4 id="h-41-math25-gram-重叠检测">4.1 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span>-gram 重叠检测<a class="anchor" href="#h-41-math25-gram-重叠检测" aria-label="本节链接">#</a></h4>
+<p>最经典的做法（GPT-3 时代起被广泛使用）：取测试样本的所有 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span>-gram（通常是词级或字符级），检查是否出现在训练语料中。定义</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord cjk_fallback">污染率</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.363em;vertical-align:-0.936em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.427em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">#</span><span class="mopen">{</span><span class="mord text"><span class="mord cjk_fallback">测试样本</span></span><span class="mclose">}</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">#</span><span class="mopen">{</span><span class="mord text"><span class="mord cjk_fallback">测试样本中含至少一个命中</span><span class="mord"> </span></span><span class="mord mathnormal">n</span><span class="mord text"><span class="mord">-gram</span></span><span class="mclose">}</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.936em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></p>
+<p>它的<strong>全部要害在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span> 的选择上</strong>，而且这是一个无法两头兼顾的取舍（本节代码 D 段给的是实测数字，语料为合成中文文本）：</p>
+<table>
+<thead>
+<tr>
+<th><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span></th>
+<th>逐字复制</th>
+<th>改写 20%</th>
+<th>仅共享模板</th>
+<th>全新</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>8</td>
+<td>命中 1.00</td>
+<td>命中 0.86</td>
+<td><strong>误报 1.00</strong></td>
+<td>0.00</td>
+</tr>
+<tr>
+<td>13</td>
+<td>命中 1.00</td>
+<td>命中 0.23</td>
+<td><strong>误报 1.00</strong></td>
+<td>0.00</td>
+</tr>
+<tr>
+<td>20</td>
+<td>命中 1.00</td>
+<td><strong>漏检 0.03</strong></td>
+<td><strong>误报 1.00</strong></td>
+<td>0.00</td>
+</tr>
+</tbody></table>
+<p>读法：</p>
+<ul>
+<li><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">8</span></span></span></span>：改写过的文本也大量命中（召回高），但<strong>只要共享一句模板/版权声明就报警</strong>（误报 100%）。</li>
+<li><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">20</span></span></span></span>：模板误报没有改善（因为模板本身就是长串重复），但改写文本基本全部漏掉。</li>
+<li>三行的&quot;仅模板&quot;都是 1.00 —— 这说明<strong><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span>-gram 检测无法区分&quot;共享模板&quot;与&quot;真污染&quot;</strong>，必须先把模板/boilerplate 去掉（第 2 章第 4 节的内容），否则污染率会被系统性高估到没有信息量。</li>
+</ul>
+<p><strong>实践建议</strong>：用<strong>多个 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span> 分别报告</strong>（例如 8/13/20 三条曲线），而不是挑一个数。报告&quot;<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">13</span></span></span></span> 时污染率 2.3%，其中 90% 来自共享 boilerplate&quot;比&quot;污染率 2.3%&quot;有用得多。</p>
+<h4 id="h-42-近邻检测">4.2 近邻检测<a class="anchor" href="#h-42-近邻检测" aria-label="本节链接">#</a></h4>
+<p><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span>-gram 只能抓字面重叠。改写、翻译、格式变化都要靠近邻：</p>
+<ol>
+<li>对训练语料与测试样本分别算 MinHash 签名或 embedding；</li>
+<li>做近邻检索（LSH / ANN 索引），取出高于阈值的对；</li>
+<li><strong>人工核验一批</strong>，估计precision/recall，再外推污染率。</li>
+</ol>
+<p>⚠️ 第 3 步不能省：近邻检测的阈值与&quot;什么算污染&quot;都是主观判断，没有人工核验的污染率只是另一个未校准的分数。第 2 章第 2 节会给出 MinHash/LSH 的完整实现。</p>
+<h4 id="h-43-排序可预测性检测">4.3 排序/可预测性检测<a class="anchor" href="#h-43-排序可预测性检测" aria-label="本节链接">#</a></h4>
+<p>一个比 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span>-gram 更能抓&quot;语义污染&quot;的信号：<strong>看模型对测试样本的损失分布是否异常</strong>。</p>
+<ul>
+<li>把测试样本按模型损失排序，看损失最低的那一批是不是&quot;看起来很简单&quot;；</li>
+<li>如果某个子集的损失异常低（远低于同难度的其它样本），它很可能被见过；</li>
+<li>用<strong>样本难度代理</strong>（比如另一个从未见过该语料的模型给出的损失）做归一化：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">Δ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord">ℓ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">model</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.9805em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord">ℓ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">proxy</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span></span>，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">Δ</span></span></span></span> 显著为负的样本是被污染的候选。</li>
+</ul>
+<p>这个方法的优势是不依赖字面重叠，能抓到&quot;看过答案的改写版&quot;；劣势是它需要第二个模型，且低损失也可能只是&quot;这个样本确实简单&quot;。</p>
+<h4 id="h-44-成员推断membership-inference作为下界证据">4.4 成员推断（membership inference）作为下界证据<a class="anchor" href="#h-44-成员推断membership-inference作为下界证据" aria-label="本节链接">#</a></h4>
+<p>训练一个分类器区分&quot;这个样本在训练集里吗&quot;（用模型输出/损失/置信度作为特征）。它的准确率显著高于随机，就说明模型确实记住了训练样本 —— 这是<strong>记忆化存在</strong>的直接证据，从而给泄漏的危害提供一个下界。注意：<strong>成员推断成功不等于评测集被污染</strong>，它只说明&quot;若被污染，危害是实在的&quot;。两者要分开报告。</p>
+<h4 id="h-45-结构性审计最可靠也最枯燥的一类">4.5 结构性审计：最可靠也最枯燥的一类<a class="anchor" href="#h-45-结构性审计最可靠也最枯燥的一类" aria-label="本节链接">#</a></h4>
+<p>上面都是统计检测，它们都有漏检。<strong>最可靠的方法是把管线本身审一遍</strong>，因为泄漏大多数时候是一个<strong>结构错误</strong>，而不是一个统计异常：</p>
+<ol>
+<li><strong>切分脚本审计</strong>：切分发生在去重之前还是之后？按时间还是随机？按实体分组了吗？</li>
+<li><strong>特征时间戳审计</strong>：逐特征确认&quot;预测时刻可得&quot;。</li>
+<li><strong>预处理作用域审计</strong>：每一个 <code>fit</code>（StandardScaler、PCA、TargetEncoder、特征选择、词表、过滤器阈值）用的是哪个集合？</li>
+<li><strong>选择动作审计</strong>：列出所有&quot;看评测结果后做的决定&quot;（模型、超参、配比、阈值、提示词），确认它们的依据集合是验证集而不是测试集。</li>
+<li><strong>访问审计</strong>：测试集放在哪里？谁能读？读了之后有没有记录？</li>
+</ol>
+<p><strong>第 4 条是最容易漏的</strong>，因为它不是代码错误，而是工作习惯。一个可执行的工程手段是：<strong>把测试集的访问做成一件麻烦事</strong>（单独的目录、需要显式命令、每次访问写日志），并用一个&quot;从未被任何人看过&quot;的隐藏集做最终验收。</p>
+<h4 id="h-46-检测的固有局限">4.6 检测的固有局限<a class="anchor" href="#h-46-检测的固有局限" aria-label="本节链接">#</a></h4>
+<p>必须说清：<strong>你无法证明&quot;没有泄漏&quot;。</strong> 你只能：</p>
+<ul>
+<li>提高检测的覆盖（多种 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span>、多种近邻度量、结构性审计）；</li>
+<li>给出污染率的<strong>上界</strong>（&quot;在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">13</span></span></span></span> 的字符级匹配下，污染率 ≤ 2.3%&quot;）；</li>
+<li>用<strong>独立的新评测集</strong>做最终验证（新题 = 物理上不可能进过旧训练语料）。</li>
+</ul>
+<p>最后一条是最强的证据，也是最贵的：它要求评测集能持续更新（第 4.2 节的动态评测集）。</p>
+<h3 id="h-五修法与代价">五、修法与代价<a class="anchor" href="#h-五修法与代价" aria-label="本节链接">#</a></h3>
+<table>
+<thead>
+<tr>
+<th>手段</th>
+<th>能挡哪类泄漏</th>
+<th>代价 / 残余风险</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>训练语料中删除匹配片段</td>
+<td>基准污染（字面级）</td>
+<td>删掉的可能是合法共现（常见短语、公共知识）；改写污染仍漏</td>
+</tr>
+<tr>
+<td>只删重叠 span 而不删整篇</td>
+<td>同上，且保留文档结构</td>
+<td>实现复杂；span 边界破坏可读性与其它质量信号</td>
+</tr>
+<tr>
+<td>提高 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span>（如 20+）</td>
+<td>降低误删</td>
+<td>漏检近改写；对模板仍误报</td>
+</tr>
+<tr>
+<td>按实体/时间/来源分组切分</td>
+<td>组泄漏、时间泄漏</td>
+<td>评测方差变大；可能与部署分布不符</td>
+</tr>
+<tr>
+<td>预处理全部限定在训练集</td>
+<td>预处理泄漏</td>
+<td>工程量大；小数据下统计量噪声大</td>
+</tr>
+<tr>
+<td>独立验证集承担全部选择</td>
+<td>选择泄漏</td>
+<td>需要真正执行纪律；验证集被消耗后要重建</td>
+</tr>
+<tr>
+<td>私有 held-out + 访问审计</td>
+<td>全部类型（作为最终验收）</td>
+<td>成本高；更新慢，仍会随时间饱和</td>
+</tr>
+<tr>
+<td>动态/持续更新的评测集</td>
+<td>基准污染的长期解</td>
+<td>成本最高；题目难度漂移，跨版本不可直接比</td>
+</tr>
+</tbody></table>
+<p><strong>一个必须承认的取舍</strong>：去污染会把&quot;合法但罕见&quot;的文本也删掉。比如某个专业术语的标准定义句在测试集与训练语料里都出现 —— 它既是&quot;污染&quot;也是&quot;知识&quot;。删除它会削弱模型对该知识的掌握；保留它会让这道题的分数虚高。<strong>这个取舍没有通用解</strong>，工程上的折中是：<strong>删除长匹配（≥ 某长度）的 span、保留短语级共现</strong>，并把&quot;删除比例&quot;与&quot;删除样例&quot;记录下来供评审。</p>
+<h4 id="h-微调与对齐场景的泄漏形态">微调与对齐场景的泄漏形态<a class="anchor" href="#h-微调与对齐场景的泄漏形态" aria-label="本节链接">#</a></h4>
+<p>上面六家族在微调（SFT/RLHF）阶段有各自的特化形态，值得单列，因为它们最容易被忽略：</p>
+<ol>
+<li><strong>指令-评测同源</strong>：评测集的题目是同一批标注员用同一套模板写的，于是微调数据与评测集在<strong>模板层面</strong>同源 —— 模型学到的是模板，而不是任务。<strong>检测</strong>：把评测题的模板换一种写法，看掉了多少。</li>
+<li><strong>答案在输入里</strong>：微调样本的 prompt 里包含了参考答案（比如&quot;请改写下面这句话：&lt;原句&gt;&quot;），模型学到的是复制而非生成。<strong>检测</strong>：检查 prompt 与 response 的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span>-gram 重叠率，重叠高的样本要审。</li>
+<li><strong>对齐数据的评测泄漏</strong>：安全评测的用例出现在安全对齐数据里。这一类特别危险，因为它的表现是&quot;安全能力优秀&quot;，而真实鲁棒性未知。</li>
+<li><strong>用评测做早停</strong>：选择&quot;在第几步停下&quot;就等于在评测上做梯度下降。<strong>修法</strong>：早停只允许看验证集。</li>
+<li><strong>拒答率被隐式优化</strong>：如果拒答样本在微调数据里占比过高，模型会学到&quot;多拒答&quot;，安全评测分数上升但有用性下降 —— 严格说这不是泄漏，但它与泄漏共享同一个症状（虚高的安全分数），所以排查时要一起看。</li>
+</ol>
+<h3 id="h-代码四段实验把三层代价测出来">代码：四段实验，把三层代价测出来<a class="anchor" href="#h-代码四段实验把三层代价测出来" aria-label="本节链接">#</a></h3>
+<p>下面四段各自针对一类机制。全部是合成数据，目的是让<strong>真实值可算</strong>（有从未参与任何环节的 held-out），从而直接测量&quot;报出的分数&quot;与&quot;真实泛化&quot;的差。</p>
+<pre data-lang="python"><code class="language-python"># -*- coding: utf-8 -*-
+&quot;&quot;&quot;泄漏的代价：四段实验（合成数据，只为看清机制）。&quot;&quot;&quot;
+import numpy as np
+
+rng = np.random.default_rng(11)
+
+# ============ A. 记忆型泄漏：把 test 样本连标签注入训练集 ============
+def knn1(Xtr, ytr, Xte):
+    d = ((Xte[:, None, :] - Xtr[None, :, :]) ** 2).sum(-1)
+    return ytr[d.argmin(1)]
+
+def logreg(Xtr, ytr, Xte, steps=3000, lr=0.5):
+    &quot;&quot;&quot;限量容量的模型：只有 2 个权重，记住单个样本的能力很弱。&quot;&quot;&quot;
+    W, b = np.zeros(Xtr.shape[1]), 0.0
+    for _ in range(steps):
+        q = 1 / (1 + np.exp(-(Xtr @ W + b)))
+        g = q - ytr
+        W -= lr * (Xtr * g[:, None]).mean(0)
+        b -= lr * g.mean()
+    return (1 / (1 + np.exp(-(Xte @ W + b))) &gt; 0.5).astype(int)
+
+def blobs(n, r, sep=0.8):
+    y = r.integers(0, 2, n)
+    return r.normal(size=(n, 2)) + np.where(y == 1, sep, -sep)[:, None], y
+
+Xtr, ytr = blobs(2000, rng)
+Xte, yte = blobs(1000, rng)
+Xho, yho = blobs(1000, rng)          # 干净的 held-out：从未参与任何环节
+
+print(&quot;=== A. 记忆型泄漏（把 test 样本连标签注入训练集）===&quot;)
+print(f&quot;{&#39;注入&#39;:&gt;5} {&#39;1-NN报出&#39;:&gt;9} {&#39;1-NN真实&#39;:&gt;9} {&#39;高估&#39;:&gt;7} | &quot;
+      f&quot;{&#39;LR报出&#39;:&gt;8} {&#39;LR真实&#39;:&gt;8} {&#39;高估&#39;:&gt;7}&quot;)
+for rho in [0.0, 0.05, 0.1, 0.2, 0.4]:
+    k = int(rho * len(Xte))
+    idx = rng.choice(len(Xte), k, replace=False) if k else np.array([], dtype=int)
+    X2 = np.vstack([Xtr, Xte[idx]]) if k else Xtr
+    y2 = np.concatenate([ytr, yte[idx]]) if k else ytr
+    a_rep = (knn1(X2, y2, Xte) == yte).mean(); a_ho = (knn1(X2, y2, Xho) == yho).mean()
+    b_rep = (logreg(X2, y2, Xte) == yte).mean(); b_ho = (logreg(X2, y2, Xho) == yho).mean()
+    print(f&quot;{rho:5.2f} {a_rep:9.4f} {a_ho:9.4f} {a_rep-a_ho:+7.4f} | &quot;
+          f&quot;{b_rep:8.4f} {b_ho:8.4f} {b_rep-b_ho:+7.4f}&quot;)
+
+# ============ B. 预处理泄漏：特征选择时用了 test 的标签 ============
+def nearest_centroid(Xtr, ytr, Xte, cols):
+    A, B = Xtr[:, cols], Xte[:, cols]
+    mu = np.stack([A[ytr == c].mean(0) for c in (0, 1)])
+    return ((B[:, None, :] - mu[None, :, :]) ** 2).sum(-1).argmin(1)
+
+print(&quot;\n=== B. 预处理泄漏：400 个纯噪声特征里按 |corr| 选 top-20 ===&quot;)
+print(&quot;     两个选择集大小都是 200：A=独立 200 条；B=train(100) ∪ test(100)&quot;)
+acc = {k: [] for k in [&quot;A 独立选择集:报出&quot;, &quot;A 独立选择集:全新&quot;,
+                       &quot;B 含test:报出&quot;, &quot;B 含test:全新&quot;]}
+for seed in range(80):
+    r = np.random.default_rng(seed)
+    n_nf = 400
+    X_tr, y_tr = r.normal(size=(100, n_nf)), r.integers(0, 2, 100)
+    X_te, y_te = r.normal(size=(100, n_nf)), r.integers(0, 2, 100)
+    X_fr, y_fr = r.normal(size=(200, n_nf)), r.integers(0, 2, 200)   # 全新评测
+    X_s,  y_s  = r.normal(size=(200, n_nf)), r.integers(0, 2, 200)   # 独立选择集
+    for X, y in ((X_tr, y_tr), (X_te, y_te), (X_fr, y_fr), (X_s, y_s)):
+        X[:, 0] += y * 1.2            # 只有一个真信号特征，其余 399 个是纯噪声
+    def topk(X, y, k=20):
+        c = np.array([abs(np.corrcoef(X[:, j], y)[0, 1]) for j in range(X.shape[1])])
+        return np.argsort(-c)[:k]
+    sA = topk(X_s, y_s)
+    sB = topk(np.vstack([X_tr, X_te]), np.concatenate([y_tr, y_te]))
+    acc[&quot;A 独立选择集:报出&quot;].append((nearest_centroid(X_tr, y_tr, X_te, sA) == y_te).mean())
+    acc[&quot;A 独立选择集:全新&quot;].append((nearest_centroid(X_tr, y_tr, X_fr, sA) == y_fr).mean())
+    acc[&quot;B 含test:报出&quot;].append((nearest_centroid(X_tr, y_tr, X_te, sB) == y_te).mean())
+    acc[&quot;B 含test:全新&quot;].append((nearest_centroid(X_tr, y_tr, X_fr, sB) == y_fr).mean())
+for k, v in acc.items():
+    print(f&quot;     {k:16s} = {np.mean(v):.4f}&quot;)
+print(f&quot;     高估幅度：A = {np.mean(acc[&#39;A 独立选择集:报出&#39;])-np.mean(acc[&#39;A 独立选择集:全新&#39;]):+.4f}&quot;
+      f&quot;   B = {np.mean(acc[&#39;B 含test:报出&#39;])-np.mean(acc[&#39;B 含test:全新&#39;]):+.4f}&quot;)
+
+# ============ C. 模型选择泄漏：winner&#39;s curse ============
+print(&quot;\n=== C. 用测试集做模型选择：报出的最大值 vs 真实值 ===&quot;)
+for K in [5, 20, 100]:
+    rep, tru = [], []
+    for seed in range(30):
+        r = np.random.default_rng(1000 + seed)
+        n_tr, n_te = 100, 200
+        y_tr, y_te, y_fr = (r.integers(0, 2, n) for n in (n_tr, n_te, n_te))
+        X_tr, X_te, X_fr = (r.normal(size=(n, 300)) for n in (n_tr, n_te, n_te))
+        X_tr[:, 0] += y_tr; X_te[:, 0] += y_te; X_fr[:, 0] += y_fr
+        best, cfg = -1.0, None
+        for _ in range(K):                       # K 个候选配置 = K 个随机特征子集
+            cols = r.choice(300, 20, replace=False)
+            a = (nearest_centroid(X_tr, y_tr, X_te, cols) == y_te).mean()
+            if a &gt; best:
+                best, cfg = a, cols
+        rep.append(best)                         # 报出 = 在 test 上的最大值
+        tru.append((nearest_centroid(X_tr, y_tr, X_fr, cfg) == y_fr).mean())
+    print(f&quot;     K={K:3d}: 报出 = {np.mean(rep):.4f}  真实 = {np.mean(tru):.4f}&quot;
+          f&quot;  高估 = {np.mean(rep)-np.mean(tru):+.4f}&quot;)
+
+# ============ D. n-gram 污染检测：n 的取舍 ============
+print(&quot;\n=== D. 字符级 n-gram 污染检测：n 小误报（模板），n 大漏报（改写）===&quot;)
+BOILER = &quot;版权所有 本站内容仅供学习交流 转载请注明出处&quot;
+VOCAB = [chr(0x4e00 + i) for i in range(200)]
+r = np.random.default_rng(5)
+def rand_text(n):
+    return &quot;&quot;.join(r.choice(VOCAB, n))
+corpus = [rand_text(60) + BOILER for _ in range(300)]
+items = []
+for d in corpus[:80]:
+    span = d[:40]
+    items.append((&quot;逐字复制&quot;, span))
+    t = list(span)
+    for i in r.choice(40, 8, replace=False):     # 改写 20% 的字
+        t[i] = r.choice(VOCAB)
+    items.append((&quot;改写20%&quot;, &quot;&quot;.join(t)))
+for _ in range(80):
+    items.append((&quot;仅模板&quot;, rand_text(40) + BOILER))     # 只共享模板，不是污染
+    items.append((&quot;全新&quot;, rand_text(40)))
+for n in (8, 13, 20):
+    grams = set()
+    for d in corpus:
+        grams.update(d[i:i+n] for i in range(len(d) - n + 1))
+    row = []
+    for t in (&quot;逐字复制&quot;, &quot;改写20%&quot;, &quot;仅模板&quot;, &quot;全新&quot;):
+        sub = [x for k, x in items if k == t]
+        hit = np.mean([any(x[i:i+n] in grams for i in range(len(x) - n + 1)) for x in sub])
+        row.append(f&quot;{t}={hit:.2f}&quot;)
+    print(f&quot;     n={n:2d}  &quot; + &quot;  &quot;.join(row))</code></pre>
+<p>实际输出：</p>
+<pre><code>=== A. 记忆型泄漏（把 test 样本连标签注入训练集）===
+   注入    1-NN报出    1-NN真实      高估 |     LR报出     LR真实      高估
+ 0.00    0.8010    0.8030 -0.0020 |   0.8660   0.8700 -0.0040
+ 0.05    0.8120    0.8020 +0.0100 |   0.8660   0.8700 -0.0040
+ 0.10    0.8230    0.8060 +0.0170 |   0.8660   0.8700 -0.0040
+ 0.20    0.8480    0.8000 +0.0480 |   0.8650   0.8720 -0.0070
+ 0.40    0.8970    0.7950 +0.1020 |   0.8660   0.8670 -0.0010
+
+=== B. 预处理泄漏：400 个纯噪声特征里按 |corr| 选 top-20 ===
+     两个选择集大小都是 200：A=独立 200 条；B=train(100) ∪ test(100)
+     A 独立选择集:报出       = 0.6871
+     A 独立选择集:全新       = 0.6851
+     B 含test:报出       = 0.7885
+     B 含test:全新       = 0.6381
+     高估幅度：A = +0.0020   B = +0.1504
+
+=== C. 用测试集做模型选择：报出的最大值 vs 真实值 ===
+     K=  5: 报出 = 0.5577  真实 = 0.5452  高估 = +0.0125
+     K= 20: 报出 = 0.6268  真实 = 0.6007  高估 = +0.0262
+     K=100: 报出 = 0.6677  真实 = 0.6402  高估 = +0.0275
+
+=== D. 字符级 n-gram 污染检测：n 小误报（模板），n 大漏报（改写）===
+     n= 8  逐字复制=1.00  改写20%=0.86  仅模板=1.00  全新=0.00
+     n=13  逐字复制=1.00  改写20%=0.23  仅模板=1.00  全新=0.00
+     n=20  逐字复制=1.00  改写20%=0.03  仅模板=1.00  全新=0.00</code></pre>
+<p><strong>五条结论，逐段读：</strong></p>
+<ul>
+<li><strong>A 段回答&quot;泄漏的伤害取决于什么&quot;</strong>：同一个泄漏（把测试样本注入训练集），1-NN 报出 0.8970 而真实只有 0.7950（高估 <strong>+10.2 个点</strong>），而只有两个权重的逻辑回归高估 ≈ 0。<strong>泄漏的危害与模型的记忆化容量成正比</strong> —— 这直接推出两条工程推论：(a) 模型越大、训练轮数越多，同一份污染的危害越大；(b) 评估一个数据集是否被污染，不能只看&quot;有没有重叠&quot;，还要看&quot;重叠样本有多少能被记住&quot;。</li>
+<li><strong>B 段是本节最重要的一段</strong>：两个管线的选择集<strong>大小完全相同（都是 200 条）</strong>，唯一区别是其中一个把测试集算进去了。泄漏管线的报出分数 0.7885 比干净管线高 10 个点，而它的<strong>真实性能 0.6381 反而比干净管线（0.6851）更差</strong>。这就是 3.1 节 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0968em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.9468em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span></span><span style="top:-3.2523em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.1667em;"><span class="mord">^</span></span></span></span></span></span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0576em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">leak</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">λ</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord"><span class="mord mathrm">Mem</span></span></span></span></span> 的实证：泄漏不是常数偏移，它让选择过程挑了一个对测试集过拟合的配置。</li>
+<li><strong>C 段是同一机制的另一种形态</strong>：没有任何数据重叠，只是&quot;用测试集比较了 K 个候选，报了最好的那个&quot;。K 越大高估越多（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">K</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">5</span></span></span></span> 时 +1.25 点，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">K</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">100</span></span></span></span> 时 +2.75 点）。<strong>这正是选择性推断（winner&#39;s curse）</strong>：最大值的期望随候选数上升，任何&quot;从 N 个方案里挑最好的并在同一批数据上报告&quot;的流程都会高估。</li>
+<li><strong>D 段给出 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span> 的取舍实证</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">8</span></span></span></span> 时改写文本 86% 被判污染（召回高），但共享模板的干净文本 100% 被误报；<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">20</span></span></span></span> 时模板误报没有改善（模板本身就是长重复），改写文本却只剩 3% 命中。<strong>&quot;仅模板&quot;三行全是 1.00</strong> 说明：不做 boilerplate 去除，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span>-gram 污染率这个数字就没有信息量。</li>
+<li>⚠️ 全部为<strong>合成数据</strong>：数值只用于展示机制的形状与量级，不代表任何真实数据集上的污染率。真实结论必须自己测。</li>
+</ul>
+<h3 id="h-练习">练习<a class="anchor" href="#h-练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><p><strong>定义判定</strong>：下面五件事，哪些是泄漏？用 1.1 的三个要件逐条论证，并说明 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">Z</span></span></span></span> 是什么、路径是什么。
+（a）用外部知识库增强模型；（b）用训练集训练一个 BPE 词表，然后用它编码测试集；（c）在验证集上早停；（d）用测试集上的分位数做异常值截断；（e）把测试集的样本用同义改写做数据增强后加入训练集。</p>
+</li>
+<li><p><strong>推导选择偏差</strong>：设 K 个候选模型在测试集上的分数是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0576em;">S</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0576em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0315em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7778em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">μ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0315em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">ε</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0315em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">ε</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0315em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∼</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.0641em;vertical-align:-0.25em;"></span><span class="mord mathcal" style="margin-right:0.1474em;">N</span><span class="mopen">(</span><span class="mord">0</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0359em;">σ</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span><span class="mclose">)</span></span></span></span> 独立，且真实的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">μ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0315em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 都等于 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">μ</span></span></span></span>。
+（a）写出报出分数 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mop"><span class="mop">max</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0315em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0576em;">S</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0576em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0315em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 的期望，并说明它随 K 如何增长；
+（b）用高斯最大值的尾界说明 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathbb">E</span><span class="mopen">[</span><span class="mop"><span class="mop">max</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0315em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">ε</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0315em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">]</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.04em;vertical-align:-0.1078em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">σ</span><span class="mord sqrt"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.9322em;"><span class="svg-align" style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord" style="padding-left:0.833em;"><span class="mord">2</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop">ln</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">K</span></span></span><span style="top:-2.8922em;"><span class="pstrut" style="height:3em;"></span><span class="hide-tail" style="min-width:0.853em;height:1.08em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="1.08em" viewBox="0 0 400000 1080" preserveAspectRatio="xMinYMin slice"><path d="M95,702
+c-2.7,0,-7.17,-2.7,-13.5,-8c-5.8,-5.3,-9.5,-10,-9.5,-14
+c0,-2,0.3,-3.3,1,-4c1.3,-2.7,23.83,-20.7,67.5,-54
+c44.2,-33.3,65.8,-50.3,66.5,-51c1.3,-1.3,3,-2,5,-2c4.7,0,8.7,3.3,12,10
+s173,378,173,378c0.7,0,35.3,-71,104,-213c68.7,-142,137.5,-285,206.5,-429
+c69,-144,104.5,-217.7,106.5,-221
+l0 -0
+c5.3,-9.3,12,-14,20,-14
+H400000v40H845.2724
+s-225.272,467,-225.272,467s-235,486,-235,486c-2.7,4.7,-9,7,-19,7
+c-6,0,-10,-1,-12,-3s-194,-422,-194,-422s-65,47,-65,47z
+M834 80h400000v40h-400000z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.1078em;"><span></span></span></span></span></span></span></span></span>，并与代码 C 段的实测值对照（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">σ</span></span></span></span> 可以用单次评测的标准误 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.24em;vertical-align:-0.305em;"></span><span class="mord sqrt"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.935em;"><span class="svg-align" style="top:-3.2em;"><span class="pstrut" style="height:3.2em;"></span><span class="mord" style="padding-left:1em;"><span class="mord mathnormal">p</span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord mathnormal">p</span><span class="mclose">)</span><span class="mord">/</span><span class="mord mathnormal">n</span></span></span><span style="top:-2.895em;"><span class="pstrut" style="height:3.2em;"></span><span class="hide-tail" style="min-width:1.02em;height:1.28em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="1.28em" viewBox="0 0 400000 1296" preserveAspectRatio="xMinYMin slice"><path d="M263,681c0.7,0,18,39.7,52,119
+c34,79.3,68.167,158.7,102.5,238c34.3,79.3,51.8,119.3,52.5,120
+c340,-704.7,510.7,-1060.3,512,-1067
+l0 -0
+c4.7,-7.3,11,-11,19,-11
+H40000v40H1012.3
+s-271.3,567,-271.3,567c-38.7,80.7,-84,175,-136,283c-52,108,-89.167,185.3,-111.5,232
+c-22.3,46.7,-33.8,70.3,-34.5,71c-4.7,4.7,-12.3,7,-23,7s-12,-1,-12,-1
+s-109,-253,-109,-253c-72.7,-168,-109.3,-252,-110,-252c-10.7,8,-22,16.7,-34,26
+c-22,17.3,-33.3,26,-34,26s-26,-26,-26,-26s76,-59,76,-59s76,-60,76,-60z
+M1001 80h400000v40h-400000z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.305em;"><span></span></span></span></span></span></span></span></span> 估）；
+（c）如果候选之间高度相关（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0361em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathrm">Corr</span></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal">ε</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">ε</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0572em;">j</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">ρ</span></span></span></span>），这个偏差会变大还是变小？为什么？这对&quot;我只搜了 3 个超参&quot;的辩护意味着什么？</p>
+</li>
+<li><p><strong>去污染的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span> 选择</strong>：你的评测集有 2000 道题，训练语料 1T token。
+（a）分别用 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">8</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">13</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">20</span></span></span></span> 跑字符级匹配，得到污染率 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.9444em;vertical-align:-0.1944em;"></span><span class="mord">3.1%</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">1.4%</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">0.6%</span></span></span></span>。你如何判断其中有多少是 boilerplate 造成的？（给出一个可执行的测量方案）
+（b）你要给出一个&quot;污染率上界&quot;，应该报哪个 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span>、附什么说明？
+（c）现在换用 embedding 近邻，取阈值 0.9 时&quot;污染率&quot;变成 12%。请说明这个 12% 与前面的 1.4% 哪个更接近真相，以及你需要什么才能回答这个问题。</p>
+</li>
+<li><p><strong>时间泄漏审计</strong>：表里有 8 个特征，标签是&quot;用户下月是否流失&quot;，预测时刻是每月最后一天。特征清单：
+<code>近30天登录次数</code>、<code>当前套餐价格</code>、<code>是否已提交退订申请</code>、<code>上月客服工单数</code>、<code>账户余额</code>、<code>近90天平均消费</code>、<code>是否被营销活动中签</code>、<code>入网月数</code>。
+（a）逐个判断是否存在目标泄漏或时间泄漏，说明理由；
+（b）对&quot;近90天平均消费&quot;给出一个具体的窗口设计，使得它不跨越预测时刻；
+（c）若&quot;是否已提交退订申请&quot;确实高度相关，你会怎么处理（删除？还是保留但重新定义任务）？</p>
+</li>
+<li><p><strong>组织措施设计</strong>：你要在一个 15 人的团队里防止&quot;用测试集做决策&quot;。
+（a）设计一套<strong>技术手段</strong>（目录权限、命令、日志、CI 检查）而不是口号；
+（b）设计一个&quot;隐藏集&quot;的使用流程：谁能用、多久用一次、用完怎么办；
+（c）说明你的方案的两个漏洞，以及为什么这两个漏洞无法完全消除。</p>
+</li>
+<li><p><strong>微调泄漏</strong>：你要在一个安全对齐数据集（5 万条拒答样本）上微调，并用一个 1000 题的内部安全评测验收。
+（a）列出至少三类可能的泄漏，并给出对应的检测手段；
+（b）如果安全评测分数从 82% 涨到 96%，而有用性评测从 71% 掉到 58%，你会先查哪一类？说明你的排查顺序与依据；
+（c）设计一个&quot;模板替换对照实验&quot;来区分&quot;学到了安全行为&quot;与&quot;学到了评测模板&quot;。</p>
+</li>
+</ol>
+<h3 id="h-小结">小结<a class="anchor" href="#h-小结" aria-label="本节链接">#</a></h3>
+<ul>
+<li><strong>泄漏的定义是因果的</strong>：存在一条从&quot;评测侧/未来侧信息 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">Z</span></span></span></span>&quot;到&quot;训练或选择过程 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathcal" style="margin-right:0.2542em;">T</span></span></span></span>&quot;的路径，且该通路在部署时不存在。三个要件（有通路、部署时不可得、影响指标解释）缺一不可。</li>
+<li><strong>&quot;学习器&quot;不止是模型</strong>：超参、早停、阈值、过滤器、配比、提示词 —— 任何&quot;看了结果再决定&quot;的环节都是学习器，都吃泄漏。<strong>只要测试集参与过任何决策，它就不再是无偏估计器。</strong></li>
+<li><strong>六个家族</strong>：基准污染、训练-测试同源、时间泄漏、组泄漏、目标泄漏、预处理泄漏。它们可以用同一套排查逻辑处理（这个决策用到了哪些信息？部署时拿得到吗？），但<strong>检测手段不同</strong>，不能只做 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span>-gram。</li>
+<li><strong>代价分三层</strong>：① <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.9468em;"></span><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.9468em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span></span><span style="top:-3.2523em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.1667em;"><span class="mord">^</span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">λ</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord"><span class="mord mathrm">Mem</span></span></span></span></span> 破坏的是<strong>排序</strong>，于是模型选择被反转 —— 代码 B 段的实证是&quot;报出高 10 个点、真实低 4.7 个点&quot;；② 破坏独立性假设，让置信区间被<strong>低估</strong>；③ 破坏决策的<strong>可逆性</strong>，历史结论全部作废而不是打折。<strong>部分泄漏（3%）比严重泄漏（80%）更难处理</strong>，因为它落在&quot;看起来像真进步&quot;的区间。</li>
+<li><strong>泄漏的危害与记忆化容量成正比</strong>（代码 A 段：同一次泄漏，1-NN 高估 10.2 点，线性模型高估 0）。模型越大/训练轮数越多，同一份污染的危害越大。</li>
+<li><strong><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span>-gram 检测的全部要害在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span></strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">8</span></span></span></span> 误报（boilerplate 100% 命中），<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">20</span></span></span></span> 漏检（改写只剩 3% 命中）。<strong>不做 boilerplate 去除，污染率没有信息量</strong>；正确做法是多个 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span> 分别报告并给出上界。</li>
+<li><strong>&quot;用测试集挑最好的 K 个候选&quot;本身就是泄漏</strong>（winner&#39;s curse）：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">K</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">5/20/100</span></span></span></span> 分别高估 1.25 / 2.62 / 2.75 个点。</li>
+<li><strong>你无法证明&quot;没有泄漏&quot;</strong>，只能给污染率上界、做结构性审计（切分顺序、特征时间戳、<code>fit</code> 的作用域、选择动作、访问记录），并用一个<strong>从未参与任何环节</strong>的独立评测集做最终验收。修法都有代价，且去污染的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span> 取舍没有通用解。</li>
+</ul>

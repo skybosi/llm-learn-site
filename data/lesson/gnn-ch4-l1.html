@@ -1,0 +1,120 @@
+<h2 id="h-graphsage">GraphSAGE<a class="anchor" href="#h-graphsage" aria-label="本节链接">#</a></h2>
+<p>上一章我们学完了 GCN：它在固定的图结构上，用归一化的邻接矩阵把邻居特征聚合起来，学出每个节点的嵌入。但 GCN 有一个明显的短板——它是<strong>直推式（transductive）</strong>的：训练时所有节点都在计算图里，学出来的本质是&quot;每个节点的专属嵌入向量&quot;。一旦来了一个训练时从未出现过的新节点，GCN 就束手无策了，因为它的参数并不直接告诉你&quot;如何从特征生成嵌入&quot;，而是直接记住了&quot;这个节点的嵌入长什么样&quot;。</p>
+<p>GraphSAGE 要解决的正是这个问题：<strong>把&quot;记住每个节点的嵌入&quot;改成&quot;学会一个从邻居特征生成嵌入的函数&quot;</strong>。只要学会了这个函数，任何带有特征的新节点，甚至是整张全新的图，都能直接套用函数算出嵌入。这就是&quot;归纳式（inductive）&quot;学习。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-核心思想从查表到学函数">1. 核心思想：从&quot;查表&quot;到&quot;学函数&quot;<a class="anchor" href="#h-1-核心思想从查表到学函数" aria-label="本节链接">#</a></h4>
+<p>对比一下两种思路，区别非常直观：</p>
+<ul>
+<li><strong>GCN（直推式）</strong>：目标是为<strong>训练图里已有的每个节点</strong>学一个向量。换节点、换图，模型就失效。</li>
+<li><strong>GraphSAGE（归纳式）</strong>：目标是为<strong>每个节点</strong>学一个&quot;聚合函数&quot; <code>AGGREGATE</code>，它把某个节点的邻居特征汇总成一个向量，再与该节点自身特征结合生成嵌入。这个函数与具体节点无关、与图规模无关，所以能迁移到新节点。</li>
+</ul>
+<p>因此 GraphSAGE 的名字也点出了它的做法：<strong>SA</strong>mple and <strong>AGG</strong>re<strong>G</strong>ate（采样并聚合）。它不追求一次性看到全部邻居，而是先<strong>采样</strong>固定数量的邻居，再<strong>聚合</strong>它们的特征。</p>
+<p><figure><img class="md-img" src="content/courses/graph-neural-networks/assets/chapter-4-figure-01.svg" alt="GraphSAGE 聚合流程示意：中心节点 v 先按固定数量采样出第一跳、第二跳邻居，箭头从邻居指向中心表示 AGGREGATE 聚合，聚合结果与自身特征 CONCAT 后经权重矩阵 W 和非线性变换 σ 得到新嵌入，最后 L2 归一化，整体强调&quot;学函数而非记向量&quot;" loading="lazy" decoding="async"><figcaption>GraphSAGE 聚合流程示意：中心节点 v 先按固定数量采样出第一跳、第二跳邻居，箭头从邻居指向中心表示 AGGREGATE 聚合，聚合结果与自身特征 CONCAT 后经权重矩阵 W 和非线性变换 σ 得到新嵌入，最后 L2 归一化，整体强调&quot;学函数而非记向量&quot;</figcaption></figure>
+</p>
+<h4 id="h-2-前向传播的三个步骤">2. 前向传播的三个步骤<a class="anchor" href="#h-2-前向传播的三个步骤" aria-label="本节链接">#</a></h4>
+<p>设第 <code>k</code> 层中心节点 <code>v</code> 的嵌入为 <code>h_v^k</code>（初始 <code>h_v^0 = x_v</code>，即原始特征）。GraphSAGE 每一层做三件事：</p>
+<p><strong>第一步：聚合邻居。</strong> 把 <code>v</code> 的所有（或采样后的）邻居上一层的表示汇总成一个向量：</p>
+<pre><code>h_N(v)^k = AGGREGATE_k( { h_u^(k-1) : u ∈ N(v) } )</code></pre>
+<p>花括号强调这是&quot;一个集合&quot;，聚合操作必须对邻居的<strong>顺序不敏感</strong>（图没有天然顺序），所以常用的聚合器都是置换不变（permutation-invariant）的：均值、最大池化等。</p>
+<p><strong>第二步：拼接自身并做线性变换。</strong> 把邻居聚合结果与节点自身的上一轮表示拼在一起，乘权重矩阵，再过激活函数：</p>
+<pre><code>h_v^k = σ( W^k · CONCAT( h_v^(k-1), h_N(v)^k ) )</code></pre>
+<p>拼接这一步是 GraphSAGE 区别于朴素均值聚合的关键：它让&quot;自己过去的状态&quot;和&quot;邻居带给我的信息&quot;分成两个通道，各自独立地经过 <code>W^k</code> 加权，模型可以自主决定更相信自己还是更相信邻居。</p>
+<p><strong>第三步：归一化。</strong> 对每层输出做 L2 归一化，防止多轮聚合后向量范数越滚越大，训练更稳定：</p>
+<pre><code>h_v^k = h_v^k / || h_v^k ||₂</code></pre>
+<p>最后一层（第 <code>K</code> 层）的输出 <code>z_v = h_v^K</code> 就是节点 <code>v</code> 的最终嵌入。</p>
+<h4 id="h-3-采样让计算量可控">3. 采样：让计算量可控<a class="anchor" href="#h-3-采样让计算量可控" aria-label="本节链接">#</a></h4>
+<p>真实图里节点度分布极不均匀（一个&quot;超级节点&quot;可能有上万个邻居）。如果每层都要聚合<strong>全部</strong>邻居，计算量和内存都会失控。GraphSAGE 的解法是<strong>邻居采样</strong>：</p>
+<ul>
+<li>对第 1 跳邻居采样 <code>S₁</code> 个，对第 2 跳邻居采样 <code>S₂</code> 个（不足则重复采样补齐）。</li>
+<li>这样每个节点的聚合计算量被一个常数上界约束住，与图规模解耦，也让模型能在超大图上做<strong>小批量（mini-batch）</strong>训练。</li>
+</ul>
+<p>采样引入了随机性，可以理解为一种正则化（类似 dropout），实践中反而常常让训练更稳健。</p>
+<h4 id="h-4-三种聚合器">4. 三种聚合器<a class="anchor" href="#h-4-三种聚合器" aria-label="本节链接">#</a></h4>
+<p><code>AGGREGATE</code> 可以是任意的可微、置换不变函数，论文给出了三种：</p>
+<ul>
+<li><strong>均值聚合（Mean）</strong>：取邻居特征的逐元素平均。它最朴素，也最接近 GCN。</li>
+<li><strong>LSTM 聚合</strong>：把邻居当作一个序列喂给 LSTM。表达力更强，但 LSTM 对顺序敏感，需要把邻居随机打乱来&quot;强迫&quot;它忽略顺序。</li>
+<li><strong>池化聚合（Pool）</strong>：每个邻居先过一个全连接层，再逐元素取 max 或 mean。表达力与计算量之间比较均衡。</li>
+</ul>
+<h4 id="h-5-推导均值聚合如何退化成-gcn">5. 推导：均值聚合如何&quot;退化&quot;成 GCN<a class="anchor" href="#h-5-推导均值聚合如何退化成-gcn" aria-label="本节链接">#</a></h4>
+<p>这是理解两种模型关系的关键一步。GraphSAGE 论文提出过一个变体：<strong>均值聚合时，把中心节点自己也放进被聚合的集合里</strong>，且<strong>不做拼接</strong>：</p>
+<pre><code>h_v^k = σ( W^k · MEAN( { h_v^(k-1) } ∪ { h_u^(k-1) : u ∈ N(v) } ) )</code></pre>
+<p>如果图是无权无向图、且邻居采用&quot;等权平均&quot;，那么这一式与 GCN 的传播规则在形式上是高度一致的：GCN 里节点 <code>v</code> 的更新正是&quot;自身与邻居特征按度归一化后加权求和，再过线性变换与激活&quot;。差别只在于归一化系数——GCN 用的是 <code>1/sqrt(d_v · d_u)</code>（度数开方），GraphSAGE 的均值聚合用的是 <code>1/(|N(v)|+1)</code>（邻居数加一）。</p>
+<p>这个&quot;退化&quot;说明：<strong>GCN 可以看作 GraphSAGE 的一个特例</strong>，而 GraphSAGE 通过&quot;拼接 + 可学习聚合器 + 采样&quot;获得了更强的归纳能力和更大的灵活度。</p>
+<h4 id="h-6-无监督目标没有标签也能学">6. 无监督目标：没有标签也能学<a class="anchor" href="#h-6-无监督目标没有标签也能学" aria-label="本节链接">#</a></h4>
+<p>GraphSAGE 常配一个<strong>无监督的图损失</strong>来学嵌入（不依赖节点标签）：</p>
+<pre><code>L = -log( σ( z_u^T z_v ) ) - Q · E_{v_n ~ P_n(v)} log( σ( -z_u^T z_vn ) )</code></pre>
+<p>意思是：让&quot;图上相邻（或随机游走共现）的节点对&quot;嵌入相似度高（第一项），同时让&quot;随机采样的负样本对&quot;相似度低（第二项，<code>Q</code> 为负样本数）。学到的嵌入再交给下游任务（分类、检索等）使用。当然，如果有标签，也可以直接用交叉熵做有监督训练。</p>
+<h3 id="h-二可运行示例">二、可运行示例<a class="anchor" href="#h-二可运行示例" aria-label="本节链接">#</a></h3>
+<p><strong>示例：用 PyG 的 <code>SAGEConv</code> 在 Cora 上做节点分类</strong></p>
+<pre data-lang="python"><code class="language-python">import torch
+import torch.nn.functional as F
+from torch_geometric.nn import SAGEConv
+from torch_geometric.datasets import Planetoid
+
+# 1. 载入 Cora 引文网络（节点=论文，边=引用，特征=词袋向量，标签=研究主题）
+dataset = Planetoid(root=&#39;./data/Cora&#39;, name=&#39;Cora&#39;)
+data = dataset[0]
+
+# 2. 定义两层 GraphSAGE 模型
+class GraphSAGE(torch.nn.Module):
+    def __init__(self, in_ch, hidden_ch, out_ch):
+        super().__init__()
+        self.conv1 = SAGEConv(in_ch, hidden_ch)   # 第 1 层：聚合一跳邻居
+        self.conv2 = SAGEConv(hidden_ch, out_ch)  # 第 2 层：聚合两跳邻居
+
+    def forward(self, x, edge_index):
+        x = self.conv1(x, edge_index)             # 内部完成聚合+拼接+线性变换
+        x = F.relu(x)
+        x = F.dropout(x, p=0.5, training=self.training)
+        x = self.conv2(x, edge_index)
+        return F.log_softmax(x, dim=1)            # 输出各类别的对数概率
+
+model = GraphSAGE(dataset.num_features, 16, dataset.num_classes)
+optimizer = torch.optim.Adam(model.parameters(), lr=0.01, weight_decay=5e-4)
+
+# 3. 训练循环：只用带标签的训练节点算损失（半监督）
+def train():
+    model.train()
+    optimizer.zero_grad()
+    out = model(data.x, data.edge_index)
+    loss = F.nll_loss(out[data.train_mask], data.y[data.train_mask])
+    loss.backward()
+    optimizer.step()
+    return loss.item()
+
+# 4. 评估：分别在训练/验证/测试节点上算准确率
+def evaluate():
+    model.eval()
+    out = model(data.x, data.edge_index)
+    pred = out.argmax(dim=1)
+    accs = []
+    for mask in [data.train_mask, data.val_mask, data.test_mask]:
+        correct = int((pred[mask] == data.y[mask]).sum())
+        accs.append(correct / int(mask.sum()))
+    return accs
+
+for epoch in range(200):
+    loss = train()
+    if epoch % 20 == 0:
+        train_acc, val_acc, test_acc = evaluate()
+        print(f&#39;Epoch {epoch:03d} | Loss {loss:.4f} | &#39;
+              f&#39;Train {train_acc:.4f} | Val {val_acc:.4f} | Test {test_acc:.4f}&#39;)</code></pre>
+<p>运行后测试集准确率通常在 0.80 左右。注意：这段代码虽然用了 <code>SAGEConv</code>，但训练方式仍是&quot;整图直推式&quot;。要真正发挥 GraphSAGE 的归纳能力（处理新节点），应改用 <code>NeighborLoader</code> 做小批量采样训练——下一章实战会展开。</p>
+<p><strong>动手验证&quot;归纳能力&quot;</strong>：训练时把部分节点连同边从图中&quot;藏起来&quot;，训练结束后把这些节点重新插回图里、用学到的模型给它们算嵌入并预测，观察准确率。GraphSAGE 能直接给出嵌入（因为它是函数），这正是 GCN 做不到的。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>复述三步骤</strong>：不看讲义，写出 GraphSAGE 每层的&quot;聚合→拼接+变换→归一化&quot;三个公式，并说明每个符号的含义。</li>
+<li><strong>推导特例</strong>：证明当聚合器为&quot;自身+邻居的等权均值且不做拼接&quot;时，GraphSAGE 在形式上退化为 GCN；两者的归一化系数分别是什么？</li>
+<li><strong>置换不变性</strong>：为什么聚合器必须对邻居顺序不敏感？LSTM 聚合器为什么需要先把邻居随机打乱？</li>
+<li><strong>采样的影响</strong>：把邻居采样数 <code>S₁</code> 从 25 降到 5，重新训练，观察准确率和训练速度的变化，并解释原因。</li>
+<li><strong>前瞻</strong>：GraphSAGE 对所有邻居&quot;一视同仁&quot;（等权或最大池化）。下一课要学的 GAT 会给不同邻居分配不同的重要性权重——想想&quot;加权&quot;能带来什么好处。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>GraphSAGE 原论文：Hamilton, Ying, Leskovec. &quot;Inductive Representation Learning on Large Graphs&quot; (2017)：<a href="https://arxiv.org/abs/1706.02216" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1706.02216</a></li>
+<li>PyG 官方文档 · SAGEConv：<a href="https://pytorch-geometric.readthedocs.io/en/latest/generated/torch_geometric.nn.conv.SAGEConv.html" target="_blank" rel="noopener noreferrer">https://pytorch-geometric.readthedocs.io/en/latest/generated/torch_geometric.nn.conv.SAGEConv.html</a></li>
+<li>PyG 官方文档 · GraphSAGE 示例：<a href="https://pytorch-geometric.readthedocs.io/en/latest/modules/nn.html" target="_blank" rel="noopener noreferrer">https://pytorch-geometric.readthedocs.io/en/latest/modules/nn.html</a></li>
+<li>PyG 官方文档 · NeighborLoader（采样小批量）：<a href="https://pytorch-geometric.readthedocs.io/en/latest/generated/torch_geometric.loader.NeighborLoader.html" target="_blank" rel="noopener noreferrer">https://pytorch-geometric.readthedocs.io/en/latest/generated/torch_geometric.loader.NeighborLoader.html</a></li>
+</ul>
+<p><a href="#/l/gnn-ch4-l2">下一课：GAT 注意力</a></p>

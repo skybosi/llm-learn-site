@@ -1,0 +1,643 @@
+<h2 id="h-审计影响面与回滚发现脏数据之后的十分钟">审计、影响面与回滚：发现脏数据之后的十分钟<a class="anchor" href="#h-审计影响面与回滚发现脏数据之后的十分钟" aria-label="本节链接">#</a></h2>
+<h3 id="h-这一节要解决什么">这一节要解决什么<a class="anchor" href="#h-这一节要解决什么" aria-label="本节链接">#</a></h3>
+<p>前三节都在为&quot;事情发生的那一刻&quot;做准备：第 1 节给数据集一个由内容决定的身份，第 2 节画出依赖关系，第 3 节让同一件事能重演。但真实世界的顺序恰好相反 —— <strong>你先发现一个已经发生过的错误</strong>：</p>
+<blockquote>
+<p>&quot;三月前那批标注是错的，错误率大概 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">30%</span></span></span></span>。它进过生产。&quot;</p>
+</blockquote>
+<p>这句话之后，十分钟内要回答六个问题，而它们全部有截止时间（可能是管理层在等、可能是客户在问）：</p>
+<ol>
+<li><strong>它影响了什么？</strong>（哪些数据集版本、哪些模型、哪些对外报告）</li>
+<li><strong>哪些还在服役？</strong>（已经下线的模型不用管）</li>
+<li><strong>结论要改吗？</strong>（报告里的结论是错的，还是只是数字略有不同）</li>
+<li><strong>要不要回滚？回滚到哪？</strong>（检查点都很新，但它们可能建在脏数据上）</li>
+<li><strong>代价多大？</strong>（全量重跑 vs 只重跑受影响集 vs 先重标再重跑）</li>
+<li><strong>怎么证明我做完了？</strong>（一份可存档、可被第三方核对的记录）</li>
+</ol>
+<p>本节就是把这六个问题装成一条<strong>可执行的十分钟流程</strong>。四节的关系在这里收口：</p>
+<table>
+<thead>
+<tr>
+<th>节</th>
+<th>提供什么</th>
+<th>在本节的角色</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>第 1 节</td>
+<td>内容寻址 + 三段快照</td>
+<td>账本里的每一个 <code>dataset@vver</code> 都是可验证的身份；<code>params</code> 段让&quot;数据没变但参数变了&quot;可区分</td>
+</tr>
+<tr>
+<td>第 2 节</td>
+<td>血缘图 + 影响面 + 最小切断</td>
+<td>影响面查询与&quot;重跑哪一段&quot;的依据</td>
+</tr>
+<tr>
+<td>第 3 节</td>
+<td>三个可复现等级</td>
+<td>让&quot;重跑一遍&quot;这个动作有意义（R1 不成立时，重跑结果不可比）</td>
+</tr>
+<tr>
+<td><strong>本节</strong></td>
+<td><strong>账本 + 处置 + 回滚点 + 报告卡</strong></td>
+<td>把前三节装成一次可交付的审计</td>
+</tr>
+</tbody></table>
+<h3 id="h-一账本审计的唯一前提是当时有记录">一、账本：审计的唯一前提是&quot;当时有记录&quot;<a class="anchor" href="#h-一账本审计的唯一前提是当时有记录" aria-label="本节链接">#</a></h3>
+<h4 id="h-11-概念一次消费一条记录">1.1 概念：一次消费一条记录<a class="anchor" href="#h-11-概念一次消费一条记录" aria-label="本节链接">#</a></h4>
+<p>账本是<strong>只追加</strong>的事件流，每条记录回答一个四元组：</p>
+<pre data-lang="text"><code class="language-text">(src 版本) --kind--&gt; (dst 版本)   at 时间   附加：行数、备注</code></pre>
+<ul>
+<li><strong><code>src</code> / <code>dst</code> 都必须是内容寻址的版本</strong>，不是路径。理由在第 1 节已经给过：路径可以被覆盖，而审计必须能回答&quot;三个月前那个 <code>train/</code> 目录里到底是哪一份&quot;。实测记录长这样：<code>bad_labels@v2 -&gt; labeled_train_v2@r1</code>（<code>derive</code>，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1200</span></span></span></span> 行）。</li>
+<li><strong><code>kind</code> 决定污染怎么传播</strong>。本节用四种：<ul>
+<li><code>derive</code>：从数据生成数据（清洗、过滤、采样）——<strong>全量传播</strong>；</li>
+<li><code>train</code>：训练模型——<strong>全量传播</strong>（模型吸收了脏标签）；</li>
+<li><code>eval</code>：评测——<strong>全量传播</strong>（评测分算在脏输入上）；</li>
+<li><code>cite</code>：报告/决策引用了这份数据或这个模型——<strong>只把结论绑上去</strong>（报告里的数字被引用，但报告本身不产生新的数据资产）。</li>
+</ul>
+</li>
+<li><strong><code>at</code> 绝不进任何哈希</strong>。它是展示与排序用的，进了哈希就让账本自己不可复现（第 1 节的反例 1）。实测的账本哈希只覆盖 <code>(seq, src, dst, kind, n_rows)</code> 这五项。</li>
+</ul>
+<h4 id="h-12-为什么这样设计账本与血缘的分工">1.2 为什么这样设计：账本与血缘的分工<a class="anchor" href="#h-12-为什么这样设计账本与血缘的分工" aria-label="本节链接">#</a></h4>
+<p>两者容易混，但它们的<strong>写入时机</strong>完全不同：</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>血缘图（第 2 节）</th>
+<th>账本（本节）</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>写的是什么</td>
+<td><strong>可能的</strong>依赖（图上的边）</td>
+<td><strong>实际发生的</strong>消费（事件）</td>
+</tr>
+<tr>
+<td>什么时候写</td>
+<td>管线定义时（声明）</td>
+<td>每次运行时（事实）</td>
+</tr>
+<tr>
+<td>回答什么</td>
+<td>&quot;谁可能受影响&quot;</td>
+<td>&quot;谁实际用过，什么时候用的&quot;</td>
+</tr>
+<tr>
+<td>缺失时</td>
+<td>影响面偏小或偏大</td>
+<td>无法审计（不知道有没有用过）</td>
+</tr>
+</tbody></table>
+<p><strong>审计必须靠账本，因为只有账本能回答&quot;有没有&quot;。</strong> 血缘图能说&quot;这个模型的上游里有这份数据&quot;，但说不了&quot;这个模型在 2 月 7 日那次训练里到底读了它的哪个版本&quot;。而&quot;到底读没读&quot;决定了要不要回滚一个已经上线的模型 —— 这是本节的第一个真问题，也是最贵的一个。</p>
+<h4 id="h-13-怎么做最小可用账本的三个纪律">1.3 怎么做：最小可用账本的三个纪律<a class="anchor" href="#h-13-怎么做最小可用账本的三个纪律" aria-label="本节链接">#</a></h4>
+<ol>
+<li><strong>只追加，不修改</strong>（与第 1 节的不可变快照同一套机制：只追加的 JSONL + 不可重写的前缀）。</li>
+<li><strong>每次消费都写，包括&quot;没影响&quot;的那些</strong>。账本的价值来自<strong>完整性</strong>：如果只记录&quot;出问题的消费&quot;，那它就不能用来做影响面查询。代价是体积（大公司的账本能到 TB 级），处置是按时间分区 + 只保留 <code>(src, dst, kind)</code> 的摘要。</li>
+<li><strong>账本自己也要版本化</strong>。实测的 <code>账本内容哈希 = c2f3defc2a1025e6</code> 会写进审计报告卡 —— 否则&quot;我查过账本了&quot;这句话无法被核对（三个月后有人可能补写过账本）。</li>
+</ol>
+<h3 id="h-二影响面账本--图--加权可达">二、影响面：账本 + 图 = 加权可达<a class="anchor" href="#h-二影响面账本--图--加权可达" aria-label="本节链接">#</a></h3>
+<h4 id="h-21-概念为什么需要加权">2.1 概念：为什么需要&quot;加权&quot;<a class="anchor" href="#h-21-概念为什么需要加权" aria-label="本节链接">#</a></h4>
+<p>第 2 节的列级可达是<strong>布尔</strong>的（能到达 / 不能）。审计场景需要一个更细的量，因为不同的边<strong>绑定强度</strong>不同：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord">w</span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0359em;">v</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.4882em;vertical-align:-1.4382em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.4306em;"><span style="top:-2.3479em;margin-left:0em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">path </span></span><span class="mord mathnormal mtight">s</span><span class="mrel mtight">→</span><span class="mord mathnormal mtight" style="margin-right:0.0359em;">v</span></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span><span class="mop">max</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.8882em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.05em;"><span style="top:-1.8479em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">e</span><span class="mrel mtight">∈</span><span class="mord text mtight"><span class="mord mtight">path</span></span></span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∏</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.4382em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">c</span><span class="mopen">(</span><span class="mord text"><span class="mord">kind</span></span><span class="mopen">(</span><span class="mord mathnormal">e</span><span class="mclose">))</span></span></span></span></span></p>
+<p>本节取 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">c</span><span class="mopen">(</span><span class="mord text"><span class="mord texttt">derive</span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">c</span><span class="mopen">(</span><span class="mord text"><span class="mord texttt">train</span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">c</span><span class="mopen">(</span><span class="mord text"><span class="mord texttt">eval</span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">c</span><span class="mopen">(</span><span class="mord text"><span class="mord texttt">cite</span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.5</span></span></span></span>。理由：被 <code>cite</code> 的下游产物（报告、决策）<strong>继承了结论</strong>，但没有继承数据；它的数字会错，但它不会继续污染别的东西。取最大值（而不是求和）是因为路径不独立：同一份脏数据通过两条路径到达同一个产物，污染还是那份污染。</p>
+<p>实测结果（<code>bad_labels@v2</code> 为源）：</p>
+<table>
+<thead>
+<tr>
+<th>产物</th>
+<th>污染权重</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>labeled_train_v2@r1</code></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1.0000</span></span></span></span></td>
+<td>直接 derive（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1200</span></span></span></span> 行脏标签被并入）</td>
+</tr>
+<tr>
+<td><code>labeled_train_v3@r1</code></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1.0000</span></span></span></span></td>
+<td>直接 derive（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1500</span></span></span></span> 行）</td>
+</tr>
+<tr>
+<td><code>model_b@r1</code></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1.0000</span></span></span></span></td>
+<td>在脏数据上训练</td>
+</tr>
+<tr>
+<td><code>model_c@r1</code></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1.0000</span></span></span></span></td>
+<td>在脏数据上训练</td>
+</tr>
+<tr>
+<td><code>model_d@r1</code></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1.0000</span></span></span></span></td>
+<td>在脏数据上训练</td>
+</tr>
+<tr>
+<td><code>report_q1_quality@r1</code></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.5000</span></span></span></span></td>
+<td>cite 引用（两处：数据统计与模型对比）</td>
+</tr>
+<tr>
+<td><code>report_q2_plan@r1</code></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.5000</span></span></span></span></td>
+<td>cite 引用（配比计划的输入统计）</td>
+</tr>
+</tbody></table>
+<p><strong>四行 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1.0000</span></span></span></span> 与两行 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.5000</span></span></span></span> 的区别直接对应两种处置</strong>：前者必须重跑，后者只需重算被引用的那几句话。</p>
+<h4 id="h-22-怎么做把影响面落到可执行的清单">2.2 怎么做：把&quot;影响面&quot;落到可执行的清单<a class="anchor" href="#h-22-怎么做把影响面落到可执行的清单" aria-label="本节链接">#</a></h4>
+<p>影响面查询只需要三段代码（本节第一、二段）：建账本 → 建图 → 加权遍历。工程上真正要小心的是三件事：</p>
+<ol>
+<li><strong>图的节点必须带版本</strong>。<code>labeled_train_v2@r1</code> 与 <code>labeled_train_v3@r1</code> 是两个节点，不是一个。不带版本会把&quot;用 v2 训练的 model_b&quot;和&quot;用 v3 训练的 model_c&quot;混成一个，于是回滚时会多跑一个模型。</li>
+<li><strong><code>cite</code> 与 <code>train</code> 必须分开</strong>。把 <code>cite</code> 也算成全量污染，会让报告被列为&quot;必须重训模型&quot; —— 这是审计里最常见的一类浪费。</li>
+<li><strong>权重只用来排序与分组，不用来做判决</strong>。<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.5</span></span></span></span> 不代表&quot;一半错&quot;，它只代表&quot;只有引用关系&quot;。判决要靠第四节的敏感度与 MDE。</li>
+</ol>
+<h4 id="h-23-边界账本的三个缺失模式">2.3 边界：账本的三个缺失模式<a class="anchor" href="#h-23-边界账本的三个缺失模式" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>漏记</strong>：某次训练没写账本 → 影响面偏小 → <strong>这是最危险的方向</strong>（会得出&quot;不用管&quot;的错误结论）。检测手段：训练管线在启动时<strong>强制要求</strong>一个账本写入的返回值，没有就不许跑。</li>
+<li><strong>错记版本</strong>：写的是 <code>labeled_train@v2</code>，实际读的是 v3（手工回填、脚本 bug）。检测手段：让账本记录<strong>内容哈希</strong>（不只是名字），事后可重算核对。</li>
+<li><strong>时间不完整</strong>：只记了开始时间没记结束时间，于是&quot;3 月 15 日之后有没有用过&quot;无法回答。处置：记录训练起止时间，并把&quot;区间重叠&quot;作为影响面的判据之一。</li>
+</ul>
+<h3 id="h-三代价与处置三种做法的账">三、代价与处置：三种做法的账<a class="anchor" href="#h-三代价与处置三种做法的账" aria-label="本节链接">#</a></h3>
+<h4 id="h-31-三种处置">3.1 三种处置<a class="anchor" href="#h-31-三种处置" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>处置</th>
+<th>动作</th>
+<th>适用</th>
+<th>代价（本节合成账）</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>A 全量重跑</strong></td>
+<td>从源头重跑整条管线</td>
+<td>不确定影响面 / 账本不可信</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">321</span></span></span></span></td>
+</tr>
+<tr>
+<td><strong>B 只重跑受影响集</strong></td>
+<td>用影响面清单，只重跑那些节点</td>
+<td>账本完整、图可信</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">259</span></span></span></span>（省 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">19.3%</span></span></span></span>）</td>
+</tr>
+<tr>
+<td><strong>C 重标 + 重跑受影响集</strong></td>
+<td>先修数据，再从修好的点往下跑</td>
+<td>数据本身错了（本例）</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">271</span></span></span></span>（重标 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">12</span></span></span></span> + 重跑 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">259</span></span></span></span>）</td>
+</tr>
+</tbody></table>
+<p>读这张表有三层：</p>
+<ol>
+<li><strong>B 相对 A 只省 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">19.3%</span></span></span></span>，因为这个案例的影响面本来就大</strong>（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">7/9</span></span></span></span> 个产物）。影响面越小，B 的优势越大 —— 这就是第 2 节&quot;最小切断&quot;的价值：把重跑入口压到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> 个节点，再往下必须重跑的只有它下游。</li>
+<li><strong>C 比 B 贵</strong>，但它是唯一<strong>真正修好</strong>的选项。B 只是在干净的<strong>旧</strong>数据上重跑，脏数据还在（下一次还会被用）。</li>
+<li><strong>A 不是&quot;保险&quot;，它是&quot;放弃定位&quot;</strong>。选 A 的人通常是因为账本不可信 —— 而账本不可信这件事本身就是要向管理层报告的结论。</li>
+</ol>
+<h4 id="h-32-回滚点单位是数据版本--配比--阶段表三元组">3.2 回滚点：单位是&quot;数据版本 + 配比 + 阶段表&quot;三元组<a class="anchor" href="#h-32-回滚点单位是数据版本--配比--阶段表三元组" aria-label="本节链接">#</a></h4>
+<p>这是本节最重要的一条工程结论。检查点（checkpoint）通常被当成&quot;训练进度的存档&quot;，但在审计场景里，它的身份是<strong>三元组</strong>：</p>
+<pre data-lang="text"><code class="language-text">rollback_point = (数据版本, 配比 params_hash, 阶段表)</code></pre>
+<p>实测的三个检查点：</p>
+<table>
+<thead>
+<tr>
+<th>检查点</th>
+<th>建于</th>
+<th>数据版本</th>
+<th>参数</th>
+<th>阶段</th>
+<th>续跑成本</th>
+<th>可用？</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>ckpt-0205</code></td>
+<td>2026-02-05</td>
+<td><code>labeled_train_v1@r1</code></td>
+<td><code>5c1f</code></td>
+<td>epoch 4/8</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">30</span></span></span></span></td>
+<td>✅ 干净</td>
+</tr>
+<tr>
+<td><code>ckpt-0226</code></td>
+<td>2026-02-26</td>
+<td><code>labeled_train_v2@r1</code></td>
+<td><code>5c1f</code></td>
+<td>epoch 6/8</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">10</span></span></span></span></td>
+<td>❌ 数据版本脏</td>
+</tr>
+<tr>
+<td><code>ckpt-0318</code></td>
+<td>2026-03-18</td>
+<td><code>labeled_train_v3@r1</code></td>
+<td><code>9ab2</code></td>
+<td>epoch 2/8</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">45</span></span></span></span></td>
+<td>❌ 数据版本脏</td>
+</tr>
+</tbody></table>
+<p><strong><code>ckpt-0226</code> 是这里最诱人的陷阱</strong>：它最新之外还最便宜（续跑只要 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">10</span></span></span></span>，比干净的那个便宜 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">3</span></span></span></span> 倍）。但它的数据版本就是问题版本 —— 从它继续跑，等于在脏数据上学到的参数上继续学，脏标签的影响不会消失。<strong>检查点再新也不能回滚到一个脏的数据版本上。</strong></p>
+<blockquote>
+<p><strong>推论</strong>：回滚点必须在<strong>数据版本</strong>这一层做隔离（第 1 节的不可变前缀就是为这件事服务的）。如果检查点只记&quot;第几个 epoch&quot;，它就永远无法回答&quot;这个 epoch 用的是哪份数据&quot;。</p>
+</blockquote>
+<h3 id="h-四什么时候不需要回滚">四、什么时候&quot;不需要回滚&quot;<a class="anchor" href="#h-四什么时候不需要回滚" aria-label="本节链接">#</a></h3>
+<p>审计的结论不总是&quot;回滚&quot;。有三种情况可以<strong>不回滚</strong>，但每一种都要证据 —— 没有证据的&quot;我觉得影响不大&quot;不是结论，是赌博。</p>
+<h4 id="h-41-产物已经下线">4.1 产物已经下线<a class="anchor" href="#h-41-产物已经下线" aria-label="本节链接">#</a></h4>
+<p>实测里<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">5</span></span></span></span> 个受影响产物<strong>全部仍在服役</strong>（<code>model_b</code>、<code>model_c</code>、<code>model_d</code>、<code>report_q1_quality</code>、<code>report_q2_plan</code>），所以这条不成立。如果 <code>model_b</code> 与 <code>model_d</code> 已经下线，受影响集立刻少两个，代价按比例下降。<strong>证据形式</strong>：下线记录（什么时候、被谁替代、是否还有流量）。</p>
+<h4 id="h-42-结论的敏感度低于-mde">4.2 结论的敏感度低于 MDE<a class="anchor" href="#h-42-结论的敏感度低于-mde" aria-label="本节链接">#</a></h4>
+<p>实测：报告结论对该数据的敏感度上界 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.6</span></span></span></span> 点，事先声明的 MDE 是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2.0</span></span></span></span> 点。于是</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6835em;vertical-align:-0.0391em;"></span><span class="mord">0.6</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&lt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6684em;vertical-align:-0.024em;"></span><span class="mord">2.0</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">⟹</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord cjk_fallback">「结论是否变化」在本套评测下不可判定</span></span></span></span></span></span></p>
+<p>正确的动作<strong>不是</strong>&quot;所以不用管&quot;，而是：<strong>不改结论，但在报告里加注</strong>（写清哪一节受该数据影响、敏感度上界、以及重算后若变化会怎么处理）。把它写成&quot;没影响&quot;是报告失真 —— 这与第 3 章第 4 节&quot;不可判定是正式结论&quot;是同一条纪律。</p>
+<p><strong>敏感度怎么估？</strong> 最便宜的做法是<strong>子集重算</strong>：把受影响的那部分样本从评测里剔除（或用脏数据的下界替换），看主指标动多少。这个量是&quot;上界&quot;而不是精确值，取保守方向即可。</p>
+<h4 id="h-43-污染权重低于阈值">4.3 污染权重低于阈值<a class="anchor" href="#h-43-污染权重低于阈值" aria-label="本节链接">#</a></h4>
+<p>实测里两个报告落在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0269em;">w</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6835em;vertical-align:-0.0391em;"></span><span class="mord">0.5</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&lt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.75</span></span></span></span>：它们只被 <code>cite</code>，没有被训练消费。<strong>证据形式</strong>：账本里该产物的入边 kind 全是 <code>cite</code>（可查询、可核对）。</p>
+<p><strong>但这条有一个必须写清的附加条件</strong>：权重低只说明&quot;没有继续污染&quot;，不说明&quot;结论没错&quot;。若报告正文里有&quot;这批标注的一致性为 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.94</span></span></span></span>&quot;这样的直接统计，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0269em;">w</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.5</span></span></span></span> 也救不了它 —— 它必须重算那一段。</p>
+<p><figure><img class="md-img" src="content/courses/data-engineering/assets/chapter-5-figure-04.svg" alt="修切断点比全量重跑省一个数量级" loading="lazy" decoding="async"><figcaption>修切断点比全量重跑省一个数量级</figcaption></figure>
+</p>
+<h3 id="h-五把四节收成一份报告卡">五、把四节收成一份报告卡<a class="anchor" href="#h-五把四节收成一份报告卡" aria-label="本节链接">#</a></h3>
+<p>审计的产出不是&quot;我查了&quot;，而是一份<strong>可存档、可被第三方核对</strong>的报告卡：</p>
+<pre data-lang="text"><code class="language-text">report_card = {
+  finding:            结论（含抽样量与置信区间）
+  ledger_hash:        账本内容哈希（证明查的是哪一版账本）
+  affected_direct:    直接消费者数
+  affected_weighted:  加权可达数
+  still_live:         仍在服役的受影响产物
+  cost:               {A_full, B_affected, C_relabel_rerun}
+  sensitivity_vs_MDE: {sensitivity, MDE}
+  action:             处置决定
+  unresolved:         本轮**没有**审到的东西
+}</code></pre>
+<p>最后一项 <code>unresolved</code> 是这张卡里最容易省掉、也最不该省的一项。实测的两条：</p>
+<ul>
+<li>上游 <code>raw_web@v7/v8</code> 未审计（本轮只审了标签侧）；</li>
+<li><code>model_d@r1</code> 的下游用途未登记（账本有缺口）。</li>
+</ul>
+<p><strong>一条审计的价值有上限：它的上限就是它自己写下来的盲区。</strong> 把盲区写进卡里，下一次审计才知道从哪继续；不写，下一个人会以为这张卡覆盖了全部。</p>
+<h3 id="h-六代码">六、代码<a class="anchor" href="#h-六代码" aria-label="本节链接">#</a></h3>
+<p>六段（合成账本，⚠️ 非真实生产记录）：0 段建账本并算它的内容哈希；1 段做两个方向的账本查询；2 段把账本变成加权可达的影响面；3 段算三种处置的代价；4 段给出&quot;不需要回滚&quot;的三种情况与它们的证据；5 段处理回滚点三元组；6 段产出报告卡。</p>
+<h4 id="h-读输出的七个要点">读输出的七个要点<a class="anchor" href="#h-读输出的七个要点" aria-label="本节链接">#</a></h4>
+<ol>
+<li><strong>账本的哈希只覆盖&quot;事实&quot;字段</strong>（0 段）：<code>(seq, src, dst, kind, n_rows)</code>，得到 <code>c2f3defc2a1025e6</code>；<code>at</code> 不进哈希（第 1 节的反例 1）。这一步让&quot;我查的是哪一版账本&quot;变成一句可核对的话。</li>
+<li><strong>两个查询方向给出两条不同的信息</strong>（1 段）：正向（<code>bad_labels@v2 -&gt;</code>）只有 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2</span></span></span></span> 条事件 —— <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2</span></span></span></span> 月 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">3</span></span></span></span> 日与 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">3</span></span></span></span> 月 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">15</span></span></span></span> 日各一次 <code>derive</code>；反向（<code>report_q1_quality@r1 &lt;-</code>）只有 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2</span></span></span></span> 条入边，其中 <code>labeled_train_v2@r1</code> 被标了 <code>*</code>。<strong>逆向查询是&quot;这个报告该不该加注&quot;的直接依据</strong>：如果反向表里没有 <code>bad_labels@v2</code>，那这个报告根本不用动。</li>
+<li><strong>加权可达把 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">7</span></span></span></span> 个产物分成两组</strong>（2 段）：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">5</span></span></span></span> 个权重 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1.0000</span></span></span></span>（数据集与三个模型）、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2</span></span></span></span> 个权重 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.5000</span></span></span></span>（两份报告，只有 <code>cite</code>）。这个分界线就是&quot;重跑&quot;与&quot;重算那几句话&quot;的分界线。</li>
+<li><strong>代价表里 B 只省 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">19.3%</span></span></span></span></strong>（3 段）：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">259/321</span></span></span></span>。这个数字看起来不惊艳，但它对应的是&quot;不用碰 <code>model_a</code> 与 <code>labeled_train_v1</code>&quot;这两个与问题无关的产物；影响面越小，B 相对 A 的优势越大 —— 而<strong>把影响面算小</strong>正是第 2 节最小切断要解决的问题。</li>
+<li><strong>回滚点的陷阱是 <code>ckpt-0226</code></strong>（5 段）：它续跑只要 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">10</span></span></span></span>（比干净的 <code>ckpt-0205</code> 便宜 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">3</span></span></span></span> 倍），但它的数据版本是 <code>labeled_train_v2@r1</code>（脏）。输出里 <code>干净回滚点 = [&#39;ckpt-0205&#39;]</code> 这句话是有代价的：干净的那个要多花 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">20</span></span></span></span> 个单位。<strong>审计的结论经常是&quot;选更贵的那个&quot;。</strong></li>
+<li><strong>&quot;不需要回滚&quot;必须带证据</strong>（4 段）：三项检查里，第一项不成立（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">5</span></span></span></span> 个受影响产物全部仍在服役），第二项成立但结论是&quot;加注&quot;而不是&quot;不管&quot;（敏感度 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6835em;vertical-align:-0.0391em;"></span><span class="mord">0.6</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&lt;</span></span></span></span> MDE <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2.0</span></span></span></span>），第三项成立且可核对（两个报告的入边 kind 全是 <code>cite</code>）。</li>
+<li><strong>报告卡的哈希覆盖 <code>action</code> 与 <code>unresolved</code></strong>（6 段）：<code>f7aac7dc6719a1f6</code>。这意味着处置决定与盲区清单都被固定下来 —— 六周后有人问&quot;当时为什么决定不回滚 <code>model_d</code>&quot;，答案在卡里，且卡没被改过。</li>
+</ol>
+<pre data-lang="python"><code class="language-python"># data-ch5-l4: 审计账本、影响面与回滚
+# 纯标准库；账本事件为合成生成（⚠️ 合成数据，非真实生产记录）
+import collections, hashlib, json, sys
+
+print(f&quot;python {sys.version.split()[0]}&quot;)
+
+# ---------- 0. 账本：一次&quot;消费&quot;一条记录（append-only） ----------
+# 字段刻意做成第 1 节的版本标识 + 第 2 节的图节点：
+#   src  = 被读的数据版本，形如 dataset@dver（content.root）
+#   dst  = 消费它的产物版本，形如 model@run
+#   kind = derive / train / eval / cite
+#   at   = 发生时间（只用于展示与排序，绝不进任何哈希）
+ledger = []
+_seq = 0
+
+def record(dataset, dver, consumer, cver, kind, at, n_rows, note=&quot;&quot;):
+    global _seq
+    _seq += 1
+    ledger.append({&quot;seq&quot;: _seq, &quot;src&quot;: f&quot;{dataset}@{dver}&quot;,
+                   &quot;dst&quot;: f&quot;{consumer}@{cver}&quot;, &quot;kind&quot;: kind, &quot;at&quot;: at,
+                   &quot;n_rows&quot;: n_rows, &quot;note&quot;: note})
+
+# 12 条事件：bad_labels 的 v2（3 个月前重标、错误率 30%）被 4 个模型用过
+record(&quot;bad_labels&quot;, &quot;v1&quot;, &quot;labeled_train_v1&quot;, &quot;r1&quot;, &quot;derive&quot;, &quot;2026-01-08&quot;, 900)
+record(&quot;bad_labels&quot;, &quot;v2&quot;, &quot;labeled_train_v2&quot;, &quot;r1&quot;, &quot;derive&quot;, &quot;2026-02-03&quot;, 1200)
+record(&quot;bad_labels&quot;, &quot;v2&quot;, &quot;labeled_train_v3&quot;, &quot;r1&quot;, &quot;derive&quot;, &quot;2026-03-15&quot;, 1500)
+record(&quot;raw_web&quot;,    &quot;v7&quot;, &quot;labeled_train_v2&quot;, &quot;r1&quot;, &quot;derive&quot;, &quot;2026-02-03&quot;, 4000)
+record(&quot;raw_web&quot;,    &quot;v8&quot;, &quot;labeled_train_v3&quot;, &quot;r1&quot;, &quot;derive&quot;, &quot;2026-03-15&quot;, 5000)
+record(&quot;labeled_train_v1&quot;, &quot;r1&quot;, &quot;model_a&quot;, &quot;r1&quot;, &quot;train&quot;, &quot;2026-01-12&quot;, 900)
+record(&quot;labeled_train_v2&quot;, &quot;r1&quot;, &quot;model_b&quot;, &quot;r1&quot;, &quot;train&quot;, &quot;2026-02-07&quot;, 1200)
+record(&quot;labeled_train_v3&quot;, &quot;r1&quot;, &quot;model_c&quot;, &quot;r1&quot;, &quot;train&quot;, &quot;2026-03-20&quot;, 1500)
+record(&quot;labeled_train_v2&quot;, &quot;r1&quot;, &quot;model_d&quot;, &quot;r1&quot;, &quot;train&quot;, &quot;2026-02-19&quot;, 1200)
+record(&quot;labeled_train_v2&quot;, &quot;r1&quot;, &quot;report_q1_quality&quot;, &quot;r1&quot;, &quot;cite&quot;, &quot;2026-02-25&quot;, 1200)
+record(&quot;model_b&quot;, &quot;r1&quot;, &quot;report_q1_quality&quot;, &quot;r1&quot;, &quot;cite&quot;, &quot;2026-02-25&quot;, 0)
+record(&quot;labeled_train_v3&quot;, &quot;r1&quot;, &quot;report_q2_plan&quot;, &quot;r1&quot;, &quot;cite&quot;, &quot;2026-04-02&quot;, 1500)
+
+print(&quot;\n=== 0. 账本 ===&quot;)
+print(f&quot;   事件数 = {len(ledger)}   时间跨度 = &quot;
+      f&quot;{min(e[&#39;at&#39;] for e in ledger)} ~ {max(e[&#39;at&#39;] for e in ledger)}&quot;)
+print(f&quot;   涉及源 = {sorted({e[&#39;src&#39;] for e in ledger})}&quot;)
+print(f&quot;   涉及产物 = {sorted({e[&#39;dst&#39;] for e in ledger})}&quot;)
+bad = [e for e in ledger if e[&quot;src&quot;] == &quot;bad_labels@v2&quot;]
+print(f&quot;   问题数据 bad_labels@v2 的消费事件 = {len(bad)} 条&quot;)
+
+def canon(o):
+    return json.dumps(o, sort_keys=True, separators=(&quot;,&quot;, &quot;:&quot;),
+                      ensure_ascii=False).encode()
+
+def hh(o):
+    return hashlib.sha256(canon(o)).hexdigest()
+
+ledger_hash = hh(sorted((e[&quot;seq&quot;], e[&quot;src&quot;], e[&quot;dst&quot;], e[&quot;kind&quot;], e[&quot;n_rows&quot;])
+                        for e in ledger))
+print(f&quot;   账本内容哈希 = {ledger_hash[:16]}&quot;
+      f&quot;（账本自身也要版本化；at 不进哈希）&quot;)
+
+# ---------- 1. 账本查询：两个方向 ----------
+by_src, by_dst = collections.defaultdict(list), collections.defaultdict(list)
+for e in ledger:
+    by_src[e[&quot;src&quot;]].append(e)
+    by_dst[e[&quot;dst&quot;]].append(e)
+
+print(&quot;\n=== 1. 账本的两个查询方向 ===&quot;)
+print(&quot;   正向（这份数据影响了谁）：bad_labels@v2 -&gt;&quot;)
+for e in by_src[&quot;bad_labels@v2&quot;]:
+    print(f&quot;     {e[&#39;at&#39;]}  {e[&#39;kind&#39;]:6s} {e[&#39;dst&#39;]}  ({e[&#39;n_rows&#39;]} 行)&quot;)
+print(&quot;   反向（这个产物用了什么）：report_q1_quality@r1 &lt;-&quot;)
+for e in by_dst[&quot;report_q1_quality@r1&quot;]:
+    star = &quot; *&quot; if e[&quot;src&quot;] == &quot;bad_labels@v2&quot; else &quot;&quot;
+    print(f&quot;     {e[&#39;at&#39;]}  {e[&#39;kind&#39;]:6s} {e[&#39;src&#39;]}{star}&quot;)
+
+# ---------- 2. 影响面：账本 + 依赖图 = 加权可达 ----------
+# 权重：derive/train 把污染传下去，cite 只把&quot;结论&quot;绑上去
+WEIGHT = {&quot;derive&quot;: 1.0, &quot;train&quot;: 1.0, &quot;eval&quot;: 1.0, &quot;cite&quot;: 0.5}
+GRAPH = collections.defaultdict(list)
+for e in ledger:
+    GRAPH[e[&quot;src&quot;]].append((e[&quot;dst&quot;], e[&quot;kind&quot;]))
+
+def contaminated(seed):
+    # 从 seed 出发的加权可达；节点权重 = 路径上各边权重之积的最大值
+    conf, q = {}, collections.deque([(seed, 1.0)])
+    while q:
+        node, w = q.popleft()
+        for nxt, kind in sorted(GRAPH.get(node, [])):
+            nw = w * WEIGHT[kind]
+            if nw &gt; conf.get(nxt, 0.0):
+                conf[nxt] = nw
+                q.append((nxt, nw))
+    return conf
+
+conf = contaminated(&quot;bad_labels@v2&quot;)
+print(&quot;\n=== 2. 影响面（bad_labels@v2 的加权可达）===&quot;)
+for node, w in sorted(conf.items(), key=lambda kv: (-kv[1], kv[0])):
+    kinds = sorted({k for _, k in GRAPH.get(node, [])})
+    print(f&quot;   {node:22s} 污染权重 {w:.4f}   它自己还会喂 {kinds}&quot;)
+direct = sorted({d for d, _ in GRAPH[&quot;bad_labels@v2&quot;]})
+print(f&quot;   直接消费者 {len(direct)} 个: {direct}&quot;)
+print(f&quot;   加权可达总共 {len(conf)} 个产物&quot;)
+
+# ---------- 3. 处置代价：三种方式的账 ----------
+COST = {                                    # 合成的单位成本（GPU·小时 或 人·天）
+    &quot;labeled_train_v1@r1&quot;: 2, &quot;labeled_train_v2@r1&quot;: 3, &quot;labeled_train_v3@r1&quot;: 4,
+    &quot;model_a@r1&quot;: 60, &quot;model_b@r1&quot;: 80, &quot;model_c@r1&quot;: 100, &quot;model_d@r1&quot;: 70,
+    &quot;report_q1_quality@r1&quot;: 1, &quot;report_q2_plan@r1&quot;: 1,
+}
+def cost_of(nodes):
+    return sum(COST.get(n, 0) for n in nodes)
+
+all_nodes = sorted(COST)
+cost_a = cost_of(all_nodes)
+cost_b = cost_of(conf)
+recost = 12                                  # 重新标注 1200 行的成本（合成）
+cost_c = recost + cost_b
+print(&quot;\n=== 3. 三种处置的代价 ===&quot;)
+print(f&quot;   全部产物 {len(all_nodes)} 个，单位成本合计 {cost_a}&quot;)
+print(f&quot;   A 全量重跑                : {cost_a}&quot;)
+print(f&quot;   B 只重跑受影响集({len(conf)} 个)   : {cost_b}  -&gt; 省 &quot;
+      f&quot;{(1 - cost_b / cost_a) * 100:.1f}%&quot;)
+print(f&quot;   C 重新标注 + 重跑受影响集 : 重标 {recost} + {cost_b} = {cost_c}&quot;)
+print(&quot;   -&gt; B 与 C 的差别不在「跑多少」，而在「要不要修数据」&quot;)
+
+# ---------- 4. 什么时候&quot;不需要回滚&quot; ----------
+print(&quot;\n=== 4. 不需要回滚的三种情况（都要有证据）===&quot;)
+live = {&quot;model_b@r1&quot;, &quot;model_c@r1&quot;, &quot;model_d@r1&quot;,
+        &quot;report_q1_quality@r1&quot;, &quot;report_q2_plan@r1&quot;}
+need = sorted(n for n in conf if n in live)
+print(f&quot;   仍在服役的受影响产物 = {need}&quot;)
+MDE, sensitivity = 2.0, 0.6              # 个点；MDE 事先声明（第 3 章第 3 节）
+print(f&quot;   报告结论对该数据的敏感度上界 {sensitivity} 点  vs  MDE {MDE} 点&quot;
+      f&quot;  -&gt; {&#39;必须重算&#39; if sensitivity &gt;= MDE else &#39;可不改结论，但报告须加注&#39;}&quot;)
+low = sorted(n for n, w in conf.items() if w &lt; 0.75)
+print(f&quot;   污染权重 &lt; 0.75 的产物 = {low}（只有 cite：被引用，没被训练消费）&quot;)
+
+# ---------- 5. 回滚点：单位是&quot;数据版本 + 配比 + 阶段表&quot;三元组 ----------
+print(&quot;\n=== 5. 回滚单位与检查点账本 ===&quot;)
+CHECKPOINTS = [
+    {&quot;id&quot;: &quot;ckpt-0205&quot;, &quot;at&quot;: &quot;2026-02-05&quot;, &quot;data&quot;: &quot;labeled_train_v1@r1&quot;,
+     &quot;params_hash&quot;: &quot;5c1f&quot;, &quot;stage&quot;: &quot;epoch 4/8&quot;, &quot;resume&quot;: 30, &quot;clean&quot;: True},
+    {&quot;id&quot;: &quot;ckpt-0226&quot;, &quot;at&quot;: &quot;2026-02-26&quot;, &quot;data&quot;: &quot;labeled_train_v2@r1&quot;,
+     &quot;params_hash&quot;: &quot;5c1f&quot;, &quot;stage&quot;: &quot;epoch 6/8&quot;, &quot;resume&quot;: 10, &quot;clean&quot;: False},
+    {&quot;id&quot;: &quot;ckpt-0318&quot;, &quot;at&quot;: &quot;2026-03-18&quot;, &quot;data&quot;: &quot;labeled_train_v3@r1&quot;,
+     &quot;params_hash&quot;: &quot;9ab2&quot;, &quot;stage&quot;: &quot;epoch 2/8&quot;, &quot;resume&quot;: 45, &quot;clean&quot;: False},
+]
+for c in CHECKPOINTS:
+    flag = &quot;&quot; if c[&quot;clean&quot;] else &quot;  &lt;- 脏（它建在问题数据版本上）&quot;
+    print(f&quot;   {c[&#39;id&#39;]}  {c[&#39;at&#39;]}  data={c[&#39;data&#39;]:24s}&quot;
+          f&quot; params={c[&#39;params_hash&#39;]}  {c[&#39;stage&#39;]:12s} 续跑 {c[&#39;resume&#39;]}{flag}&quot;)
+usable = [c[&quot;id&quot;] for c in CHECKPOINTS if c[&quot;clean&quot;]]
+print(f&quot;   干净回滚点 = {usable}  （其余两个再新也不能用）&quot;)
+print(&quot;   -&gt; 回滚点只有在「数据版本 + 配比 + 阶段表」三者都对得上时才有意义；&quot;)
+print(&quot;      数据版本脏时，检查点再新也不能用（那是回滚到脏数据上）&quot;)
+
+# ---------- 6. 审计报告卡 ----------
+report = {
+    &quot;finding&quot;: &quot;bad_labels@v2 错误率 0.30（抽样 200 条，95% CI [0.24, 0.37]）&quot;,
+    &quot;ledger_hash&quot;: ledger_hash[:16],
+    &quot;affected_direct&quot;: len(direct),
+    &quot;affected_weighted&quot;: len(conf),
+    &quot;still_live&quot;: need,
+    &quot;cost&quot;: {&quot;A_full&quot;: cost_a, &quot;B_affected&quot;: cost_b, &quot;C_relabel_rerun&quot;: cost_c},
+    &quot;sensitivity_vs_MDE&quot;: {&quot;sensitivity&quot;: sensitivity, &quot;MDE&quot;: MDE},
+    &quot;action&quot;: &quot;重新标注 + 重跑受影响集；报告结论不改但加注&quot;,
+    &quot;unresolved&quot;: [&quot;上游 raw_web@v7/v8 未审计（本轮只审了标签侧）&quot;,
+                   &quot;model_d@r1 的下游用途未登记（账本缺口）&quot;],
+}
+print(&quot;\n=== 6. 审计报告卡（可存档）===&quot;)
+print(json.dumps(report, sort_keys=True, ensure_ascii=False, indent=1))
+print(f&quot;   报告卡哈希 = {hh(report)[:16]}&quot;)</code></pre>
+<p>运行输出（Python 3.14.5；本段在本机连续两次运行逐字节一致）：</p>
+<pre data-lang="text"><code class="language-text">python 3.14.5
+
+=== 0. 账本 ===
+   事件数 = 12   时间跨度 = 2026-01-08 ~ 2026-04-02
+   涉及源 = [&#39;bad_labels@v1&#39;, &#39;bad_labels@v2&#39;, &#39;labeled_train_v1@r1&#39;, &#39;labeled_train_v2@r1&#39;, &#39;labeled_train_v3@r1&#39;, &#39;model_b@r1&#39;, &#39;raw_web@v7&#39;, &#39;raw_web@v8&#39;]
+   涉及产物 = [&#39;labeled_train_v1@r1&#39;, &#39;labeled_train_v2@r1&#39;, &#39;labeled_train_v3@r1&#39;, &#39;model_a@r1&#39;, &#39;model_b@r1&#39;, &#39;model_c@r1&#39;, &#39;model_d@r1&#39;, &#39;report_q1_quality@r1&#39;, &#39;report_q2_plan@r1&#39;]
+   问题数据 bad_labels@v2 的消费事件 = 2 条
+   账本内容哈希 = c2f3defc2a1025e6（账本自身也要版本化；at 不进哈希）
+
+=== 1. 账本的两个查询方向 ===
+   正向（这份数据影响了谁）：bad_labels@v2 -&gt;
+     2026-02-03  derive labeled_train_v2@r1  (1200 行)
+     2026-03-15  derive labeled_train_v3@r1  (1500 行)
+   反向（这个产物用了什么）：report_q1_quality@r1 &lt;-
+     2026-02-25  cite   labeled_train_v2@r1
+     2026-02-25  cite   model_b@r1
+
+=== 2. 影响面（bad_labels@v2 的加权可达）===
+   labeled_train_v2@r1    污染权重 1.0000   它自己还会喂 [&#39;cite&#39;, &#39;train&#39;]
+   labeled_train_v3@r1    污染权重 1.0000   它自己还会喂 [&#39;cite&#39;, &#39;train&#39;]
+   model_b@r1             污染权重 1.0000   它自己还会喂 [&#39;cite&#39;]
+   model_c@r1             污染权重 1.0000   它自己还会喂 []
+   model_d@r1             污染权重 1.0000   它自己还会喂 []
+   report_q1_quality@r1   污染权重 0.5000   它自己还会喂 []
+   report_q2_plan@r1      污染权重 0.5000   它自己还会喂 []
+   直接消费者 2 个: [&#39;labeled_train_v2@r1&#39;, &#39;labeled_train_v3@r1&#39;]
+   加权可达总共 7 个产物
+
+=== 3. 三种处置的代价 ===
+   全部产物 9 个，单位成本合计 321
+   A 全量重跑                : 321
+   B 只重跑受影响集(7 个)   : 259  -&gt; 省 19.3%
+   C 重新标注 + 重跑受影响集 : 重标 12 + 259 = 271
+   -&gt; B 与 C 的差别不在「跑多少」，而在「要不要修数据」
+
+=== 4. 不需要回滚的三种情况（都要有证据）===
+   仍在服役的受影响产物 = [&#39;model_b@r1&#39;, &#39;model_c@r1&#39;, &#39;model_d@r1&#39;, &#39;report_q1_quality@r1&#39;, &#39;report_q2_plan@r1&#39;]
+   报告结论对该数据的敏感度上界 0.6 点  vs  MDE 2.0 点  -&gt; 可不改结论，但报告须加注
+   污染权重 &lt; 0.75 的产物 = [&#39;report_q1_quality@r1&#39;, &#39;report_q2_plan@r1&#39;]（只有 cite：被引用，没被训练消费）
+
+=== 5. 回滚单位与检查点账本 ===
+   ckpt-0205  2026-02-05  data=labeled_train_v1@r1      params=5c1f  epoch 4/8    续跑 30
+   ckpt-0226  2026-02-26  data=labeled_train_v2@r1      params=5c1f  epoch 6/8    续跑 10  &lt;- 脏（它建在问题数据版本上）
+   ckpt-0318  2026-03-18  data=labeled_train_v3@r1      params=9ab2  epoch 2/8    续跑 45  &lt;- 脏（它建在问题数据版本上）
+   干净回滚点 = [&#39;ckpt-0205&#39;]  （其余两个再新也不能用）
+   -&gt; 回滚点只有在「数据版本 + 配比 + 阶段表」三者都对得上时才有意义；
+      数据版本脏时，检查点再新也不能用（那是回滚到脏数据上）
+
+=== 6. 审计报告卡（可存档）===
+{
+ &quot;action&quot;: &quot;重新标注 + 重跑受影响集；报告结论不改但加注&quot;,
+ &quot;affected_direct&quot;: 2,
+ &quot;affected_weighted&quot;: 7,
+ &quot;cost&quot;: {
+  &quot;A_full&quot;: 321,
+  &quot;B_affected&quot;: 259,
+  &quot;C_relabel_rerun&quot;: 271
+ },
+ &quot;finding&quot;: &quot;bad_labels@v2 错误率 0.30（抽样 200 条，95% CI [0.24, 0.37]）&quot;,
+ &quot;ledger_hash&quot;: &quot;c2f3defc2a1025e6&quot;,
+ &quot;sensitivity_vs_MDE&quot;: {
+  &quot;MDE&quot;: 2.0,
+  &quot;sensitivity&quot;: 0.6
+ },
+ &quot;still_live&quot;: [
+  &quot;model_b@r1&quot;,
+  &quot;model_c@r1&quot;,
+  &quot;model_d@r1&quot;,
+  &quot;report_q1_quality@r1&quot;,
+  &quot;report_q2_plan@r1&quot;
+ ],
+ &quot;unresolved&quot;: [
+  &quot;上游 raw_web@v7/v8 未审计（本轮只审了标签侧）&quot;,
+  &quot;model_d@r1 的下游用途未登记（账本缺口）&quot;
+ ]
+}
+   报告卡哈希 = f7aac7dc6719a1f6</code></pre>
+<h3 id="h-七取舍与边界">七、取舍与边界<a class="anchor" href="#h-七取舍与边界" aria-label="本节链接">#</a></h3>
+<table>
+<thead>
+<tr>
+<th>选择</th>
+<th>换来什么</th>
+<th>付出什么</th>
+<th>什么时候选另一边</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>全量账本（每次消费都记）</td>
+<td>影响面查询可信；能回答&quot;有没有用过&quot;</td>
+<td>体积（TB 级）；写入延迟；长期存储成本</td>
+<td>体量太大时：按时间分区 + 只留摘要 + 对关键数据集全量</td>
+</tr>
+<tr>
+<td>只记&quot;重要消费&quot;</td>
+<td>便宜</td>
+<td><strong>影响面偏小</strong>（最危险的方向）</td>
+<td>不要选。宁可记了不用</td>
+</tr>
+<tr>
+<td><code>cite</code> 权重 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.5</span></span></span></span></td>
+<td>把&quot;引用&quot;与&quot;污染&quot;分开，省下大量重算</td>
+<td>权重值是主观的（为什么不是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.3</span></span></span></span>？）</td>
+<td>需要更精确时：按&quot;报告里引用了哪些字段&quot;做列级 cite</td>
+</tr>
+<tr>
+<td>三种处置按账算</td>
+<td>决策有依据，可解释</td>
+<td>成本模型本身是估计（本例的成本是合成的）</td>
+<td>有真实成本表时：直接代入</td>
+</tr>
+<tr>
+<td>检查点带数据版本</td>
+<td>回滚点可用（能判断脏不脏）</td>
+<td>存储成本 × 检查点数；实现要改训练循环</td>
+<td>检查点极贵时：只对&quot;关键版本切换点&quot;打检查点</td>
+</tr>
+<tr>
+<td>报告卡存档</td>
+<td>处置与盲区可核对</td>
+<td>每次审计多写一张卡（约半小时）</td>
+<td>不要省。它是审计唯一的交付物</td>
+</tr>
+</tbody></table>
+<p><strong>四条硬边界：</strong></p>
+<ol>
+<li><strong>账本不完整时，影响面不可信，而&quot;不可信&quot;必须报告出来。</strong> 最贵的失败不是&quot;影响面算错&quot;，而是&quot;用不完整的账本算出一个看起来很确定的小影响面&quot;。所以报告卡里必须有 <code>unresolved</code>，并且要区分&quot;查过、确认没有&quot;与&quot;没查&quot;。</li>
+<li><strong>回滚不是万能的。</strong> 回滚的代价常常是&quot;重训 + 重新上线 + 重新评测&quot;，而<strong>已经做出的决策</strong>（用旧模型批过的数据、对外发布的报告）不会被回滚撤销。因此处置清单里要有一类&quot;不可回滚项&quot;（对外发布物、下游合作方），它们的处置是<strong>更正与通知</strong>，不是重跑。</li>
+<li><strong>&quot;不影响结论&quot;与&quot;没影响&quot;是两句话。</strong> 敏感度 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6835em;vertical-align:-0.0391em;"></span><span class="mord">0.6</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&lt;</span></span></span></span> MDE <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2.0</span></span></span></span> 的结论是&quot;本次评测分辨不出变化&quot;，不是&quot;结论对&quot;。报告加注必须写成前者。把不可判定写成无影响，是本节与第 3 章第 4 节共同反对的那一种报告失真。</li>
+<li><strong>审计有保鲜期。</strong> 今天算出的影响面在下一次有人往管线里加节点之后就可能失效（第 2 节的第 3 种落差：陈旧）。处置：报告卡里写上图版本哈希与账本哈希，并在管线结构变更时<strong>重新跑一次影响面</strong>（这是变更评审的一部分，不是审计的一部分）。</li>
+</ol>
+<h3 id="h-练习">练习<a class="anchor" href="#h-练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><p><strong>给你自己的项目建一份最小账本</strong>：
+（a）列出至少 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">8</span></span></span></span> 条&quot;消费事件&quot;（数据 → 产物），每条带 <code>src@ver</code>、<code>dst@ver</code>、<code>kind</code>、时间、行数；
+（b）算它的内容哈希，并说明你把哪些字段排除在哈希之外、为什么；
+（c）从账本里挑一份数据做正向查询，报告&quot;它影响了几个产物、其中几个还在服役&quot;。</p>
+</li>
+<li><p><strong>影响面的手工 vs 程序</strong>：
+（a）在你的账本上手工画出依赖图（纸笔），标出每个节点；
+（b）用加权可达算一遍，与手工结果比对；把差异逐条解释（是漏了边，还是权重分歧）；
+（c）说明你的 <code>cite</code> / <code>train</code> / <code>derive</code> 三类边的权重各取多少、依据是什么。</p>
+</li>
+<li><p><strong>回滚点审计</strong>：翻出你项目里现有的检查点（或模型存档），为每一个填写三元组 <code>(数据版本, 配比哈希, 阶段表)</code>。
+（a）哪些检查点你<strong>填不出</strong>数据版本？填不出意味着什么？
+（b）假设今天发现三个月前的一份数据是脏的，列出所有<strong>不可用</strong>的检查点与理由；
+（c）给出&quot;下一个检查点该记什么&quot;的字段清单。</p>
+</li>
+<li><p><strong>敏感度上界的估计</strong>：选一个你的主指标与一份可疑数据。
+（a）用&quot;剔除可疑样本后重算&quot;给出敏感度的粗略上界；
+（b）与事先声明的 MDE 比较，判定是&quot;必须重算&quot;还是&quot;加注即可&quot;；
+（c）写出那句加注的原文（要求：既不说&quot;没影响&quot;，也不说&quot;结论错了&quot;）。</p>
+</li>
+<li><p><strong>处置代价模型</strong>：为你在 (1) 里建的账本补一张成本表（每个产物的重跑成本）。
+（a）算 A / B / C 三种处置的代价；
+（b）找出&quot;B 相对 A 优势最大&quot;与&quot;最小&quot;的两个源节点，解释差别从哪来；
+（c）说明你的成本表里哪几项是估的（并标明不确定性量级）。</p>
+</li>
+<li><p><strong>报告卡演练（限时）</strong>：假设现在发现一份数据脏，你有 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">10</span></span></span></span> 分钟。
+（a）写出完整报告卡（用本节第六段的字段），<strong>必须在十分钟内</strong>；
+（b）标出卡里哪几项你是&quot;查过&quot;、哪几项是&quot;估的&quot;、哪几项是&quot;没查&quot;；
+（c）把&quot;没查&quot;的项写进 <code>unresolved</code>，并给出下一步谁在什么时候补上。</p>
+</li>
+<li><p><strong>不可回滚项清单</strong>：列出你项目里&quot;已经发出去、回滚不了&quot;的东西（对外报告、客户交付、下游派生数据）。
+（a）逐项给出更正方式（撤回 / 更正说明 / 通知下游）；
+（b）对每一项，给出&quot;发现它被污染&quot;的检测手段（它通常不在你的管线里，所以需要外部信号）；
+（c）说明这份清单应该由谁维护、更新频率是多少。</p>
+</li>
+</ol>
+<h3 id="h-小结">小结<a class="anchor" href="#h-小结" aria-label="本节链接">#</a></h3>
+<ul>
+<li><strong>审计的唯一前提是账本</strong>：一次消费一条记录，<code>src@ver --kind--&gt; dst@ver</code>，只追加，并且<strong>账本自己也有内容哈希</strong>（实测 <code>c2f3defc2a1025e6</code>，只覆盖 <code>(seq, src, dst, kind, n_rows)</code>，<code>at</code> 不进）。账本与血缘图的分工是&quot;实际发生&quot;与&quot;可能发生&quot;——<strong>只有账本能回答&quot;有没有用过&quot;</strong>。</li>
+<li><strong><code>kind</code> 决定污染怎么传播</strong>：<code>derive</code> / <code>train</code> / <code>eval</code> 全量传播，<code>cite</code> 只把结论绑上去。实测加权可达把 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">7</span></span></span></span> 个受影响产物分成 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">5</span></span></span></span> 个权重 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1.0000</span></span></span></span>（数据集 + 三个模型）与 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2</span></span></span></span> 个权重 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.5000</span></span></span></span>（两份报告）—— <strong>这条分界线就是&quot;重跑&quot;与&quot;重算那几句话&quot;的分界线</strong>。</li>
+<li><strong>三种处置的代价要算出来</strong>：全量重跑 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">321</span></span></span></span>、只重跑受影响集 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">259</span></span></span></span>（省 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">19.3%</span></span></span></span>）、重标 + 重跑 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">271</span></span></span></span>。B 相对 A 的优势随影响面变小而增大（影响面 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">7/9</span></span></span></span> 时只有 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">19.3%</span></span></span></span>）；C 比 B 贵，但它是唯一真正修好的选项。</li>
+<li><strong>回滚点的单位是&quot;数据版本 + 配比 + 阶段表&quot;三元组</strong>。实测里 <code>ckpt-0226</code> 续跑只要 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">10</span></span></span></span>（比干净的 <code>ckpt-0205</code> 便宜 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">3</span></span></span></span> 倍），但它的数据版本就是问题版本 —— <strong>检查点再新、再便宜也不能回滚到脏数据上</strong>。干净回滚点往往更贵。</li>
+<li><strong>&quot;不需要回滚&quot;有三种情况，每一种都要证据</strong>：产物已下线（下线记录）、敏感度低于 MDE（须写成&quot;不可判定&quot;并加注，不是&quot;没影响&quot;）、污染权重低于阈值（账本入边 kind 全是 <code>cite</code>，可核对）。实测里第一项不成立、第二项成立但结论是加注、第三项成立。</li>
+<li><strong>不可回滚项必须单独列</strong>：已经发出去的报告、客户交付、下游派生数据，回滚不了 —— 它们的处置是更正与通知。审计清单里没有这一类，等于假装世界只有自己的管线。</li>
+<li><strong>审计的交付物是报告卡</strong>，它的哈希覆盖 <code>action</code> 与 <code>unresolved</code>（实测 <code>f7aac7dc6719a1f6</code>）。<strong>一条审计的价值上限就是它写下来的盲区</strong>：把&quot;没查&quot;写进卡里，下一次才知道从哪继续。</li>
+<li><strong>四节在这里收口</strong>：第 1 节的身份让账本可核对，第 2 节的图让影响面可计算，第 3 节的 R1/R2/R3 让&quot;重跑&quot;这件事有意义（R1 不成立时重跑结果不可比），本节把三者装成一次十分钟内能交出去的审计。<strong>反过来说：如果账本不完整、图不新鲜、或者重跑不可复现，那么&quot;十分钟&quot;这个承诺本身就是假的</strong> —— 本节从头到尾都在为那句话的成立付账。</li>
+</ul>
+<blockquote>
+<p>下一节：本章四节把数据从&quot;一堆文件&quot;变成了&quot;可标识、可追溯、可重演、可审计的对象&quot;。继续往下有三条自然的分支：<strong>数据契约与门禁</strong>（把第 4 章的分布级门禁变成上游必须满足的接口，让脏数据在入口就被挡住，而不是三个月后被发现）、<strong>数据卡与对外发布</strong>（把本节报告卡里那些字段变成数据集对外交付的标准附件）、以及<strong>成本账</strong>（把每一层的可复现与记账成本折算成&quot;一次审计的期望代价&quot;，用来决定哪些数据集值得全量账本、哪些只需要摘要）。三条分支的共性是同一个问题的不同侧面：<strong>记账的粒度应该由&quot;出事时的代价&quot;倒推，而不是由&quot;抄起来方便&quot;决定。</strong></p>
+</blockquote>

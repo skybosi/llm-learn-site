@@ -1,0 +1,118 @@
+<h2 id="h-peft-库">PEFT 库<a class="anchor" href="#h-peft-库" aria-label="本节链接">#</a></h2>
+<p>上一课我们把 LoRA 挂到了量化基座上，但那些 <code>LoraConfig</code>、<code>get_peft_model</code> 到底是哪来的？它们来自 Hugging Face 的 <strong>PEFT（Parameter-Efficient Fine-Tuning）</strong> 库——一个把 LoRA、Prefix-tuning、Prompt tuning、IA3 等所有&quot;只训一小撮参数&quot;的方法统一起来的上层框架。这一课我们学透 PEFT 的抽象：怎么注入、怎么保存、怎么合并，以及它为什么能让不同微调方法&quot;换汤不换药&quot;地切换。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-peft-在解决什么">1. PEFT 在解决什么<a class="anchor" href="#h-1-peft-在解决什么" aria-label="本节链接">#</a></h4>
+<p>所有高效微调方法共享同一套模式：<strong>冻结基座 → 在结构里插入一小块可训练模块 → 只训练那块模块</strong>。差别只在于&quot;这块模块长什么样、插在哪里&quot;。PEFT 把这套模式抽象成统一的 API，让你改一行配置就能从 LoRA 换成 IA3，而训练循环、保存加载、部署逻辑完全不用动。</p>
+<p>它的两个核心抽象是：</p>
+<ul>
+<li><strong>PeftConfig</strong>：描述&quot;插什么、怎么插&quot;的配置对象（如 <code>LoraConfig</code>、<code>IA3Config</code>）；</li>
+<li><strong>PeftModel</strong>：包裹基座模型、持有适配器权重的模型对象。</li>
+</ul>
+<h4 id="h-2-注入适配器get_peft_model">2. 注入适配器：get_peft_model<a class="anchor" href="#h-2-注入适配器get_peft_model" aria-label="本节链接">#</a></h4>
+<p><code>get_peft_model(base_model, config)</code> 做的事是：遍历基座的每一层，按 <code>config</code> 里的 <code>target_modules</code> 找到目标模块，把原始 <code>Linear</code> 换成&quot;原始层 + 适配器&quot;的复合层，并<strong>冻结基座、只放开适配器参数</strong>。之后这个 <code>PeftModel</code> 就能像普通 <code>nn.Module</code> 一样前向、反向、交给 Trainer 训练。</p>
+<p>对 LoRA 来说，核心是 <code>LoraConfig</code> 的几个关键参数：</p>
+<table>
+<thead>
+<tr>
+<th>参数</th>
+<th>含义</th>
+<th>常见取值</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>r</code></td>
+<td>低秩维度，决定增量矩阵的大小</td>
+<td>8 / 16 / 64</td>
+</tr>
+<tr>
+<td><code>lora_alpha</code></td>
+<td>缩放系数，与 r 一起决定有效学习率</td>
+<td>16 / 32</td>
+</tr>
+<tr>
+<td><code>target_modules</code></td>
+<td>要挂适配器的模块名列表</td>
+<td><code>[&quot;q_proj&quot;,&quot;v_proj&quot;]</code> 等</td>
+</tr>
+<tr>
+<td><code>lora_dropout</code></td>
+<td>适配器上的 dropout，防过拟合</td>
+<td>0.05</td>
+</tr>
+<tr>
+<td><code>task_type</code></td>
+<td>任务类型，决定加不加因果/序列头</td>
+<td><code>&quot;CAUSAL_LM&quot;</code></td>
+</tr>
+</tbody></table>
+<p><code>lora_alpha</code> 是新手最容易困惑的参数：LoRA 的输出会乘以 <code>alpha / r</code>，所以真正决定&quot;增量有多强&quot;的是这个<strong>比值</strong>，而非 alpha 的绝对值。把 <code>alpha</code> 和 <code>r</code> 同时翻倍，效果不变。</p>
+<p><figure><img class="md-img" src="content/courses/llm-fine-tuning/assets/chapter-4-figure-03.svg" alt="PEFT 统一工作流：加载基座 → 注入适配器 → 训练 → 保存/合并" loading="lazy" decoding="async"><figcaption>PEFT 统一工作流：加载基座 → 注入适配器 → 训练 → 保存/合并</figcaption></figure>
+</p>
+<h4 id="h-3-保存与加载适配器是独立的">3. 保存与加载：适配器是独立的<a class="anchor" href="#h-3-保存与加载适配器是独立的" aria-label="本节链接">#</a></h4>
+<p>训练完 LoRA 后，你<strong>不需要</strong>保存整个模型——<code>model.save_pretrained()</code> 只把适配器权重（几 MB 到几十 MB 的 <code>adapter_model.safetensors</code>）连同 <code>adapter_config.json</code> 存下来。部署时用 <code>PeftModel.from_pretrained(base_model, adapter_path)</code> 把适配器重新挂回基座。这意味着：同一个基座可以挂无数个不同任务的适配器，像&quot;换插件&quot;一样切换能力。</p>
+<h4 id="h-4-合并merge_and_unload">4. 合并：merge_and_unload<a class="anchor" href="#h-4-合并merge_and_unload" aria-label="本节链接">#</a></h4>
+<p>适配器在推理时每次前向都要做&quot;基座输出 + 适配器增量&quot;的加法，多一层计算。若你不再需要&quot;可插拔&quot;，可以调用 <code>merge_and_unload()</code>，把 <code>W + B A</code> 直接<strong>算进基座权重里</strong>，返回一个普通模型。合并后体积和原基座一样，推理无额外开销，适合最终部署。</p>
+<h4 id="h-5-与量化的组合">5. 与量化的组合<a class="anchor" href="#h-5-与量化的组合" aria-label="本节链接">#</a></h4>
+<p>上一课看到，<code>get_peft_model</code> 前先 <code>prepare_model_for_kbit_training</code>，PEFT 就能把 LoRA 挂在 4-bit 基座上。PEFT 的量化支持和 bitsandbytes 深度整合，这也是 QLoRA 能&quot;开箱即用&quot;的原因。</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面完整走一遍&quot;注入 → 训练一步 → 保存 → 加载 → 合并&quot;，代码依赖 <code>transformers</code>、<code>peft</code>。</p>
+<pre data-lang="python"><code class="language-python">import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import LoraConfig, get_peft_model
+
+model_id = &quot;gpt2&quot;  # 用小型模型，CPU 也能跑通流程
+
+model = AutoModelForCausalLM.from_pretrained(model_id)
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+tokenizer.pad_token = tokenizer.eos_token
+
+# 1) 定义 LoRA 配置
+config = LoraConfig(
+    r=8,
+    lora_alpha=16,                       # 缩放比值 = alpha/r = 2
+    target_modules=[&quot;c_attn&quot;, &quot;c_proj&quot;], # GPT-2 的注意力层名（不同模型名称不同）
+    lora_dropout=0.05,
+    bias=&quot;none&quot;,
+    task_type=&quot;CAUSAL_LM&quot;,
+)
+
+# 2) 注入适配器：基座被冻结，只有 LoRA 参数可训练
+model = get_peft_model(model, config)
+model.print_trainable_parameters()
+# 输出形如：trainable params: 294,912 || all params: 124,734,720 || trainable%: 0.2364
+
+# 3) 模拟一步训练（真实任务请用 Trainer + 数据集）
+opt = torch.optim.AdamW(model.parameters(), lr=1e-4)
+inputs = tokenizer(&quot;今天天气不错&quot;, return_tensors=&quot;pt&quot;)
+loss = model(**inputs, labels=inputs[&quot;input_ids&quot;]).loss
+loss.backward()
+opt.step()
+print(f&quot;示例损失：{loss.item():.4f}&quot;)
+
+# 4) 保存适配器：只存几 MB 的 adapter 权重 + 配置
+model.save_pretrained(&quot;./my-lora-adapter&quot;)
+
+# 5) 重新加载：把适配器挂回同一个基座
+from peft import PeftModel
+base = AutoModelForCausalLM.from_pretrained(model_id)
+loaded = PeftModel.from_pretrained(base, &quot;./my-lora-adapter&quot;)
+
+# 6) 合并进基座并卸载适配器：得到普通模型，推理无额外开销
+merged = loaded.merge_and_unload()
+print(&quot;合并后的模型类型：&quot;, type(merged).__name__)</code></pre>
+<p>运行后你会看到：<code>gpt2</code> 约 1.24 亿参数里，可训练的 LoRA 只有约 29 万，占比 0.2%。保存到 <code>./my-lora-adapter</code> 的是几 MB 的小文件，而不是 500MB 的整个模型——这正是 PEFT 的价值所在。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>把 <code>target_modules</code> 换成 <code>[&quot;c_attn&quot;]</code>（只挂一个模块），再看 <code>print_trainable_parameters()</code>，对比参数量的变化，理解&quot;挂载范围&quot;的杠杆作用。</li>
+<li>保持 <code>alpha / r = 2</code> 不变，分别用 <code>(r=8, alpha=16)</code> 和 <code>(r=16, alpha=32)</code> 各跑一次，观察两者可训练参数量和缩放比值的关系。</li>
+<li>保存适配器后，用 <code>PeftModel.from_pretrained</code> 加载到<strong>另一个</strong>同架构模型上（如 <code>distilgpt2</code>），会发生什么？查文档确认适配器能否跨模型迁移，并解释原因。</li>
+<li>比较 <code>merge_and_unload</code> 前后的模型显存/参数量，总结&quot;可插拔适配器&quot;与&quot;合并部署&quot;各自适合什么场景。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Hugging Face · PEFT 文档（Quicktour）：<a href="https://huggingface.co/docs/peft/quicktour" target="_blank" rel="noopener noreferrer">https://huggingface.co/docs/peft/quicktour</a></li>
+<li>Hugging Face · PEFT 文档（LoRA 开发者指南）：<a href="https://huggingface.co/docs/peft/developer_guides/lora" target="_blank" rel="noopener noreferrer">https://huggingface.co/docs/peft/developer_guides/lora</a></li>
+<li>Hugging Face · PEFT 源码仓库：<a href="https://github.com/huggingface/peft" target="_blank" rel="noopener noreferrer">https://github.com/huggingface/peft</a></li>
+<li>LoRA 原论文（Hu 等，2021）：<a href="https://arxiv.org/abs/2106.09685" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2106.09685</a></li>
+</ul>
+<p><a href="#/l/ft-ch4-l3">下一课：其他高效微调</a></p>

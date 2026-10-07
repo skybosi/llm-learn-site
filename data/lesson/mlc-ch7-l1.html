@@ -1,0 +1,257 @@
+<h2 id="h-代码生成路径torchinductor--xla--tvm--cuda--trito">代码生成路径：TorchInductor / XLA / TVM → CUDA / Triton<a class="anchor" href="#h-代码生成路径torchinductor--xla--tvm--cuda--trito" aria-label="本节链接">#</a></h2>
+<p>第 6 课把 schedule 选了出来，但 schedule 只是一份意图：tile 多大、哪层并行、要不要融合。把它变成可执行代码是另一件事——这一步决定你最终拿到的是 Triton 源码、LLVM IR 还是 CUDA C。三条主流路线给出的东西并不一样，要回答的问题却完全一样：<strong>哪个算子值得生成、哪个交给库、生成的代码长什么样</strong>。本课把三家的出口对齐到同一张派发表，并算出&quot;融合一次省多少&quot;。</p>
+<p><figure><img class="md-img" src="content/courses/ml-compilers/assets/chapter-7-figure-01.svg" alt="代码生成路径：从图到 kernel 的五段与三条出口" loading="lazy" decoding="async"><figcaption>代码生成路径：从图到 kernel 的五段与三条出口</figcaption></figure>
+</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-同一张图最后一公里各不相同">1. 同一张图，最后一公里各不相同<a class="anchor" href="#h-1-同一张图最后一公里各不相同" aria-label="本节链接">#</a></h4>
+<p><strong>TorchInductor</strong> 是 <code>torch.compile</code> 的默认后端，用 Python 实现，核心 IR 是 define-by-run 的<strong>循环层 IR</strong>：每个 buffer 由一个 <code>inner_fn(index)</code> 描述&quot;第 index 个元素怎么算&quot;，索引是 SymPy 表达式，所以符号 shape 能一路流到代码里。它刻意只保留两个下层目标——GPU 生成 <strong>Triton</strong>，CPU 生成 <strong>C++/OpenMP</strong>（PyTorch 官方公告的原话是&quot;两个代表设计空间不同位置的 lower-level execution targets&quot;）。官方另一条关键信息是：除 matmul / conv 走<strong>带 epilogue 融合的模板</strong>之外，其余 kernel 都由 IR 生成；尚未实现的算子先走 ATen 回退。</p>
+<p><strong>XLA</strong> 的工作面在 HLO / StableHLO：先在 HLO 层做融合（producer-consumer fusion）与 layout 决策，再由 GPU 后端的 emitter 把 fusion 变成代码——XLA 源码里就有这一层（<code>xla/backends/gpu/codegen/triton/fusion_emitter.cc</code>），Triton 与循环两种发射器最终都交给 LLVM 出 PTX。</p>
+<p><strong>TVM</strong> 把&quot;算什么&quot;和&quot;怎么算&quot;彻底分开：Relax 描述计算、TE / TensorIR 描述调度，<code>tvm.build</code> 先降到目标源码（CUDA C 等）再交给 nvcc 之类的工具链。它还开了一条与&quot;自己生成&quot;并列的路——<strong>BYOC</strong>（Bring Your Own Codegen）：用 DFPattern 把 <code>matmul + bias + relu</code> 这类片段标记出来，交给 cuBLAS / CUTLASS / cuDNN，剩下的计算仍由 TVM 生成的 kernel 负责，两者在 <code>relax.build()</code> 时链接成同一个可执行体。</p>
+<table>
+<thead>
+<tr>
+<th>路线</th>
+<th>前端 IR</th>
+<th>调度在哪一层</th>
+<th>出口</th>
+<th>谁产出机器码</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>TorchInductor</td>
+<td>FX 图 + define-by-run 循环层 IR</td>
+<td>Python scheduler（<code>can_fuse</code> / <code>score_fusion</code>）+ 自动调优</td>
+<td>Triton（GPU）、C++/OpenMP（CPU）</td>
+<td>Triton 编译器、主机 C++ 编译器</td>
+</tr>
+<tr>
+<td>XLA</td>
+<td>HLO / StableHLO</td>
+<td>HLO pass、fusion、layout assignment</td>
+<td>Triton 融合发射器 / LLVM IR</td>
+<td>LLVM（→ PTX）</td>
+</tr>
+<tr>
+<td>TVM</td>
+<td>Relax + TE / TensorIR</td>
+<td>AutoTVM / Ansor 搜出的 schedule</td>
+<td>目标源码（CUDA C 等）+ BYOC 外部库</td>
+<td>nvcc / LLVM / 外部库自身</td>
+</tr>
+</tbody></table>
+<h4 id="h-2-出口只有三条责任边界完全不同">2. 出口只有三条，责任边界完全不同<a class="anchor" href="#h-2-出口只有三条责任边界完全不同" aria-label="本节链接">#</a></h4>
+<p>把上表压平，任何算子最终落进三格之一：</p>
+<ul>
+<li><strong>extern（库调用）</strong>：把 GEMM / 卷积交给已经按形状调过的库。它的能力上限就是库的上限，代价是<strong>默认不参与前后融合</strong>——只有模板提供 epilogue 槽位时，<code>bias</code>、激活才能搭车。</li>
+<li><strong>generated（生成 kernel）</strong>：点链、归约、索引变换这类&quot;每个框架版本都在变&quot;的算子。收益来自融合与省 DRAM 往返，风险来自 tile 选择、掩码边界与资源约束（第 2 课）。</li>
+<li><strong>fallback（回退）</strong>：没有 lowering 的算子。它保证语义、牺牲性能，而且必须被显式记账（第 3 课）。</li>
+</ul>
+<p>《The Deep Learning Compiler: A Comprehensive Survey》把代码生成归成&quot;编译生成&quot;与&quot;调用库&quot;两类——上面这张表就是那套分类在三条真实路线上的投影。</p>
+<h4 id="h-3-循环层-ir三家最后一块可编程的地方">3. 循环层 IR：三家最后一块&quot;可编程&quot;的地方<a class="anchor" href="#h-3-循环层-ir三家最后一块可编程的地方" aria-label="本节链接">#</a></h4>
+<p>不管前端长什么样，到了循环层就只剩：循环嵌套 + 并行/向量化标注 + 掩码/谓词 + buffer 读写。这一层还能用文本表达、也能用解释器执行。本课代码就用它算：一条 4 段点链在 8M 个 float32 元素上，<strong>未融合</strong>要写 3 个中间张量、4 次 kernel 启动，按&quot;每个 kernel 一遍读一遍写&quot;的模型估算是 256 MiB 流量；<strong>融合后</strong>中间值只活在寄存器里，1 次启动、64 MiB——4 倍差距全部来自&quot;中间张量有没有落 DRAM&quot;，与算力无关。</p>
+<h4 id="h-4-block-层程序triton-把并行映射接走了">4. block 层程序：Triton 把并行映射接走了<a class="anchor" href="#h-4-block-层程序triton-把并行映射接走了" aria-label="本节链接">#</a></h4>
+<p>Triton 把上一步再抬一层：一个 program instance 负责一个 block，地址写成 <code>pid * BLOCK + arange(BLOCK)</code>，边界靠掩码收口，<code>tl.dot</code> 的累加器默认在 fp32。程序员只声明&quot;块多大&quot;，块内线程、共享内存、向量化交给编译器。这也解释了 Inductor 为什么选它：官方在公告的讨论里直说 Triton&quot;需要的调优少得多&quot;，而 TVM 的强项是众多非 GPU 目标。分工因此稳定：<strong>上游决定什么被生成，块层语言决定生成得多容易，编译器决定生成得多好</strong>。</p>
+<h4 id="h-5-常见坑">5. 常见坑<a class="anchor" href="#h-5-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>以为 matmul 也是生成的</strong>：多数路线下它是模板或库调用；打印出的&quot;生成代码&quot;里看不到 GEMM 主体是正常的。</li>
+<li><strong>把 IR 打印当成目标代码</strong>：循环层 IR 之后还有索引扁平化、内存分配、device/线程绑定，之后才是 C 或 PTX。</li>
+<li><strong>只看能否跑通，不看有无 fallback</strong>：一段能跑通的产物可能有一半算子在回退（第 3 课给出台账方法）。</li>
+<li><strong>在生成路径上忽略 dtype 与 layout 的一致性</strong>：生成器对签名比 eager 严格，类型或步长对不上就整段回退。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>纯 Python + numpy（本机 <code>python3.10.16</code> + <code>numpy 1.26.2</code> 实跑，无需 GPU）。五段对应上面五节：派发表、融合/未融合的循环层 IR 与流量模型、Triton 风格 block 程序与掩码统计、生成代码与 eager 的逐元素对拍、三条出口的分工。</p>
+<pre data-lang="python"><code class="language-python"># ---- 第 1 课：同一张图 → 三条代码生成出口（numpy，本机 python3.10.16 + numpy 1.26.2 实跑）----
+import numpy as np
+
+# ================= 1. 派发表：每个算子走哪条出口 =================
+DISPATCH = [
+    (&quot;matmul(x, W)&quot;,  &quot;extern&quot;,    &quot;调用 cuBLAS/cuDNN 等外部 kernel&quot;, &quot;库已按形状调过，生成器正面打很难赢&quot;),
+    (&quot;add(_, bias)&quot;,  &quot;generated&quot;, &quot;融进 matmul 的 epilogue&quot;,        &quot;点链与模板做后融合才免一次往返&quot;),
+    (&quot;relu(_)&quot;,       &quot;generated&quot;, &quot;与点链合成同一个 kernel&quot;,         &quot;逐元素算子收益最大、风险最低&quot;),
+    (&quot;sum(_, dim=1)&quot;, &quot;generated&quot;, &quot;归约 kernel（跨线程/block）&quot;,      &quot;归约要额外的通信与中间缓冲&quot;),
+    (&quot;mul(_, 0.5)&quot;,   &quot;generated&quot;, &quot;并入同一个融合区域&quot;,              &quot;标量广播不需要单独搬数据&quot;),
+    (&quot;custom_op(_)&quot;,  &quot;fallback&quot;,  &quot;没有 lowering，回退到框架 eager&quot;,  &quot;正确性优先：回退必须保证语义不变&quot;),
+]
+
+print(&quot;=== 1. 派发表：同一个图，出口不止一条 ===&quot;)
+print(f&quot;  {&#39;算子&#39;:&lt;15}{&#39;出口&#39;:&lt;11}{&#39;生成物&#39;:&lt;30}理由&quot;)
+for op, path, what, why in DISPATCH:
+    print(f&quot;  {op:&lt;15}{path:&lt;11}{what:&lt;30}{why}&quot;)
+
+# ================= 2. 循环层 IR：融合前 vs 融合后 =================
+N_EL = 8 * 1024 * 1024          # 8M 元素
+BYTES = 4                       # float32
+ARRAY_MB = N_EL * BYTES / 2**20
+
+def ir_text(fused):
+    if not fused:
+        return [
+            &quot;kernel0: for i in range(0, %d, 4): vec4 { t1[i] = a[i] * 2 }&quot; % N_EL,
+            &quot;kernel1: for i in range(0, %d, 4): vec4 { t2[i] = t1[i] + 1 }&quot; % N_EL,
+            &quot;kernel2: for i in range(0, %d, 4): vec4 { t3[i] = max(t2[i], 0) }&quot; % N_EL,
+            &quot;kernel3: for i in range(0, %d, 4): vec4 { out[i] = t3[i] * 0.5 }&quot; % N_EL,
+        ]
+    return [
+        &quot;kernel0: for i in range(0, %d, 4): vec4 {&quot; % N_EL,
+        &quot;           t = a[i] * 2          # 四段点链折成一串表达式&quot;,
+        &quot;           t = t + 1&quot;,
+        &quot;           t = max(t, 0)&quot;,
+        &quot;           out[i] = t * 0.5       # 中间张量 t1/t2/t3 全部消失&quot;,
+        &quot;         }&quot;,
+    ]
+
+def traffic_mb(kernels_read_write):
+    return kernels_read_write * ARRAY_MB
+
+print(&quot;\n=== 2. 循环层 IR：同语义、两种 schedule（流量是模型估算，不是实测）===&quot;)
+print(&quot;  [未融合] 4 个 kernel，每个中间张量都要落一次 DRAM：&quot;)
+for line in ir_text(False):
+    print(&quot;   &quot;, line)
+print(&quot;  [融合]   1 个 kernel，中间值只活在寄存器里：&quot;)
+for line in ir_text(True):
+    print(&quot;   &quot;, line)
+print(f&quot;  元素数 {N_EL}，float32 单个张量 {ARRAY_MB:.0f} MiB&quot;)
+print(f&quot;  未融合：4 kernel × (读 1 + 写 1) 张量 = {traffic_mb(8):.0f} MiB，中间张量 3 个&quot;)
+print(f&quot;  融合后：1 kernel × (读 1 + 写 1) 张量 = {traffic_mb(2):.0f} MiB，中间张量 0 个&quot;)
+print(f&quot;  流量比 = {traffic_mb(8) / traffic_mb(2):.1f}x，kernel 启动次数比 = 4.0x&quot;)
+
+# ================= 3. block 层程序：Triton 风格（带掩码） =================
+def triton_like(shape, block):
+    n = int(np.prod(shape))
+    grid = (n + block - 1) // block
+    return [
+        &quot;@triton.jit&quot;,
+        &quot;def pointwise(a_ptr, out_ptr, n, BLOCK: tl.constexpr):&quot;,
+        &quot;    pid = tl.program_id(0)&quot;,
+        &quot;    offs = pid * BLOCK + tl.arange(0, BLOCK)&quot;,
+        f&quot;    m = offs &lt; n                  # 掩码：n={n} 不是 {block} 的整数倍时兜住尾巴&quot;,
+        &quot;    x = tl.load(a_ptr + offs, mask=m, other=0.0)&quot;,
+        &quot;    y = tl.maximum(x * 2.0 + 1.0, 0.0) * 0.5&quot;,
+        &quot;    tl.store(out_ptr + offs, y, mask=m)&quot;,
+        f&quot;# grid = ({grid},)  # cdiv(n, BLOCK) = ceil({n}/{block})&quot;,
+    ]
+
+print(&quot;\n=== 3. block 层程序：一个 program 处理一个 block，边界靠掩码 ===&quot;)
+for line in triton_like((1000,), 128):
+    print(&quot;  &quot; + line)
+print(&quot;  块内地址 offs = pid*BLOCK + arange(BLOCK)：整除性、对齐、边界三件事都由掩码收口&quot;)
+total_lanes = ((1000 + 127) // 128) * 128
+waste = total_lanes - 1000
+print(f&quot;  有效 1000 个元素 / 实际发射 {total_lanes} 个 lane，空转 {waste} 个 = {waste / total_lanes:.2%}&quot;)
+
+# ================= 4. 三种出口的执行对拍 =================
+def gen_exec(a, cache):
+    &quot;&quot;&quot;按照生成的循环层 IR 执行：中间值只走寄存器（cache），不落 DRAM。&quot;&quot;&quot;
+    out = np.empty_like(a)
+    for i in range(a.size):
+        t = a[i] * np.float32(2.0)
+        cache[&quot;t1_reg&quot;] = t
+        t = t + np.float32(1.0)
+        t = max(t, np.float32(0.0))
+        out[i] = t * np.float32(0.5)
+    return out
+
+def eager_exec(a, cache):
+    &quot;&quot;&quot;未融合：每一步的材料化中间张量都要写回内存。&quot;&quot;&quot;
+    t1 = a * np.float32(2.0); cache[&quot;t1&quot;] = t1
+    t2 = t1 + np.float32(1.0); cache[&quot;t2&quot;] = t2
+    t3 = np.maximum(t2, np.float32(0.0)); cache[&quot;t3&quot;] = t3
+    return t3 * np.float32(0.5)
+
+rng = np.random.default_rng(7)
+a = rng.standard_normal(64 * 96).astype(np.float32)
+cache_g, cache_e = {}, {}
+g = gen_exec(a, cache_g)
+e = eager_exec(a, cache_e)
+print(&quot;\n=== 4. 对拍：生成代码与 eager 必须逐元素一致（正确性是底线）===&quot;)
+print(f&quot;  生成 kernel 与 eager 最大绝对差 = {np.abs(g - e).max()}&quot;)
+print(f&quot;  逐元素全等 = {np.array_equal(g, e)}&quot;)
+print(f&quot;  eager 需常驻的中间张量：{sorted(cache_e)}（每个都占 {a.size * 4 / 1024:.0f} KiB）&quot;)
+print(&quot;  生成路径：点链折成一串表达式，中间值只在寄存器里活一瞬，不进 buffer 分配表&quot;)
+
+# ================= 5. 三条出口的分工小结 =================
+print(&quot;\n=== 5. 三家的分工（同一张图的三段不同命题）===&quot;)
+for name, claim, evidence in [
+    (&quot;外部库(out)&quot;, &quot;把 GEMM/卷积做到硬件极限&quot;, &quot;cuBLAS/cuDNN：模板化 kernel，不参与融合则多一次 DRAM 往返&quot;),
+    (&quot;生成 kernel&quot;, &quot;把点链/归约融成少数 kernel&quot;, &quot;Triton / C++(OpenMP)：Inductor 的两条唯一出口&quot;),
+    (&quot;回退路径&quot;, &quot;保证没 lowering 的算子仍然正确&quot;, &quot;ATen/框架算子：慢但语义与 eager 完全一致&quot;),
+]:
+    print(f&quot;  {name:&lt;12}{claim:&lt;22}{evidence}&quot;)</code></pre>
+<p>实际运行结果：</p>
+<pre data-lang="text"><code class="language-text">=== 1. 派发表：同一个图，出口不止一条 ===
+  算子             出口         生成物                           理由
+  matmul(x, W)   extern     调用 cuBLAS/cuDNN 等外部 kernel    库已按形状调过，生成器正面打很难赢
+  add(_, bias)   generated  融进 matmul 的 epilogue          点链与模板做后融合才免一次往返
+  relu(_)        generated  与点链合成同一个 kernel               逐元素算子收益最大、风险最低
+  sum(_, dim=1)  generated  归约 kernel（跨线程/block）          归约要额外的通信与中间缓冲
+  mul(_, 0.5)    generated  并入同一个融合区域                     标量广播不需要单独搬数据
+  custom_op(_)   fallback   没有 lowering，回退到框架 eager       正确性优先：回退必须保证语义不变
+
+=== 2. 循环层 IR：同语义、两种 schedule（流量是模型估算，不是实测）===
+  [未融合] 4 个 kernel，每个中间张量都要落一次 DRAM：
+    kernel0: for i in range(0, 8388608, 4): vec4 { t1[i] = a[i] * 2 }
+    kernel1: for i in range(0, 8388608, 4): vec4 { t2[i] = t1[i] + 1 }
+    kernel2: for i in range(0, 8388608, 4): vec4 { t3[i] = max(t2[i], 0) }
+    kernel3: for i in range(0, 8388608, 4): vec4 { out[i] = t3[i] * 0.5 }
+  [融合]   1 个 kernel，中间值只活在寄存器里：
+    kernel0: for i in range(0, 8388608, 4): vec4 {
+               t = a[i] * 2          # 四段点链折成一串表达式
+               t = t + 1
+               t = max(t, 0)
+               out[i] = t * 0.5       # 中间张量 t1/t2/t3 全部消失
+             }
+  元素数 8388608，float32 单个张量 32 MiB
+  未融合：4 kernel × (读 1 + 写 1) 张量 = 256 MiB，中间张量 3 个
+  融合后：1 kernel × (读 1 + 写 1) 张量 = 64 MiB，中间张量 0 个
+  流量比 = 4.0x，kernel 启动次数比 = 4.0x
+
+=== 3. block 层程序：一个 program 处理一个 block，边界靠掩码 ===
+  @triton.jit
+  def pointwise(a_ptr, out_ptr, n, BLOCK: tl.constexpr):
+      pid = tl.program_id(0)
+      offs = pid * BLOCK + tl.arange(0, BLOCK)
+      m = offs &lt; n                  # 掩码：n=1000 不是 128 的整数倍时兜住尾巴
+      x = tl.load(a_ptr + offs, mask=m, other=0.0)
+      y = tl.maximum(x * 2.0 + 1.0, 0.0) * 0.5
+      tl.store(out_ptr + offs, y, mask=m)
+  # grid = (8,)  # cdiv(n, BLOCK) = ceil(1000/128)
+  块内地址 offs = pid*BLOCK + arange(BLOCK)：整除性、对齐、边界三件事都由掩码收口
+  有效 1000 个元素 / 实际发射 1024 个 lane，空转 24 个 = 2.34%
+
+=== 4. 对拍：生成代码与 eager 必须逐元素一致（正确性是底线）===
+  生成 kernel 与 eager 最大绝对差 = 0.0
+  逐元素全等 = True
+  eager 需常驻的中间张量：[&#39;t1&#39;, &#39;t2&#39;, &#39;t3&#39;]（每个都占 24 KiB）
+  生成路径：点链折成一串表达式，中间值只在寄存器里活一瞬，不进 buffer 分配表
+
+=== 5. 三家的分工（同一张图的三段不同命题）===
+  外部库(out)    把 GEMM/卷积做到硬件极限       cuBLAS/cuDNN：模板化 kernel，不参与融合则多一次 DRAM 往返
+  生成 kernel   把点链/归约融成少数 kernel     Triton / C++(OpenMP)：Inductor 的两条唯一出口
+  回退路径        保证没 lowering 的算子仍然正确  ATen/框架算子：慢但语义与 eager 完全一致</code></pre>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选，需自备或云上按需：在真实工具链里看同一段图的产物 ----
+# PyTorch（看 Inductor 生成了什么）：
+#   TORCH_LOGS=&quot;output_code&quot; python3 -c &quot;import torch; f=torch.compile(lambda x: torch.relu(x*2+1)*0.5); f(torch.randn(1000))&quot;
+#   TORCH_COMPILE_DEBUG=1 python3 your_model.py     # 会落盘一个 debug 目录，里面有 IR 与生成代码
+# XLA（看 HLO 与 LLVM IR）：
+#   XLA_FLAGS=--xla_dump_to=/tmp/xla_dump python3 your_tf_or_jax_script.py
+# TVM（打印 CUDA C 源码；需自行 pip 安装）：
+#   python3 -c &quot;import tvm; from tvm import relax; print(tvm.__version__)&quot;   # 版本以官方为准
+#   # 构建后：mod.imported_modules[0].get_source() 就是生成的 CUDA C
+# 三个工具一个都没有也不影响本课：上面的 numpy 版已经把出口、流量与对拍全部算出来了。
+# 具体 flag 名与行为以你所用版本的官方文档为准。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：给派发表加一列&quot;能否融合&quot;，规则自定（例如只有点链与归约可融、extern 不可融），再把第 2 节的流量模型改成读派发表自动求和；对&quot;4 段点链 + 1 次 GEMM&quot;的混合图算一遍流量，与&quot;全融合&quot;的乐观上界对比。</li>
+<li><strong>解释</strong>：为什么融合能让流量从 256 MiB 降到 64 MiB，却完全不影响浮点运算次数？指出一条&quot;融合不省流量也不省启动&quot;的图，并说明这类图该不该融。</li>
+<li><strong>对比/验证</strong>：把第 4 节的 block 程序改成 <code>BLOCK=64</code> 与 <code>BLOCK=256</code> 两版，分别算出 1000、1025、4096 三个 shape 下的空转 lane 比例；解释为什么&quot;块越大越浪费&quot;和&quot;块越大越省地址计算&quot;会同时成立。</li>
+<li><strong>思考</strong>：如果某个模型 70% 时间在 extern 的 GEMM 上、25% 在生成的点链上、5% 在回退算子上，那么&quot;把点链生成质量提升 20%&quot;能把端到端提高多少？这个账对&quot;该不该自研编译器&quot;的决策意味着什么？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>PyTorch dev-discuss, <em>TorchInductor: a PyTorch-native Compiler with Define-by-Run IR and Symbolic Shapes</em>（两个下层目标 Triton / C++-OpenMP、&quot;除 matmul/conv 模板外几乎全部由 IR 生成&quot;、未实现算子走 ATen 回退、以及&quot;Triton 需要的调优少得多&quot;的原始表述）：<a href="https://dev-discuss.pytorch.org/t/torchinductor-a-pytorch-native-compiler-with-define-by-run-ir-and-symbolic-shapes/747" target="_blank" rel="noopener noreferrer">https://dev-discuss.pytorch.org/t/torchinductor-a-pytorch-native-compiler-with-define-by-run-ir-and-symbolic-shapes/747</a></li>
+<li>Apache TVM, <em>External Library Dispatch (BYOC)</em>（四段流水线 <code>FuseOpsByPattern</code> → <code>MergeCompositeFunctions</code> → <code>RunCodegen</code> → 链接；<code>relax.ext.&lt;backend&gt;</code>；JSONSerializer 与 CSourceCodegen 两种策略；cuBLAS / CUTLASS / cuDNN / DNNL 的支持范围与 check 函数）：<a href="https://tvm.apache.org/docs/arch/external_library_dispatch.html" target="_blank" rel="noopener noreferrer">https://tvm.apache.org/docs/arch/external_library_dispatch.html</a></li>
+<li>Apache TVM, <em>Code Generation</em>（<code>tvm.build</code> 的目标源码生成与后端工具链衔接）：<a href="https://tvm.apache.org/docs/arch/codegen.html" target="_blank" rel="noopener noreferrer">https://tvm.apache.org/docs/arch/codegen.html</a></li>
+<li>OpenXLA, <em>GPU emitters</em>（XLA GPU 后端的发射器分层，含 Triton 融合发射器）：<a href="https://openxla.org/xla/emitters" target="_blank" rel="noopener noreferrer">https://openxla.org/xla/emitters</a></li>
+<li>Mingzhen Li et al., <em>The Deep Learning Compiler: A Comprehensive Survey</em>（代码生成的&quot;编译生成 vs 调用库&quot;两条路线、后端优化三分法）：<a href="https://arxiv.org/abs/2002.03794" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2002.03794</a></li>
+</ul>
+<p><a href="#/l/mlc-ch7-l2">下一课：生成质量：与手写 kernel 的差距从哪里来</a></p>

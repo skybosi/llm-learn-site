@@ -1,0 +1,189 @@
+<h2 id="h-归约朴素--树形--warp-shuffle--多级">归约：朴素 → 树形 → warp shuffle → 多级<a class="anchor" href="#h-归约朴素--树形--warp-shuffle--多级" aria-label="本节链接">#</a></h2>
+<p>求和看起来是最不需要设计算法的操作。但在 GPU 上它同时踩了三个坑：串行依赖太长、跨线程通信太贵、浮点加法的结合律不成立。一片 1024 个数、256 个线程的归约，朴素写法要 1023 步；树形只要 11 步；把最后几级搬进寄存器（warp shuffle）才摸到显存带宽允许的上限。这一课把三代写法的<strong>代价账</strong>与<strong>误差账</strong>都算成可打印的数字，并给出无 GPU 的复现路径。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-归约的定义与并行化的两个代价">1. 归约的定义与并行化的两个代价<a class="anchor" href="#h-1-归约的定义与并行化的两个代价" aria-label="本节链接">#</a></h4>
+<p><strong>归约</strong>（reduction）是把 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span></span></span></span> 个元素通过一个满足结合律的二元算子合并成 1 个结果，例如 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.2809em;vertical-align:-0.2997em;"></span><span class="mop"><span class="mop op-symbol small-op" style="position:relative;top:0em;">∑</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.9812em;"><span style="top:-2.4003em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">i</span><span class="mrel mtight">=</span><span class="mord mtight">0</span></span></span></span><span style="top:-3.2029em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.109em;">N</span><span class="mbin mtight">−</span><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2997em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">x</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>。并行化它要付两种代价：<strong>时序步数</strong>（depth，最长依赖链长度，决定延迟）与<strong>总工作量</strong>（work，全部加法次数之和，决定吞吐）。</p>
+<p>顺序累加 depth <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.3669em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span>、work <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.3669em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span>；树形归约 work 同样是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span>，但 depth <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.3669em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.9386em;vertical-align:-0.2441em;"></span><span class="mop"><span class="mop">lo<span style="margin-right:0.0139em;">g</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.207em;"><span style="top:-2.4559em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2441em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span></span></span></span>。<strong>并行归约的收益全在 depth 上，不在 work 上</strong>——所以块内归约常常是 memory-bound（受显存带宽限制）：加法便宜，把数据搬进来贵。</p>
+<h4 id="h-2-块内树形归约步数从-1023-降到-11">2. 块内树形归约：步数从 1023 降到 11<a class="anchor" href="#h-2-块内树形归约步数从-1023-降到-11" aria-label="本节链接">#</a></h4>
+<p>把 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span></span></span></span> 个元素平均分给 256 个线程，每个线程先串行累加自己那 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mord">/256</span></span></span></span> 个（步数 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mord">/256</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span>），再在 shared memory 上做 8 级树形合并（每级活跃线程减半）。<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1024</span></span></span></span> 时每线程 4 个元素：<code>(4-1) + 8 = 11</code> 步，相比单线程的 1023 步快 93 倍。</p>
+<p>一个关键工程细节：<strong>合并方式选 <code>s[i] += s[i + stride]</code> 而不是 <code>s[i] += s[i - stride]</code></strong>。后者在部分线程上会造成显式的分支发散（divergent branch），而前者在 stride 小于 warp 尺寸时整个 warp 一起执行、由 <code>if (tid &lt; stride)</code> 统一屏蔽。这不是&quot;更快一点&quot;，而是让最后 5 级可以整段替换成 shuffle。</p>
+<h4 id="h-3-warp-shuffle把最后-5-级搬进寄存器">3. warp shuffle：把最后 5 级搬进寄存器<a class="anchor" href="#h-3-warp-shuffle把最后-5-级搬进寄存器" aria-label="本节链接">#</a></h4>
+<p><strong>warp shuffle</strong>（线程束内数据交换）用一条指令让同一 warp 的线程互读对方的寄存器，不经过 shared memory，也不需要 <code>__syncthreads()</code>。典型模式：</p>
+<pre data-lang="cpp"><code class="language-cpp">for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1)
+    val += __shfl_down_sync(0xffffffffu, val, offset);</code></pre>
+<p><code>__shfl_down_sync(mask, val, offset)</code> 让每个线程拿到&quot;比自己大 offset 号&quot;的那个线程的 <code>val</code>；<code>mask</code> 指明参与这次交换的线程集合。<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1024</span></span></span></span>、256 线程时，5 级 shuffle 换掉 5 级 shared memory 往返，每级省掉一次 <code>__syncthreads()</code>。</p>
+<p><strong>mask 不是可有可无的礼貌参数</strong>：块内 shuffle 阶段常常只有部分线程活跃（例如只剩 8 个线程在算）。若让未参与协作的线程也进入 <code>__shfl_down_sync</code>，而 mask 没有如实描述活跃集合，行为就是未定义的。规则很简单：<strong>mask 里的每个线程都必须执行同一个 shuffle 调用</strong>；不足一个 warp 时用 <code>__activemask()</code> 或显式传 <code>(1u &lt;&lt; count) - 1</code>。</p>
+<h4 id="h-4-多级归约与跨块合并">4. 多级归约与跨块合并<a class="anchor" href="#h-4-多级归约与跨块合并" aria-label="本节链接">#</a></h4>
+<p>单块最多管几万元素。<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span></span></span></span> 到百万级时必须<strong>多级</strong>：每个 block 各自归约出一份部分和，再合并这些部分和。合并有三条路：</p>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>做法</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>两级 kernel</td>
+<td>第一 kernel 写部分和数组，第二 kernel 再归约</td>
+<td>多一次全量读写 + 一次 launch</td>
+</tr>
+<tr>
+<td>单 kernel + 原子</td>
+<td>每块最后一个线程 <code>atomicAdd</code> 到全局累加器</td>
+<td><strong>浮点结果不确定</strong></td>
+</tr>
+<tr>
+<td>协作组 grid</td>
+<td><code>cg::this_grid().sync()</code> 后在最后一块里完成合并</td>
+<td>需 cooperative launch，grid 尺寸受限</td>
+</tr>
+</tbody></table>
+<p>shared memory 树形归约的每一级之间<strong>必须</strong>有 <code>__syncthreads()</code>：少了它编译器可能把另一线程写的值缓存在寄存器里，读到的还是旧值。这是第 5 章内存模型在本课的直接落脚点。</p>
+<p><figure><img class="md-img" src="content/courses/gpu-cuda-kernels/assets/chapter-6-figure-03.svg" alt="归约写法演进：depth 从 N 降到 log N，再靠 shuffle 与多级合并" loading="lazy" decoding="async"><figcaption>归约写法演进：depth 从 N 降到 log N，再靠 shuffle 与多级合并</figcaption></figure>
+</p>
+<h4 id="h-5-误差账树形归约顺带买到的精度">5. 误差账：树形归约顺带买到的精度<a class="anchor" href="#h-5-误差账树形归约顺带买到的精度" aria-label="本节链接">#</a></h4>
+<p>浮点加法不满足结合律：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord mathnormal">a</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">b</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">c</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel"><span class="mrel"><span class="mord vbox"><span class="thinbox"><span class="rlap"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="inner"><span class="mord"><span class="mrel"></span></span></span><span class="fix"></span></span></span></span></span><span class="mspace nobreak"></span><span class="mrel">=</span></span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal">a</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord mathnormal">b</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">c</span><span class="mclose">)</span></span></span></span>。串行累加每一步都把&quot;巨大的前缀和&quot;与&quot;单个元素&quot;相加，相对误差按 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span> 累积；树形归约每一步只把<strong>量级相近</strong>的两个部分和相加，相对误差按 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.9386em;vertical-align:-0.2441em;"></span><span class="mop"><span class="mop">lo<span style="margin-right:0.0139em;">g</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.207em;"><span style="top:-2.4559em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2441em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">n</span></span></span></span> 累积。<strong>树形归约不只是更快，在精度上也通常更稳。</strong></p>
+<p>下一节用 <code>struct</code> 手工做 float32 舍入把这件事量出来：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord"><span class="mord">2</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">25</span></span></span></span></span></span></span></span></span></span></span></span> 个 <code>1.0f</code> 丢给顺序累加会停在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord"><span class="mord">2</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">24</span></span></span></span></span></span></span></span></span></span></span></span>（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8974em;vertical-align:-0.0833em;"></span><span class="mord"><span class="mord">2</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">24</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> 在 float32 里无法表示），而树形累加得到正确值。长序列的求和、方差、均值都会撞上它。</p>
+<h4 id="h-6-常见坑">6. 常见坑<a class="anchor" href="#h-6-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>最后一级 shuffle 读越界</strong>：活跃线程只剩 3 个却仍从 <code>offset=16</code> 走，会拿到垃圾数据；必须按活跃集合裁剪 offset 起点。</li>
+<li><strong>以为 shuffle 能替代 <code>__syncthreads()</code></strong>：shuffle 只在 warp 内有效，跨 warp 通信仍要走 shared memory + 屏障。</li>
+<li><strong>每级都写全局内存</strong>：把部分和每级写回 HBM，会把树形归约省下的带宽加回去（第 4 章的账本同样适用）。</li>
+<li><strong>用 <code>atomicAdd</code> 做可复现实验的基线</strong>：原子加的执行顺序由调度决定，同一输入两次运行可能差几个 ULP。</li>
+<li><strong>忽略收尾</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span></span></span></span> 不是线程数整数倍时，边界线程必须传单位元（0.0f），否则垃圾会参与求和。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>三段纯 Python（只用标准库 <code>random</code> / <code>struct</code> / <code>math</code>，<strong>无 GPU、无需 numpy</strong>）分别做三件事：算清三种策略的代价账、展开块内树形归约的逐级规模、量化求和顺序对 float32 精度的影响。</p>
+<pre data-lang="python"><code class="language-python"># ===== 本课示例：三种归约策略的代价账 + 求和顺序对精度的影响 =====
+import random, struct, math
+
+# ---------- 1. 三种策略的代价账：加法次数、参与的线程、跨线程通信 ----------
+N, TPB = 1024, 256          # 元素数、每块线程数
+
+def sequential_work(n):
+    &quot;&quot;&quot;单线程累加 n 个数：n-1 次加法，0 次跨线程通信。&quot;&quot;&quot;
+    return dict(adds=n - 1, steps=n - 1, threads=1, cross_thread=0)
+
+def tree_reduce_work(n):
+    &quot;&quot;&quot;块内树形归约：每线程先串行加 n/TPB 个，再做 log2(TPB) 级跨线程合并。&quot;&quot;&quot;
+    per_thread = n // TPB
+    levels = int(math.log2(TPB))
+    return dict(adds=(per_thread - 1) + levels, steps=(per_thread - 1) + levels,
+                threads=TPB, cross_thread=levels)
+
+def shuffle_reduce_work(n, warp=32):
+    &quot;&quot;&quot;warp shuffle 版本：最后 log2(warp) 级在寄存器里交换，不经过 shared memory。&quot;&quot;&quot;
+    per_thread = n // TPB
+    levels = int(math.log2(warp))
+    shared_levels = int(math.log2(TPB // warp))
+    return dict(adds=(per_thread - 1) + levels, steps=(per_thread - 1) + levels,
+                threads=TPB, cross_thread=shared_levels + levels)
+
+print(f&quot;归约 N={N}，每块 {TPB} 线程&quot;)
+print(f&quot;{&#39;策略&#39;:&lt;14} {&#39;每线程加法&#39;:&gt;8} {&#39;跨线程轮数&#39;:&gt;9} {&#39;时序步数&#39;:&gt;7}&quot;)
+for name, d in ((&quot;顺序(单线程)&quot;, sequential_work(N)),
+                (&quot;树形+shared&quot;, tree_reduce_work(N)),
+                (&quot;树形+shuffle&quot;, shuffle_reduce_work(N))):
+    print(f&quot;{name:&lt;14} {d[&#39;adds&#39;]:&gt;8} {d[&#39;cross_thread&#39;]:&gt;9} {d[&#39;steps&#39;]:&gt;7}&quot;)
+print(f&quot;顺序策略步数 / shuffle 策略步数 = {sequential_work(N)[&#39;steps&#39;] / shuffle_reduce_work(N)[&#39;steps&#39;]:.0f}x&quot;)
+
+# ---------- 2. 块内树形归约的逐级规模（shared memory 视图） ----------
+print(&quot;\n块内树形归约各级（跨线程合并）：&quot;)
+stride, active, level = 1, TPB // 2, 1
+while stride &lt; TPB:
+    print(f&quot;  第 {level} 级：活跃线程 {active:&gt;3}，比较距离 {stride:&gt;3}&quot;)
+    stride, active, level = stride * 2, active // 2, level + 1
+
+# ---------- 3. 求和顺序与浮点误差：float32 下逐次 vs 成对 ----------
+def f32(x):
+    return struct.unpack(&#39;&lt;f&#39;, struct.pack(&#39;&lt;f&#39;, x))[0]
+
+def seq_sum(vals):
+    acc = f32(0.0)
+    for v in vals:
+        acc = f32(acc + v)
+    return acc
+
+def pair_sum(vals):
+    cur = [f32(v) for v in vals]
+    while len(cur) &gt; 1:
+        nxt = [f32(cur[i] + cur[i + 1]) for i in range(0, len(cur) - 1, 2)]
+        if len(cur) % 2:
+            nxt.append(cur[-1])
+        cur = nxt
+    return cur[0]
+
+random.seed(7)
+print(&quot;\n随机均匀分布 [-1,1]，用 math.fsum 作精确参考：&quot;)
+for n in (1024, 4096, 16384, 65536):
+    vals = [random.uniform(-1, 1) for _ in range(n)]
+    exact = math.fsum(vals)
+    print(f&quot;  n={n:&gt;6} 精确={exact:+.8f} 逐次误差={abs(seq_sum(vals)-exact):.2e}&quot;
+          f&quot; 成对误差={abs(pair_sum(vals)-exact):.2e}&quot;)
+
+# ---------- 4. 极端情形：全部是 1.0f，顺序累加会在 2^24 处停住 ----------
+print(&quot;\n全部元素为 1.0f（预期和 = n）：&quot;)
+for n in (1 &lt;&lt; 24, 1 &lt;&lt; 25, 1 &lt;&lt; 26):
+    ones = [1.0] * n
+    print(f&quot;  n={n:&gt;11,} 逐次累加={seq_sum(ones):&gt;12.0f} 成对累加={pair_sum(ones):&gt;12.0f}&quot;)</code></pre>
+<p>在 <code>python3</code>（纯标准库，本机 python3.10 验证）下实际运行结果：</p>
+<pre data-lang="text"><code class="language-text">归约 N=1024，每块 256 线程
+策略                每线程加法     跨线程轮数    时序步数
+顺序(单线程)            1023         0    1023
+树形+shared            11         8      11
+树形+shuffle            8         8       8
+顺序策略步数 / shuffle 策略步数 = 128x
+
+块内树形归约各级（跨线程合并）：
+  第 1 级：活跃线程 128，比较距离   1
+  第 2 级：活跃线程  64，比较距离   2
+  第 3 级：活跃线程  32，比较距离   4
+  第 4 级：活跃线程  16，比较距离   8
+  第 5 级：活跃线程   8，比较距离  16
+  第 6 级：活跃线程   4，比较距离  32
+  第 7 级：活跃线程   2，比较距离  64
+  第 8 级：活跃线程   1，比较距离 128
+
+随机均匀分布 [-1,1]，用 math.fsum 作精确参考：
+  n=  1024 精确=-30.92664127 逐次误差=3.60e-05 成对误差=1.92e-07
+  n=  4096 精确=-21.72054820 逐次误差=2.52e-05 成对误差=1.47e-06
+  n= 16384 精确=-18.78531775 逐次误差=7.38e-05 成对误差=2.53e-06
+  n= 65536 精确=-34.52432157 逐次误差=1.81e-05 成对误差=4.76e-06
+
+全部元素为 1.0f（预期和 = n）：
+  n= 16,777,216 逐次累加=    16777216 成对累加=    16777216
+  n= 33,554,432 逐次累加=    16777216 成对累加=    33554432
+  n= 67,108,864 逐次累加=    16777216 成对累加=    67108864</code></pre>
+<p>两处值得盯住的对照：<strong>顺序与树形的时序步数差 128 倍而不是 1024 倍</strong>——因为每线程仍要串行处理 4 个元素，剩下 8 级才是树形的功劳；<strong>全 1.0f 的极端情形下逐次累加直接失效</strong>（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord"><span class="mord">2</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">25</span></span></span></span></span></span></span></span></span></span></span></span> 与 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord"><span class="mord">2</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">26</span></span></span></span></span></span></span></span></span></span></span></span> 都停在 16777216），这解释了为什么生产级归约与第 5 课的验证容差都必须假定&quot;加法顺序会改结果&quot;。</p>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选，需自备 GPU 或云上按需开一台：把账本和真机对上 ----
+# nvcc -O3 -arch=sm_90 -o reduce reduce.cu
+# ./reduce
+#   nsys profile -o reduce_prof ./reduce    # 先看这个 4KB 的归约到底有没有等显存
+#   ncu --metrics dram__bytes_read.sum,l1tex__data_bank_conflicts_pipe_lsu_mem_shared.sum \
+#       --launch-skip 3 --launch-count 1 ./reduce
+# 判读：
+#   dram__bytes_read.sum ≈ N×4 字节（一遍读满）→ 已经是带宽上限，别再优化加法
+#   dram__bytes_read.sum 远超 N×4          → 部分和被反复写回，检查是不是每级都 store
+#   若你把树形版本换成 shuffle 版本而 dram 字节不变、时间却降了 → 省下的是 __syncthreads 与 bank 冲突
+# 指标名与可用性以你本机 `ncu --query-metrics` 的输出为准；没有 GPU 不影响本课，上面的 Python 已把
+# 步数账与精度账都算完了。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><p><strong>实现</strong>：把 <code>pair_sum</code> 改写成&quot;Kahan 补偿求和&quot;，在 <code>n=65536</code> 的随机数据上比较它与成对累加的误差。再把它和树形归约（8 级）的误差放一起，解释为什么 Kahan 的 work 更高但常数更小。</p>
+</li>
+<li><p><strong>解释</strong>：为什么块内树形归约的合并要用 <code>s[i] += s[i + stride]</code> 而不是 <code>s[i] += s[i - stride]</code>？从&quot;分支发散&quot;与&quot;能否替换成 shuffle&quot;两个角度各写一句。</p>
+</li>
+<li><p><strong>对比/验证</strong>：把 <code>N</code> 改成 1000（不是 256 的整数倍）。写出边界线程应传什么值、最后一级 shuffle 的 <code>offset</code> 起点应取多少（活跃线程 1000 的尾块只有 232 个，不足 8 个 warp），再用 <code>pair_sum</code> 在 1000 个随机数上验证树形结果的误差量级。</p>
+</li>
+<li><p><strong>思考</strong>：若要求&quot;同一输入两次运行结果逐位相同&quot;，上面三种跨块合并方案里哪些不合格？如果又要求单次 kernel launch，还剩哪条路，代价是什么？</p>
+</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>NVIDIA, <em>CUDA C++ Programming Guide</em>「Warp Shuffle Functions」（<code>__shfl_down_sync</code> 语义与 mask 契约）：<a href="https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#warp-shuffle-functions" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#warp-shuffle-functions</a></li>
+<li>NVIDIA, <em>CUDA C++ Programming Guide</em>「Cooperative Groups」§4.4.6.1 Reduce 与 <code>tiled_partition</code>（块内/子组归约的官方抽象）：<a href="https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/cooperative-groups.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/cooperative-groups.html</a></li>
+<li>NVIDIA, <em>CUDA C++ Best Practices Guide</em> §9.2 Bandwidth（理论带宽 vs 有效带宽；归约为何常常 memory-bound）：<a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#bandwidth" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#bandwidth</a></li>
+<li>NVIDIA Research, <em>Single-pass Parallel Prefix Scan with Decoupled Look-back</em>（多级归约/扫描的单遍合并思路，第 2 课继续用）：<a href="https://research.nvidia.com/sites/default/files/publications/nvr-2016-002.pdf" target="_blank" rel="noopener noreferrer">https://research.nvidia.com/sites/default/files/publications/nvr-2016-002.pdf</a></li>
+</ul>
+<p><a href="#/l/cuda-ch6-l2">下一课：前缀和（scan）：并行算法的第一个门槛</a></p>

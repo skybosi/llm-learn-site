@@ -1,0 +1,265 @@
+<h2 id="h-类型系统与类型检查规则">类型系统与类型检查规则<a class="anchor" href="#h-类型系统与类型检查规则" aria-label="本节链接">#</a></h2>
+<pre data-lang="js"><code class="language-js">&quot;1&quot; + 1        // JavaScript: &quot;11&quot;，不报错</code></pre>
+<p>一行不报错却含义诡异的代码，比报错的代码更危险。类型检查的目标不是&quot;防止手误&quot;，而是把&quot;运行期才可能爆炸&quot;的东西提前成<strong>编译期的判定</strong>。本课把它写成一张可运行的规则表：说清&quot;类型&quot;是什么、规则怎么写、哪里最容易漏，再用不到百行 Python 实现一个能给出准确诊断的检查器。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-类型表达式类型系统的词汇表">1. 类型表达式：类型系统的词汇表<a class="anchor" href="#h-1-类型表达式类型系统的词汇表" aria-label="本节链接">#</a></h4>
+<p>龙书 §6.3.1 的起点：<strong>类型表达式</strong>（type expression）要么是<strong>基本类型</strong>，要么是对<strong>类型构造子</strong>（type constructor）的一次应用。构造子至少四种：数组 <code>array(n, T)</code>、记录 <code>record(字段名与类型)</code>、乘积 <code>T1 × T2</code>、函数 <code>T1 → T2</code>。本课只用两个基本类型加一个函数构造子：</p>
+<table>
+<thead>
+<tr>
+<th>写法</th>
+<th>含义</th>
+<th>出现位置</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>int</code> / <code>float</code></td>
+<td>基本类型</td>
+<td>字面量、变量、运算符规则</td>
+</tr>
+<tr>
+<td><code>bool</code> / <code>string</code></td>
+<td>基本类型</td>
+<td>比较结果、<code>+</code> 的字符串拼接</td>
+</tr>
+<tr>
+<td><code>(T1, T2) → R</code></td>
+<td>函数类型</td>
+<td>函数调用规则</td>
+</tr>
+<tr>
+<td><code>error</code></td>
+<td>检查器内部哨兵，不是语言类型</td>
+<td>第 6 小节</td>
+</tr>
+</tbody></table>
+<p>把类型写成数据而不是散落的字符串比较，规则才能变成&quot;查表&quot;，检查器也才能保持短小。</p>
+<h4 id="h-2-类型等价结构等价-vs-名字等价">2. 类型等价：结构等价 vs 名字等价<a class="anchor" href="#h-2-类型等价结构等价-vs-名字等价" aria-label="本节链接">#</a></h4>
+<p>规则里到处要问&quot;这两个类型是不是同一个&quot;，龙书 §6.3.2 说这是两种流派：</p>
+<ul>
+<li><strong>结构等价</strong>（structural）：递归比较类型表达式的结构，相同即等价。实现简单，但 <code>type Meters = float</code> 与 <code>type Feet = float</code> 会被当成同一个类型，单位信息丢了。</li>
+<li><strong>名字等价</strong>（nominal）：只有同一个名字声明的类型才等价。Ada 的 <code>type MyInteger is new Integer;</code> 之下，两者的变量互相赋值就是类型错误——结构一样也没用。</li>
+</ul>
+<p>要区分&quot;语义不同的同构类型&quot;（单位、ID、句柄）就用名字等价，只关心&quot;能否按同一套操作处理&quot;就用结构等价。例 2 是结构等价的实现：两个匿名记录在名字等价下永远不同。</p>
+<h4 id="h-3-静态检查可靠sound与强类型">3. 静态检查、可靠（sound）与强类型<a class="anchor" href="#h-3-静态检查可靠sound与强类型" aria-label="本节链接">#</a></h4>
+<p>§6.5 把类型检查拆成三件事：语言提供<strong>类型系统</strong>（&quot;什么类型能出现在哪&quot;）；编译器为程序各部分<strong>赋类型</strong>；编译器<strong>保证</strong>用法符合规则。第三件事不必在编译期完成——检查可以推到运行期，但那时编译器的工作是&quot;生成检查代码&quot;而非&quot;判定合法&quot;。于是有两个易混术语：</p>
+<ul>
+<li><strong>可靠（sound）的类型系统</strong>：保证所有检查都能在<strong>执行前</strong>完成。</li>
+<li><strong>强类型的实现</strong>：编译出的程序<strong>保证不会出现类型错误</strong>。</li>
+</ul>
+<p>&quot;可靠&quot;说的是系统性质，不是编译器的完成度。</p>
+<h4 id="h-4-规则的两种形式综合与推导">4. 规则的两种形式：综合与推导<a class="anchor" href="#h-4-规则的两种形式综合与推导" aria-label="本节链接">#</a></h4>
+<p>§6.5.1 区分两类检查：<strong>类型综合</strong>（type synthesis）用子部分类型推出整体类型，自底向上（<code>int + float</code> → <code>float</code>）；<strong>类型推导</strong>（type inference）从用法反推类型，ML 系语言靠它做到不写标注也能检查。本课只做综合——它是下一课&quot;隐式转换&quot;的前置。加法规则写成判断式是：</p>
+<pre><code>Γ ⊢ e1 : int     Γ ⊢ e2 : int
+─────────────────────────────          Γ 是类型环境：名字 → 类型
+        Γ ⊢ e1 + e2 : int</code></pre>
+<p><code>Γ</code>（Gamma）就是第 1 课符号表里 <code>name → type</code> 的投影；规则可以直译成字典键 <code>(op, 左类型, 右类型)</code>，表外一切组合都判错。</p>
+<h4 id="h-5-一张检查清单">5. 一张检查清单<a class="anchor" href="#h-5-一张检查清单" aria-label="本节链接">#</a></h4>
+<p>真实编译器漏检查的地方高度集中，把规则列全比写代码更重要：</p>
+<table>
+<thead>
+<tr>
+<th>构造</th>
+<th>规则</th>
+<th>违反时</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>变量引用</td>
+<td>名字在 <code>Γ</code> 中可查</td>
+<td>未定义变量 + 引用处行号</td>
+</tr>
+<tr>
+<td>二元算术</td>
+<td>两侧同类型且属 <code>int</code>/<code>float</code>（<code>+</code> 另允许 <code>string</code>）</td>
+<td>运算符不接受 A 与 B</td>
+</tr>
+<tr>
+<td>比较</td>
+<td>两侧同类型且可比</td>
+<td>同上</td>
+</tr>
+<tr>
+<td>赋值</td>
+<td><code>Γ(名字)</code> 与右值类型相同</td>
+<td>声明为 X，却赋了 Y</td>
+</tr>
+<tr>
+<td>函数调用</td>
+<td>函数存在；实参个数与逐个类型相等</td>
+<td>未定义函数 / 个数 / 实参不匹配</td>
+</tr>
+<tr>
+<td>条件表达式</td>
+<td>条件为 <code>bool</code>，两分支类型一致</td>
+<td>条件非布尔 / 分支不一致</td>
+</tr>
+</tbody></table>
+<p>本课刻意<strong>不做隐式转换</strong>：<code>f / x</code> 必须报错。这不是偷懒，而是把它留到下一课当<strong>显式规则</strong>引入。</p>
+<h4 id="h-6-error-类型一个错误只报一次">6. <code>error</code> 类型：一个错误只报一次<a class="anchor" href="#h-6-error-类型一个错误只报一次" aria-label="本节链接">#</a></h4>
+<p>不加哨兵时，<code>(z + 1) * 2</code> 会因为 <code>z</code> 未定义而连报三条（<code>+</code>、<code>*</code> 各叠一条）。用户只需看第一条：给类型格加一个 <code>error</code>，子节点一旦是 <code>error</code>，父节点直接返回它、不再生成新诊断。例 1 用 <code>suppress</code> 开关对照，诊断条数是 1 与 3。</p>
+<p><figure><img class="md-img" src="content/courses/compiler-foundations/assets/chapter-3-figure-03.svg" alt="类型综合的检查顺序，以及 error 哨兵如何让一个错误只报一次" loading="lazy" decoding="async"><figcaption>类型综合的检查顺序，以及 error 哨兵如何让一个错误只报一次</figcaption></figure>
+</p>
+<h4 id="h-7-常见坑">7. 常见坑<a class="anchor" href="#h-7-常见坑" aria-label="本节链接">#</a></h4>
+<ol>
+<li><strong>报错不含位置与期望</strong>：只说 <code>type error</code> 等于没说；诊断至少要给位置、期望类型与实际类型。</li>
+<li><strong>把&quot;类型不同&quot;写成一句话</strong>：<code>bool + int</code> 与 <code>int + string</code> 是两类问题，混淆后不知该改哪边。</li>
+<li><strong>漏掉调用点的检查</strong>：最容易忘的是<strong>实参个数</strong>与<strong>返回类型</strong>。</li>
+<li><strong>规则表与文档不同步</strong>：规则表是唯一事实源；加了规则却没加表项，后续 pass 行为就会不一致。</li>
+</ol>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>例 1 是一个完整检查器：<code>RULES</code> 是规则表，<code>FUNCS</code> 是函数签名表，<code>Checker.check</code> 自底向上综合类型，返回 <code>ERR</code> 抑制级联报错。</p>
+<pre data-lang="python"><code class="language-python"># ---- 例 1：类型检查器（严格规则：不做隐式转换）----
+INT, FLOAT, BOOL, STR, ERR = &#39;int&#39;, &#39;float&#39;, &#39;bool&#39;, &#39;string&#39;, &#39;error&#39;
+
+RULES = {                      # (运算符, 左类型, 右类型) -&gt; 结果类型；表里没有就是类型错误
+    (&#39;+&#39;, INT, INT): INT,     (&#39;+&#39;, FLOAT, FLOAT): FLOAT, (&#39;+&#39;, STR, STR): STR,
+    (&#39;-&#39;, INT, INT): INT,     (&#39;-&#39;, FLOAT, FLOAT): FLOAT,
+    (&#39;*&#39;, INT, INT): INT,     (&#39;*&#39;, FLOAT, FLOAT): FLOAT,
+    (&#39;/&#39;, INT, INT): INT,     (&#39;/&#39;, FLOAT, FLOAT): FLOAT,   # int / int 是整数除法
+    (&#39;&lt;&#39;, INT, INT): BOOL,    (&#39;&lt;&#39;, FLOAT, FLOAT): BOOL,
+    (&#39;==&#39;, INT, INT): BOOL,   (&#39;==&#39;, FLOAT, FLOAT): BOOL,   (&#39;==&#39;, STR, STR): BOOL,
+}
+
+FUNCS = {                      # 函数签名：名字 -&gt; (形参类型元组, 返回类型)
+    &#39;add&#39;:  ((INT, INT), INT),
+    &#39;sqrt&#39;: ((FLOAT,), FLOAT),
+    &#39;len&#39;:  ((STR,), INT),
+}
+
+class Checker:
+    &quot;&quot;&quot;自底向上综合类型（type synthesis）；返回 ERR 以抑制级联报错&quot;&quot;&quot;
+    def __init__(self, env, suppress=True):
+        self.env = env             # 名字 -&gt; 类型，由第 1 课的符号表给出
+        self.suppress = suppress   # True: 子节点出错就返回 ERR，不再叠加错误
+        self.errors = []
+
+    def error(self, line, msg):
+        self.errors.append(f&#39;L{line}: {msg}&#39;)
+        return ERR
+
+    def check(self, node, line):
+        tag = node[0]
+        if tag == &#39;num&#39;:                                  # (&#39;num&#39;, 值, 类型)
+            return node[2]
+        if tag == &#39;var&#39;:                                  # (&#39;var&#39;, 名字)
+            name = node[1]
+            if name not in self.env:
+                return self.error(line, f&#39;未定义变量 {name!r}&#39;)
+            return self.env[name]
+        if tag == &#39;bin&#39;:                                  # (&#39;bin&#39;, op, 左, 右)
+            _, op, left, right = node
+            lt, rt = self.check(left, line), self.check(right, line)
+            if ERR in (lt, rt):
+                if self.suppress:
+                    return ERR                            # 关键：子节点已出错，不再报第二遍
+                return self.error(line, f&#39;运算符 {op!r} 不接受 {lt} 与 {rt}&#39;)
+            if (op, lt, rt) not in RULES:
+                return self.error(line, f&#39;运算符 {op!r} 不接受 {lt} 与 {rt}&#39;)
+            return RULES[(op, lt, rt)]
+        if tag == &#39;call&#39;:                                 # (&#39;call&#39;, 函数名, [实参...])
+            _, name, args = node
+            if name not in FUNCS:
+                return self.error(line, f&#39;未定义函数 {name!r}&#39;)
+            params, ret = FUNCS[name]
+            if len(args) != len(params):
+                return self.error(line, f&#39;{name} 要 {len(params)} 个参数，给了 {len(args)} 个&#39;)
+            ats = [self.check(a, line) for a in args]
+            if ERR in ats:
+                return ERR
+            bad = [(p, a) for p, a in zip(params, ats) if p != a]
+            if bad:
+                return self.error(line, f&#39;{name} 实参不匹配：&#39; +
+                                  &#39;；&#39;.join(f&#39;需要 {p} 得到 {a}&#39; for p, a in bad))
+            return ret
+        if tag == &#39;assign&#39;:                               # (&#39;assign&#39;, 名字, 右值)
+            _, name, rhs = node
+            rt = self.check(rhs, line)
+            if rt == ERR:
+                return ERR
+            if name not in self.env:
+                return self.error(line, f&#39;赋值给未声明的变量 {name!r}&#39;)
+            if self.env[name] != rt:
+                return self.error(line, f&#39;{name} 声明为 {self.env[name]}，却赋了 {rt}&#39;)
+            return rt
+        raise AssertionError(f&#39;未知节点 {tag}&#39;)
+
+ENV = {&#39;x&#39;: INT, &#39;f&#39;: FLOAT, &#39;s&#39;: STR, &#39;b&#39;: BOOL}
+num = lambda v, t=INT: (&#39;num&#39;, v, t)
+var = lambda n: (&#39;var&#39;, n)
+
+CASES = [
+    &#39;x + x&#39;, &#39;x + s&#39;, &#39;b + x&#39;, &#39;f / x&#39;, &#39;s + s&#39;,
+    &#39;add(x, x)&#39;, &#39;add(x, f)&#39;, &#39;add(x)&#39;, &#39;sqrt(x)&#39;, &#39;(z + 1) * 2&#39;,
+]
+for src in CASES:
+    ast = {
+        &#39;x + x&#39;:        (&#39;bin&#39;, &#39;+&#39;, var(&#39;x&#39;), var(&#39;x&#39;)),
+        &#39;x + s&#39;:        (&#39;bin&#39;, &#39;+&#39;, var(&#39;x&#39;), var(&#39;s&#39;)),
+        &#39;b + x&#39;:        (&#39;bin&#39;, &#39;+&#39;, var(&#39;b&#39;), var(&#39;x&#39;)),
+        &#39;f / x&#39;:        (&#39;bin&#39;, &#39;/&#39;, var(&#39;f&#39;), var(&#39;x&#39;)),
+        &#39;s + s&#39;:        (&#39;bin&#39;, &#39;+&#39;, var(&#39;s&#39;), var(&#39;s&#39;)),
+        &#39;add(x, x)&#39;:    (&#39;call&#39;, &#39;add&#39;, [var(&#39;x&#39;), var(&#39;x&#39;)]),
+        &#39;add(x, f)&#39;:    (&#39;call&#39;, &#39;add&#39;, [var(&#39;x&#39;), var(&#39;f&#39;)]),
+        &#39;add(x)&#39;:       (&#39;call&#39;, &#39;add&#39;, [var(&#39;x&#39;)]),
+        &#39;sqrt(x)&#39;:      (&#39;call&#39;, &#39;sqrt&#39;, [var(&#39;x&#39;)]),
+        &#39;(z + 1) * 2&#39;:  (&#39;bin&#39;, &#39;*&#39;, (&#39;bin&#39;, &#39;+&#39;, var(&#39;z&#39;), num(1)), num(2)),
+    }[src]
+    c = Checker(dict(ENV))
+    t = c.check(ast, 1)
+    print(f&#39;{src:12s} -&gt; {&quot;OK&quot; if t != ERR else &quot;REJECT&quot;:6s} type={t:6s} {c.errors}&#39;)
+
+# 同一个错误表达式，关掉 ERR 短路后错误会&quot;级联&quot;成三条
+for suppress in (True, False):
+    c = Checker(dict(ENV), suppress=suppress)
+    c.check((&#39;bin&#39;, &#39;*&#39;, (&#39;bin&#39;, &#39;+&#39;, var(&#39;z&#39;), num(1)), num(2)), 1)
+    print(f&#39;suppress={suppress!s:5s} 错误条数={len(c.errors)} {c.errors}&#39;)</code></pre>
+<pre><code>x + x        -&gt; OK     type=int    []
+x + s        -&gt; REJECT type=error  [&quot;L1: 运算符 &#39;+&#39; 不接受 int 与 string&quot;]
+b + x        -&gt; REJECT type=error  [&quot;L1: 运算符 &#39;+&#39; 不接受 bool 与 int&quot;]
+f / x        -&gt; REJECT type=error  [&quot;L1: 运算符 &#39;/&#39; 不接受 float 与 int&quot;]
+s + s        -&gt; OK     type=string []
+add(x, x)    -&gt; OK     type=int    []
+add(x, f)    -&gt; REJECT type=error  [&#39;L1: add 实参不匹配：需要 int 得到 float&#39;]
+add(x)       -&gt; REJECT type=error  [&#39;L1: add 要 2 个参数，给了 1 个&#39;]
+sqrt(x)      -&gt; REJECT type=error  [&#39;L1: sqrt 实参不匹配：需要 float 得到 int&#39;]
+(z + 1) * 2  -&gt; REJECT type=error  [&quot;L1: 未定义变量 &#39;z&#39;&quot;]
+suppress=True  错误条数=1 [&quot;L1: 未定义变量 &#39;z&#39;&quot;]
+suppress=False 错误条数=3 [&quot;L1: 未定义变量 &#39;z&#39;&quot;, &quot;L1: 运算符 &#39;+&#39; 不接受 error 与 int&quot;, &quot;L1: 运算符 &#39;*&#39; 不接受 error 与 int&quot;]</code></pre>
+<p>注意 <code>f / x</code> 被拒绝：严格规则下 <code>float</code> 与 <code>int</code> 不能相除。这条规则正是下一课的起点——真实语言会在这里插一次隐式转换。</p>
+<p>例 2 把类型当数据结构，演示结构等价的判定：</p>
+<pre data-lang="python"><code class="language-python"># ---- 例 2：结构等价 vs 名字等价（龙书 §6.3.2）；独立可运行 ----
+INT, FLOAT = &#39;int&#39;, &#39;float&#39;        # 只为让本片段单独跑起来，与例 1 同值
+
+def structural_eq(t1, t2):
+    &quot;&quot;&quot;把类型表达式本身当树递归比较：结构相同即等价&quot;&quot;&quot;
+    if isinstance(t1, tuple) or isinstance(t2, tuple):
+        if not (isinstance(t1, tuple) and isinstance(t2, tuple)):
+            return False
+        return len(t1) == len(t2) and all(structural_eq(a, b) for a, b in zip(t1, t2))
+    return t1 == t2
+
+CellA = (&#39;record&#39;, ((&#39;x&#39;, INT), (&#39;y&#39;, FLOAT)))
+CellB = (&#39;record&#39;, ((&#39;x&#39;, INT), (&#39;y&#39;, FLOAT)))
+CellC = (&#39;record&#39;, ((&#39;x&#39;, INT), (&#39;y&#39;, INT)))
+print(&#39;结构等价 CellA==CellB:&#39;, structural_eq(CellA, CellB),
+      &#39;| CellA==CellC:&#39;, structural_eq(CellA, CellC))
+print(&#39;名字等价 CellA==CellB:&#39;, &#39;CellA&#39; == &#39;CellB&#39;, &#39;（按名字比，两个匿名结构永不相同）&#39;)</code></pre>
+<pre><code>结构等价 CellA==CellB: True | CellA==CellC: False
+名字等价 CellA==CellB: False （按名字比，两个匿名结构永不相同）</code></pre>
+<p>同一对类型，两种等价观给出相反的答案。选哪种不是实现细节：它决定 <code>Meters</code>（米）能不能悄悄换成 <code>Feet</code>（英尺）。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：给 <code>Checker</code> 增加 <code>(&#39;if&#39;, 条件, 分支真, 分支假)</code> 节点：条件须为 <code>bool</code>、两分支类型一致，规则用独立的表表达（别塞进 <code>check</code> 的分支）。</li>
+<li><strong>解释</strong>：<code>error</code> 为什么能抑制级联报错，又为什么不能当普通类型放进 <code>RULES</code>？不加哨兵时，5 层嵌套里的未定义变量最多报几条？</li>
+<li><strong>对比/验证</strong>：把 <code>(&#39;/&#39;, INT, INT): INT</code> 改成 <code>(&#39;/&#39;, INT, INT): FLOAT</code> 后重跑例 1，说明变化，并指出&quot;整数除法&quot;的责任转到了谁身上。</li>
+<li><strong>思考</strong>：<code>sound</code>（可靠）与&quot;把所有检查都做完&quot;差在哪里？给一个&quot;类型系统可靠但某编译器漏检查&quot;的场景，说明后果。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Aho, Lam, Sethi, Ullman, <em>Compilers: Principles, Techniques, and Tools</em>（龙书，2nd ed.）§6.3「Types and Declarations」（§6.3.1 类型表达式、§6.3.2 结构等价与名字等价）、§6.5「Type Checking」（§6.5.1 综合与推导）</li>
+<li>Robert Nystrom, <em>Crafting Interpreters</em> 第 2 章「A Map of the Territory」（静态分析中的类型检查）：<a href="https://craftinginterpreters.com/a-map-of-the-territory.html" target="_blank" rel="noopener noreferrer">https://craftinginterpreters.com/a-map-of-the-territory.html</a></li>
+<li>LLVM 官方 IR 参考手册（LLVM IR 强类型：<code>add</code> 两操作数类型必须相同且等于结果类型）：<a href="https://llvm.org/docs/LangRef.html" target="_blank" rel="noopener noreferrer">https://llvm.org/docs/LangRef.html</a></li>
+<li>LLVM 官方 Kaleidoscope 教程第 3 章（类型约束在 codegen 期立刻暴露）：<a href="https://llvm.org/docs/tutorial/MyFirstLanguageFrontend/LangImpl03.html" target="_blank" rel="noopener noreferrer">https://llvm.org/docs/tutorial/MyFirstLanguageFrontend/LangImpl03.html</a></li>
+</ul>
+<p><a href="#/l/cf-ch3-l3">下一课：隐式转换、绑定与语义动作的落点</a></p>

@@ -1,0 +1,145 @@
+<h2 id="h-向量召回双塔ann">向量召回（双塔/ANN）<a class="anchor" href="#h-向量召回双塔ann" aria-label="本节链接">#</a></h2>
+<blockquote>
+<p>上一课说到向量召回是最主流的一路召回，本课就把它彻底讲透。核心要回答两个&quot;为什么&quot;：<strong>为什么向量召回比协同过滤更能泛化？为什么它在百万级物品池上还能快到毫秒级？</strong> 答案分别藏在&quot;双塔模型&quot;和&quot;近似最近邻（ANN）&quot;里。</p>
+</blockquote>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-从共现到语义向量召回解决了什么">1. 从&quot;共现&quot;到&quot;语义&quot;：向量召回解决了什么<a class="anchor" href="#h-1-从共现到语义向量召回解决了什么" aria-label="本节链接">#</a></h4>
+<p>ItemCF 的召回逻辑是&quot;物品 A 和物品 B 被同一批用户喜欢过，所以喜欢 A 的人可能也喜欢 B&quot;。它依赖<strong>共现</strong>——两个物品必须在行为数据里一起出现过。这带来两个盲区：</p>
+<ul>
+<li><strong>稀疏盲区</strong>：冷门物品共现次数少，相似度算不准。</li>
+<li><strong>语义盲区</strong>：两部从没被同一用户看过的电影，风格、题材可能高度相似，但 ItemCF 完全看不到。</li>
+</ul>
+<p>向量召回换了一条思路：<strong>把用户和物品都投影到同一个向量空间</strong>，用&quot;用户向量与物品向量的内积/余弦&quot;直接度量&quot;这个用户会不会喜欢这个物品&quot;。只要模型学会把&quot;喜欢电竞的用户&quot;和&quot;电竞类物品&quot;映射到相近的方向，那么即便某个电竞物品<strong>从未和这个用户产生过交互</strong>，只要它自己的向量落在电竞区域，也能被内积打高分。这就是向量召回&quot;能泛化到未见交互&quot;的根本原因——<strong>它建模的是内容/兴趣的语义，而不是行为共现的表象</strong>。</p>
+<h4 id="h-2-双塔模型让用户塔和物品塔各算各的">2. 双塔模型：让用户塔和物品塔&quot;各算各的&quot;<a class="anchor" href="#h-2-双塔模型让用户塔和物品塔各算各的" aria-label="本节链接">#</a></h4>
+<p>如果让一个模型把&quot;用户特征 + 物品特征&quot;拼在一起进网络做交互（像精排那样），那么给一个用户召回时，需要把它和<strong>每一个</strong>候选物品都过一遍网络——百万次前向，时延爆炸。<strong>双塔（two-tower）</strong>模型的妙处就是把&quot;用户&quot;和&quot;物品&quot;拆成两个独立的塔：</p>
+<pre><code>用户特征 ──&gt; User Tower（MLP）  ──&gt; e_u ∈ R^d
+物品特征 ──&gt; Item Tower（MLP）  ──&gt; e_i ∈ R^d
+打分 = &lt;e_u, e_i&gt;（内积）</code></pre>
+<p>两塔<strong>独立编码、最后只做一次内积</strong>。这带来一个决定性的工程优势：<strong>物品向量可以离线批量算好，存进向量索引；线上只算一次用户向量，然后去索引里做内积检索</strong>。用户向量每请求算一次，物品向量离线预计算，检索时用 ANN 加速——这就是向量召回能&quot;快&quot;的结构基础。</p>
+<p><figure><img class="md-img" src="content/courses/recommendation-systems/assets/chapter-5-figure-02.svg" alt="双塔模型：两塔独立编码、内积打分" loading="lazy" decoding="async"><figcaption>双塔模型：两塔独立编码、内积打分</figcaption></figure>
+</p>
+<p>训练双塔的样本从行为日志来：<strong>正样本</strong> = 用户点击过的 (用户, 物品) 对；<strong>负样本</strong> = 随机采样的 (用户, 物品) 对。损失常用交叉熵或对比损失（如把内积当作 logit，正样本推向 1、负样本推向 0）。一个高频技巧是 <strong>in-batch negatives</strong>：把一个 batch 里其他用户的正样本，当作当前用户的负样本，几乎零成本地扩大负样本量，还能顺带学到&quot;用户之间要有区分度&quot;。</p>
+<p>双塔也有代价：<strong>用户和物品在最后一刻才交互（只做内积）</strong>，表达力弱于精排里&quot;特征全程交叉&quot;的模型。所以双塔适合召回（粗筛），不适合精排（精打分）。后续演进出的&quot;多兴趣向量&quot;（一个用户学多个兴趣向量，分别召回）就是为了缓解&quot;单向量难以概括用户多种兴趣&quot;的问题。</p>
+<h4 id="h-3-为什么快近似最近邻检索ann">3. 为什么&quot;快&quot;：近似最近邻检索（ANN）<a class="anchor" href="#h-3-为什么快近似最近邻检索ann" aria-label="本节链接">#</a></h4>
+<p>即使所有物品向量都算好了，如果给每个物品都做一次内积（暴力检索），百万物品仍是百万次乘法，达不到毫秒级。<strong>近似最近邻（ANN）</strong>牺牲一点点&quot;找到的绝对最优性&quot;，换取数量级的加速。主流思路：</p>
+<ul>
+<li><strong>基于图的检索（HNSW）</strong>：把向量建成多层&quot;近邻图&quot;，检索时像爬山一样沿边走到局部最优，复杂度近似对数级，召回质量高，是当前最常用的方案之一。</li>
+<li><strong>倒排 + 量化（IVF + PQ）</strong>：先用聚类把向量分成若干桶（倒排），检索时只查最近的几个桶；桶内再用<strong>乘积量化（PQ）</strong>把向量压缩成短码，用查表法快速算近似距离，内存占用大幅下降。</li>
+<li><strong>哈希（LSH）</strong>：把相近的向量以高概率哈希到同一个桶，检索时只比对同桶向量，最简单但精度通常较低。</li>
+</ul>
+<p>工业界通常用现成的向量检索引擎，如 <strong>Faiss</strong>（Facebook 开源）、<strong>Milvus</strong>、<strong>Annoy</strong> 等。它们的共性思路是：<strong>离线建索引，在线查近似近邻</strong>，把&quot;百万次内积&quot;变成&quot;对数级跳跃 + 少量精确计算&quot;。</p>
+<p>整个检索流程可以概括为：</p>
+<pre><code>离线：全部物品 ──&gt; Item Tower ──&gt; 物品向量库 ──&gt; 建 ANN 索引（HNSW/IVF+PQ）
+在线：当前用户 ──&gt; User Tower ──&gt; 用户向量 q  ──&gt; ANN 检索 topK ──&gt; 候选物品</code></pre>
+<h3 id="h-二可运行示例">二、可运行示例<a class="anchor" href="#h-二可运行示例" aria-label="本节链接">#</a></h3>
+<h4 id="h-示例-1pytorch-简化双塔--in-batch-负采样">示例 1：PyTorch 简化双塔 + in-batch 负采样<a class="anchor" href="#h-示例-1pytorch-简化双塔--in-batch-负采样" aria-label="本节链接">#</a></h4>
+<p>训练一个极简双塔，用 in-batch negatives 拉大正负样本内积差距。</p>
+<pre data-lang="python"><code class="language-python">import torch
+import torch.nn as nn
+
+class TwoTower(nn.Module):
+    def __init__(self, num_users, num_items, embed_dim=16, hidden=32):
+        super().__init__()
+        self.user_emb = nn.Embedding(num_users, embed_dim)
+        self.item_emb = nn.Embedding(num_items, embed_dim)
+        # 两个塔：各自一个全连接，把 embedding 投影到打分空间
+        self.user_tower = nn.Sequential(nn.Linear(embed_dim, hidden), nn.ReLU(),
+                                        nn.Linear(hidden, embed_dim))
+        self.item_tower = nn.Sequential(nn.Linear(embed_dim, hidden), nn.ReLU(),
+                                        nn.Linear(hidden, embed_dim))
+
+    def forward(self, u, i):
+        eu = self.user_tower(self.user_emb(u))   # (B, d)
+        ei = self.item_tower(self.item_emb(i))   # (B, d)
+        return eu, ei
+
+def train_two_tower():
+    torch.manual_seed(0)
+    num_users, num_items = 200, 500
+    model = TwoTower(num_users, num_items)
+    opt = torch.optim.Adam(model.parameters(), lr=1e-2)
+    loss_fn = nn.BCEWithLogitsLoss()
+
+    for step in range(300):
+        B = 64
+        # 正样本：用户 u 点击了物品 i
+        u = torch.randint(0, num_users, (B,))
+        i = torch.randint(0, num_items, (B,))
+        eu, ei = model(u, i)
+        # 打分矩阵 S[b, b&#39;] = &lt;eu_b, ei_b&#39;&gt;，对角线是正样本，其余是 in-batch 负样本
+        S = eu @ ei.T                        # (B, B)
+        labels = torch.eye(B)                # 对角线为 1
+        loss = loss_fn(S, labels)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        if step % 100 == 0:
+            print(f&quot;step {step:&gt;3}: loss = {loss.item():.4f}&quot;)
+
+    # 验证：正样本内积应明显大于随机负样本内积
+    with torch.no_grad():
+        u = torch.randint(0, num_users, (100,))
+        i = torch.randint(0, num_items, (100,))
+        eu, ei = model(u, i)
+        pos = (eu * ei).sum(dim=1)
+        i_neg = torch.randint(0, num_items, (100,))
+        _, ei_neg = model(u, i_neg)
+        neg = (eu * ei_neg).sum(dim=1)
+        print(&quot;正样本内积均值:&quot;, round(pos.mean().item(), 3))
+        print(&quot;负样本内积均值:&quot;, round(neg.mean().item(), 3))
+
+train_two_tower()</code></pre>
+<h4 id="h-示例-2用-numpy-模拟离线建索引--在线暴力近似检索">示例 2：用 NumPy 模拟&quot;离线建索引 + 在线暴力/近似检索&quot;<a class="anchor" href="#h-示例-2用-numpy-模拟离线建索引--在线暴力近似检索" aria-label="本节链接">#</a></h4>
+<p>演示物品向量离线入库、在线用内积检索 topK，并对比暴力检索与&quot;先聚类分桶再桶内检索&quot;的加速思路。</p>
+<pre data-lang="python"><code class="language-python">import numpy as np
+
+np.random.seed(0)
+n_items, d = 100000, 32
+item_vecs = np.random.randn(n_items, d)
+item_vecs /= np.linalg.norm(item_vecs, axis=1, keepdims=True)  # 归一化
+
+def brute_search(q, item_vecs, k=5):
+    &quot;&quot;&quot;暴力检索：对所有物品算内积，取 topK。&quot;&quot;&quot;
+    s = item_vecs @ q                       # (n_items,)
+    return np.argsort(-s)[:k]
+
+def ivf_search(q, centroids, item_vecs, nprobe=2, k=5):
+    &quot;&quot;&quot;简化 IVF：先找最近的 nprobe 个桶，再只在桶内暴力检索。&quot;&quot;&quot;
+    bucket = np.argmax(centroids @ q)       # 找最近的一个聚类中心(简化)
+    # 这里简化为：取离 q 最近的 nprobe 个中心所代表的桶
+    center_sim = centroids @ q
+    top_centers = np.argsort(-center_sim)[:nprobe]
+    cand = np.concatenate([np.where(np.argmax(item_vecs @ centroids.T, axis=1) == c)[0]
+                           for c in top_centers])
+    s = item_vecs[cand] @ q
+    return cand[np.argsort(-s)[:k]]
+
+q = np.random.randn(d)
+q /= np.linalg.norm(q)
+
+# 聚类出 64 个中心，模拟倒排桶
+n_centers = 64
+centroids = item_vecs[np.random.choice(n_items, n_centers, replace=False)]
+centroids /= np.linalg.norm(centroids, axis=1, keepdims=True)
+
+import time
+t0 = time.time(); brute = brute_search(q, item_vecs); t1 = time.time()
+ivf = ivf_search(q, centroids, item_vecs); t2 = time.time()
+print(&quot;暴力检索 top5:&quot;, brute.tolist(), f&quot;耗时 {(t1-t0)*1000:.2f} ms&quot;)
+print(&quot;IVF 检索 top5:&quot;, ivf.tolist(), f&quot;耗时 {(t2-t1)*1000:.2f} ms&quot;)
+print(&quot;两法 top5 重合数:&quot;, len(set(brute.tolist()) &amp; set(ivf.tolist())))</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>解释为什么双塔的&quot;物品向量离线算、用户向量在线算&quot;这个特性，是它能在召回阶段被大规模使用的前提；如果两塔必须联合计算（交互式），时延上会发生什么？</li>
+<li>把示例 1 的 <code>B</code> 从 64 改成 8，观察 in-batch negatives 数量变化对训练效果的影响，并说明 in-batch 负采样&quot;负样本越少越容易训歪&quot;的原因。</li>
+<li>说明&quot;单向量召回&quot;在用户兴趣多样化时的局限，以及&quot;多兴趣向量&quot;为什么能缓解它（不必写代码，讲清思路即可）。</li>
+<li>思考题：双塔内积打分与余弦相似度打分在什么情况下等价？物品向量归一化对 ANN 检索有什么好处？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>微软 DSSM《Learning Deep Structured Semantic Models for Web Search using Clickthrough Data》（双塔思想来源之一）：<a href="https://posenhuang.github.io/papers/cikm2013_DSSM_fullversion.pdf" target="_blank" rel="noopener noreferrer">https://posenhuang.github.io/papers/cikm2013_DSSM_fullversion.pdf</a></li>
+<li>HNSW 论文《Efficient and robust approximate nearest neighbor search using Hierarchical Navigable Small World graphs》：<a href="https://arxiv.org/abs/1603.09320" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1603.09320</a></li>
+<li>Faiss 官方仓库（IVF/PQ 等 ANN 实现）：<a href="https://github.com/facebookresearch/faiss" target="_blank" rel="noopener noreferrer">https://github.com/facebookresearch/faiss</a></li>
+<li>YouTube 推荐论文《Deep Neural Networks for YouTube Recommendations》：<a href="https://static.googleusercontent.com/media/research.google.com/zh-CN//pubs/archive/45530.pdf" target="_blank" rel="noopener noreferrer">https://static.googleusercontent.com/media/research.google.com/zh-CN//pubs/archive/45530.pdf</a></li>
+</ul>
+<p><a href="#/l/rec-ch5-l3">下一课：粗排与精排</a></p>

@@ -1,0 +1,75 @@
+<h2 id="h-图像分类">图像分类<a class="anchor" href="#h-图像分类" aria-label="本节链接">#</a></h2>
+<p>前两章我们一直在&quot;看懂&quot;结构，这一章开始&quot;动手跑&quot;。<strong>图像分类</strong>是 CNN 最经典的任务：输入一张图片，输出它属于哪个类别。本课先建立端到端的整体认识，然后做一件性价比极高的事——<strong>迁移学习</strong>：不从头训练一个百万参数的网络，而是拿预训练好的 ResNet 微调，几分钟就能得到不错的分类器。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-图像分类要解决什么">1. 图像分类要解决什么<a class="anchor" href="#h-1-图像分类要解决什么" aria-label="本节链接">#</a></h4>
+<p>形式上，图像分类是学一个函数：把一张 H×W×C 的图片映射到 K 个类别的概率分布。模型输出 K 个分数（logits），经过 <strong>softmax</strong> 转成概率，取概率最大的类别作为预测结果。</p>
+<p>训练时用的是<strong>交叉熵损失</strong>：让正确类别的概率尽量接近 1。评估时常用 <strong>准确率</strong>（预测对的样本占比），有时也看 top-5 准确率（前五个预测里是否包含正确答案）。</p>
+<h4 id="h-2-一条完整的流水线">2. 一条完整的流水线<a class="anchor" href="#h-2-一条完整的流水线" aria-label="本节链接">#</a></h4>
+<pre><code>原始图片 → 预处理（缩放/归一化）→ 模型前向 → logits → softmax → 类别
+训练时再加一条：真实标签 → 交叉熵损失 → 反向传播 → 更新参数</code></pre>
+<p>其中&quot;预处理&quot;至关重要：训练时的模型是在特定均值/方差归一化、特定尺寸下训出来的，推理时必须用<strong>完全一致</strong>的变换，否则精度会莫名其妙地掉。</p>
+<h4 id="h-3-为什么要迁移学习">3. 为什么要迁移学习<a class="anchor" href="#h-3-为什么要迁移学习" aria-label="本节链接">#</a></h4>
+<p>从零训练一个 ResNet-50 在 ImageNet 上要几十块 GPU 跑好几天，普通学习者根本扛不住。但<strong>迁移学习</strong>绕开了这个坑：ImageNet 上训好的模型已经学到了大量通用的底层特征（边缘、纹理、物体部件），这些特征对绝大多数视觉任务都有用。我们只需：</p>
+<ol>
+<li>载入预训练权重；</li>
+<li>把最后一层全连接换成适应自己类别数的分类头；</li>
+<li>用小学习率微调（fine-tune）整个网络，或只训练新换的分类头（冻结骨干）。</li>
+</ol>
+<p>迁移学习把&quot;海量数据 + 海量算力&quot;的需求，降级成&quot;少量数据 + 一块普通显卡&quot;，是实际项目中用得最多的技巧。</p>
+<h4 id="h-4-torchvision-里的现成模型">4. torchvision 里的现成模型<a class="anchor" href="#h-4-torchvision-里的现成模型" aria-label="本节链接">#</a></h4>
+<p><code>torchvision.models</code> 提供了一整套预训练骨干：<code>resnet18</code>、<code>resnet50</code>、<code>vgg16</code>、<code>mobilenet_v2</code>、<code>efficientnet_b0</code> 等，一行代码即可载入。PyTorch 较新版本统一用 <code>weights=</code> 参数指定预训练权重，如：</p>
+<pre data-lang="python"><code class="language-python">from torchvision import models
+net = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)</code></pre>
+<p>每个权重对象还自带 <code>transforms()</code> 方法，能给出官方推荐的预处理变换，帮我们避免&quot;归一化参数配错&quot;的坑。</p>
+<p><figure><img class="md-img" src="content/courses/deep-learning-architectures/assets/chapter-3-figure-01.svg" alt="图像分类端到端流水线的示意" loading="lazy" decoding="async"><figcaption>图像分类端到端流水线的示意</figcaption></figure>
+</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面用预训练的 ResNet-18 对一张图片做推理，并演示如何把它的最后一层换成 10 类分类头。</p>
+<pre data-lang="python"><code class="language-python">import torch
+from torchvision import models, transforms
+from PIL import Image
+
+# 1) 载入预训练 ResNet-18（会自动下载权重，需联网）
+net = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+net.eval()
+
+# 2) 官方推荐的预处理变换
+preprocess = transforms.Compose([
+    transforms.Resize(256),
+    transforms.CenterCrop(224),        # ResNet 输入要求 224x224
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                         std=[0.229, 0.224, 0.225]),   # ImageNet 统计值
+])
+
+# 3) 读取一张图片并前向（示例图片可自行替换成本地路径）
+img = Image.open(&quot;cat.jpg&quot;).convert(&quot;RGB&quot;)
+x = preprocess(img).unsqueeze(0)       # 加 batch 维度 -&gt; [1, 3, 224, 224]
+
+with torch.no_grad():
+    logits = net(x)                    # [1, 1000] 的类别分数
+prob = torch.softmax(logits, dim=1)
+top5 = prob.topk(5)                    # 取 top-5
+print(&quot;Top-5 类别编号:&quot;, top5.indices[0].tolist())
+print(&quot;Top-5 概率:&quot;, [round(p, 4) for p in top5.values[0].tolist()])
+
+# 4) 迁移学习：把最后一层全连接换成 10 类分类头
+num_classes = 10
+in_features = net.fc.in_features      # ResNet 的 fc 输入维度（512）
+net.fc = torch.nn.Linear(in_features, num_classes)
+print(&quot;替换后的分类头:&quot;, net.fc)</code></pre>
+<p>运行后，网络会输出 1000 个类别分数，取 top-5 大致能看出图片内容；替换 <code>fc</code> 后，网络就能被微调成任意类别数的分类器——这就是迁移学习的最小改动版本。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>打印 <code>net.fc</code> 替换前后的形状，说明为什么只需改这一层，前面的卷积部分不用动。</li>
+<li>用 <code>models.ResNet18_Weights.IMAGENET1K_V1.transforms()</code> 打印官方预处理，与你手写的 <code>preprocess</code> 对比，找出差异。</li>
+<li>把模型换成 <code>models.mobilenet_v2(weights=models.MobileNet_V2_Weights.IMAGENET1K_V1)</code>，找到它的分类头（提示：<code>net.classifier</code>），做同样的 10 类替换。</li>
+<li>思考：如果自己的任务只有 100 张图，为什么&quot;冻结骨干、只训分类头&quot;往往比&quot;微调整个网络&quot;更不容易过拟合？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>PyTorch 官方文档 · torchvision.models：<a href="https://pytorch.org/vision/stable/models.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/vision/stable/models.html</a></li>
+<li>PyTorch 官方教程 · 迁移学习：<a href="https://pytorch.org/tutorials/beginner/transfer_learning_tutorial.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/tutorials/beginner/transfer_learning_tutorial.html</a></li>
+<li>Stanford cs231n · Transfer Learning 一节：<a href="https://cs231n.github.io/transfer-learning/" target="_blank" rel="noopener noreferrer">https://cs231n.github.io/transfer-learning/</a></li>
+</ul>
+<p><a href="#/l/dl-ch3-l2">下一课：数据集准备</a></p>

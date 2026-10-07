@@ -1,0 +1,245 @@
+<h2 id="h-原子操作与规约的正确用法">原子操作与规约的正确用法<a class="anchor" href="#h-原子操作与规约的正确用法" aria-label="本节链接">#</a></h2>
+<p>第 4 章的 tiling 把每个输出元素的乘加锁在寄存器里，代价是&quot;块与块互不相干&quot;成了硬约束——一旦两个 block 往同一块输出累加，那套账全部失效。跨 block 累加靠原子操作（atomic operation）：把&quot;读-改-写&quot;绑成不可分割的一步。用对它有两个层次的问题：语义上会不会丢更新，工程上要不要每个线程都去撞同一把锁。</p>
+<p><figure><img class="md-img" src="content/courses/gpu-cuda-kernels/assets/chapter-5-figure-01.svg" alt="原子操作：从每线程收紧到每块" loading="lazy" decoding="async"><figcaption>原子操作：从每线程收紧到每块</figcaption></figure>
+</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-acc--a-在全局内存上不是一条指令">1. <code>acc += a</code> 在全局内存上不是一条指令<a class="anchor" href="#h-1-acc--a-在全局内存上不是一条指令" aria-label="本节链接">#</a></h4>
+<p>编译器把 <code>acc += a</code> 放进 SASS 至少是三条微指令：load 到寄存器、寄存器内相加、store 回内存。两条这样的序列交错执行时，完全可能出现&quot;两个线程都读到旧值，后写者覆盖先写者&quot;。下面这个模型把 1024 次 <code>+= 1.0</code> 按最坏交错排一遍：非原子写法只剩 1（丢了 1023 次更新），原子写法正确得到 1024。这不是 GPU 特有的毛病，而是&quot;并发写同一地址&quot;的普遍后果——GPU 只是把它放大到几千个线程同时竞争。</p>
+<h4 id="h-2-cuda-提供了什么">2. CUDA 提供了什么<a class="anchor" href="#h-2-cuda-提供了什么" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>入口</th>
+<th>语义要点</th>
+<th>典型用途</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>atomicAdd(p, v)</code> 等 <code>atomic*</code> 族</td>
+<td>读-改-写不可分割，返回旧值；默认是 device 作用域的 relaxed 语义</td>
+<td>全局累加、计数器、直方图</td>
+</tr>
+<tr>
+<td><code>atomicCAS(p, cmp, v)</code></td>
+<td>比较-交换，是自定义原子操作的地基</td>
+<td>实现 <code>atomicMin</code> 之外的自定义语义</td>
+</tr>
+<tr>
+<td><code>cuda::atomic_ref&lt;T, Scope&gt;</code></td>
+<td>把普通内存当原子对象用，可显式指定内存序与作用域</td>
+<td>需要 acquire/release 的发布-订阅（下一课）</td>
+</tr>
+<tr>
+<td><code>atomicAdd_block</code> / <code>atomicAdd_system</code></td>
+<td>把作用域收窄到 block / 放大到系统</td>
+<td>收窄可省一致性开销；放大用于多卡与 CPU</td>
+</tr>
+</tbody></table>
+<p><strong>作用域（scope）</strong>与<strong>内存序（memory order）</strong>是两件不同的事：本课只用默认语义，下一课展开。先记住一条——默认的 device 作用域覆盖同一张卡上的所有线程。</p>
+<h4 id="h-3-竞争不是唯一的问题位数也要算">3. 竞争不是唯一的问题，&quot;位数&quot;也要算<a class="anchor" href="#h-3-竞争不是唯一的问题位数也要算" aria-label="本节链接">#</a></h4>
+<p>原子操作的吞吐由同一地址上的串行化程度决定。设规约 8192 个线程、结果写进一个地址：</p>
+<table>
+<thead>
+<tr>
+<th>策略</th>
+<th>原子指令数</th>
+<th>最大同址并发度</th>
+<th>最长冲突链</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>每线程 1 次原子</td>
+<td>8,192</td>
+<td>1</td>
+<td>1.0</td>
+</tr>
+<tr>
+<td>先做 4 线程聚合</td>
+<td>8,192</td>
+<td>4</td>
+<td>3.0</td>
+</tr>
+<tr>
+<td>warp 内聚合（32）</td>
+<td>8,192</td>
+<td>32</td>
+<td>6.0</td>
+</tr>
+<tr>
+<td>block 内聚合（256）</td>
+<td>8,192</td>
+<td>256</td>
+<td>9.0</td>
+</tr>
+</tbody></table>
+<p>最反直觉的是第一列：<strong>原子指令数一次都没少</strong>。聚合改变的不是&quot;发多少条指令&quot;，而是&quot;这些指令打在几个地址上&quot;。同址并发度从 1 抬到 256，等于把原本必须串行的 256 次操作并成一次；最后一列用指数退避模型估算的串行深度（同一地址上 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">c</span></span></span></span> 次操作约需 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.9386em;vertical-align:-0.2441em;"></span><span class="mop"><span class="mop">lo<span style="margin-right:0.0139em;">g</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.207em;"><span style="top:-2.4559em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2441em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">c</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> 轮）从 1.0 涨到 9.0——这是<strong>收益</strong>：256 次操作被压进 9 个串行轮次。</p>
+<p>工程结论：<strong>先用片上手段（寄存器 + shared memory + shuffle）把结果收敛到每块一次，再让这一次原子操作去撞全局地址</strong>——第 2 章两级归约的延长线。</p>
+<h4 id="h-4-warp-聚合为什么成立">4. warp 聚合为什么成立<a class="anchor" href="#h-4-warp-聚合为什么成立" aria-label="本节链接">#</a></h4>
+<p>warp 内先做前缀和（<code>__shfl_up_sync</code>），每个 lane 掌握左边所有 lane 的局部和；再用后缀和（<code>__shfl_down_sync</code>）拿到右边的和。两者相加等于&quot;全 warp 之和减去自己&quot;，于是只需 lane 0 发一次 <code>atomicAdd</code>。下面这段纯 Python 用更朴素的方式验证同一件事：5 步之后 lane <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6595em;"></span><span class="mord mathnormal">i</span></span></span></span> 手里的下标恰好是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6595em;"></span><span class="mord mathnormal">i</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="minner">…</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">31</span></span></span></span>，lane 0 就握有全部 32 个元素。</p>
+<pre data-lang="python"><code class="language-python">s = list(range(32))                                    # 待求和的 32 个元素
+lanes = [{i: s[i]} for i in range(32)]                 # 每个 lane 先持有自己的元素
+for off in (16, 8, 4, 2, 1):
+    lanes = [(lanes[i] if i + off &gt;= 32 else {**lanes[i], **lanes[i + off]})
+             for i in range(32)]                        # 并入右边第 off 个 lane 的子集
+print(&quot;lane 0 持有&quot;, len(lanes[0]), &quot;个元素，下标&quot;, min(lanes[0]), &quot;..&quot;, max(lanes[0]),
+      &quot;| lane 7 持有&quot;, len(lanes[7]), &quot;个，下标&quot;, min(lanes[7]), &quot;..&quot;, max(lanes[7]))</code></pre>
+<h4 id="h-5-浮点原子加换顺序就换结果">5. 浮点原子加：换顺序就换结果<a class="anchor" href="#h-5-浮点原子加换顺序就换结果" aria-label="本节链接">#</a></h4>
+<p><code>atomicAdd</code> 对 float 不保证任何顺序，而浮点加法<strong>不满足结合律</strong>。两个可复现的实测观测：</p>
+<ul>
+<li>float32 累加 100 万次 <code>0.1</code> 得 <strong>100958.34</strong>，精确值是 100000——绝对误差 958.34；</li>
+<li>65536 个 float32 随机数：顺序累加 <strong>-122.873650</strong>，numpy 的成对（pairwise）求和 <strong>-122.875633</strong>，差 1.98e-03。</li>
+</ul>
+<p>所以原子操作只保证<strong>正确性</strong>，不保证<strong>可复现性</strong>。要求逐次按位一致的场景（对拍、单元测试）要么用确定性规约（固定分区与固定累加顺序），要么改用 float64，要么接受容差。</p>
+<h4 id="h-6-常见坑">6. 常见坑<a class="anchor" href="#h-6-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>拿 <code>atomicAdd</code> 当同步原语</strong>：它只保证这一次读-改-写不可分割，不保证&quot;你写的其它数据也已可见&quot;——那是下一课的 fence 与内存序。</li>
+<li><strong>每个线程都去做全局原子</strong>：正确但慢；先把块内收敛掉。</li>
+<li><strong>把 <code>atomicAdd</code> 的返回值当&quot;当前值&quot;</strong>：它返回<strong>加之前</strong>的旧值；用它分配唯一编号是对的，用它读最终值就错了。</li>
+<li><strong>目标未初始化</strong>：原子操作不会替你清零，<code>cudaMemset</code> 或初始化 kernel 不能省。</li>
+<li><strong>指望浮点原子加的确定性</strong>：见上一节。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>第一段纯 Python/numpy（无 GPU）：先让&quot;丢更新&quot;发生一次，再看聚合如何减少同址竞争，最后量出浮点求和的顺序敏感性。</p>
+<pre data-lang="python"><code class="language-python"># ===== 本课示例 1：非原子累加为什么会丢更新（交错执行） =====
+import math
+
+def simulate(chunks_a, chunks_b, atomic):
+    &quot;&quot;&quot;把 acc += a 看成 LOAD/ADD/STORE 三条微指令，并让两个线程交错执行。
+    atomic=True：三条微指令不可分割；False：允许两个 LOAD 都发生在 STORE 之前。&quot;&quot;&quot;
+    acc, reg = 0.0, {&quot;A&quot;: 0.0, &quot;B&quot;: 0.0}
+    if atomic:
+        for a in chunks_a + chunks_b:
+            acc += a
+        return acc
+    for a in chunks_a:      # 最坏交错：A、B 各自先读（读到同一个旧值）
+        reg[&quot;A&quot;] = acc
+    for a in chunks_b:
+        reg[&quot;B&quot;] = acc
+    for a in chunks_a:      # A 写回
+        acc = reg[&quot;A&quot;] + a
+    for a in chunks_b:      # B 写回：用的是旧值，覆盖 A 的结果
+        acc = reg[&quot;B&quot;] + a
+    return acc
+
+N = 512
+got = simulate([1.0]*N, [1.0]*N, atomic=False)
+print(f&quot;非原子累加：acc = {got:&gt;6.0f}  期望 {2*N}  丢失 {2*N-got:.0f} 次更新&quot;)
+got = simulate([1.0]*N, [1.0]*N, atomic=True)
+print(f&quot;原子累加：  acc = {got:&gt;6.0f}  期望 {2*N}  丢失 {2*N-got:.0f} 次更新&quot;)
+
+# ===== 本课示例 2：warp/block 聚合把原子指令数与最长冲突链一起降下来 =====
+def agg_stats(groups):
+    &quot;&quot;&quot;groups：每次原子操作落到的地址列表。返回 (原子指令数, 最长冲突链, 最大同址并发度)。
+    同一地址上的 c 次原子操作必须串行；指数退避把它压到约 log2(c)+1 轮。&quot;&quot;&quot;
+    hist = {}
+    for addr in groups:
+        hist[addr] = hist.get(addr, 0) + 1
+    ops = sum(hist.values())
+    cmax = max(hist.values())
+    return ops, (math.log2(cmax) + 1 if cmax &gt; 1 else 1.0), cmax
+
+BLOCKS, WARPS, THREADS = 32, 8, 32
+print(f&quot;\n规约 {BLOCKS} block × {WARPS} warp × {THREADS} thread = {BLOCKS*WARPS*THREADS} 个线程&quot;)
+print(f&quot;{&#39;策略&#39;:&lt;20}{&#39;原子指令数&#39;:&gt;12}{&#39;最长冲突链&#39;:&gt;12}{&#39;最大同址并发度&#39;:&gt;14}&quot;)
+for name, groups in (
+    (&quot;每线程 1 次原子&quot;,   [(b, w, t)   for b in range(BLOCKS) for w in range(WARPS) for t in range(THREADS)]),
+    (&quot;4 线程聚合后再原子&quot;, [(b, w, t//4) for b in range(BLOCKS) for w in range(WARPS) for t in range(THREADS)]),
+    (&quot;warp 内聚合(32)&quot;,   [(b, w)      for b in range(BLOCKS) for w in range(WARPS) for _ in range(THREADS)]),
+    (&quot;block 内聚合(256)&quot;, [(b,)        for b in range(BLOCKS) for _ in range(WARPS) for _ in range(THREADS)]),
+):
+    ops, depth, cmax = agg_stats(groups)
+    print(f&quot;{name:&lt;20}{ops:&gt;12,}{depth:&gt;12.1f}{cmax:&gt;14}&quot;)
+
+# ===== 本课示例 3：求和顺序变了，结果就变（原子加不保证顺序） =====
+import numpy as np
+f32 = np.float32
+def seq_sum(vals):
+    acc = f32(0.0)
+    for v in vals:
+        acc = f32(acc + v)
+    return float(acc)
+
+print(&quot;\nfloat32 不满足加法结合律，三个可复现的观测：&quot;)
+acc = f32(0.0)
+for _ in range(1_000_000):
+    acc = f32(acc + f32(0.1))
+print(f&quot;  1) 1e6 次累加 0.1  = {float(acc):.2f}（期望 100000.00，绝对误差 {float(acc)-100000.0:.2f}）&quot;)
+
+rng = np.random.default_rng(7)
+x = rng.standard_normal(65536).astype(np.float32)
+seq = seq_sum(x)
+pw = float(np.add.reduce(x, dtype=np.float32))
+ex = math.fsum(float(v) for v in x)
+print(f&quot;  2) 65536 个随机数：顺序累加 {seq:.6f} vs numpy 成对求和 {pw:.6f}，&quot;
+      f&quot;差 {abs(seq-pw):.2e}（精确和 {ex:.6f}）&quot;)
+
+ones = 1_000_000
+for big in (1e7, 1e6):                              # 大数放尾部 vs 放开头
+    A = [f32(1.0)] * ones + [f32(big)] * 4
+    B = [f32(big)] * 4 + [f32(1.0)] * ones
+    print(f&quot;  3) 大数 {big:g}：{seq_sum(A):.1f} vs {seq_sum(B):.1f}，&quot;
+          f&quot;差 {seq_sum(B) - seq_sum(A):.1f}&quot;)</code></pre>
+<p>Python 3.14.5 + numpy 2.5.3 下实际运行结果：</p>
+<pre data-lang="text"><code class="language-text">非原子累加：acc =      1  期望 1024  丢失 1023 次更新
+原子累加：  acc =   1024  期望 1024  丢失 0 次更新
+
+规约 32 block × 8 warp × 32 thread = 8192 个线程
+策略                         原子指令数       最长冲突链       最大同址并发度
+每线程 1 次原子                  8,192         1.0             1
+4 线程聚合后再原子                 8,192         3.0             4
+warp 内聚合(32)               8,192         6.0            32
+block 内聚合(256)             8,192         9.0           256
+
+float32 不满足加法结合律，三个可复现的观测：
+  1) 1e6 次累加 0.1  = 100958.34（期望 100000.00，绝对误差 958.34）
+  2) 65536 个随机数：顺序累加 -122.873650 vs numpy 成对求和 -122.875633，差 1.98e-03（精确和 -122.875634）
+  3) 大数 1e+07：41000000.0 vs 40000000.0，差 -1000000.0
+  3) 大数 1e+06：5000000.0 vs 5000000.0，差 0.0</code></pre>
+<p>第三组是结论的关键：同一批数据只是换了大数的位置，1e7 时相差 1000000，换成 1e6 时又分毫不差——<strong>误差方向不可预测，不能靠&quot;换个顺序碰运气&quot;</strong>。</p>
+<p>把结论落到真实 kernel 的写法如下，核心是&quot;块内先用 shared memory 收敛到每块一次原子&quot;：</p>
+<pre data-lang="cuda"><code class="language-cuda">// 每块一次全局 atomicAdd：块内用 shared memory 归约，再让一个线程入账
+__global__ void blockSumOnce(const float* __restrict__ in, float* __restrict__ out, int n) {
+    __shared__ float partial[256];
+    int tid = threadIdx.x;
+    float v = 0.f;
+    for (int i = blockIdx.x * blockDim.x + tid; i &lt; n; i += gridDim.x * blockDim.x)
+        v += in[i];                              // 每线程先在自己的寄存器里累加
+    partial[tid] = v;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s &gt; 0; s &gt;&gt;= 1) {   // 8 轮，每轮之间必须同步
+        if (tid &lt; s) partial[tid] += partial[tid + s];
+        __syncthreads();                             // 上一轮的写对下一轮的读可见
+    }
+    if (tid == 0) atomicAdd(out, partial[0]);    // 全块只剩这一次原子操作
+}
+
+// warp 内聚合：0 次块内原子，只让 lane 0 发一次全局 atomicAdd
+__device__ __forceinline__ float warpSum(float v) {
+    #pragma unroll
+    for (int off = 16; off &gt; 0; off &gt;&gt;= 1)
+        v += __shfl_down_sync(0xffffffffu, v, off);
+    return v;                                    // 每个 lane 都得到同一个 warp 总和
+}</code></pre>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选：需要 GPU。先确认原子操作真的成了瓶颈，再谈优化 ----
+# nvcc -O3 -arch=sm_90 --ptxas-options=-v -o reduce reduce.cu
+# ncu --metrics lts__t_sectors_op_atom.sum,lts__t_sectors_op_red.sum,\
+#         sm__throughput.avg.pct_of_peak_sustained_elapsed ./reduce
+# 判读：lts__t_sectors_op_atom.sum 高且 sm__throughput 低 → 时间花在 L2 的原子串行化上，
+#       把&quot;每线程一次原子&quot;改成&quot;每块一次&quot;应能显著改善；若 sm__throughput 接近打满则原子不是瓶颈。
+# 想量化不确定性：同一份输入连跑 20 次并把输出写文件比对，看是否出现按位不同的结果。
+# 指标名以 ncu --query-metrics 在你本机出的清单为准。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：改造 <code>blockSumOnce</code>——先用 <code>__shfl_down_sync</code> 在 warp 内求和，再让每个 warp 的 lane 0 写 shared，最后 warp 0 做一次 5 步 shuffle。数一数改完后 <code>__syncthreads()</code> 从 8 次降到几次。</li>
+<li><strong>解释</strong>：为什么&quot;原子指令数&quot;在示例 2 里完全没变，而最大同址并发度却从 1 变到 256？把这两个量分别对应到硬件上的哪种资源。</li>
+<li><strong>对比/验证</strong>：把示例 3 的第 2 组数据换成 <code>np.float64</code> 重跑，观察顺序累加与成对求和的差会变成多少；再解释为什么&quot;精度更高的累加器&quot;能减轻顺序敏感性。</li>
+<li><strong>思考</strong>：如果一个 kernel 用 float32 原子加得到的结果每次都不一致，但它要参与分布式训练的梯度同步，你会付出什么代价来换取确定性？至少列出两种方案及其代价。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>NVIDIA, <em>CUDA Programming Guide</em> —「Device-Callable APIs and Intrinsics」中的 Atomic Functions 小节（<code>atomicAdd</code> / <code>atomicCAS</code> 的类型与作用域变体、返回值语义；节号随版本变化，请在页内搜索 &quot;Atomic Functions&quot;）：<a href="https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/device-callable-apis.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/device-callable-apis.html</a></li>
+<li>NVIDIA, <em>CUDA Programming Guide</em> —「CUDA C++ Memory Model」的 Atomicity 小节（原子性对作用域的要求，也是本课&quot;原子性不等于顺序性&quot;的口径来源）：<a href="https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/cuda-cpp-memory-model.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/cuda-cpp-memory-model.html</a></li>
+<li>NVIDIA, <em>Parallel Thread Execution ISA</em> — <code>atom</code> / <code>red</code> 指令与内存一致性模型（原子指令的类型表、<code>red</code> 不回传旧值这一区别）：<a href="https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-atom" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-atom</a></li>
+<li>NVIDIA, <em>CUDA C++ Best Practices Guide</em> — Data Transfer Between Host and Device / 规约与 warp shuffle 相关小节（树形归约的官方逐步推导；节号随版本变化，请用目录页的目录定位）：<a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/contents.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/contents.html</a></li>
+</ul>
+<p><a href="#/l/cuda-ch5-l2">下一课：内存序与可见性：为什么有些 kernel 必须 fence</a></p>

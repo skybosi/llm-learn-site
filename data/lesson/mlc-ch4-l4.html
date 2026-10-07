@@ -1,0 +1,260 @@
+<h2 id="h-优化的安全性什么时候等价变换其实不等价">优化的安全性：什么时候&quot;等价变换&quot;其实不等价<a class="anchor" href="#h-优化的安全性什么时候等价变换其实不等价" aria-label="本节链接">#</a></h2>
+<p>前三课一直在改写图：折叠常量、换 layout、复用内存。每一步都写着&quot;等价&quot;，但<strong>&quot;等价&quot;到底指什么</strong>，决定了哪些改写合法。同一个 <code>(x+y)+z</code>，在实数域等于 <code>x+(y+z)</code>，在 float32 上有 9.78% 的随机输入组合给出不同结果；同一个 <code>x*0</code>，x 有限时等于 0，x 是 NaN 时等于 NaN。这一课把&quot;等价&quot;拆成可判定的层级，给出四条改写规则的实测反例率，并给出编译器真正依赖的那份东西——<strong>语义契约</strong>。</p>
+<p><figure><img class="md-img" src="content/courses/ml-compilers/assets/chapter-4-figure-02.svg" alt="等价变换的合法性判定：契约 → 守卫 → 重写 → 三重验收" loading="lazy" decoding="async"><figcaption>等价变换的合法性判定：契约 → 守卫 → 重写 → 三重验收</figcaption></figure>
+</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-等价有三个层级">1. &quot;等价&quot;有三个层级<a class="anchor" href="#h-1-等价有三个层级" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>层级</th>
+<th>含义</th>
+<th>允许的改写</th>
+<th>谁需要</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>位一致</strong>（bit-exact）</td>
+<td>逐位相同</td>
+<td>恒等式、常量折叠（同 dtype）、布局视图、内存复用</td>
+<td>复现性要求高的训练/科学计算</td>
+</tr>
+<tr>
+<td><strong>数值近似</strong>（within tolerance）</td>
+<td>差在容差内</td>
+<td>重排归约树、融合、用 FMA 替乘加、fast-math</td>
+<td>大多数推理与训练</td>
+</tr>
+<tr>
+<td><strong>统计等价</strong></td>
+<td>分布/最终指标不变</td>
+<td>采样、随机丢弃</td>
+<td>少见的宽松场景</td>
+</tr>
+</tbody></table>
+<p><strong>没有普适的&quot;正确&quot;，只有&quot;相对契约的正确&quot;</strong>。编译器优化的每一步都必须问：这一步在哪个层级上成立？</p>
+<h4 id="h-2-七类真实反例附实测">2. 七类真实反例（附实测）<a class="anchor" href="#h-2-七类真实反例附实测" aria-label="本节链接">#</a></h4>
+<p>前四项是本课程序在 20000 组 float32 随机输入上跑出来的<strong>不等价比例</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>改写</th>
+<th>不等价比例</th>
+<th>最大绝对差</th>
+<th>原因</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>(x+z)-z → x</code></td>
+<td>48.63%</td>
+<td>8.0</td>
+<td>消去律在有限精度下失效</td>
+</tr>
+<tr>
+<td><code>(x*y)*z → x*(y*z)</code></td>
+<td>35.24%</td>
+<td>1.1e15</td>
+<td>中间量溢出/下溢方向不同</td>
+</tr>
+<tr>
+<td><code>(x+y)+z → x+(y+z)</code></td>
+<td>9.78%</td>
+<td>8.0</td>
+<td>结合律不成立</td>
+</tr>
+<tr>
+<td><code>x*0 → +0</code>（丢符号）</td>
+<td>49.98%</td>
+<td>0</td>
+<td>一半输入产生 <code>-0.0</code>，符号可被后续 <code>1/x</code> 观察到</td>
+</tr>
+<tr>
+<td><code>x*0 → ±0</code>（保号）</td>
+<td><strong>0%</strong></td>
+<td>0</td>
+<td>这才是正确写法</td>
+</tr>
+</tbody></table>
+<p>剩下三类要单独看：</p>
+<ul>
+<li><strong>NaN / Inf</strong>：<code>nan*0.0 = nan</code>、<code>inf*0.0 = nan</code>。想消掉 <code>x*0→0</code> 就必须能证明 <code>x</code> 有限。</li>
+<li><strong>大数吞小数</strong>：float32 下 <code>1e16 + 1.0</code> 还是 <code>1e16</code>——加法结果与左操作数逐位相同。</li>
+<li><strong>归约顺序</strong>：8 个 float32 的顺序累加与配对累加分别是 <code>6.900000215637192e-08</code> 与 <code>6.899999505094456e-08</code>。<strong>融合与并行归约必然改这条链的形状</strong>，所以任何声称&quot;融合后位一致&quot;的说法都不成立。</li>
+<li><strong>整数与 dtype</strong>：<code>int8</code> 下 <code>100+100</code> 回绕成 <code>-56</code>；<code>-7/2</code> 在向下取整与向零取整下是 <code>-4</code> 与 <code>-3</code>；<code>float32</code> 表示不了 <code>2^24+1</code>。</li>
+</ul>
+<h4 id="h-3-契约把允许什么写下来">3. 契约：把&quot;允许什么&quot;写下来<a class="anchor" href="#h-3-契约把允许什么写下来" aria-label="本节链接">#</a></h4>
+<p>主流编译器的做法都是<strong>把一个显式的数值契约暴露给用户</strong>，而不是偷偷选一种：</p>
+<ul>
+<li><strong>XLA</strong> 的语义由官方文档定义（含各算子对 NaN/Inf 与精度的规定），后端选择是否可以重排由编译选项控制。</li>
+<li><strong>torch.compile / TorchInductor</strong> 默认在&quot;保持可接受的数值行为&quot;的前提下做图改写；具体策略随版本演进，<strong>以官方文档为准</strong>，本课不写死版本号。</li>
+<li><strong>TVM</strong> 把常量折叠与化简作为独立 pass，是否重排归约取决于 pass 的规则集与目标后端。</li>
+</ul>
+<p>写进契约的典型条款：是否允许重排归约、是否允许用 FMA、是否允许 <code>÷c→×(1/c)</code>、是否要求 NaN/Inf 语义、容差是多少。<strong>契约之外的一切&quot;优化&quot;都是 bug。</strong></p>
+<h4 id="h-4-守卫把条件变成可检查的-ir">4. 守卫：把&quot;条件&quot;变成可检查的 IR<a class="anchor" href="#h-4-守卫把条件变成可检查的-ir" aria-label="本节链接">#</a></h4>
+<p>知道&quot;什么条件下成立&quot;之后，编译器把它变成<strong>守卫</strong>（guard）：<code>x*0→0</code> 加一条&quot;x 有限&quot;的假设；<code>÷c→×(1/c)</code> 加一条&quot;c ≠ 0&quot;；动态 shape 加一条 shape 断言（第 2 章讲过 guard 与重编译的关系）。守卫有两种命运：<strong>静态证得</strong>（编译期消掉）或<strong>运行时检查</strong>（不合就回退）。</p>
+<h4 id="h-5-验收三重检查缺一不可">5. 验收：三重检查缺一不可<a class="anchor" href="#h-5-验收三重检查缺一不可" aria-label="本节链接">#</a></h4>
+<p>一次改写要过三关：</p>
+<ol>
+<li><strong>类型/形状</strong>：类型推导与形状校验（图 IR 自带，pass 必须维护）；</li>
+<li><strong>数值</strong>：同一组输入跑&quot;改前改后&quot;两条路，逐元素对拍——本课程序用的就是这一手；</li>
+<li><strong>端到端</strong>：真实模型上跑测试集，确认精度指标没有回归。</li>
+</ol>
+<p>第 2 关是唯一能在<strong>没有 GPU、没有大模型</strong>时完成的，也是本课的全部内容：<strong>对拍不是可选项</strong>。</p>
+<h4 id="h-6-常见坑">6. 常见坑<a class="anchor" href="#h-6-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>只在&quot;典型输入&quot;上对拍</strong>：随机测试的价值恰恰在极端量级（<code>1e16</code>、<code>1e-30</code>、NaN）。</li>
+<li><strong>用 <code>==</code> 比 NaN</strong>：NaN ≠ NaN，必须显式判 <code>isnan</code>，否则&quot;全部通过&quot;是假象。</li>
+<li><strong>忘了负数零</strong>：<code>math.copysign</code> 才能区分 <code>-0.0</code> 与 <code>+0.0</code>，这是本课发现 49.98% 不等价的唯一原因。</li>
+<li><strong>把&quot;默认设置&quot;当&quot;保证&quot;</strong>：框架的默认数值行为会随版本变化，落进契约里的才算数。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面这段纯 Python（标准库 <code>struct</code> / <code>math</code> / <code>random</code>）把上面所有反例变成可执行的判定：五条改写规则各跑 20000 组随机 float32 输入、特殊值检查、归约顺序对照、整数/dtype 边界，最后打印一张判定表。</p>
+<pre data-lang="python"><code class="language-python"># ---- 第 4 课示例：等价性判定 —— 四条改写规则在 float32 上的实测（纯 Python + struct）----
+# f32(x) 用 struct 做真正的 4 字节舍入，模拟&quot;目标 dtype 是 float32&quot;
+import struct, math, random
+
+def f32(x):
+    try:
+        return struct.unpack(&#39;f&#39;, struct.pack(&#39;f&#39;, x))[0]
+    except OverflowError:
+        return math.inf if x &gt; 0 else -math.inf
+
+def same(a, b):
+    &quot;&quot;&quot;浮点等价：NaN 只与 NaN 等价；-0.0 与 0.0 按 IEEE 不等价（符号可被观察）。&quot;&quot;&quot;
+    if isinstance(a, float) and isinstance(b, float):
+        if math.isnan(a) or math.isnan(b): return math.isnan(a) and math.isnan(b)
+        if a == 0.0 and b == 0.0: return math.copysign(1, a) == math.copysign(1, b)
+    return a == b
+
+# 每条规则：给 (x, y, z) 返回 (原始结果, 优化后的结果)；优化必须判恒等
+def rule_add_zero(x, y, z):  return f32(f32(x + z) - z), x           # x+z-z 想换成 x
+def rule_swap_add(x, y, z):  return f32(f32(x + y) + z), f32(x + f32(y + z))
+def rule_swap_mul(x, y, z):  return f32(f32(x * y) * z), f32(x * f32(y * z))
+def rule_mul_zero(x, y, z):  return f32(x * 0.0), math.copysign(0.0, x)   # 保留符号的正确版本
+def rule_mul_zero_naive(x, y, z): return f32(x * 0.0), 0.0                # 直接写 0.0 的版本
+
+print(&#39;=== 1. 改写规则的随机对照（20000 组 float32 输入，量级 1e-8 ~ 1e8）===&#39;)
+random.seed(11)
+def rnd():
+    return f32(random.choice([-1, 1]) * random.random() * 10 ** random.randint(-8, 8))
+vals = [(rnd(), rnd(), rnd()) for _ in range(20000)]
+for name, fn in ((&#39;(x+z)-z → x&#39;, rule_add_zero),
+                 (&#39;(x+y)+z → x+(y+z)&#39;, rule_swap_add),
+                 (&#39;(x*y)*z → x*(y*z)&#39;, rule_swap_mul),
+                 (&#39;x*0 → ±0（保号）&#39;, rule_mul_zero),
+                 (&#39;x*0 → +0（不保号）&#39;, rule_mul_zero_naive)):
+    bad, worst = 0, 0.0
+    for x, y, z in vals:
+        got, want = fn(x, y, z)
+        if not same(got, want):
+            bad += 1
+            if math.isfinite(got) and math.isfinite(want):
+                worst = max(worst, abs(got - want))
+    print(f&#39;  {name:&lt;20} 不等价 {bad:&gt;6}/{len(vals)} 组（{100 * bad / len(vals):5.2f}%）&#39;
+          f&#39;  最大绝对差 {worst:.3e}&#39;)
+
+print(&#39;\n=== 2. 特殊值：NaN / Inf / 溢出 / 大数吞小数 ===&#39;)
+specials = [(&#39;nan&#39;, float(&#39;nan&#39;)), (&#39;+inf&#39;, float(&#39;inf&#39;)), (&#39;-inf&#39;, float(&#39;-inf&#39;))]
+print(f&#39;  nan*0.0 = {f32(float(&quot;nan&quot;) * 0.0)!r}   inf*0.0 = {f32(float(&quot;inf&quot;) * 0.0)!r}&#39;
+      f&#39;   (-inf)*0.0 = {f32(float(&quot;-inf&quot;) * 0.0)!r}   → &quot;x*0→0&quot; 前提是 x 有限&#39;)
+a, b = f32(1e16), f32(1.0)
+print(f&#39;  a+b = {f32(a + b)!r}（与 a 相同：1.0 小于 a 的 ULP，被吞掉）&#39;)
+x16, y1, z16 = f32(1e16), f32(1.0), f32(-1e16)
+print(f&#39;  (x+y)+z = {f32(f32(x16 + y1) + z16)!r}   x+(y+z) = {f32(x16 + f32(y1 + z16))!r}&#39;
+      f&#39;   ← 这一组恰好都是 0.0；真正的差异在随机测试里（9.78% 不等价）&#39;)
+p, q = f32(1e20), f32(1e-30)
+print(f&#39;  (p*q)*q = {f32(f32(p * q) * q)!r}   p*(q*q) = {f32(p * f32(q * q))!r}&#39;
+      f&#39;   ← 下溢/溢出方向不同&#39;)
+
+print(&#39;\n=== 3. 归约顺序：顺序累加 vs 配对累加（float32）===&#39;)
+xs = [f32(v) for v in (7e-9, 1e-8, 5e-9, 1e-8, 1e-8, 1e-8, 7e-9, 1e-8)]
+seq = 0.0
+for v in xs: seq = f32(seq + v)
+def tree(v):
+    if len(v) == 1: return v[0]
+    m = len(v) // 2
+    return f32(tree(v[:m]) + tree(v[m:]))
+print(f&#39;  顺序累加 = {seq!r}&#39;)
+print(f&#39;  配对累加 = {tree(xs)!r}&#39;)
+print(f&#39;  差 = {seq - tree(xs):.3e}   → 融合/并行归约会改这条链的形状，必须写进数值契约&#39;)
+
+print(&#39;\n=== 4. 整数与 dtype：溢出、取整、收窄 ===&#39;)
+i8 = lambda v: ((v + 128) % 256) - 128
+print(f&#39;  int8 100+100 = {i8(200)}（回绕）   Python 大整数 = {200}&#39;)
+print(f&#39;  -7 整除：向下取整 {(-7) // 2}（Python/floor）  向零取整 {int(-7 / 2)}（C/trunc）&#39;)
+print(f&#39;  float32 表示 2^24+1 = {f32(16777217.0)!r}（丢掉最低位）&#39;)
+
+print(&#39;\n=== 5. 可执行的等价性判定表 ===&#39;)
+rules = [(&#39;x+0 → x&#39;, &#39;浮点&#39;, &#39;成立（含 NaN/Inf；但 -0.0+0.0=+0.0 会改符号，按 strict 语义要保号）&#39;),
+         (&#39;x*1 → x&#39;, &#39;浮点&#39;, &#39;成立（含 NaN/Inf）&#39;),
+         (&#39;x*0 → ±0（保号）&#39;, &#39;浮点&#39;, &#39;有限值上成立（含 -0 符号）；NaN/Inf 上应为 NaN，不能折&#39;),
+         (&#39;x*0 → +0（丢符号）&#39;, &#39;浮点&#39;, &#39;不成立：随机测试里约一半输入是 -0.0，符号可被后续 1/x 观察到&#39;),
+         (&#39;(x+y)+z → x+(y+z)&#39;, &#39;浮点&#39;, &#39;不成立（随机测试 20000 组里有不等价）&#39;),
+         (&#39;(x*y)*z → x*(y*z)&#39;, &#39;浮点&#39;, &#39;不成立（同上，且有下溢方向差异）&#39;),
+         (&#39;(x+z)-z → x&#39;, &#39;浮点&#39;, &#39;不成立（消去律在有限精度下失效）&#39;),
+         (&#39;归约改树形/并行&#39;, &#39;浮点&#39;, &#39;不位一致，需数值契约声明容差&#39;),
+         (&#39;100+100 → 200&#39;, &#39;int8&#39;, &#39;不成立（回绕成 -56）&#39;),
+         (&#39;-7/2 → 结果&#39;, &#39;int&#39;, &#39;随语言（floor -4 / trunc -3）&#39;),
+         (&#39;f64 常量降为 f32&#39;, &#39;dtype&#39;, &#39;先确认可表示（2^24+1 → 16777216.0）&#39;)]
+for i, (r, k, v) in enumerate(rules, 1):
+    print(f&#39;  {i:&gt;2}. {r:&lt;20} [{k:&lt;4}] {v}&#39;)</code></pre>
+<p>实际运行结果：</p>
+<pre data-lang="text"><code class="language-text">=== 1. 改写规则的随机对照（20000 组 float32 输入，量级 1e-8 ~ 1e8）===
+  (x+z)-z → x          不等价   9726/20000 组（48.63%）  最大绝对差 8.000e+00
+  (x+y)+z → x+(y+z)    不等价   1956/20000 组（ 9.78%）  最大绝对差 8.000e+00
+  (x*y)*z → x*(y*z)    不等价   7049/20000 组（35.24%）  最大绝对差 1.126e+15
+  x*0 → ±0（保号）         不等价      0/20000 组（ 0.00%）  最大绝对差 0.000e+00
+  x*0 → +0（不保号）        不等价   9996/20000 组（49.98%）  最大绝对差 0.000e+00
+
+=== 2. 特殊值：NaN / Inf / 溢出 / 大数吞小数 ===
+  nan*0.0 = nan   inf*0.0 = nan   (-inf)*0.0 = nan   → &quot;x*0→0&quot; 前提是 x 有限
+  a+b = 1.0000000272564224e+16（与 a 相同：1.0 小于 a 的 ULP，被吞掉）
+  (x+y)+z = 0.0   x+(y+z) = 0.0   ← 这一组恰好都是 0.0；真正的差异在随机测试里（9.78% 不等价）
+  (p*q)*q = 9.99994610111476e-41   p*(q*q) = 0.0   ← 下溢/溢出方向不同
+
+=== 3. 归约顺序：顺序累加 vs 配对累加（float32）===
+  顺序累加 = 6.900000215637192e-08
+  配对累加 = 6.899999505094456e-08
+  差 = 7.105e-15   → 融合/并行归约会改这条链的形状，必须写进数值契约
+
+=== 4. 整数与 dtype：溢出、取整、收窄 ===
+  int8 100+100 = -56（回绕）   Python 大整数 = 200
+  -7 整除：向下取整 -4（Python/floor）  向零取整 -3（C/trunc）
+  float32 表示 2^24+1 = 16777216.0（丢掉最低位）
+
+=== 5. 可执行的等价性判定表 ===
+   1. x+0 → x              [浮点  ] 成立（含 NaN/Inf；但 -0.0+0.0=+0.0 会改符号，按 strict 语义要保号）
+   2. x*1 → x              [浮点  ] 成立（含 NaN/Inf）
+   3. x*0 → ±0（保号）         [浮点  ] 有限值上成立（含 -0 符号）；NaN/Inf 上应为 NaN，不能折
+   4. x*0 → +0（丢符号）        [浮点  ] 不成立：随机测试里约一半输入是 -0.0，符号可被后续 1/x 观察到
+   5. (x+y)+z → x+(y+z)    [浮点  ] 不成立（随机测试 20000 组里有不等价）
+   6. (x*y)*z → x*(y*z)    [浮点  ] 不成立（同上，且有下溢方向差异）
+   7. (x+z)-z → x          [浮点  ] 不成立（消去律在有限精度下失效）
+   8. 归约改树形/并行             [浮点  ] 不位一致，需数值契约声明容差
+   9. 100+100 → 200        [int8] 不成立（回绕成 -56）
+  10. -7/2 → 结果            [int ] 随语言（floor -4 / trunc -3）
+  11. f64 常量降为 f32         [dtype] 先确认可表示（2^24+1 → 16777216.0）</code></pre>
+<p>四处可核对的结论：<strong>不等价是常态不是例外</strong>（最高 48.63%，四条&quot;看起来显然&quot;的改写里三条有反例）；<strong>符号与 NaN 是规则的一部分</strong>（保号版本 0% 失败、丢符号版本 49.98% 失败，差别只在 <code>copysign</code>）；<strong>归约链的形状本身就是语义</strong>（顺序与配对累加差 7.105e-15，融合必然引入这一项）；<strong>整数与 dtype 各有一类边界</strong>（回绕、取整方向、<code>2^24+1</code> 不可表示）。</p>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选，需自备 GPU 或云上按需一台：在真实编译栈上做&quot;改前改后&quot;对拍 ----
+# 1) 关掉编译做基准：python3 eval.py --no-compile        （以你所用框架的开关为准）
+# 2) 打开编译重跑：    python3 eval.py
+# 3) 逐层比较输出张量的最大绝对/相对差，而不只是最终指标：
+#    print((y_ref - y_new).abs().max().item())
+# 4) 若框架提供数值相关开关（如允许/禁止重排归约），把它显式写进实验记录。
+# 没有 GPU 也能完成本课：上面的纯 Python 已经把判定表与全部反例算出来了。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：给 <code>same</code> 加一个&quot;容差模式&quot;（相对误差 ≤ 1e-5 视为等价），用它重跑第 1 节，把 <code>(x+y)+z → x+(y+z)</code> 的&quot;不等价&quot;比例降到 0 需要多大的容差？这个容差对训练意味着什么？</li>
+<li><strong>解释</strong>：为什么 <code>x*0 → ±0</code> 是 0% 失败，而 <code>x*0 → +0</code> 是 49.98% 失败？写出一个能观察到这个差异的下游表达式（提示：<code>1/x</code>）。</li>
+<li><strong>对比/验证</strong>：把 <code>rule_add_zero</code> 改成真正的 <code>(x+y)-y</code>，用 <code>x=1.0, y=1e16</code> 跑一次，再用 20000 组随机输入跑一次；解释为什么单个手挑的例子与随机测试给出的结论可能不同。</li>
+<li><strong>思考</strong>：本章四课分别做了折叠、布局改写、内存复用、安全性判定。如果只允许你保留其中一课的内容交给下游（第 5 章融合、第 6 章调度）使用，你选哪一课？给出判据而不是直觉。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>OpenXLA 官方文档（XLA 语义定义与编译选项；本课&quot;契约决定允许哪些改写&quot;的一手依据）：<a href="https://openxla.org/xla" target="_blank" rel="noopener noreferrer">https://openxla.org/xla</a></li>
+<li>PyTorch 官方文档 <em>torch.compiler 概览</em>（编译器默认数值行为与相关配置；具体默认值随版本演进，以官方文档为准）：<a href="https://docs.pytorch.org/docs/stable/user_guide/torch_compiler/torch.compiler.html" target="_blank" rel="noopener noreferrer">https://docs.pytorch.org/docs/stable/user_guide/torch_compiler/torch.compiler.html</a></li>
+<li>PyTorch 官方教程 <em>Introduction to torch.compile</em>（如何在真实模型上做&quot;改前改后&quot;的对照实验，与本课第 5 节验收流程对应）：<a href="https://docs.pytorch.org/tutorials/intermediate/torch_compile_tutorial.html" target="_blank" rel="noopener noreferrer">https://docs.pytorch.org/tutorials/intermediate/torch_compile_tutorial.html</a></li>
+<li>Tianqi Chen et al., <em>TVM: An Automated End-to-End Optimizing Compiler for Deep Learning</em>（OSDI&#39;18；图级改写的规则集与&quot;正确性优先&quot;的工程约束）：<a href="https://www.usenix.org/conference/osdi18/presentation/chen" target="_blank" rel="noopener noreferrer">https://www.usenix.org/conference/osdi18/presentation/chen</a></li>
+<li>Lianmin Zheng et al., <em>The Deep Learning Compiler: A Comprehensive Survey</em>（图级/算子级优化的正确性与数值误差讨论）：<a href="https://arxiv.org/abs/2002.03794" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2002.03794</a></li>
+</ul>
+<p><a href="#/learn/../chapter-5/lesson-01">下一章：算子融合</a></p>

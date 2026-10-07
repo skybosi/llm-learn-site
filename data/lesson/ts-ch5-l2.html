@@ -1,0 +1,103 @@
+<h2 id="h-informer-等长时序模型">Informer 等长时序模型<a class="anchor" href="#h-informer-等长时序模型" aria-label="本节链接">#</a></h2>
+<p>上一课我们算出：标准 Transformer 的自注意力代价是 O(L²)，L 是序列长度。长时序预测恰恰需要很长的输入窗口（成百上千个时间步），L² 会直接让训练不可行。Informer 是 2021 年 AAAI 最佳论文之一，专门为<strong>长序列时间序列预测（LSTF）</strong>改造 Transformer，用三招把代价压下来：<strong>概率稀疏注意力</strong>、<strong>自注意力蒸馏</strong>、<strong>生成式解码器</strong>。这一课我们逐一拆解它的动机与机制——重点不是背公式，而是理解&quot;为什么这样做能又省又快&quot;。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-观察注意力权重其实是稀疏的">1. 观察：注意力权重其实是&quot;稀疏&quot;的<a class="anchor" href="#h-1-观察注意力权重其实是稀疏的" aria-label="本节链接">#</a></h4>
+<p>Informer 的出发点来自一个经验观察：在自注意力里，softmax 之后的权重分布通常是<strong>长尾的</strong>——极少数 Query 拿到了显著的大权重，绝大多数 Query 的权重分布接近<strong>均匀分布</strong>，几乎不提供有用信息。论文用 KL 散度度量&quot;某个 Query 的注意力分布偏离均匀分布的程度&quot;：</p>
+<pre><code>M(q_i, K) = max_j { q_i·k_j / √d } − (1/L) Σ_j q_i·k_j / √d</code></pre>
+<p>这个式子有个直观解释：如果 <code>q_i</code> 和所有 <code>k_j</code> 的打分都差不多（分布接近均匀），那么&quot;最大值&quot;和&quot;平均值&quot;几乎相等，<code>M</code> 接近 0——这个 Query 是&quot;惰性&quot;的，可以略过；反之，如果 <code>q_i</code> 对少数几个 <code>k</code> 打分特别高，<code>M</code> 就大——这个 Query 是&quot;活跃&quot;的，必须保留。</p>
+<p>这就是<strong>概率稀疏（ProbSparse）自注意力</strong>的核心：<strong>只让少数&quot;活跃&quot;的 Query 做完整的注意力，其余 Query 直接用均值近似</strong>。价值不大却要花一样多的算力，才是 O(L²) 浪费的根源。</p>
+<h4 id="h-2-probsparse挑出-top-u-个活跃-query">2. ProbSparse：挑出 top-u 个活跃 Query<a class="anchor" href="#h-2-probsparse挑出-top-u-个活跃-query" aria-label="本节链接">#</a></h4>
+<p>具体做法：对每个 Query 估算 <code>M(q_i, K)</code>，选出 top-u 个活跃 Query（u 通常取 <code>c·ln L</code>，远小于 L），只对这 u 个 Query 计算完整的 key-value 注意力；其余 Query 的输出用一个&quot;对 Value 的平均&quot;来填充。这样计算量从 O(L²) 降到：</p>
+<pre><code>O(L · ln L)</code></pre>
+<p>因为活跃 Query 只有 O(ln L) 个，每个要对 L 个 key 算一次，总共 O(L ln L)。论文还证明了 top-u 采样是&quot;稀疏化的有界近似&quot;——误差可控，不会因为省算力而明显掉点。</p>
+<h4 id="h-3-自注意力蒸馏编码器逐层减半">3. 自注意力蒸馏：编码器逐层&quot;减半&quot;<a class="anchor" href="#h-3-自注意力蒸馏编码器逐层减半" aria-label="本节链接">#</a></h4>
+<p>长输入即使每层都稀疏，层数一多、每层都要处理 L 长序列，仍然贵。Informer 的第二个技巧是<strong>蒸馏（distilling）</strong>：编码器每往上一层，就用一次步长为 2 的卷积池化把序列长度<strong>减半</strong>。</p>
+<pre><code>X_{l+1} = MaxPool( ELU( Conv1d( X_l ) ) )</code></pre>
+<p>为什么要&quot;减半&quot;还能不丢信息？长时序的信息是<strong>冗余</strong>的，相邻时间步高度相关。逐步下采样，等于让网络在更高的抽象层级上看序列——底层关注细粒度局部变化，高层关注全局趋势与长周期。每减半一次，下一层的自注意力代价再降 4 倍。L 层下来，编码器的总复杂度从 O(L²) 一路压到 O(L ln L)。</p>
+<h4 id="h-4-生成式解码器一次前向输出整段预测">4. 生成式解码器：一次前向输出整段预测<a class="anchor" href="#h-4-生成式解码器一次前向输出整段预测" aria-label="本节链接">#</a></h4>
+<p>标准 Transformer 解码器是<strong>自回归</strong>的——一次只生成一个 token，生成 H 步就要跑 H 次前向，慢且误差累积。Informer 的第三个创新是<strong>生成式解码器（generative style decoder）</strong>：把要预测的 H 个位置<strong>一次性</strong>喂给解码器，只做一次前向，就同时输出整段未来。实现上是给解码器输入一段&quot;占位符&quot;（待预测位置的填充），再用因果掩码保证每个位置只看历史不看未来。于是预测 H 步的时间从 O(H·模型前向) 变成 O(1·模型前向)。</p>
+<h4 id="h-5-三招合起来的效果">5. 三招合起来的效果<a class="anchor" href="#h-5-三招合起来的效果" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>稀疏注意力</strong>：砍掉惰性 Query 的冗余计算，O(L²) → O(L ln L)；</li>
+<li><strong>蒸馏</strong>：编码器逐层下采样，进一步降低 L 的基数；</li>
+<li><strong>生成式解码</strong>：一次前向出整段预测，避免自回归的 O(H) 与误差累积。</li>
+</ul>
+<p>三者叠加，Informer 在 ETTh、ECL、Weather 等长序列基准上，以更快的推理速度取得了比 Informer 之前的强基线更好的预测精度。它同时回答了长时序的两个痛点：<strong>算不动</strong>与<strong>预测不准</strong>。</p>
+<p><figure><img class="md-img" src="content/courses/time-series/assets/chapter-5-figure-02.svg" alt="ProbSparse 注意力筛选活跃 Query + 蒸馏下采样 + 生成式解码三招示意" loading="lazy" decoding="async"><figcaption>ProbSparse 注意力筛选活跃 Query + 蒸馏下采样 + 生成式解码三招示意</figcaption></figure>
+</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面实现一个<strong>简化版 ProbSparse 注意力</strong>，对照标准注意力的计算量。为了教学清晰，我们用&quot;均值近似 + top-u 选择&quot;复现核心思想，不做论文的完整工程优化。</p>
+<pre data-lang="python"><code class="language-python">import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+torch.manual_seed(0)
+
+def standard_attention(q, k, v, scale):
+    &quot;&quot;&quot;标准注意力：所有 Query 都做完整计算，代价 O(L^2)。&quot;&quot;&quot;
+    scores = q @ k.transpose(-2, -1) * scale       # (L, L)
+    attn = F.softmax(scores, dim=-1)
+    return attn @ v
+
+def probsparse_attention(q, k, v, scale, factor=5):
+    &quot;&quot;&quot;简化版 ProbSparse：只对 top-u 个&quot;活跃&quot;Query 做完整注意力。
+
+    q, k, v: (L, d)，u = factor * ln(L)，远小于 L。
+    &quot;&quot;&quot;
+    L, d = q.shape
+    u = max(1, int(factor * torch.log(torch.tensor(L, dtype=torch.float32)).item()))
+
+    # 1) 估算每个 Query 的&quot;稀疏度&quot;：打分最大值与平均值的差
+    #    差值大 =&gt; 分布偏离均匀 =&gt; 活跃；差值小 =&gt; 惰性
+    scores = q @ k.transpose(-2, -1) * scale       # (L, L)，仅用于筛选
+    M = scores.max(dim=-1).values - scores.mean(dim=-1)  # (L,)
+
+    # 2) 选出 top-u 个活跃 Query 的下标
+    top_idx = torch.topk(M, u).indices
+
+    # 3) 只对活跃 Query 做完整的 softmax 注意力
+    q_active = q[top_idx]                          # (u, d)
+    scores_active = q_active @ k.transpose(-2, -1) * scale
+    attn_active = F.softmax(scores_active, dim=-1) @ v   # (u, d)
+
+    # 4) 惰性 Query 用所有 Value 的均值近似填充（对应论文的&quot;均值替代&quot;思想）
+    out = v.mean(dim=0, keepdim=True).expand(L, d) # (L, d)
+    out[top_idx] = attn_active
+    return out
+
+# 构造一个长序列：L=256, d=32
+L, d = 256, 32
+q = torch.randn(L, d)
+k = torch.randn(L, d)
+v = torch.randn(L, d)
+scale = 1.0 / (d ** 0.5)
+
+out_std = standard_attention(q, k, v, scale)
+out_sparse = probsparse_attention(q, k, v, scale)
+print(&quot;标准注意力输出形状:&quot;, out_std.shape)
+print(&quot;ProbSparse 输出形状:&quot;, out_sparse.shape)
+
+# 统计实际参与的 Query 数量
+u = max(1, int(5 * torch.log(torch.tensor(L, dtype=torch.float32)).item()))
+print(f&quot;总 Query 数 L={L}，ProbSparse 只完整计算 top-{u} 个活跃 Query&quot;)
+print(f&quot;筛选出的活跃 Query 下标: {torch.topk((q @ k.T * scale).max(-1).values - (q @ k.T * scale).mean(-1), u).indices.tolist()}&quot;)</code></pre>
+<p>运行后注意：</p>
+<ul>
+<li>两个输出的形状完全一致 <code>(L, d)</code>，但 <code>probsparse_attention</code> 只为 u≈28 个 Query 做了完整 softmax，其余 228 个直接用均值——省掉了大量无效计算；</li>
+<li><code>M</code> 越大代表该 Query 的注意力分布越&quot;尖锐&quot;、越值得保留，这正是&quot;稀疏&quot;的数学含义；</li>
+<li>真实 Informer 还做了随机采样近似 <code>M</code>、以及用更精细的均值/最大值估计，但&quot;筛选活跃 Query&quot;这一主线与本例一致。</li>
+</ul>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>把 <code>factor</code> 从 5 改成 1 和 50，观察 u 的变化。factor 越大越接近标准注意力，factor 越小越省算力但近似越粗糙——你如何理解&quot;稀疏度&quot;与&quot;精度&quot;的权衡？</li>
+<li>手工验证：当某个 Query 对所有 key 的打分完全相同时，<code>M=0</code>，它会被归为惰性。为什么这类 Query 对最终输出贡献不大？</li>
+<li>思考蒸馏的作用：如果把序列先做步长 2 的 MaxPool 再喂给注意力，长度减半后计算量降为原来的几分之一？这和 TCN 的&quot;空洞扩大感受野&quot;有什么思想上的联系与区别？</li>
+<li>思考生成式解码：标准自回归解码预测 H 步要 H 次前向，生成式解码只需 1 次。代价是什么？（提示：H 步的预测之间失去了逐步依赖，模型需要靠别的方式建模未来内部的结构。）</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Zhou et al. · Informer: Beyond Efficient Transformer for Long Sequence Time-Series Forecasting (AAAI 2021)：<a href="https://arxiv.org/abs/2012.07436" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2012.07436</a></li>
+<li>Informer 官方代码仓库：<a href="https://github.com/zhouhaoyi/Informer2020" target="_blank" rel="noopener noreferrer">https://github.com/zhouhaoyi/Informer2020</a></li>
+<li>Vaswani et al. · Attention Is All You Need：<a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1706.03762</a></li>
+</ul>
+<p><a href="#/l/ts-ch5-l3">下一课：多变量预测</a></p>

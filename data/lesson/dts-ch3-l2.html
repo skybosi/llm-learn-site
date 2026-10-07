@@ -1,0 +1,234 @@
+<h2 id="h-infiniband--roce--gpudirect-rdma跨机通信路径">InfiniBand / RoCE / GPUDirect RDMA：跨机通信路径<a class="anchor" href="#h-infiniband--roce--gpudirect-rdma跨机通信路径" aria-label="本节链接">#</a></h2>
+<p>域内再快也出不了机箱。一旦 rank 分布到两台机器上，数据必须穿过网卡——而 GPU 不能被别的节点直接寻址，所以&quot;跨机&quot;这两个字换来的是一条固定路径：GPU → PCIe → NIC → 线缆 → 对端 NIC → PCIe → 对端 GPU。本课把这条路径拆成三段可算的账，并给出一个反直觉的结论：<strong>有时候瓶颈不是网络，而是 PCIe</strong>。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-跨机只有一扇门网卡">1. 跨机只有一扇门：网卡<a class="anchor" href="#h-1-跨机只有一扇门网卡" aria-label="本节链接">#</a></h4>
+<p>节点之间的通信必须经过 NIC（host channel adapter）。这带来两个直接后果：</p>
+<ul>
+<li><strong>节点出口带宽 = 各 NIC 端口之和</strong>，而不是 NVLink 域带宽。8 卡机每卡一条 400 Gb/s 的 IB 口时，出口是 8×50 = 400 GB/s 单向；只有 2 条口时出口仅 100 GB/s。</li>
+<li><strong>门到门的距离要付钱</strong>：数据在 GPU 与 NIC 之间还得过一次 PCIe。这一步是否多余，就是 GPUDirect RDMA 要回答的问题。</li>
+</ul>
+<h4 id="h-2-infiniband-与-roce同一套-verbs两种网络">2. InfiniBand 与 RoCE：同一套 verbs，两种网络<a class="anchor" href="#h-2-infiniband-与-roce同一套-verbs两种网络" aria-label="本节链接">#</a></h4>
+<p>按 IBTA 规范，InfiniBand 每端口单向带宽（Gb/s ÷ 8 得 GB/s）：</p>
+<table>
+<thead>
+<tr>
+<th>代际</th>
+<th>每端口速率</th>
+<th>单向</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>EDR</td>
+<td>100 Gb/s</td>
+<td>12.5 GB/s</td>
+<td>—</td>
+</tr>
+<tr>
+<td>HDR</td>
+<td>200 Gb/s</td>
+<td>25 GB/s</td>
+<td>—</td>
+</tr>
+<tr>
+<td>NDR</td>
+<td>400 Gb/s</td>
+<td>50 GB/s</td>
+<td>已给出最终物理规范</td>
+</tr>
+<tr>
+<td>XDR</td>
+<td>800 Gb/s</td>
+<td>100 GB/s</td>
+<td>每通道 SerDes 200 Gb/s；交换机间可到 1.6 Tb/s</td>
+</tr>
+</tbody></table>
+<p><strong>InfiniBand</strong> 是一套独立的网络架构（有自己的子网管理器与链路层），设计上原生无损、延迟低。<strong>RoCE</strong> 是&quot;RDMA over Converged Ethernet&quot;：把 RDMA 语义跑在以太网上（RoCEv2 用 UDP 封装），能用便宜的以太网交换机组网，但因为以太网默认有丢包，需要 PFC/ECN 一类的拥塞控制把网络做成&quot;无损或近无损&quot;，否则重传会把吞吐打下来。</p>
+<p>对上层来说两者是<strong>同一套 verbs</strong>，所以 NCCL 只认一个 IB 传输层（可用 <code>NCCL_IB_DISABLE</code> 关闭、或 <code>NCCL_NET=Socket</code> 强制走 TCP 回退——回退后性能掉一个量级，属于排障手段而非常态）。RoCE 相关参数也在 NCCL 环境变量里：<code>NCCL_IB_GID_INDEX</code> 指定 RoCE 的 GID 索引，<code>NCCL_IB_ROCE_VERSION_NUM</code> 指定 RoCE 版本（默认 2）。</p>
+<h4 id="h-3-gpudirect-rdma省掉的那次主机中转">3. GPUDirect RDMA：省掉的那次主机中转<a class="anchor" href="#h-3-gpudirect-rdma省掉的那次主机中转" aria-label="本节链接">#</a></h4>
+<p>没有 GPUDirect RDMA（GDR）时，路径是&quot;GPU 显存 → 主机 bounce buffer → NIC&quot;，payload 在 PCIe 上要走两遍（先写进主机内存，NIC 再读走）。GDR 让 NIC 通过 PCIe BAR 直接读写真显存，把这一步变成一遍。</p>
+<p>官方文档给出的硬条件很值得记：<strong>两个设备必须共享同一个上游 PCIe root complex</strong>，所以&quot;能不能用 GDR&quot;本质是一个拓扑问题，不是开关问题。NCCL 默认在拓扑允许时启用，并用 <code>NCCL_NET_GDR_LEVEL</code> 按 GPU–NIC 的拓扑距离设置门槛：<code>LOC</code>（永不用）、<code>PIX</code>（同一 PCIe 交换机）、<code>PXB</code>（多个 PCIe 交换机）、<code>PHB</code>（同一 NUMA 节点、流量过 CPU）、<code>SYS</code>（跨 NUMA 也启用）。另有 <code>NCCL_DMABUF_ENABLE</code> 用 Linux dma-buf 子系统做显存注册（默认为 1，内核或驱动不支持时自动关闭）。</p>
+<h4 id="h-4-路径账本math0">4. 路径账本：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord">Σ</span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mop">max</span><span class="mopen">(</span><span class="mord mathnormal">s</span><span class="mord">/</span><span class="mord mathnormal" style="margin-right:0.0528em;">β</span><span class="mclose">)</span></span></span></span><a class="anchor" href="#h-4-路径账本math0" aria-label="本节链接">#</a></h4>
+<p>一段多跳路径要按流水线算：<strong>延迟项逐段相加，带宽项取最慢的一段</strong>（不是相加，也不是取最快）：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="mopen">(</span><span class="mord mathnormal">s</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.3277em;vertical-align:-1.2777em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.05em;"><span style="top:-1.8723em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∑</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.2777em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:-0.0037em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.988em;vertical-align:-0.8804em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.4306em;"><span style="top:-2.3723em;margin-left:0em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span><span class="mop">max</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.7277em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.1076em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal" style="margin-right:0.0528em;">β</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:-0.0528em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">s</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.8804em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></p>
+<p>这是本课最有用的一条式。它在示例 2 里直接给出答案（4 KiB / 1 MiB / 256 MiB，PCIe 4.0 与 5.0 两种机器）：</p>
+<table>
+<thead>
+<tr>
+<th>机器</th>
+<th>4 KiB</th>
+<th>1 MiB</th>
+<th>256 MiB</th>
+<th>瓶颈</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>PCIe 4.0 x16（31.5 GB/s）+ NDR</td>
+<td>6.4 μs</td>
+<td>39.6 μs</td>
+<td>8.53 ms</td>
+<td>本地 PCIe</td>
+</tr>
+<tr>
+<td>PCIe 5.0 x16（63.0 GB/s）+ NDR</td>
+<td>6.4 μs</td>
+<td>27.3 μs</td>
+<td>5.38 ms</td>
+<td>本地 NIC</td>
+</tr>
+</tbody></table>
+<p><strong>反直觉的地方</strong>：NDR 单口单向 50 GB/s，比 PCIe 4.0 x16 的 31.5 GB/s 还宽。也就是说，在 PCIe 4.0 的机器上插一张 NDR 网卡，网卡永远吃不饱——PCIe 才是瓶颈。换到 PCIe 5.0 x16（63 GB/s），瓶颈才回到网卡。<strong>先算清哪一段最慢，再谈调优。</strong></p>
+<p><figure><img class="md-img" src="content/courses/distributed-training-systems/assets/chapter-3-figure-03.svg" alt="数据跨机要走的路径，以及 GPUDirect 省掉了哪一段" loading="lazy" decoding="async"><figcaption>数据跨机要走的路径，以及 GPUDirect 省掉了哪一段</figcaption></figure>
+</p>
+<h4 id="h-5-从节点出口看-ring跨机那一跳有多贵">5. 从节点出口看 ring：跨机那一跳有多贵<a class="anchor" href="#h-5-从节点出口看-ring跨机那一跳有多贵" aria-label="本节链接">#</a></h4>
+<p>把上面两段合起来：8 张卡、每卡一条 NDR 口，用示例 3 的模型算 1 GiB 梯度的 ring AllReduce（每步每条环边传 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span><span class="mord">/</span><span class="mord mathnormal">p</span></span></span></span>，共 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">2</span><span class="mopen">(</span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span></span></span></span> 步）：</p>
+<table>
+<thead>
+<tr>
+<th>规模</th>
+<th>单向 β</th>
+<th>预测时间</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1 节点 × 8 卡</td>
+<td>450 GB/s（NVLink）</td>
+<td>4.25 ms</td>
+</tr>
+<tr>
+<td>2 节点 × 8 卡</td>
+<td>50 GB/s（NDR）</td>
+<td>40.42 ms</td>
+</tr>
+<tr>
+<td>8 节点 × 8 卡</td>
+<td>50 GB/s</td>
+<td>42.91 ms</td>
+</tr>
+<tr>
+<td>32 节点 × 8 卡</td>
+<td>50 GB/s</td>
+<td>45.33 ms</td>
+</tr>
+</tbody></table>
+<p>从 1 台机器加到 2 台，时间涨了约 9.5 倍——几乎全部来自链路从 NVLink 换成 NDR（450 → 50 GB/s）这一次性跳变。之后继续从 2 节点加到 32 节点，时间只从 40.4 ms 缓慢涨到 45.3 ms：<strong>ring 里每个 rank 要搬的总字节数约等于 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">2</span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span></span></span></span>，与 p 无关</strong>，随 p 增长的只有 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">2</span><span class="mopen">(</span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span></span></span></span> 次 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span>。所以跨机的代价是&quot;换链路&quot;的跳变，而不是&quot;加节点&quot;的线性恶化——前提是每张卡都能独占一条 rail 口；如果 8 张卡共享 2 条口，β 就被分摊，时间会成倍上涨。</p>
+<p>这也是后面所有并行策略的动机：<strong>要压的不是节点数，而是&quot;多少字节必须出门&quot;。</strong></p>
+<h4 id="h-6-常见坑">6. 常见坑<a class="anchor" href="#h-6-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>Gb/s 当 GB/s 用</strong>：把 400 Gb/s 当 400 GB/s，预算会差 8 倍。</li>
+<li><strong>只看端口速率，不看 NIC 与 GPU 的亲和性</strong>：NIC 挂在别的 PCIe 交换机或别的 NUMA 节点时，GDR 可能被 <code>NCCL_NET_GDR_LEVEL</code> 挡在 <code>PHB</code>/<code>SYS</code>，路径上多绕一跳。</li>
+<li><strong>在 RoCE 上忽略无损配置</strong>：没有 PFC/ECN 的以太网遇到拥塞会丢包重传，吞吐可能塌到与 TCP 同级。</li>
+<li><strong>以为 GDR 一定可用</strong>：需要共享上游 root complex；虚拟化与 IOMMU 配置也会影响。</li>
+<li><strong>把 Socket 回退当成正常结果</strong>：<code>NCCL_NET=Socket</code>/<code>NCCL_IB_DISABLE=1</code> 是排障手段，性能量级不同。</li>
+</ul>
+<h4 id="h-7-这一课到哪里为止">7. 这一课到哪里为止<a class="anchor" href="#h-7-这一课到哪里为止" aria-label="本节链接">#</a></h4>
+<p>这里假设了&quot;任意两台机器之间的路径等价&quot;。真实集群不是这样：它按 rail 与 spine 分层，跨层的那条路会骤降。下一课专门讲这件事。</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>三段纯 Python（只用标准库）：先把 IB 端口速率换成 GB/s，再用流水线账本比较 GDR 与 bounce buffer，最后把跨机规模扫一遍。</p>
+<pre data-lang="python"><code class="language-python"># ===== 示例 1：InfiniBand 各代端口速率（Gb/s 换 GB/s 要除以 8） =====
+IB = [(&quot;EDR&quot;, 100), (&quot;HDR&quot;, 200), (&quot;NDR&quot;, 400), (&quot;XDR&quot;, 800)]      # Gb/s per port
+print(&quot;InfiniBand 单口速率（IBTA 规范给出的量级）：&quot;)
+for gen, gbps in IB:
+    print(f&quot;  {gen:&lt;4} {gbps:4d} Gb/s/口 → 单向 {gbps / 8:6.1f} GB/s&quot;)
+print(f&quot;  8 口 NDR 的节点出口合计：单向 {8 * 400 / 8:.0f} GB/s&quot;)
+
+
+# ===== 示例 2：跨机路径账本 T = Σα + max(s/β)（流水线下延迟相加、带宽取最慢一段） =====
+def pipelined_us(s, hops):
+    &quot;&quot;&quot;hops = [(段名, α_μs, β_GB/s)]；返回这一段路径的传输时间（微秒）。&quot;&quot;&quot;
+    return sum(a for _, a, _ in hops) + max(s / (b * 1e9) * 1e6 for _, _, b in hops)
+
+
+def hops(s, pcie_bw, gdr):
+    &quot;&quot;&quot;gdr=True：GPU 与 NIC 之间 payload 只过一次 PCIe；
+    gdr=False：payload 先在 PCIe 上写进主机 bounce buffer，NIC 再读一遍 → PCIe 段承载两倍字节。&quot;&quot;&quot;
+    eff = pcie_bw if gdr else pcie_bw / 2
+    return [(&quot;本地 PCIe&quot;, 1.5, eff), (&quot;本地 NIC&quot;, 1.0, 50.0),
+            (&quot;IB 链路&quot;, 1.3, 50.0), (&quot;对端 NIC&quot;, 1.0, 50.0), (&quot;对端 PCIe&quot;, 1.5, eff)]
+
+
+def bottleneck(hops_):
+    return max(hops_, key=lambda h: 1.0 / h[2])[0]
+
+
+for pcie, tag in ((31.5, &quot;PCIe 4.0 x16&quot;), (63.0, &quot;PCIe 5.0 x16&quot;)):
+    print(f&quot;\n{pcie:.1f} GB/s 的 {tag} + 单口 NDR 400 Gb/s：&quot;)
+    for kib in (4, 1024, 262144):
+        s = kib * 1024
+        t_gdr = pipelined_us(s, hops(s, pcie, True))
+        t_buf = pipelined_us(s, hops(s, pcie, False))
+        print(f&quot;  {kib:&gt;6} KiB：GDR {t_gdr:9.1f} μs（瓶颈 {bottleneck(hops(s, pcie, True))}）&quot;
+              f&quot;   bounce {t_buf:9.1f} μs   比值 {t_buf / t_gdr:4.2f}×&quot;)
+
+
+# ===== 示例 3：8 卡 ring AllReduce 跨机（每个 rank 独占一条 rail NIC） =====
+def ring_ms(total_bytes, P, alpha_us, beta_gbps):
+    &quot;&quot;&quot;ring AllReduce：每步每条环边只传 s = total/P，共 2(P-1) 步。&quot;&quot;&quot;
+    lat = 2 * (P - 1) * alpha_us
+    bw = 2 * (P - 1) / P * total_bytes / (beta_gbps * 1e9) * 1e6
+    return (lat + bw) / 1e3
+
+
+grad = 1 * 2**30                                    # 1 GiB 梯度
+print(f&quot;\n{grad / 2**30:.0f} GiB AllReduce，每 rank 一条 NDR 口（单向 50 GB/s），α=5 μs：&quot;)
+for nodes in (1, 2, 4, 8, 16, 32):
+    P = 8 * nodes
+    beta = 450.0 if nodes == 1 else 50.0            # 单机走 NVLink，跨机走 rail NIC
+    print(f&quot;  {nodes:&gt;2} 节点 × 8 卡 = {P:&gt;3} rank   ring = {ring_ms(grad, P, 5.0, beta):8.2f} ms&quot;)</code></pre>
+<p>在 Python 3.14.5（仅标准库）下实际运行结果：</p>
+<pre data-lang="text"><code class="language-text">InfiniBand 单口速率（IBTA 规范给出的量级）：
+  EDR   100 Gb/s/口 → 单向   12.5 GB/s
+  HDR   200 Gb/s/口 → 单向   25.0 GB/s
+  NDR   400 Gb/s/口 → 单向   50.0 GB/s
+  XDR   800 Gb/s/口 → 单向  100.0 GB/s
+  8 口 NDR 的节点出口合计：单向 400 GB/s
+
+31.5 GB/s 的 PCIe 4.0 x16 + 单口 NDR 400 Gb/s：
+       4 KiB：GDR       6.4 μs（瓶颈 本地 PCIe）   bounce       6.6 μs   比值 1.02×
+    1024 KiB：GDR      39.6 μs（瓶颈 本地 PCIe）   bounce      72.9 μs   比值 1.84×
+  262144 KiB：GDR    8528.1 μs（瓶颈 本地 PCIe）   bounce   17049.8 μs   比值 2.00×
+
+63.0 GB/s 的 PCIe 5.0 x16 + 单口 NDR 400 Gb/s：
+       4 KiB：GDR       6.4 μs（瓶颈 本地 NIC）   bounce       6.4 μs   比值 1.01×
+    1024 KiB：GDR      27.3 μs（瓶颈 本地 NIC）   bounce      39.6 μs   比值 1.45×
+  262144 KiB：GDR    5375.0 μs（瓶颈 本地 NIC）   bounce    8528.1 μs   比值 1.59×
+
+1 GiB AllReduce，每 rank 一条 NDR 口（单向 50 GB/s），α=5 μs：
+   1 节点 × 8 卡 =   8 rank   ring =     4.25 ms
+   2 节点 × 8 卡 =  16 rank   ring =    40.42 ms
+   4 节点 × 8 卡 =  32 rank   ring =    41.92 ms
+   8 节点 × 8 卡 =  64 rank   ring =    42.91 ms
+  16 节点 × 8 卡 = 128 rank   ring =    43.88 ms
+  32 节点 × 8 卡 = 256 rank   ring =    45.33 ms</code></pre>
+<p>下面这段是<strong>可选</strong>实验：两张以上 GPU、两台机器的选择都不强求——单机单卡也能看到本课关心的字段（NIC 列表、GPU–NIC 距离）。无卡时读一遍输出格式即可，不影响本课结论。</p>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选：本机有 IB/RoCE 网卡即可；无网卡时看判读方法 ----
+ibstat                      # IB 端口状态与速率（若装的是 RoCE，则用 ibv_devinfo 看链路层）
+ibv_devinfo -v | grep -E &quot;state|rate|link_layer&quot;
+nvidia-smi topo -m          # 左侧 NIC 列与 GPU 的距离：PIX/PXB/PHB/SYS 决定 GDR 能不能用
+show_gids                   # RoCE 场景下看 GID 表，配合 NCCL_IB_GID_INDEX
+
+# 量网卡真实带宽（perftest；单机也能跑 loopback，双机 -H &lt;对端&gt; 更真实）
+# git clone https://github.com/linux-rdma/perftest &amp;&amp; cd perftest &amp;&amp; ./autogen.sh &amp;&amp; make
+ib_write_bw -d mlx5_0 -a -F --report_gbits        # 服务端
+ib_write_bw -d mlx5_0 -a -F --report_gbits &lt;服务端IP&gt;   # 客户端
+
+# 让 NCCL 打印它探测到的拓扑与 GDR 决策（跑一次 nccl-tests 即可）
+NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,GRAPH ./build/all_reduce_perf -b 8 -e 1G -f 2 -g 2
+# 关注日志里的 &quot;GPU Direct RDMA Enabled/Disabled&quot; 与拓扑搜索路径；
+# 需要固化版本时用 NCCL_TOPO_DUMP_FILE 导出 XML。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：给示例 2 增加一段&quot;bounce buffer 版&quot;的聚合账本：假设 PCIe 上 payload 只走一遍而不是两遍（即 <code>eff = pcie_bw</code>），比较 1 MiB 与 256 MiB 两行的耗时，并解释为什么小消息几乎不受影响。</li>
+<li><strong>解释</strong>：为什么&quot;延迟相加、带宽取最慢&quot;是对多跳流水线的正确近似？请画一条 3 跳的时间轴（每跳 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:-0.0037em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 与 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">s</span><span class="mord">/</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0528em;">β</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:-0.0528em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>）说明。</li>
+<li><strong>对比/验证</strong>：把示例 1 的 <code>8 * 400 / 8</code> 改成每节点 2 条 NDR、4 条 NDR，重算节点出口；再说明为什么&quot;节点出口&quot;不等于&quot;单条 ring 的可用带宽&quot;（提示：ring 每个 rank 只用自己那条 rail 的口）。</li>
+<li><strong>思考</strong>：一台 PCIe 4.0 的机器上，把双口 NDR 网卡换成双口 XDR（800 Gb/s）有意义吗？请用示例 2 的瓶颈项回答，并给出你需要的额外信息。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>NVIDIA, <em>GPUDirect RDMA</em>（CUDA 文档，Overview 与 Standard DMA / GPUDirect RDMA Transfers：直连路径、PCIe BAR、以及&quot;两设备需共享上游 PCI Express root complex&quot;的限制）：<a href="https://docs.nvidia.com/cuda/gpudirect-rdma/index.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/gpudirect-rdma/index.html</a></li>
+<li>NVIDIA, <em>NCCL User Guide</em> — Environment Variables（<code>NCCL_NET_GDR_LEVEL</code> 的 LOC/PIX/PXB/PHB/SYS 距离门槛、<code>NCCL_DMABUF_ENABLE</code>、<code>NCCL_IB_HCA</code>、<code>NCCL_IB_GID_INDEX</code>、<code>NCCL_IB_ROCE_VERSION_NUM</code>、<code>NCCL_IB_DISABLE</code>）：<a href="https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html</a></li>
+<li>InfiniBand Trade Association, <em>IBTA Unveils XDR InfiniBand Specification</em>（XDR 每端口 800 Gb/s、每通道 SerDes 200 Gb/s、交换机间 1.6 Tb/s，以及 NDR 400 Gb/s 的最终物理规范）：<a href="https://infinibandta.org/ibta-unveils-xdr-infiniband-specification-to-enable-the-next-generation-of-ai-and-scientific-computing/" target="_blank" rel="noopener noreferrer">https://infinibandta.org/ibta-unveils-xdr-infiniband-specification-to-enable-the-next-generation-of-ai-and-scientific-computing/</a></li>
+<li>InfiniBand Trade Association, <em>RoCE Initiative</em>（RoCE / RoCEv2 的定位与以太网部署要点；本课&quot;无损以太网&quot;一节的来源）：<a href="https://infinibandta.org/roce-initiative/" target="_blank" rel="noopener noreferrer">https://infinibandta.org/roce-initiative/</a></li>
+<li>NVIDIA, <em>NCCL User Guide</em> — Collectives（bus bandwidth 口径与集合通信性能表的读法，用于把自己实测的 <code>ib_write_bw</code>/<code>nccl-tests</code> 数据代回本课模型）：<a href="https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/collectives.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/collectives.html</a></li>
+</ul>
+<p><a href="#/l/dts-ch3-l3">下一课：拓扑感知：rail-optimized 与跨域通信为何骤降</a></p>

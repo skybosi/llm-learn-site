@@ -1,0 +1,117 @@
+<h2 id="h-注意力打分">注意力打分<a class="anchor" href="#h-注意力打分" aria-label="本节链接">#</a></h2>
+<p>上一课我们建立了直觉：注意力是用 Query 去&quot;比对&quot;每个 Key，得到相关程度。这个&quot;比对&quot;在数学上就是<strong>打分函数（scoring function）</strong>，它输出一个标量，衡量&quot;这个 Key 和当前 Query 有多相关&quot;。打分方式不止一种——点积、缩放点积、加性、双线性——各自有不同的代价与适用场景。这一课我们把它们逐一拆开，用 PyTorch 亲手实现并比较。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-打分函数是注意力的心脏">1. 打分函数是注意力的&quot;心脏&quot;<a class="anchor" href="#h-1-打分函数是注意力的心脏" aria-label="本节链接">#</a></h4>
+<p>注意力的计算链条是：<strong>打分 → 归一化（softmax）→ 加权求和</strong>。其中打分决定了一切：打分准，权重才分得清&quot;谁重要、谁无关&quot;；打分糊，后面的归一化和加权再精致也白搭。所以理解打分函数，是理解所有注意力变体的关键。</p>
+<p>统一记法：给定查询向量 <code>q</code> 和键向量 <code>k</code>，打分函数 <code>score(q, k)</code> 输出一个标量。实际中 <code>q</code> 只一个，<code>k</code> 有一串（编码器每个位置一个），于是得到一列标量分数，再交给 softmax。</p>
+<h4 id="h-2-点积打分与它的膨胀隐患">2. 点积打分与它的&quot;膨胀&quot;隐患<a class="anchor" href="#h-2-点积打分与它的膨胀隐患" aria-label="本节链接">#</a></h4>
+<p>最简单直接的想法：把 <code>q</code> 和 <code>k</code> 做点积。</p>
+<pre><code>score(q, k) = q · k = qᵀ k</code></pre>
+<p>点积衡量两个向量方向一致的程度，计算量极小。但它有个隐患：<strong>向量的维度 <code>d</code> 越大，点积的数值越容易&quot;爆炸&quot;</strong>。因为点积是 <code>d</code> 个分量乘积之和，<code>d</code> 越大，这个和的标准差越大。数值一大，softmax 就会退化成近似 one-hot——权重几乎全压在最大值上，梯度趋近 0，训练不动。这个隐患在下一章&quot;缩放点积&quot;里会正式解决，这里先记住点积打分很&quot;贪快但容易飘&quot;。</p>
+<h4 id="h-3-加性打分bahdanau-风格">3. 加性打分（Bahdanau 风格）<a class="anchor" href="#h-3-加性打分bahdanau-风格" aria-label="本节链接">#</a></h4>
+<p>加性注意力不直接点积，而是把 <code>q</code> 和 <code>k</code> <strong>拼接</strong>起来，喂进一个小的前馈网络，输出一个标量：</p>
+<pre><code>score(q, k) = vᵀ tanh(W_q q + W_k k)</code></pre>
+<p>这里的 <code>W_q</code>、<code>W_k</code> 先把 <code>q</code>、<code>k</code> 各自投影到同一个隐空间，相加后过 <code>tanh</code> 压一压，再由向量 <code>v</code> 投影成标量。加性打分的好处是<strong>表达能力强</strong>——<code>q</code> 和 <code>k</code> 不必同维度，网络可以学到任意复杂的相关性；代价是多几层矩阵乘，参数更多、更慢。它是最早被用在神经机器翻译里的注意力打分（Bahdanau 2014），可以看作是&quot;可学习的两两匹配器&quot;。</p>
+<h4 id="h-4-双线性打分luong-general-风格">4. 双线性打分（Luong &quot;general&quot; 风格）<a class="anchor" href="#h-4-双线性打分luong-general-风格" aria-label="本节链接">#</a></h4>
+<p>在点积和加性之间取一个折中：在 <code>q</code> 与 <code>k</code> 之间夹一个<strong>可学习矩阵 <code>W</code></strong>：</p>
+<pre><code>score(q, k) = qᵀ W k</code></pre>
+<p>当 <code>W</code> 是单位矩阵时，它退化成普通点积；当 <code>W</code> 是任意矩阵时，它让 <code>q</code> 和 <code>k</code> 的不同维度之间可以&quot;交叉配对&quot;，比点积更灵活，又比加性更轻量。它只多一个 <code>d×d</code> 的参数矩阵，是工程里很实用的选择。</p>
+<p><figure><img class="md-img" src="content/courses/attention-transformer/assets/chapter-1-figure-02.svg" alt="点积、加性、双线性三种打分函数的结构对比" loading="lazy" decoding="async"><figcaption>点积、加性、双线性三种打分函数的结构对比</figcaption></figure>
+</p>
+<h4 id="h-5-三种打分怎么选">5. 三种打分怎么选<a class="anchor" href="#h-5-三种打分怎么选" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>打分方式</th>
+<th>公式</th>
+<th>参数</th>
+<th>特点</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>点积</td>
+<td><code>qᵀ k</code></td>
+<td>无</td>
+<td>最快，维度大时数值易膨胀</td>
+</tr>
+<tr>
+<td>加性</td>
+<td><code>vᵀ tanh(W_q q + W_k k)</code></td>
+<td>多</td>
+<td>表达力最强，q/k 可不同维度</td>
+</tr>
+<tr>
+<td>双线性</td>
+<td><code>qᵀ W k</code></td>
+<td>一个矩阵</td>
+<td>折中，轻量且灵活</td>
+</tr>
+</tbody></table>
+<p>实践中，Transformer 用的是&quot;点积 + 缩放&quot;，因为它在大规模并行训练下又快又稳；加性和双线性则在&quot;查询与键含义不对称&quot;的场景里仍有价值。选哪种，本质是在<strong>表达力、参数量、计算速度</strong>三者间权衡。</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面用 PyTorch 把三种打分都实现出来，对同一个 <code>q</code> 和同一串 <code>keys</code> 分别打分，直观比较它们的输出。</p>
+<pre data-lang="python"><code class="language-python">import torch
+import torch.nn as nn
+
+torch.manual_seed(0)
+
+d = 6                                    # 向量维度
+q = torch.randn(d)                       # 一个查询向量
+keys = torch.randn(3, d)                 # 3 个键（可理解为编码器 3 个时间步）
+
+# 1) 点积打分：q 与每个键直接点积
+dot_scores = keys @ q
+print(&quot;点积打分:      &quot;, dot_scores)
+
+# 2) 缩放点积打分：除以 sqrt(d)，抑制维度变大时点积数值膨胀
+scaled_scores = dot_scores / (d ** 0.5)
+print(&quot;缩放点积打分:  &quot;, scaled_scores)
+
+# 3) 加性打分（Bahdanau 风格）：q 和 k 各自投影、相加、tanh，再投影成标量
+class AdditiveScore(nn.Module):
+    def __init__(self, d, hidden):
+        super().__init__()
+        self.Wq = nn.Linear(d, hidden, bias=False)
+        self.Wk = nn.Linear(d, hidden, bias=False)
+        self.v = nn.Linear(hidden, 1, bias=False)
+
+    def forward(self, q, k):
+        # q 与 k 投影到同一隐空间后相加，tanh 压缩，最后投影成标量
+        return self.v(torch.tanh(self.Wq(q) + self.Wk(k))).squeeze(-1)
+
+add = AdditiveScore(d, hidden=8)
+add_scores = add(q, keys)
+print(&quot;加性打分:      &quot;, add_scores)
+
+# 4) 双线性打分（general 风格）：用可学习矩阵 W 夹在 q 与 k 之间
+class BilinearScore(nn.Module):
+    def __init__(self, d):
+        super().__init__()
+        self.W = nn.Linear(d, d, bias=False)
+
+    def forward(self, q, k):
+        return k @ self.W(q)             # 等价于 kᵀ W q
+
+bi = BilinearScore(d)
+bi_scores = bi(q, keys)
+print(&quot;双线性打分:    &quot;, bi_scores)</code></pre>
+<p>注意几个细节：</p>
+<ul>
+<li>加性打分里，<code>self.Wq(q)</code> 形状是 <code>(hidden,)</code>，<code>self.Wk(k)</code> 是 <code>(3, hidden)</code>，二者相加靠<strong>广播</strong>变成 <code>(3, hidden)</code>，最后 <code>v</code> 把它压成 <code>(3,)</code>，正好是每个键一个标量分；</li>
+<li>双线性打分里 <code>self.W(q)</code> 得到 <code>(d,)</code>，再与 <code>(3, d)</code> 做矩阵乘，得到 <code>(3,)</code>；</li>
+<li>三种打分的输出形状一致（都是&quot;键的个数&quot;个标量），所以后接的 softmax 与加权求和可以共用一套逻辑，这正体现了&quot;打分函数可插拔&quot;的设计。</li>
+</ul>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>把 <code>d</code> 从 6 改成 256，重新运行点积打分部分，观察未缩放的 <code>dot_scores</code> 数值量级膨胀了多少，验证&quot;维度越大点积越飘&quot;的现象。</li>
+<li>给 <code>BilinearScore</code> 的 <code>W</code> 初始化成单位矩阵，比较它的输出与点积打分是否一致，从而理解&quot;点积是双线性在 W=I 时的特例&quot;。</li>
+<li>把加性打分里的 <code>tanh</code> 换成 <code>ReLU</code>，观察输出分布的变化，思考非线性激活在&quot;可学习匹配器&quot;里起什么作用。</li>
+<li>思考：如果 <code>q</code> 的维度是 8 而 <code>k</code> 的维度是 6，上面哪种打分能直接工作？哪种需要先对齐维度？这如何影响你在异构特征上的选型？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Bahdanau et al. · Neural Machine Translation by Jointly Learning to Align and Translate：<a href="https://arxiv.org/abs/1409.0473" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1409.0473</a></li>
+<li>Luong et al. · Effective Approaches to Attention-based Neural Machine Translation：<a href="https://arxiv.org/abs/1508.04025" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1508.04025</a></li>
+<li>PyTorch 官方文档 · torch.nn.Linear：<a href="https://pytorch.org/docs/stable/generated/torch.nn.Linear.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/docs/stable/generated/torch.nn.Linear.html</a></li>
+</ul>
+<p><a href="#/l/attn-ch1-l3">下一课：注意力权重</a></p>

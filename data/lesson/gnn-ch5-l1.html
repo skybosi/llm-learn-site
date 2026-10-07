@@ -1,0 +1,107 @@
+<h2 id="h-节点分类">节点分类<a class="anchor" href="#h-节点分类" aria-label="本节链接">#</a></h2>
+<p>从这一章起，我们离开&quot;某个具体模型&quot;，站到<strong>任务</strong>的高度看问题。图上的监督学习主要有两大任务：给<strong>节点</strong>打标签，和给<strong>整张图</strong>打标签。本课先攻第一个——<strong>节点分类（node classification）</strong>：已知部分节点的标签，预测其余节点的标签。引文网络里推断论文主题、社交网络里识别用户身份、商品图里判断物品类别，都是它的典型场景。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-任务设定半监督与直推式">1. 任务设定：半监督与直推式<a class="anchor" href="#h-1-任务设定半监督与直推式" aria-label="本节链接">#</a></h4>
+<p>节点分类最经典、也最容易让人误解的设定是<strong>半监督（semi-supervised）</strong>：图里只有一小部分节点有标签（训练集），其余节点的标签要么留作验证/测试，要么根本未知。</p>
+<p>它的一个重要特性是<strong>直推式（transductive）</strong>：训练、验证、测试节点<strong>共享同一张图</strong>。模型在训练时就能&quot;看到&quot;所有节点的<strong>特征和连边</strong>，只是看不到它们的标签。好处是信息利用充分；风险是如果图结构本身和标签强相关，测试信息可能&quot;泄漏&quot;进训练过程，让评估结果偏乐观。这一点第 3 课评估会专门展开。</p>
+<h4 id="h-2-通用框架消息传递--分类头">2. 通用框架：消息传递 + 分类头<a class="anchor" href="#h-2-通用框架消息传递--分类头" aria-label="本节链接">#</a></h4>
+<p>无论底层用 GCN、SAGE 还是 GAT，节点分类的模型都可以拆成两段：</p>
+<ol>
+<li><strong>编码器（encoder）</strong>：堆叠 <code>K</code> 层图卷积，把节点特征 <code>X</code> 逐步&quot;混合&quot;邻居信息，得到每个节点的嵌入 <code>Z = GNN(X, A)</code>。<code>K</code> 通常取 2–3 层（对应聚合 2–3 跳邻居）。</li>
+<li><strong>分类头（decoder）</strong>：对每个节点的嵌入做线性变换 + softmax，输出各类别概率：</li>
+</ol>
+<pre><code>Z = GNN(X, A)                       # 节点嵌入，Z ∈ R^(N × H)
+P = softmax( Z · W_cls + b )        # 每个节点一个类别分布</code></pre>
+<p>损失函数用<strong>交叉熵</strong>，但只在<strong>有标签的训练节点</strong>上计算：</p>
+<pre><code>L = - Σ_{v ∈ V_train} log P_v[ y_v ]</code></pre>
+<p>这是半监督的精髓：<strong>只有训练节点的标签参与反向传播</strong>，但梯度会沿着图结构传遍所有节点（因为它们的嵌入参与了卷积）。</p>
+<p><figure><img class="md-img" src="content/courses/graph-neural-networks/assets/chapter-5-figure-01.svg" alt="节点分类消息传递示意：一张小图里，少数节点用实心颜色标出已知标签，其余节点为空心（未知）；从标注节点出发的箭头沿边扩散，表示标签信息通过多层卷积&quot;传播&quot;到全图；右侧画出编码器（多层 GNN）与分类头（softmax），下方标注损失只在有标签节点上计算" loading="lazy" decoding="async"><figcaption>节点分类消息传递示意：一张小图里，少数节点用实心颜色标出已知标签，其余节点为空心（未知）；从标注节点出发的箭头沿边扩散，表示标签信息通过多层卷积&quot;传播&quot;到全图；右侧画出编码器（多层 GNN）与分类头（softmax），下方标注损失只在有标签节点上计算</figcaption></figure>
+</p>
+<h4 id="h-3-为什么-23-层就够过平滑问题">3. 为什么 2–3 层就够：过平滑问题<a class="anchor" href="#h-3-为什么-23-层就够过平滑问题" aria-label="本节链接">#</a></h4>
+<p>一个关键直觉问题：既然&quot;聚合邻居&quot;能带来信息，是不是层数越深越好？答案是<strong>否<strong>。堆叠过深会引发</strong>过平滑（over-smoothing）</strong>——每多一层，每个节点都会&quot;看到&quot;更大的邻居范围，最终所有节点的嵌入趋于相同，节点间的差异被抹平，分类器无从下手。</p>
+<p>可以这样理解：一层卷积相当于对特征做一次&quot;局部平滑/低通滤波&quot;，层数越多、平滑半径越大，最后逼近&quot;整图一个均值&quot;。因此节点分类通常只用 2–3 层，靠<strong>加宽隐藏维</strong>而非加深来提升容量。</p>
+<h4 id="h-4-几个决定成败的工程细节">4. 几个决定成败的工程细节<a class="anchor" href="#h-4-几个决定成败的工程细节" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>自环（self-loop）</strong>：聚合邻居时要把节点自己也算进去（<code>Ã = A + I</code>），否则每个节点会&quot;丢掉自己的特征&quot;，层数一多信息就稀释了。PyG 的 <code>GCNConv</code> 默认 <code>add_self_loops=True</code>。</li>
+<li><strong>归一化</strong>：不同节点的度差异巨大，度数大的节点聚合后范数偏大，需用对称归一化 <code>D^-1/2 Ã D^-1/2</code> 平衡（GCN 已内置）。</li>
+<li><strong>Dropout</strong>：节点分类里对特征做 dropout（而非对边），能显著缓解小训练集上的过拟合。</li>
+<li><strong>早停 + 验证集选模型</strong>：训练集很小、噪音大，一定要用验证集监控、选最优 checkpoint，避免&quot;训到底反而变差&quot;。</li>
+</ul>
+<h4 id="h-5-标签传播与冷启动">5. 标签传播与&quot;冷启动&quot;<a class="anchor" href="#h-5-标签传播与冷启动" aria-label="本节链接">#</a></h4>
+<p>顺带澄清一个概念误区：半监督节点分类之所以能在&quot;只标了极少数节点&quot;时依然有效，靠的是<strong>特征平滑假设</strong>——相邻节点倾向同类，卷积让相邻节点的嵌入彼此靠近，于是标签通过&quot;边&quot;从标注节点流向未标注节点。这与经典的<strong>标签传播（label propagation）</strong>思想一脉相承，但 GNN 额外利用了节点特征，能处理&quot;特征与结构不完全一致&quot;的图，也在新节点到来时比纯标签传播更有泛化能力。</p>
+<h3 id="h-二可运行示例">二、可运行示例<a class="anchor" href="#h-二可运行示例" aria-label="本节链接">#</a></h3>
+<p><strong>示例：两层 GCN 在 Cora 上做节点分类（完整训练流程）</strong></p>
+<pre data-lang="python"><code class="language-python">import torch
+import torch.nn.functional as F
+from torch_geometric.nn import GCNConv
+from torch_geometric.datasets import Planetoid
+
+# 1. 数据：Cora 已内置标准的 训练/验证/测试 掩码
+dataset = Planetoid(root=&#39;./data/Cora&#39;, name=&#39;Cora&#39;)
+data = dataset[0]
+print(f&#39;节点数 {data.num_nodes} | 特征维 {dataset.num_features} | 类别数 {dataset.num_classes}&#39;)
+
+# 2. 模型：编码器（2 层 GCN）+ 分类头（log_softmax）
+class GCN(torch.nn.Module):
+    def __init__(self, in_ch, hidden_ch, out_ch):
+        super().__init__()
+        self.conv1 = GCNConv(in_ch, hidden_ch)   # 默认带自环 + 对称归一化
+        self.conv2 = GCNConv(hidden_ch, out_ch)
+
+    def forward(self, x, edge_index):
+        x = self.conv1(x, edge_index)
+        x = F.relu(x)
+        x = F.dropout(x, p=0.5, training=self.training)
+        x = self.conv2(x, edge_index)
+        return F.log_softmax(x, dim=1)           # 每个节点输出类别对数概率
+
+model = GCN(dataset.num_features, 16, dataset.num_classes)
+optimizer = torch.optim.Adam(model.parameters(), lr=0.01, weight_decay=5e-4)
+
+# 3. 训练：损失只在 train_mask 上计算（半监督）
+def train():
+    model.train()
+    optimizer.zero_grad()
+    out = model(data.x, data.edge_index)
+    loss = F.nll_loss(out[data.train_mask], data.y[data.train_mask])
+    loss.backward()
+    optimizer.step()
+    return loss.item()
+
+# 4. 评估：三个掩码各自的准确率
+@torch.no_grad()
+def evaluate():
+    model.eval()
+    pred = model(data.x, data.edge_index).argmax(dim=1)
+    return [(pred[m] == data.y[m]).float().mean().item()
+            for m in [data.train_mask, data.val_mask, data.test_mask]]
+
+best_val, best_test = 0.0, 0.0
+for epoch in range(200):
+    loss = train()
+    tr, va, te = evaluate()
+    if va &gt; best_val:               # 用验证集挑最优，测试集只报告一次
+        best_val, best_test = va, te
+    if epoch % 20 == 0:
+        print(f&#39;Epoch {epoch:03d} | Loss {loss:.4f} | &#39;
+              f&#39;Train {tr:.4f} | Val {va:.4f} | Test {te:.4f}&#39;)
+
+print(f&#39;最终：Best Val {best_val:.4f} | 对应 Test {best_test:.4f}&#39;)</code></pre>
+<p>输出里要注意一个现象：训练集准确率常常能到 1.0（因为 Cora 每类只有 20 个训练节点，模型很快记住它们），真正衡量泛化的是验证集和测试集。最终测试集准确率约 0.81，是节点分类的经典基准线。</p>
+<p><strong>练习变体</strong>：把 <code>GCNConv</code> 换成 <code>SAGEConv</code> 或 <code>GATConv</code>（第 4 章学过），只改两行 import 和构造，观察准确率变化，体会&quot;任务框架不变、只换编码器&quot;的模块化设计。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>半监督损失</strong>：解释为什么损失只在训练节点上计算，但梯度却能&quot;传遍全图&quot;？从计算图（autograd）的角度说明。</li>
+<li><strong>层数实验</strong>：把卷积层数从 2 加到 4、6、8，观察测试准确率随层数的变化，并结合&quot;过平滑&quot;解释曲线形状。</li>
+<li><strong>自环的影响</strong>：将 <code>GCNConv</code> 的 <code>add_self_loops</code> 设为 <code>False</code>，重跑并对比，说明自环为什么重要。</li>
+<li><strong>特征 vs 结构</strong>：把 <code>data.x</code> 换成随机噪声（保持结构不变）再训练，准确率如何？反过来，把 <code>edge_index</code> 换成随机边（保持特征不变）呢？这能帮你判断该任务更依赖特征还是结构。</li>
+<li><strong>前瞻</strong>：本课预测的是&quot;每个节点属于哪一类&quot;。如果任务是预测&quot;整张图属于哪一类&quot;（如分子是否有毒），节点嵌入该如何&quot;浓缩&quot;成图表示？带着这个问题进入下一课。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>GCN 原论文：Kipf, Welling. &quot;Semi-Supervised Classification with Graph Convolutional Networks&quot; (ICLR 2017)：<a href="https://arxiv.org/abs/1609.02907" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1609.02907</a></li>
+<li>PyG 官方文档 · GCNConv：<a href="https://pytorch-geometric.readthedocs.io/en/latest/generated/torch_geometric.nn.conv.GCNConv.html" target="_blank" rel="noopener noreferrer">https://pytorch-geometric.readthedocs.io/en/latest/generated/torch_geometric.nn.conv.GCNConv.html</a></li>
+<li>PyG 官方文档 · 节点分类示例（Colab）：<a href="https://colab.research.google.com/drive/1h3-vJGRVloF5zStxL5I0rSy4ZUPNsjy8" target="_blank" rel="noopener noreferrer">https://colab.research.google.com/drive/1h3-vJGRVloF5zStxL5I0rSy4ZUPNsjy8</a></li>
+<li>PyG 官方文档 · Planetoid 数据集：<a href="https://pytorch-geometric.readthedocs.io/en/latest/generated/torch_geometric.datasets.Planetoid.html" target="_blank" rel="noopener noreferrer">https://pytorch-geometric.readthedocs.io/en/latest/generated/torch_geometric.datasets.Planetoid.html</a></li>
+</ul>
+<p><a href="#/l/gnn-ch5-l2">下一课：图分类</a></p>

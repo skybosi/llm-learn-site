@@ -1,0 +1,122 @@
+<h2 id="h-综合项目">综合项目<a class="anchor" href="#h-综合项目" aria-label="本节链接">#</a></h2>
+<p>这是《深度学习架构》的最后一课。我们把前面学过的所有零件——词表与嵌入、LSTM、teacher forcing、自回归解码——组装成一个完整的 <strong>序列到序列（seq2seq）</strong> 项目。任务很经典：输入一串乱序字母，模型输出排好序的字母。它麻雀虽小，却完整复刻了机器翻译的核心结构：<strong>编码器读入 → 解码器生成</strong>。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-任务与架构总览">1. 任务与架构总览<a class="anchor" href="#h-1-任务与架构总览" aria-label="本节链接">#</a></h4>
+<p>任务定义：输入如 <code>c a b d</code>，输出 <code>a b c d</code>。输入输出<strong>长度相同但顺序不同</strong>，正好用来演示 seq2seq 的编码器-解码器结构：</p>
+<ul>
+<li><strong>编码器（Encoder）</strong>：一个 LSTM，把输入序列从头到尾读一遍，把最终的记忆（隐藏状态 <code>h</code> 和细胞状态 <code>c</code>）作为整句的&quot;语义压缩&quot;；</li>
+<li><strong>解码器（Decoder）</strong>：另一个 LSTM，用编码器传来的记忆作为初始状态，然后一个字符一个字符地生成输出序列。</li>
+</ul>
+<p>两个 LSTM 是<strong>两套独立的参数</strong>，靠&quot;初始状态&quot;传递信息：编码器最后的状态，就是解码器最初的状态。这相当于把&quot;读懂的内容&quot;递交给&quot;负责写的人&quot;。</p>
+<p><figure><img class="md-img" src="content/courses/deep-learning-architectures/assets/chapter-6-figure-04.svg" alt="seq2seq 编码器-解码器架构示意" loading="lazy" decoding="async"><figcaption>seq2seq 编码器-解码器架构示意</figcaption></figure>
+</p>
+<h4 id="h-2-三个特殊符号soseospad">2. 三个特殊符号：SOS、EOS、PAD<a class="anchor" href="#h-2-三个特殊符号soseospad" aria-label="本节链接">#</a></h4>
+<p>生成式模型需要三个特殊标记来约定&quot;何时开始、何时结束、怎么补长&quot;：</p>
+<ul>
+<li><strong><code>&lt;sos&gt;</code>（start of sequence）</strong>：解码器第一个时间步的输入，表示&quot;开始生成&quot;；</li>
+<li><strong><code>&lt;eos&gt;</code>（end of sequence）</strong>：生成到它表示&quot;这句话写完了&quot;，训练时也作为目标序列的结尾；</li>
+<li><strong><code>&lt;pad&gt;</code>（padding）</strong>：把不等长的序列补成等长，本身不参与损失计算。</li>
+</ul>
+<p>它们让变长序列的生成有了明确的&quot;起止信号&quot;，是几乎所有生成式 NLP 系统的标配。</p>
+<h4 id="h-3-训练teacher-forcing">3. 训练：teacher forcing<a class="anchor" href="#h-3-训练teacher-forcing" aria-label="本节链接">#</a></h4>
+<p>训练解码器时，我们用 teacher forcing（上一课学的）：解码器每一步的输入是<strong>真实的</strong>目标字符，而不是自己上一步的预测。整体流程：</p>
+<ol>
+<li>编码器读入乱序输入，得到最终状态；</li>
+<li>解码器以 <code>&lt;sos&gt;</code> 开头，每一步喂真实的&quot;上一个目标字符&quot;，输出对下一个字符的预测；</li>
+<li>用预测和真实目标（含 <code>&lt;eos&gt;</code>）算交叉熵，反向传播更新两个 LSTM。</li>
+</ol>
+<p>这样训练稳定高效，模型很快就能学会&quot;把字母排好序&quot;。</p>
+<h4 id="h-4-推理自回归--贪心解码">4. 推理：自回归 + 贪心解码<a class="anchor" href="#h-4-推理自回归--贪心解码" aria-label="本节链接">#</a></h4>
+<p>推理时没有老师，解码器改为自回归：以 <code>&lt;sos&gt;</code> 起步，每步取预测概率最大的字符（贪心），把它当作下一步的输入，直到输出 <code>&lt;eos&gt;</code> 或到达最大长度。这就是上一课生成流程在 seq2seq 上的完整应用。</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面完整实现并训练这个&quot;字母排序&quot;seq2seq 模型。代码刻意写得直白、贴近讲解，方便你照葫芦画瓢改造成自己的翻译/摘要任务。</p>
+<pre data-lang="python"><code class="language-python">import torch
+import torch.nn as nn
+
+torch.manual_seed(0)
+
+# 1) 词汇表：&lt;pad&gt; &lt;sos&gt; &lt;eos&gt; + 四个字母 a b c d
+chars = &quot;abcd&quot;
+tokens = [&quot;&lt;pad&gt;&quot;, &quot;&lt;sos&gt;&quot;, &quot;&lt;eos&gt;&quot;] + list(chars)
+t2i = {t: i for i, t in enumerate(tokens)}
+i2t = {i: t for t, i in t2i.items()}
+
+class Seq2Seq(nn.Module):
+    def __init__(self, vocab_size, hidden):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, hidden)
+        self.encoder = nn.LSTM(hidden, hidden, batch_first=True)
+        self.decoder = nn.LSTM(hidden, hidden, batch_first=True)
+        self.fc = nn.Linear(hidden, vocab_size)
+
+    def forward(self, src, tgt):
+        &quot;&quot;&quot;训练用（teacher forcing）。src: 乱序输入，tgt: 目标序列（以 &lt;sos&gt; 开头）。&quot;&quot;&quot;
+        # 编码器：读完整条输入，取最终状态 (h, c)
+        _, (h, c) = self.encoder(self.embed(src))
+        # 解码器：逐个喂真实目标字符
+        dec_in = self.embed(tgt)                       # (batch, tgt_len, hidden)
+        out, _ = self.decoder(dec_in, (h, c))
+        return self.fc(out)                            # (batch, tgt_len, vocab)
+
+    def decode(self, src, max_len=8):
+        &quot;&quot;&quot;推理用（自回归贪心解码）。&quot;&quot;&quot;
+        _, (h, c) = self.encoder(self.embed(src))
+        token = torch.tensor([t2i[&quot;&lt;sos&gt;&quot;]] * src.size(0))   # 每个样本都以 &lt;sos&gt; 起步
+        result = []
+        for _ in range(max_len):
+            out, (h, c) = self.decoder(self.embed(token).unsqueeze(1), (h, c))
+            token = self.fc(out.squeeze(1)).argmax(1)         # 贪心取最大概率
+            result.append(token)
+        return torch.stack(result, dim=1)                     # (batch, max_len)
+
+model = Seq2Seq(len(tokens), hidden=16)
+loss_fn = nn.CrossEntropyLoss(ignore_index=t2i[&quot;&lt;pad&gt;&quot;])     # 忽略 &lt;pad&gt;
+opt = torch.optim.Adam(model.parameters(), lr=0.01)
+
+# 2) 构造数据：对 abcd 的随机排列做排序
+def make_batch(n):
+    src, tgt = [], []
+    for _ in range(n):
+        perm = torch.randperm(len(chars))                     # 随机排列
+        src.append(perm + len(tokens) - len(chars))           # 映射到字母的索引
+        sorted_ = torch.sort(perm).values + len(tokens) - len(chars)
+        tgt.append(torch.cat([torch.tensor([t2i[&quot;&lt;sos&gt;&quot;]]), sorted_,
+                              torch.tensor([t2i[&quot;&lt;eos&gt;&quot;]])]))
+    return torch.stack(src), torch.stack(tgt)
+
+# 3) 训练
+for step in range(1000):
+    src, tgt = make_batch(64)
+    logits = model(src, tgt[:, :-1])                         # 输入不含 &lt;eos&gt;
+    loss = loss_fn(logits.reshape(-1, len(tokens)), tgt[:, 1:].reshape(-1))
+    opt.zero_grad()
+    loss.backward()
+    opt.step()
+    if step % 200 == 0:
+        print(f&quot;step {step:4d} | loss={loss.item():.4f}&quot;)
+
+# 4) 推理：拿几条新乱序输入，看能否正确排序
+test_src = torch.stack([torch.randperm(len(chars)) + len(tokens) - len(chars)
+                        for _ in range(4)])
+with torch.no_grad():
+    pred = model.decode(test_src)
+
+for s, p in zip(test_src, pred):
+    src_str = &quot;&quot;.join(i2t[i.item()] for i in s)
+    out_str = &quot;&quot;.join(i2t[i.item()] for i in p if i2t[i.item()] not in (&quot;&lt;eos&gt;&quot;, &quot;&lt;pad&gt;&quot;))
+    print(f&quot;输入 {src_str} → 输出 {out_str}&quot;)</code></pre>
+<p>运行后，损失会稳步下降，最后对新的乱序输入，模型基本能输出正确的 <code>abcd</code> 排序。这就是 seq2seq 的完整闭环：<strong>编码器读懂、解码器写出</strong>。把字母换成词、把&quot;排序&quot;换成&quot;翻译&quot;，结构完全不变——这正是机器翻译、文本摘要这些大模型的骨架。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>把字母表从 4 个扩充到 6 个（<code>abcdef</code>），重新训练并测试，观察模型是否仍能学会排序，训练时间发生了什么变化。</li>
+<li>把&quot;排序&quot;任务改成&quot;反转&quot;任务（输入 <code>abcd</code> 输出 <code>dcba</code>），只需改动 <code>make_batch</code> 里的目标构造，重训并验证。</li>
+<li>把贪心解码改成带温度采样（参考上一课的 <code>torch.multinomial</code>），观察生成结果是否出现&quot;乱序&quot;错误，并解释为什么序列任务里贪心通常更稳。</li>
+<li>思考：编码器把整句压缩成一个固定长度的状态 <code>(h, c)</code>，当输入序列很长时会遇到什么瓶颈？结合注意力机制的作用谈谈你的理解。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>PyTorch 官方文档 · LSTM：<a href="https://pytorch.org/docs/stable/generated/torch.nn.LSTM.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/docs/stable/generated/torch.nn.LSTM.html</a></li>
+<li>PyTorch 官方教程 · 翻译与 seq2seq + 注意力：<a href="https://pytorch.org/tutorials/intermediate/seq2seq_translation_tutorial.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/tutorials/intermediate/seq2seq_translation_tutorial.html</a></li>
+<li>Sutskever et al. · Sequence to Sequence Learning with Neural Networks：<a href="https://arxiv.org/abs/1409.3215" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1409.3215</a></li>
+</ul>
+<p>恭喜你完成《深度学习架构》！</p>

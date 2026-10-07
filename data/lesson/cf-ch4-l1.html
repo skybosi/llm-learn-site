@@ -1,0 +1,306 @@
+<h2 id="h-三地址码为什么几乎所有优化都建在它上面">三地址码：为什么几乎所有优化都建在它上面<a class="anchor" href="#h-三地址码为什么几乎所有优化都建在它上面" aria-label="本节链接">#</a></h2>
+<p>打开任何一个真实编译器，你会发现绝大多数优化 pass 都不读语法树：LLVM 的 <code>opt</code> 只吃 IR，GCC 的优化跑在 GIMPLE 上。为什么大家宁愿先花力气&quot;翻译&quot;一遍，也不直接在 AST 上做优化？答案有一部分是数据结构选择：<strong>三地址码</strong>（three-address code，TAC）。这一课要说清它的准确形状，以及它凭什么让常量折叠、公共子表达式消除、死代码消除都愿意建在它上面。</p>
+<p><figure><img class="md-img" src="content/courses/compiler-foundations/assets/chapter-4-figure-01.svg" alt="三地址码：把嵌套的 AST 拉成扁平、显式指令序列" loading="lazy" decoding="async"><figcaption>三地址码：把嵌套的 AST 拉成扁平、显式指令序列</figcaption></figure>
+</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-一个-ir-要满足哪四个条件才配被反复优化">1. 一个 IR 要满足哪四个条件，才配被反复优化<a class="anchor" href="#h-1-一个-ir-要满足哪四个条件才配被反复优化" aria-label="本节链接">#</a></h4>
+<p>优化 pass 的本质是&quot;在某种表示上做模式匹配，再改写&quot;。要让这件事成立，表示必须同时满足四条：</p>
+<ol>
+<li><strong>每条指令职责单一</strong>：一行只做一个运算，pass 才能用有限的模式枚举它。</li>
+<li><strong>定义与使用显式</strong>：<code>t1 = a + b</code> 直接说明 <code>t1</code> 由谁算出、<code>a</code>、<code>b</code> 被谁使用，不必穿过父节点找依赖。</li>
+<li><strong>顺序显式</strong>：程序点可比较，&quot;第几条指令&quot;即执行顺序的近似（有跳转时换成 CFG）。</li>
+<li><strong>名字可再生</strong>：临时名要多少有多少；IR 阶段故意用得很奢侈，把&quot;名字不够&quot;留给后端。</li>
+</ol>
+<p>AST 有三条不达标：它是<strong>嵌套</strong>的（条件 1、3 不满足）；同一子表达式在树里是两棵独立子树，&quot;它们同值&quot;只能靠子树同构去判；想在中间插入临时结果，还得改父节点。</p>
+<h4 id="h-2-三地址码的定义与指令种类">2. 三地址码的定义与指令种类<a class="anchor" href="#h-2-三地址码的定义与指令种类" aria-label="本节链接">#</a></h4>
+<p>三地址码是&quot;每条指令最多一个运算符、最多三个地址&quot;的 IR，典型形式 <code>x = y op z</code>；<code>x</code>、<code>y</code>、<code>z</code> 都是名字——源程序变量、常量，或编译器生成的<strong>临时名</strong>（temporary）。这套记法出自龙书《Compilers: Principles, Techniques, and Tools》§6.2.3。</p>
+<table>
+<thead>
+<tr>
+<th>类别</th>
+<th>形式</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>复制</td>
+<td><code>x = y</code></td>
+<td>赋值、参数搬运、退出 SSA 后的产物</td>
+</tr>
+<tr>
+<td>二元运算</td>
+<td><code>x = y op z</code></td>
+<td>算术与位运算</td>
+</tr>
+<tr>
+<td>无条件跳转</td>
+<td><code>goto L</code></td>
+<td>标签由 lowering 生成</td>
+</tr>
+<tr>
+<td>条件跳转</td>
+<td><code>if x relop y goto L</code></td>
+<td>比较与跳转合成一条</td>
+</tr>
+<tr>
+<td>过程调用</td>
+<td><code>param x</code>；<code>call p, n</code></td>
+<td>参数传递与调用分开，<code>n</code> 是参数个数</td>
+</tr>
+<tr>
+<td>索引与指针</td>
+<td><code>x = y[i]</code>、<code>x[i] = y</code>、<code>x = &amp;y</code>、<code>x = *y</code></td>
+<td>数组访问与取地址</td>
+</tr>
+</tbody></table>
+<p>同一套指令有三种等价记法：<strong>四元式</strong>（<code>(op, arg1, arg2, result)</code> 四元组）、<strong>三元式</strong>（省略 <code>result</code>，用&quot;第几条指令&quot;引用结果）、<strong>间接三元式</strong>（三元式加一个指令指针数组，移动指令时不必重编号）。本课用四元式，调试时最好读。</p>
+<h4 id="h-3-一段例子ast-怎么变成-tac">3. 一段例子：AST 怎么变成 TAC<a class="anchor" href="#h-3-一段例子ast-怎么变成-tac" aria-label="本节链接">#</a></h4>
+<p>源码 <code>d = (a + b) * c; e = (a + b) / c;</code>。后序遍历下降（先子后父）之后是 6 条指令：<code>t1 = a + b</code>、<code>t2 = t1 * c</code>、<code>d = t2</code>、<code>t3 = a + b</code>、<code>t4 = t3 / c</code>、<code>e = t4</code>。</p>
+<p>关键观察：同一个式子 <code>a + b</code> 出现两次，naive 下降就算了两遍，而<strong>第二次 add 是多余的</strong>——值编号（value numbering）发现 <code>t3</code> 与 <code>t1</code> 右值相同，换成 <code>t3 = copy t1</code>，一次加法消失。&quot;右值相同&quot;在 TAC 里就是<strong>两个可直接比较的元组</strong>，在 AST 里却是子树同构判定。</p>
+<h4 id="h-4-为什么几乎所有优化都建在它上面">4. 为什么几乎所有优化都建在它上面<a class="anchor" href="#h-4-为什么几乎所有优化都建在它上面" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>优化</th>
+<th>在 TAC 上的样子</th>
+<th>依赖哪条性质</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>常量折叠</td>
+<td>两个操作数都是常量 → 直接算出结果</td>
+<td>指令职责单一</td>
+</tr>
+<tr>
+<td>公共子表达式消除</td>
+<td>右值相同的指令只留一条，其余改 <code>copy</code></td>
+<td>名字可再生</td>
+</tr>
+<tr>
+<td>到达定值 / 活跃变量</td>
+<td>逐条求 def/use 集合，在图上迭代到不动点</td>
+<td>def/use 显式</td>
+</tr>
+<tr>
+<td>死代码消除</td>
+<td>结果无 use 且无副作用 → 删除</td>
+<td>副作用可枚举</td>
+</tr>
+<tr>
+<td>强度削减</td>
+<td><code>x * 2</code> → <code>x + x</code></td>
+<td>指令种类少</td>
+</tr>
+<tr>
+<td>循环不变量外提</td>
+<td>同一条指令搬到循环外</td>
+<td>顺序显式 + 可移动</td>
+</tr>
+</tbody></table>
+<p>最后一行背后的东西尤其重要：<strong>这些 pass 都不需要知道源语言长什么样</strong>，只认指令形状与数据流事实——这正是 LLVM 用同一套优化服务 C、C++、Rust、Swift 的原因。</p>
+<h4 id="h-5-tac-不是唯一选择四种-ir-风格">5. TAC 不是唯一选择：四种 IR 风格<a class="anchor" href="#h-5-tac-不是唯一选择四种-ir-风格" aria-label="本节链接">#</a></h4>
+<p>Crafting Interpreters 第 2 章 §2.1.4 列出的 IR 风格检索词正是 control flow graph、static single-assignment、continuation-passing style 与 three-address code。</p>
+<table>
+<thead>
+<tr>
+<th>形式</th>
+<th>值放在哪</th>
+<th>例子</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>名字式三地址码</td>
+<td>有名字的临时量</td>
+<td>本课的 <code>(add, a, b, t1)</code></td>
+</tr>
+<tr>
+<td>栈式字节码</td>
+<td>隐式操作数栈</td>
+<td>CPython 的 <code>LOAD_FAST</code> / <code>BINARY_ADD</code></td>
+</tr>
+<tr>
+<td>SSA</td>
+<td>每个名字只被赋值一次</td>
+<td>LLVM IR 的 <code>%x = add i32 %a, %b</code>（第 3 课）</td>
+</tr>
+<tr>
+<td>图 IR</td>
+<td>节点=运算，边=数据依赖</td>
+<td>AST、DAG、数据流图</td>
+</tr>
+</tbody></table>
+<p>本课站在最基础的那一格：<strong>LLVM IR 可以看作&quot;类型化 + SSA 化 + 名字化&quot;的三地址码</strong>，CPython 字节码则是&quot;栈式&quot;的三地址码。</p>
+<h4 id="h-6-常见坑">6. 常见坑<a class="anchor" href="#h-6-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>把 TAC 当可执行代码</strong>：它没有寄存器、栈帧与调用约定，那些全是后端的事。</li>
+<li><strong>忽略名字重定义</strong>：<code>sum = sum + i</code> 两边是两个不同的值，值编号时必须让旧编号失效；本课示例假设块内每个变量只定义一次，SSA 把这条假设变成制度（第 3 课）。</li>
+<li><strong>把有副作用的指令当纯表达式</strong>：过程调用与数组写不能因结果没人用就删。</li>
+<li><strong>用局部冒充全局</strong>：值编号只在块内成立，跨块要 CFG + 数据流（下一课）。</li>
+<li><strong>让短路被优化掉</strong>：<code>if (a != 0 &amp;&amp; b / a &gt; 0)</code> 不能降成&quot;先算 <code>b / a</code> 再合并&quot;——短路是语义。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面这段纯 Python（无第三方依赖）把&quot;表达式 → 四元式 → 局部值编号&quot;走通，并打印每条指令的 def/use 集合——后者正是第 5 章数据流分析的原料。</p>
+<pre data-lang="python"><code class="language-python"># ---- 三地址码生成 + 局部值编号（纯 Python，无第三方依赖）----
+import re
+
+TOKEN = re.compile(r&#39;\s*(?:(\d+)|([a-zA-Z_]\w*)|([-+*/()=;]))&#39;)
+
+def tokenize(src):
+    &quot;&quot;&quot;词法分析：字符流 → token 流（只认数字、标识符、运算符与分号）&quot;&quot;&quot;
+    out, i = [], 0
+    while i &lt; len(src):
+        m = TOKEN.match(src, i)
+        if not m:
+            raise SyntaxError(f&#39;非法字符 {src[i]!r} at {i}&#39;)
+        i = m.end()
+        num, name, op = m.groups()
+        if num:    out.append((&#39;NUM&#39;, int(num)))
+        elif name: out.append((&#39;NAME&#39;, name))
+        else:      out.append((&#39;OP&#39;, op))
+    return out
+
+def parse(tokens):
+    &quot;&quot;&quot;语法分析：只处理 &#39;名字 = 表达式 ;&#39; 的直线序列（控制流留到下一课）&quot;&quot;&quot;
+    pos = 0
+    def peek(): return tokens[pos] if pos &lt; len(tokens) else (None, None)
+    def eat(kind, value=None):
+        nonlocal pos
+        k, v = peek()
+        if k != kind or (value is not None and v != value):
+            raise SyntaxError(f&#39;期望 {kind}{value or &quot;&quot;}，得到 {(k, v)}&#39;)
+        pos += 1
+        return v
+    def expr():
+        node = term()
+        while peek() in ((&#39;OP&#39;, &#39;+&#39;), (&#39;OP&#39;, &#39;-&#39;)):
+            node = (&#39;bin&#39;, eat(&#39;OP&#39;), node, term())
+        return node
+    def term():
+        node = atom()
+        while peek() in ((&#39;OP&#39;, &#39;*&#39;), (&#39;OP&#39;, &#39;/&#39;)):
+            node = (&#39;bin&#39;, eat(&#39;OP&#39;), node, atom())
+        return node
+    def atom():
+        k, v = peek()
+        if k == &#39;NUM&#39;:  eat(&#39;NUM&#39;);  return (&#39;num&#39;, v)
+        if k == &#39;NAME&#39;: eat(&#39;NAME&#39;); return (&#39;var&#39;, v)
+        if (k, v) == (&#39;OP&#39;, &#39;(&#39;):
+            eat(&#39;OP&#39;, &#39;(&#39;); node = expr(); eat(&#39;OP&#39;, &#39;)&#39;); return node
+        raise SyntaxError(f&#39;表达式起始处意外 token {(k, v)}&#39;)
+    prog = []
+    while pos &lt; len(tokens):
+        name = eat(&#39;NAME&#39;); eat(&#39;OP&#39;, &#39;=&#39;)
+        prog.append((&#39;assign&#39;, name, expr())); eat(&#39;OP&#39;, &#39;;&#39;)
+    return prog
+
+OPNAME = {&#39;+&#39;: &#39;add&#39;, &#39;-&#39;: &#39;sub&#39;, &#39;*&#39;: &#39;mul&#39;, &#39;/&#39;: &#39;div&#39;}
+
+class TACGen:
+    &quot;&quot;&quot;三地址码：四元式 (op, arg1, arg2, result)，每条指令最多一个运算&quot;&quot;&quot;
+    def __init__(self):
+        self.code, self.n = [], 0
+    def tmp(self):
+        self.n += 1
+        return f&#39;t{self.n}&#39;
+    def emit(self, op, a1, a2, res):
+        self.code.append((op, a1, a2, res))
+    def gen(self, node):
+        k = node[0]
+        if k == &#39;num&#39;: return (&#39;const&#39;, node[1])
+        if k == &#39;var&#39;: return (&#39;name&#39;, node[1])
+        _, op, l, r = node
+        a1, a2 = self.gen(l), self.gen(r)      # 先子后父 = 后序遍历
+        res = self.tmp()                       # 名字可再生：临时名要多少有多少
+        self.emit(OPNAME[op], a1, a2, res)
+        return (&#39;name&#39;, res)
+    def program(self, prog):
+        for _, name, e in prog:
+            self.emit(&#39;copy&#39;, self.gen(e), None, name)
+        return self.code
+
+def def_use(instr):
+    &quot;&quot;&quot;每条指令的 (定义, 使用集合) —— 数据流分析的基本原料&quot;&quot;&quot;
+    op, a1, a2, res = instr
+    uses = [x[1] for x in (a1, a2) if x and x[0] == &#39;name&#39;]
+    return res, uses
+
+def local_cse(code):
+    &quot;&quot;&quot;局部值编号：块内相同右值只算一次，后续重算改成 copy。
+    注意：假设每个变量在块内只定义一次（否则旧的右值编号必须失效）。&quot;&quot;&quot;
+    vnum, out = {}, []
+    for op, a1, a2, res in code:
+        if op == &#39;copy&#39;:
+            key = (&#39;copy&#39;, a1, a2)
+            if key in vnum:
+                out.append((&#39;copy&#39;, (&#39;name&#39;, vnum[key]), None, res))
+            else:
+                vnum[key] = res
+                out.append((op, a1, a2, res))
+            continue
+        key = (op, a1, a2)
+        if key in vnum:
+            out.append((&#39;copy&#39;, (&#39;name&#39;, vnum[key]), None, res))   # 复用已有结果
+        else:
+            vnum[key] = res
+            out.append((op, a1, a2, res))
+    return out
+
+def show(code, title):
+    print(f&#39;--- {title}（{len(code)} 条）---&#39;)
+    for i, (op, a1, a2, res) in enumerate(code):
+        def fmt(x): return &#39;-&#39; if x is None else (str(x[1]) if x[0] == &#39;name&#39; else f&#39;#{x[1]}&#39;)
+        d, u = def_use((op, a1, a2, res))
+        print(f&#39;{i:&gt;2}: {res:&lt;4} = {op:&lt;4} {fmt(a1):&lt;4} {fmt(a2):&lt;4}  def={d} use={u}&#39;)
+
+def arith(code):
+    return sum(1 for i in code if i[0] in OPNAME.values())
+
+def copies(code):
+    return sum(1 for i in code if i[0] == &#39;copy&#39;)
+
+src = &#39;d = (a + b) * c; e = (a + b) / c;&#39;
+tac = TACGen().program(parse(tokenize(src)))
+after = local_cse(tac)
+show(tac, &#39;lowering 后的三地址码&#39;)
+show(after, &#39;值编号/公共子表达式消除后&#39;)
+print(f&#39;\n算术指令：{arith(tac)} → {arith(after)}；copy 指令：{copies(tac)} → {copies(after)}&#39;)</code></pre>
+<p>运行结果（每条指令后面直接列出 def/use，便于人工核对）：</p>
+<pre><code>--- lowering 后的三地址码（6 条）---
+ 0: t1   = add  a    b     def=t1 use=[&#39;a&#39;, &#39;b&#39;]
+ 1: t2   = mul  t1   c     def=t2 use=[&#39;t1&#39;, &#39;c&#39;]
+ 2: d    = copy t2   -     def=d use=[&#39;t2&#39;]
+ 3: t3   = add  a    b     def=t3 use=[&#39;a&#39;, &#39;b&#39;]
+ 4: t4   = div  t3   c     def=t4 use=[&#39;t3&#39;, &#39;c&#39;]
+ 5: e    = copy t4   -     def=e use=[&#39;t4&#39;]
+--- 值编号/公共子表达式消除后（6 条）---
+ 0: t1   = add  a    b     def=t1 use=[&#39;a&#39;, &#39;b&#39;]
+ 1: t2   = mul  t1   c     def=t2 use=[&#39;t1&#39;, &#39;c&#39;]
+ 2: d    = copy t2   -     def=d use=[&#39;t2&#39;]
+ 3: t3   = copy t1   -     def=t3 use=[&#39;t1&#39;]
+ 4: t4   = div  t3   c     def=t4 use=[&#39;t3&#39;, &#39;c&#39;]
+ 5: e    = copy t4   -     def=e use=[&#39;t4&#39;]
+
+算术指令：4 → 3；copy 指令：2 → 3</code></pre>
+<p>指令条数没变（6 → 6），但<strong>算术指令从 4 条降到 3 条</strong>，多出来的那条是廉价的 <code>copy</code>。这一点很重要：优化 pass 的收益要按&quot;贵指令减少、便宜指令增加&quot;来算，而不是按总条数。</p>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选（需本机有 clang）：同一条源码走一遍真实工具链 ----
+# 把下面内容存为 demo.c：
+#   int demo(int a, int b, int c) { int d = (a + b) * c; int e = (a + b) / c; return d + e; }
+# 然后：
+#   clang -O0 -S -emit-llvm demo.c -o demo_O0.ll   # 看 IR 的三地址码形态（%x = add i32 ...）
+#   clang -O2 -S demo.c -o demo_O2.s              # 看优化后重复的 add 是否只剩一次
+# 没有 clang 不影响本课：上面的 Python 版已经把&quot;重复计算 → 复用&quot;演示完整。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：给 <code>local_cse</code> 增加常量折叠——两个操作数都是常量时直接算出结果、改成 <code>copy #值</code>；用 <code>d = (2 + 3) * c;</code> 验证。</li>
+<li><strong>解释</strong>：为什么三地址码要限制&quot;每条指令最多一个运算符&quot;？允许 <code>t = a + b * c</code> 会让 pass 在哪些地方变复杂？</li>
+<li><strong>对比/验证</strong>：把例 1 的 TAC 与 <code>clang -O0 -emit-llvm</code> 对同一段 C 代码的 IR 并排比较，列出三点差异（提示：类型、<code>alloca</code>/<code>load</code>/<code>store</code>、SSA 名字）并解释来源。</li>
+<li><strong>思考</strong>：临时名&quot;无限供应&quot;为什么对后端重要？若 IR 只允许 8 个名字，编译器被迫在什么时候做寄存器分配，代价是什么？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Robert Nystrom, <em>Crafting Interpreters</em> 第 2 章 §2.1.4「Intermediate Representations」（IR 的四种风格与前端/中端/后端分工）：<a href="https://craftinginterpreters.com/a-map-of-the-territory.html" target="_blank" rel="noopener noreferrer">https://craftinginterpreters.com/a-map-of-the-territory.html</a></li>
+<li>Aho, Lam, Sethi, Ullman, <em>Compilers: Principles, Techniques, and Tools</em>（龙书）第 6 章 §6.2.3「Three-Address Code」（指令种类与四元式/三元式）：<a href="https://suif.stanford.edu/dragonbook/" target="_blank" rel="noopener noreferrer">https://suif.stanford.edu/dragonbook/</a></li>
+<li>LLVM 官方 Kaleidoscope 教程（第 3 章：从 AST 生成 LLVM IR）：<a href="https://llvm.org/docs/tutorial/" target="_blank" rel="noopener noreferrer">https://llvm.org/docs/tutorial/</a></li>
+<li>LLVM IR 参考手册（IR 的指令、类型与 SSA 名字语法）：<a href="https://llvm.org/docs/LangRef.html" target="_blank" rel="noopener noreferrer">https://llvm.org/docs/LangRef.html</a></li>
+</ul>
+<p><a href="#/l/cf-ch4-l2">下一课：控制流图（CFG）与基本块</a></p>

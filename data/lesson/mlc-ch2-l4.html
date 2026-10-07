@@ -1,0 +1,196 @@
+<h2 id="h-图断裂graph-break成因代价与诊断">图断裂（graph break）：成因、代价与诊断<a class="anchor" href="#h-图断裂graph-break成因代价与诊断" aria-label="本节链接">#</a></h2>
+<p>第 3 课的 guard 处理的是&quot;形状变了怎么办&quot;，但还有一类让编译器更难受的情况：<strong>这段 Python 的语义根本没法进图</strong>。<code>loss.item()</code> 把张量压成 Python 数字，<code>print(loss)</code> 有副作用，<code>if x.sum() &gt; 0:</code> 的条件来自张量值——这些语句一旦出现，前端只能把已捕获的前缀编译成一段图、把剩下的交回 eager 执行，再从断点继续跟踪。这个动作叫<strong>图断裂（graph break）</strong>。它的代价不是&quot;多一个 kernel&quot;，而是<strong>每断一处就多一条 Python 语言的边界</strong>：中间张量被迫物化回 eager、跨边界的算子链失去融合机会、每段还要各付一次调度开销。本课把断裂规则写成可打印的规则表与诊断器。</p>
+<p><figure><img class="md-img" src="content/courses/ml-compilers/assets/chapter-2-figure-02.svg" alt="一次执行触发图断裂的全过程" loading="lazy" decoding="async"><figcaption>一次执行触发图断裂的全过程</figcaption></figure>
+</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-前端为什么必须停">1. 前端为什么必须&quot;停&quot;<a class="anchor" href="#h-1-前端为什么必须停" aria-label="本节链接">#</a></h4>
+<p>Dynamo 类前端接管的是字节码派发，它能安全编译的语义有个硬边界：<strong>图里只能有张量计算</strong>。一旦某条指令的语义依赖&quot;Python 世界的对象&quot;——标量、容器、异常、IO、模块属性——编译结果就无法只用张量运算表达，必须停。这不是实现偷懒，而是图的表达能力决定的：FX 图只有&quot;算子 + 张量边&quot;，没有 Python 的对象模型。</p>
+<h4 id="h-2-五类常见断因">2. 五类常见断因<a class="anchor" href="#h-2-五类常见断因" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>断因</th>
+<th>典型代码</th>
+<th>为什么不能进图</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>张量 → Python 标量</td>
+<td><code>loss.item()</code>、<code>float(x)</code></td>
+<td>标量脱离图，后续 Python 逻辑无法在图上表达</td>
+</tr>
+<tr>
+<td>数据相关控制流</td>
+<td><code>if x.sum() &gt; 0:</code>、<code>while x[i] &lt; 0:</code></td>
+<td>条件来自张量值，图里只能记 guard，不能选支</td>
+</tr>
+<tr>
+<td>Python 副作用</td>
+<td><code>print</code>、写文件、改全局</td>
+<td>输出/IO 的顺序与内容不归图管</td>
+</tr>
+<tr>
+<td>Python 容器修改</td>
+<td><code>stats[&#39;n&#39;] += 1</code>、<code>list.append</code></td>
+<td>图只跟踪张量，容器状态留在 Python 里</td>
+</tr>
+<tr>
+<td>依赖张量值的断言</td>
+<td><code>assert x.max() &gt; 0</code></td>
+<td>失败要让 Python 抛异常，控制流在 Python 侧</td>
+</tr>
+</tbody></table>
+<p>与之相对，<strong>纯张量链</strong>（<code>matmul → add → relu → matmul</code>）不会断；<code>torch.where</code>、张量算术形式的条件选择也能留在图里——这是&quot;改写掉断裂&quot;的主要手段。</p>
+<h4 id="h-3-代价不是多一个-kernel这么简单">3. 代价：不是&quot;多一个 kernel&quot;这么简单<a class="anchor" href="#h-3-代价不是多一个-kernel这么简单" aria-label="本节链接">#</a></h4>
+<p>断裂把函数切成 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span></span></span></span> 段、留下 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0502em;">B</span></span></span></span> 处断点，开销至少有三块：</p>
+<ol>
+<li><strong>边界物化</strong>：每段结尾的张量必须写回 eager 的存储，下一段再从那里读，段间无法融合。</li>
+<li><strong>调度与派发</strong>：每段是一次独立的图执行（各自的内核启动、参数准备），<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span></span></span></span> 段就有 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span></span></span></span> 份固定开销。</li>
+<li><strong>Python 往返</strong>：每到断点都要回到 Python 解释器执行一条语句（这正是断因本身），再重新进入跟踪。</li>
+</ol>
+<p>本课代码用一个示意模型把这三块压成两个参数：每段固定开销 12 单位、每断点 25 单位。它<strong>不是实测性能，只用来比较相对大小</strong>；结论是同一个 7 算子的模型，四处断裂时固定开销是无断裂时的约 11 倍（12 → 136）。</p>
+<h4 id="h-4-诊断方法">4. 诊断方法<a class="anchor" href="#h-4-诊断方法" aria-label="本节链接">#</a></h4>
+<p>断裂本身不报错，所以诊断靠&quot;让编译器说出来&quot;：Dynamo 会在日志里打印<strong>断点位置与原因</strong>（<code>TORCH_LOGS=graph_breaks</code> 一类开关，具体名称以本机文档为准），再配合 <code>torch._dynamo.explain</code> 给出每段的算子数与断因。拿到断因表之后，动作是固定的两步查表：</p>
+<ul>
+<li><strong>能改写就改写</strong>：<code>if x.sum() &gt; 0</code> → <code>torch.where</code>；<code>.item()</code> 移到编译区外。</li>
+<li><strong>改不了就隔离</strong>：把副作用、日志、容器状态挪到被编译函数的<strong>外面</strong>，让编译器只看见张量。</li>
+</ul>
+<h4 id="h-5-常见坑">5. 常见坑<a class="anchor" href="#h-5-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>只数算子数</strong>：段数少不等于收益高，一段里塞满互相依赖的算子可能刚好塞满寄存器。</li>
+<li><strong>把断裂当 bug</strong>：它是前端的<strong>安全策略</strong>（宁可退回 eager 也不编错）；要处理的是代价，不是存在性。</li>
+<li><strong>用 <code>fullgraph=True</code> 当优化开关</strong>：它把断裂变成报错，只适合&quot;我要确认这段代码能整体进图&quot;的验收场景。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面用纯标准库（本机 python3.10 与 python3.14 输出一致）写一个极简前端模拟器：<code>trace_program</code> 按&quot;算子可编译则并进当前段，否则结束当前段并记断点&quot;的规则切段，<code>BREAK_RULES</code> 是断因表，最后把断点翻译成&quot;改哪一行&quot;的诊断表。</p>
+<pre data-lang="python"><code class="language-python"># ===== 图断裂：哪些语句会让前端&quot;切一刀&quot;，以及切完的代价 =====
+# 纯标准库实现（本机 python3.10 与 python3.14 输出一致）
+
+# ---------- 0. 被前端接管的算子（其余语句一律按&quot;不可编译语义&quot;处理） ----------
+COMPILABLE = {&#39;matmul&#39;, &#39;add&#39;, &#39;mul&#39;, &#39;sub&#39;, &#39;div&#39;, &#39;exp&#39;, &#39;relu&#39;}
+
+class Seg:
+    def __init__(self, start): self.start, self.ops = start, []
+    def __repr__(self):
+        return f&#39;段@{self.start}({len(self.ops)} 个算子)&#39;
+
+def trace_program(program):
+    &quot;&quot;&quot;program 是 (op, *args) 语句表。规则：算子可编译就并进当前段；
+    不可编译语句结束当前段（若无段则跳过），并记成一处断点。&quot;&quot;&quot;
+    segs, breaks, cur = [], [], None
+    for i, stmt in enumerate(program):
+        if stmt[0] in COMPILABLE:
+            if cur is None: cur = Seg(i); segs.append(cur)
+            cur.ops.append(stmt[0])
+        else:
+            if cur is not None: cur = None
+            breaks.append((i, stmt[0]))
+    return segs, breaks
+
+# ---------- 1. 断因表：Dynamo 式前端在哪几类语句上必须停 ----------
+BREAK_RULES = {
+    &#39;item&#39;:   (&#39;张量 → Python 标量&#39;, &#39;标量脱离图，后续 Python 逻辑无法在图上表达&#39;),
+    &#39;bool&#39;:   (&#39;数据相关控制流&#39;,     &#39;条件值来自张量，图里只能记 guard，不能在两支里选&#39;),
+    &#39;print&#39;:  (&#39;Python 副作用&#39;,      &#39;输出/IO 不属于张量计算，顺序也无法进图&#39;),
+    &#39;dictop&#39;: (&#39;Python 容器修改&#39;,    &#39;图只跟踪张量，容器状态要留在 Python 里&#39;),
+    &#39;assert&#39;: (&#39;依赖张量值的断言&#39;,   &#39;断言失败要让 Python 抛异常，控制流不归图管&#39;),
+}
+
+# ---------- 2. 一段真实风格的模型代码，故意埋了四处断裂点 ----------
+PROGRAM = [
+    (&#39;matmul&#39;, &#39;x&#39;, &#39;W&#39;), (&#39;add&#39;, &#39;v0&#39;, &#39;b&#39;), (&#39;relu&#39;, &#39;v1&#39;),
+    (&#39;item&#39;,),                     # loss = v2.mean().item()
+    (&#39;print&#39;,),                    # print(loss)
+    (&#39;matmul&#39;, &#39;v2&#39;, &#39;W2&#39;), (&#39;relu&#39;, &#39;v5&#39;),
+    (&#39;dictop&#39;,),                   # stats[&#39;count&#39;] += 1
+    (&#39;bool&#39;,),                     # if x.sum() &gt; 0: ...
+    (&#39;add&#39;, &#39;v6&#39;, 1.0), (&#39;mul&#39;, &#39;v9&#39;, 2.0),
+]
+
+def report(program, name):
+    segs, breaks = trace_program(program)
+    print(f&#39;=== {name} ===&#39;)
+    print(f&#39;  段划分：{segs}&#39;)
+    print(f&#39;  断点 {len(breaks)} 处：&#39;)
+    for i, op in breaks:
+        reason, detail = BREAK_RULES[op]
+        print(f&#39;    第 {i:&gt;2} 条语句 {op:&lt;6} → {reason}（{detail}）&#39;)
+    n_ops = sum(len(s.ops) for s in segs)
+    print(f&#39;  可编译算子 {n_ops} 个被切成 {len(segs)} 段；没有断裂时本可合成 1 段&#39;)
+
+print(&#39;--- 代价模型：段数 S 与断点数 B 决定固定开销 ---&#39;)
+SEG_COST, BREAK_COST = 12.0, 25.0     # 单位是&quot;示意值&quot;，此处只比较相对大小，不是实测性能
+for name, prog in ((&#39;无断裂&#39;, [p for p in PROGRAM if p[0] in COMPILABLE]),
+                   (&#39;一处断裂&#39;, PROGRAM[:4] + [p for p in PROGRAM[5:] if p[0] in COMPILABLE]),
+                   (&#39;四处断裂&#39;, PROGRAM)):
+    segs, breaks = trace_program(prog)
+    n_ops = sum(len(s.ops) for s in segs)
+    over = len(segs) * SEG_COST + len(breaks) * BREAK_COST
+    print(f&#39;  {name:&lt;6} 算子 {n_ops:&gt;2} 个 → 段 {len(segs)} 个、断点 {len(breaks)} 个，&#39;
+          f&#39;开销 {over:&gt;5.1f}（每段 {SEG_COST} + 每断点 {BREAK_COST}）&#39;)
+
+print()
+report(PROGRAM, &#39;四处断裂的模型代码&#39;)
+
+print(&#39;\n=== 融合边界：断裂会把能融合的算子链拆开 ===&#39;)
+segs, _ = trace_program(PROGRAM)
+for s in segs:
+    print(f&#39;  {s}：链内可整段融合；链尾必须把中间张量交回 eager&#39;)
+
+print(&#39;\n=== 诊断表：把断点翻译成&quot;改哪一行&quot; ===&#39;)
+FIX = {&#39;item&#39;: &#39;把 .item() 移出被编译函数（评测/日志阶段再取值）&#39;,
+       &#39;bool&#39;: &#39;改成张量运算（如 torch.where），或用编译器的动态形状开关&#39;,
+       &#39;print&#39;: &#39;移出编译区，或改用编译期可控的日志&#39;,
+       &#39;dictop&#39;: &#39;状态提到函数外，或用图外的封装层&#39;,
+       &#39;assert&#39;: &#39;只对 shape/dtype 断言（编译期可判定）&#39;}
+for i, op in trace_program(PROGRAM)[1]:
+    print(f&#39;  {i:&gt;2} {op:&lt;6} {BREAK_RULES[op][0]:&lt;14} → {FIX[op]}&#39;)</code></pre>
+<p>实际运行结果（python3.10.16，与 python3.14.5 一致）：</p>
+<pre data-lang="text"><code class="language-text">--- 代价模型：段数 S 与断点数 B 决定固定开销 ---
+  无断裂    算子  7 个 → 段 1 个、断点 0 个，开销  12.0（每段 12.0 + 每断点 25.0）
+  一处断裂   算子  7 个 → 段 2 个、断点 1 个，开销  49.0（每段 12.0 + 每断点 25.0）
+  四处断裂   算子  7 个 → 段 3 个、断点 4 个，开销 136.0（每段 12.0 + 每断点 25.0）
+
+=== 四处断裂的模型代码 ===
+  段划分：[段@0(3 个算子), 段@5(2 个算子), 段@9(2 个算子)]
+  断点 4 处：
+    第  3 条语句 item   → 张量 → Python 标量（标量脱离图，后续 Python 逻辑无法在图上表达）
+    第  4 条语句 print  → Python 副作用（输出/IO 不属于张量计算，顺序也无法进图）
+    第  7 条语句 dictop → Python 容器修改（图只跟踪张量，容器状态要留在 Python 里）
+    第  8 条语句 bool   → 数据相关控制流（条件值来自张量，图里只能记 guard，不能在两支里选）
+  可编译算子 7 个被切成 3 段；没有断裂时本可合成 1 段
+
+=== 融合边界：断裂会把能融合的算子链拆开 ===
+  段@0(3 个算子)：链内可整段融合；链尾必须把中间张量交回 eager
+  段@5(2 个算子)：链内可整段融合；链尾必须把中间张量交回 eager
+  段@9(2 个算子)：链内可整段融合；链尾必须把中间张量交回 eager
+
+=== 诊断表：把断点翻译成&quot;改哪一行&quot; ===
+   3 item   张量 → Python 标量 → 把 .item() 移出被编译函数（评测/日志阶段再取值）
+   4 print  Python 副作用     → 移出编译区，或改用编译期可控的日志
+   7 dictop Python 容器修改    → 状态提到函数外，或用图外的封装层
+   8 bool   数据相关控制流        → 改成张量运算（如 torch.where），或用编译器的动态形状开关</code></pre>
+<p>三处可核对的结论：<strong>断裂是按语义切、不是按算子切</strong>——同一份代码里 7 个可编译算子被 4 处断点切成 3 段；<strong>固定开销随段数与断点数一起涨</strong>——12 → 49 → 136，示意模型下四处断裂是 11 倍；<strong>诊断结果是行动项</strong>——每条断因都有对应的&quot;改写或隔离&quot;动作，<code>.item()</code>、<code>print</code>、容器状态三类可以靠移动代码消除，数据相关控制流要么换成张量运算、要么接受它。</p>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选，需自备能装 torch 的环境（本机未装 torch）----
+# 官方工具里看断点位置与原因（日志开关名与输出字段以本机 torch 文档为准）：
+#   TORCH_LOGS=graph_breaks python3 demo.py
+# demo.py 里写一个含 .item()、print 与数据相关 if 的函数，用 torch.compile 包一次：
+# 日志会逐个打印&quot;在哪个位置断、断因是什么&quot;，据此对照本课的断因表。
+# 想确认某段代码能整体进图：torch.compile(fn, fullgraph=True)，断裂会直接报错。
+# 不同 torch 版本打印的字段名会变，别照抄字段名；统计口径以本机运行结果为准。
+# 没有 torch 也能完成本课：上面的模拟器已把断因、段划分与代价账算完。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：给 <code>trace_program</code> 加&quot;断点代价分级&quot;——<code>print</code> 只算一次轻微开销、数据相关控制流算最高级，重跑代价模型，观察四处断裂的开销是否变化。</li>
+<li><strong>解释</strong>：为什么 <code>if x.sum() &gt; 0</code> 必须断，而 <code>x = torch.where(x &gt; 0, x, 0)</code> 不必？从&quot;图的表达能力&quot;角度回答。</li>
+<li><strong>对比/验证</strong>：把 <code>PROGRAM</code> 里的 <code>item</code>/<code>print</code>/<code>dictop</code> 三条从列表里删掉、只留 <code>bool</code>，重跑代价模型；再解释为什么&quot;移动代码&quot;能消掉三类断因，却消不掉数据相关控制流。</li>
+<li><strong>思考</strong>：<code>fullgraph=True</code> 把断裂从&quot;性能损失&quot;变成&quot;编译报错&quot;。在什么工程阶段你希望它报错、什么阶段希望它容忍？给出一个两阶段的使用策略。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>PyTorch 官方文档, <em>torch.compiler_troubleshooting</em>（图断裂的常见成因、诊断开关与规避手段）：<a href="https://docs.pytorch.org/docs/stable/torch.compiler_troubleshooting.html" target="_blank" rel="noopener noreferrer">https://docs.pytorch.org/docs/stable/torch.compiler_troubleshooting.html</a></li>
+<li>PyTorch 官方文档, <em>torch.compiler_dynamo_deepdive</em>（Dynamo 在字节码层如何切分片段、resume 与 guard 的生成位置）：<a href="https://docs.pytorch.org/docs/stable/torch.compiler_dynamo_deepdive.html" target="_blank" rel="noopener noreferrer">https://docs.pytorch.org/docs/stable/torch.compiler_dynamo_deepdive.html</a></li>
+<li>PyTorch 官方文档, <em>torch.compiler_dynamic_shapes</em>（形状与数据相关控制流对编译的影响，guard 与重编译）：<a href="https://docs.pytorch.org/docs/stable/torch.compiler_dynamic_shapes.html" target="_blank" rel="noopener noreferrer">https://docs.pytorch.org/docs/stable/torch.compiler_dynamic_shapes.html</a></li>
+<li>Zheng 等, <em>Ansor: Generating High-Performance Tensor Programs for Deep Learning</em>（OSDI&#39;20；&quot;编译器能看到的程序片段大小&quot;如何影响可优化空间）：<a href="https://www.usenix.org/conference/osdi20/presentation/zheng" target="_blank" rel="noopener noreferrer">https://www.usenix.org/conference/osdi20/presentation/zheng</a></li>
+</ul>
+<p><a href="#/l/mlc-ch3-l1">下一章：图 IR 与张量语义</a></p>

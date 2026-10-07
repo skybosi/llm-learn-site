@@ -1,0 +1,95 @@
+<h2 id="h-似然视角与采样">似然视角与采样<a class="anchor" href="#h-似然视角与采样" aria-label="本节链接">#</a></h2>
+<p>上一课把生成模型分成了三大家族。这一课深入两个贯穿所有生成模型的<strong>通用语言</strong>：<strong>似然视角</strong>（怎么训练、怎么给数据打分）和<strong>采样视角</strong>（怎么从学到的分布里&quot;抽&quot;出新样本）。搞懂这两个视角——尤其<strong>最大似然、KL 散度、ELBO、重参数化技巧</strong>这四个工具——扩散模型的训练目标和采样循环你就能一眼看懂，因为它们全是这套语言的延续。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-似然视角训练生成模型--最大化数据概率">1. 似然视角：训练生成模型 = 最大化数据概率<a class="anchor" href="#h-1-似然视角训练生成模型--最大化数据概率" aria-label="本节链接">#</a></h4>
+<p>生成模型的基本训练原则是<strong>最大似然估计（MLE）</strong>：给一批真实数据 <code>{x_i}</code>，找一个参数 <code>θ</code> 使这批数据&quot;出现得最可能&quot;：</p>
+<pre><code>θ* = argmax_θ  ∏_i P_θ(x_i)   ⟺   θ* = argmax_θ  Σ_i log P_θ(x_i)</code></pre>
+<p>取对数是为了三件事：<strong>乘积变求和</strong>（数值更稳）、<strong>凸性更好优化</strong>、<strong>与 KL 散度挂钩</strong>。最后这一点最关键：</p>
+<pre><code>(1/N) Σ_i log P_θ(x_i)  =  - KL( P_data ‖ P_θ ) + const</code></pre>
+<p>也就是说，<strong>最大化对数似然，等价于最小化真实数据分布与模型分布之间的 KL 散度</strong>。这是似然视角的&quot;世界观&quot;：把&quot;模型分布尽量贴合数据分布&quot;这个模糊目标，翻译成了可优化、可微的数值。</p>
+<p><figure><img class="md-img" src="content/courses/multimodal-diffusion/assets/chapter-1-figure-03.svg" alt="似然视角示意：左边是真实数据点云（经验分布 P_data），右边是模型分布 P_θ 的等高线曲面；中间画一支双向箭头标注 KL(P_data‖P_θ)；下方一行公式&quot;最大化 Σ log P_θ(x) ⟺ 最小化 KL(P_data‖P_θ)&quot;，强调两个目标的等价" loading="lazy" decoding="async"><figcaption>似然视角示意：左边是真实数据点云（经验分布 P_data），右边是模型分布 P_θ 的等高线曲面；中间画一支双向箭头标注 KL(P_data‖P_θ)；下方一行公式&quot;最大化 Σ log P_θ(x) ⟺ 最小化 KL(P_data‖P_θ)&quot;，强调两个目标的等价</figcaption></figure>
+</p>
+<h4 id="h-2-两个拦路虎归一化常数与边际积分">2. 两个拦路虎：归一化常数与边际积分<a class="anchor" href="#h-2-两个拦路虎归一化常数与边际积分" aria-label="本节链接">#</a></h4>
+<p>直接最大化 <code>log P_θ(x)</code> 会遇到两个难题：</p>
+<ul>
+<li><strong>配分函数难算</strong>：能量模型里 <code>P_θ(x) = exp(-E_θ(x)) / Z_θ</code>，分母 <code>Z_θ = ∫ exp(-E_θ(x)) dx</code> 是归一化常数，高维下无法求。这就是能量模型、玻尔兹曼机长期难以训练的原因。</li>
+<li><strong>隐变量难积分</strong>：VAE 里 <code>P_θ(x) = ∫ P_θ(x|z) P(z) dz</code>，要对隐变量 <code>z</code> 做全空间积分，同样不可解。</li>
+</ul>
+<h4 id="h-3-变分下界-elbo用近似后验绕开积分">3. 变分下界 ELBO：用&quot;近似后验&quot;绕开积分<a class="anchor" href="#h-3-变分下界-elbo用近似后验绕开积分" aria-label="本节链接">#</a></h4>
+<p>VAE 的对策是引入一个<strong>变分分布 <code>q(z|x)</code></strong> 去近似真实后验 <code>P(z|x)</code>，再对 <code>log P(x)</code> 做一个巧妙的分解：</p>
+<pre><code>log P(x) = E_{q(z|x)}[ log P(x) ]                     # log P(x) 与 z 无关，可放进期望
+         = E_q[ log P(x, z) - log P(z|x) ]
+         = E_q[ log P(x, z) - log q(z|x) ] + KL( q(z|x) ‖ P(z|x) )
+         =     ELBO(θ, φ)                          + KL( q ‖ P(z|x) )</code></pre>
+<p>因为 KL 散度恒非负，所以 <code>log P(x) ≥ ELBO</code>。<strong>证据（evidence）的下界</strong>由此得名。再展开 ELBO：</p>
+<pre><code>ELBO = E_{q(z|x)}[ log P_θ(x|z) ] - KL( q_φ(z|x) ‖ P(z) )
+        └── 重构项：逼生成器还原 x ──┘   └── 正则项：逼 z 靠近先验 ──┘</code></pre>
+<p>最大化 ELBO 时：重构项让&quot;编码—解码&quot;能还原数据，正则项让编码器输出别乱跑、贴近标准正态先验。<strong>当 <code>q(z|x)</code> 恰好等于真实后验时 KL 项归零，ELBO 精确等于 log P(x)</strong>——这是下界&quot;紧&quot;的时刻。</p>
+<h4 id="h-4-采样视角从分布里抽样本且要可导">4. 采样视角：从分布里&quot;抽&quot;样本，且要可导<a class="anchor" href="#h-4-采样视角从分布里抽样本且要可导" aria-label="本节链接">#</a></h4>
+<p>训练得到分布之后，怎么<strong>采样</strong>？如果模型是&quot;高斯+变换&quot;结构，最优雅的做法是<strong>重参数化技巧（reparameterization trick）</strong>。普通采样 <code>z ~ N(μ, σ²)</code> 是随机操作，梯度流不回 <code>μ</code>、<code>σ</code>；重参数化把它拆成&quot;确定性变换 + 固定噪声&quot;：</p>
+<pre><code>z = μ + σ · ε,   ε ~ N(0, I)</code></pre>
+<p><code>ε</code> 是标准正态噪声、与参数无关，于是梯度能顺畅地流回 <code>μ</code> 和 <code>σ</code>，采样动作变得<strong>可微</strong>。这是 VAE 能被端到端训练的技术关键，也是扩散模型&quot;加噪/去噪&quot;里反复出现的手势。</p>
+<p><figure><img class="md-img" src="content/courses/multimodal-diffusion/assets/chapter-1-figure-04.svg" alt="重参数化采样示意：左图是&quot;直接采样&quot;——分布 N(μ,σ²) 画成一个钟形曲线，箭头从曲线直接指向样本 z，标注&quot;随机操作，梯度断裂&quot;；右图是&quot;重参数化&quot;——标准正态 N(0,I) 采出 ε，经过&quot;z = μ + σ·ε&quot;的确定性箭头指向 z，标注&quot;确定性变换，梯度畅通&quot;" loading="lazy" decoding="async"><figcaption>重参数化采样示意：左图是&quot;直接采样&quot;——分布 N(μ,σ²) 画成一个钟形曲线，箭头从曲线直接指向样本 z，标注&quot;随机操作，梯度断裂&quot;；右图是&quot;重参数化&quot;——标准正态 N(0,I) 采出 ε，经过&quot;z = μ + σ·ε&quot;的确定性箭头指向 z，标注&quot;确定性变换，梯度畅通&quot;</figcaption></figure>
+</p>
+<h4 id="h-5-两个视角的分工">5. 两个视角的分工<a class="anchor" href="#h-5-两个视角的分工" aria-label="本节链接">#</a></h4>
+<p>把两个视角合起来看，生成模型的&quot;标准套路&quot;是：</p>
+<ol>
+<li><strong>训练阶段用似然视角</strong>：最大化 ELBO 或精确似然（或隐式地做对抗），让分布贴合数据；</li>
+<li><strong>生成阶段用采样视角</strong>：从易采样的基分布（如标准正态）抽 <code>ε</code>，再过网络变换成样本；</li>
+<li><strong>评价阶段又回到似然视角</strong>：用对数似然、FID、Inception Score 等度量生成质量。</li>
+</ol>
+<p>扩散模型会把这个套路发挥到极致：它的前向过程是&quot;把数据一步步变噪声&quot;（重参数化的叠加），反向过程是&quot;一步步把噪声变回数据&quot;（可微采样），训练目标则是&quot;让去噪网络最大化变分下界&quot;。下一课先补上&quot;为什么需要生成模型&quot;的动机，随后就进入扩散模型正文。</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>先看<strong>似然视角</strong>的最小实现：用 MLE 从样本估计高斯分布的均值和方差，并算出对数似然。</p>
+<pre data-lang="python"><code class="language-python">import torch
+
+torch.manual_seed(0)
+true_mu, true_sigma = 3.0, 2.0
+data = torch.normal(true_mu, true_sigma, (10000,))   # 从真实分布采样
+
+# —— MLE 估计：高斯均值和方差的闭式解 ——
+mu_hat = data.mean()                        # 均值估计 = 样本均值
+var_hat = data.var(unbiased=False)          # MLE 方差 = 除以 N（无偏则除以 N-1）
+sigma_hat = var_hat.sqrt()
+
+print(f&quot;真实参数: mu={true_mu}, sigma={true_sigma}&quot;)
+print(f&quot;MLE 估计: mu={mu_hat:.3f}, sigma={sigma_hat:.3f}&quot;)
+
+# —— 对数似然：MLE 真正在最大化的目标 ——
+log_p = -0.5 * (torch.log(2 * torch.pi * var_hat) + (data - mu_hat) ** 2 / var_hat)
+print(f&quot;平均对数似然: {log_p.mean():.3f}&quot;)</code></pre>
+<p>再看<strong>采样视角 + 重参数化技巧</strong>：如何让&quot;从高斯采样&quot;这件事可导。</p>
+<pre data-lang="python"><code class="language-python">import torch
+
+# —— 编码器输出均值和对数方差（真实场景由网络预测） ——
+mu = torch.tensor([0.0], requires_grad=True)
+log_var = torch.tensor([0.0], requires_grad=True)
+
+# —— 普通采样：随机操作，梯度流不回 mu/log_var ——
+z_naive = torch.normal(mu, (0.5 * log_var).exp())
+
+# —— 重参数化：确定性变换 + 固定噪声，梯度可回传 ——
+eps = torch.randn_like(mu)                  # 从标准正态采样，与参数无关
+z = mu + eps * (0.5 * log_var).exp()        # z ~ N(mu, sigma^2)，且对 mu/log_var 可导
+
+# 验证梯度能流回参数
+z.sum().backward()
+print(f&quot;d z / d mu   = {mu.grad.item():.3f}&quot;)         # 应为 1
+print(f&quot;d z / d log_var = {log_var.grad.item():.3f}&quot;) # 非零：说明 sigma 参与计算</code></pre>
+<p>运行后注意 <code>mu.grad</code> 恰好等于 1、<code>log_var.grad</code> 非零——这证明重参数化后的采样确实<strong>对分布参数可导</strong>。而 <code>z_naive</code> 那条路，梯度会被 <code>torch.normal</code> 这个随机节点&quot;截断&quot;。<strong>这十几行代码，就是 VAE 和扩散模型能够被梯度下降训练的技术根基。</strong></p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>把 MLE 代码里的样本量从 10000 改成 10、100、1000，观察估计的 <code>mu_hat</code> 随样本量如何波动，体会&quot;最大似然估计的一致性&quot;。</li>
+<li>把 <code>var_hat</code> 换成 <code>data.var(unbiased=True)</code>，说明无偏方差与 MLE 方差差在哪（除以 N-1 vs N），哪个才是&quot;最大化对数似然&quot;的闭式解。</li>
+<li>手推 <code>log P(x) = ELBO + KL(q(z|x)‖P(z|x))</code> 这行分解，写清每一步用到了什么（期望定义、对数性质、KL 定义），并说明为什么 KL 项恒非负。</li>
+<li>在重参数化代码里把 <code>z</code> 的表达式改成 <code>z = mu + eps * (0.5*log_var).exp() * 0</code>，观察 <code>log_var.grad</code> 是否变成 0，解释其含义（σ=0 时对数方差不参与采样）。</li>
+<li>思考题：为什么&quot;训练用似然、生成用采样、评价又回到似然&quot;这个循环里，最难的一环往往是&quot;采样要可导&quot;？想想 GAN 为什么可以绕开它、扩散模型又为什么必须正面解决它。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Kingma &amp; Welling, <em>Auto-Encoding Variational Bayes</em>（ELBO 与重参数化技巧）：<a href="https://arxiv.org/abs/1312.6114" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1312.6114</a></li>
+<li>Blei et al., <em>Variational Inference: A Review for Statisticians</em>（变分下界综述）：<a href="https://arxiv.org/abs/1601.00670" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1601.00670</a></li>
+<li>Rezende &amp; Mohamed, <em>Variational Inference with Normalizing Flows</em>：<a href="https://arxiv.org/abs/1505.05770" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1505.05770</a></li>
+<li>Ho et al., <em>Denoising Diffusion Probabilistic Models</em>（变分下界在扩散模型中的应用）：<a href="https://arxiv.org/abs/2006.11239" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2006.11239</a></li>
+</ul>
+<p><a href="#/l/mm-ch1-l3">下一课：为什么需要生成模型</a></p>

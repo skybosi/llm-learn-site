@@ -1,0 +1,268 @@
+<h2 id="h-内存规划与复用生命周期分析与显存峰值">内存规划与复用：生命周期分析与显存峰值<a class="anchor" href="#h-内存规划与复用生命周期分析与显存峰值" aria-label="本节链接">#</a></h2>
+<p>上一课把转置的代价从&quot;必须搬&quot;降到了&quot;零拷贝&quot;。但视图仍<strong>占着</strong>那块内存，直到最后一个消费者读完。一个 512 token 的 Transformer 层，每个中间张量各占一块、永不释放时本课实测要 225 KiB；按生命周期复用同一块池子只要 177 KiB，省 21.3%。<strong>内存规划</strong>（memory planning）回答的就是&quot;哪块内存什么时候能给谁用&quot;。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-峰值不是所有张量之和而是同时在世的最大值">1. 峰值不是&quot;所有张量之和&quot;，而是&quot;同时在世的最大值&quot;<a class="anchor" href="#h-1-峰值不是所有张量之和而是同时在世的最大值" aria-label="本节链接">#</a></h4>
+<p>朴素做法给每个张量各开一块，峰值 = <code>Σ(参数) + Σ(中间张量)</code>。但只要两个张量的<strong>生命周期不重叠</strong>，就可以共用同一块内存。TVM 论文（OSDI&#39;18）把这项技术列为图级优化的第三件事：<strong>静态内存规划</strong>（static memory planning）——执行前一次性算好每块缓冲的偏移，运行时零分配。</p>
+<p>关键量是两个数：</p>
+<ul>
+<li><strong>单时刻并发下界</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0497em;vertical-align:-0.2997em;"></span><span class="mop"><span class="mop">max</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop"><span class="mop op-symbol small-op" style="position:relative;top:0em;">∑</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1786em;"><span style="top:-2.4003em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">n</span><span class="mord text mtight"><span class="mord mtight"> </span><span class="mord cjk_fallback mtight">活到</span><span class="mord mtight"> </span></span><span class="mord mathnormal mtight">t</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2997em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">size</span></span><span class="mopen">(</span><span class="mord mathnormal">n</span><span class="mclose">)</span></span></span></span>。任何 allocator 都躲不过它，因为那一刻这些张量必须同时存在。</li>
+<li><strong>allocator 高水位</strong>：实际分配器给出的峰值。它 ≥ 下界，差值来自&quot;空洞拼不成&quot;与&quot;贪心不做最优打包&quot;。</li>
+</ul>
+<h4 id="h-2-生命周期是近似不是精确事实">2. 生命周期是&quot;近似&quot;，不是精确事实<a class="anchor" href="#h-2-生命周期是近似不是精确事实" aria-label="本节链接">#</a></h4>
+<p>生产级编译器用<strong>最后一次使用</strong>（last use）作为死亡时刻：张量活到&quot;最后一次被读&quot;那一轮。它便宜（一次反向扫描）且总是<strong>保守</strong>——真实寿命只会更短，所以静态数字常高于实测峰值。图里若有控制流（<code>if</code>、循环），&quot;最后一次使用&quot;要按支配关系与循环边界处理，简单线性扫描会错；也有编译器改用更紧的活跃区间分析换更小的池子，代价是编译时间。</p>
+<h4 id="h-3-贪心首次适配贴住下界的常用做法">3. 贪心首次适配：贴住下界的常用做法<a class="anchor" href="#h-3-贪心首次适配贴住下界的常用做法" aria-label="本节链接">#</a></h4>
+<p>算法很短：按执行序申请；维护&quot;已被占用的区间 + 释放时刻&quot;；分配时把<strong>释放时刻 ≤ 当前时刻</strong>的区间合并成空洞，找第一个够大的洞；找不到就把水位往后展。实测（512 token 层，中间张量共 96.0 KiB）：</p>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>中间池峰值</th>
+<th>总峰值</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>朴素（不释放）</td>
+<td>96.0 KiB</td>
+<td>225.0 KiB</td>
+</tr>
+<tr>
+<td>贪心复用</td>
+<td><strong>48.0 KiB</strong></td>
+<td><strong>177.0 KiB</strong></td>
+</tr>
+</tbody></table>
+<p>48.0 KiB 正好等于&quot;单时刻并发的最大值&quot;——<strong>贪心这一例贴住了下界</strong>。生命周期链是&quot;一个接一个、尺寸相近&quot;时，首次适配的合并几乎总能命中下界。</p>
+<h4 id="h-4-想再降只能改图原地写回">4. 想再降只能改图：原地写回<a class="anchor" href="#h-4-想再降只能改图原地写回" aria-label="本节链接">#</a></h4>
+<p>池子已经贴住下界，最后的空间在<strong>图本身</strong>：如果某个算子读它的输入是<strong>最后一次读</strong>，且输出与输入元素数相同，就可以<strong>原地写回</strong>（in-place）——不再要新的块。实测允许原地写回后，中间池从 48.0 KiB 再降到 42.0 KiB，总峰值 171.0 KiB。代价是<strong>别名</strong>，要求三条同时成立：</p>
+<ol>
+<li>被覆盖的输入在此之后<strong>不再被任何节点读</strong>（实测自检通过）；</li>
+<li>算子数值上允许按元素覆盖（<code>x = relu(x)</code> 可以，<code>x = x + shift(x)</code> 不行）；</li>
+<li>框架/用户接受&quot;原地&quot;语义（PyTorch 里对应 <code>relu_()</code>、<code>add_()</code> 这类带下划线的算子）。</li>
+</ol>
+<p>再想降就只能<strong>算子融合</strong>：把 <code>gelu</code> 融进上一个 <code>linear</code>，中间那个 24 KiB 张量根本不落地——第 5 章的主题。</p>
+<p><figure><img class="md-img" src="content/courses/ml-compilers/assets/chapter-4-figure-04.svg" alt="内存规划把峰值逐层压低：同时在世最大值 → 生命周期复用 → 原地写回 → 算子融合" loading="lazy" decoding="async"><figcaption>内存规划把峰值逐层压低：同时在世最大值 → 生命周期复用 → 原地写回 → 算子融合</figcaption></figure>
+</p>
+<h4 id="h-5-训练与推理的内存账不同">5. 训练与推理的内存账不同<a class="anchor" href="#h-5-训练与推理的内存账不同" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>推理（本课）</th>
+<th>训练</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>关键张量</td>
+<td>激活（前向即死）</td>
+<td>激活 + <strong>反向需要的中间量</strong></td>
+</tr>
+<tr>
+<td>生命周期</td>
+<td>出生到最后一读，短</td>
+<td>常延长到最后一次反向更新</td>
+</tr>
+<tr>
+<td>典型手段</td>
+<td>复用 + 原地写回</td>
+<td>复用 + <strong>重算</strong>（activation checkpointing，用时间换空间）</td>
+</tr>
+<tr>
+<td>峰值出现在</td>
+<td>单次前向的某一层</td>
+<td>反向的中段</td>
+</tr>
+</tbody></table>
+<p>所以&quot;推理引擎的显存规划器&quot;与&quot;训练框架的显存优化&quot;是两套账，不要拿前向峰值预测训练。</p>
+<h4 id="h-6-常见坑">6. 常见坑<a class="anchor" href="#h-6-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>把&quot;下界&quot;当&quot;可达&quot;</strong>：下界只是不能再低，能否达到取决于生命周期形状与分配次序。</li>
+<li><strong>原地写回忘了别名</strong>：视图（第 2 课）与原地写回叠加时，一个缓冲可能被两个名字引用，释放时机算错就是读到脏数据。</li>
+<li><strong>忽略对齐</strong>：为向量化，块常按 16/32/64 字节对齐；小张量多时对齐浪费会显著抬高真实占用。</li>
+<li><strong>忘记输出</strong>：模型输出与跨图传递的张量不能复用，否则回传数据被覆盖。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面这段纯 Python（无第三方依赖）在一个 10 节点的 Transformer 层上做四件事：算生命周期、算并发下界、跑贪心分配器（含原地写回模式）、最后自检别名冲突。</p>
+<pre data-lang="python"><code class="language-python"># ---- 第 3 课示例：生命周期分析 + 贪心内存复用（纯 Python，无第三方依赖）----
+# 节点 = (输出名, [输入名], 输出元素数)；1 元素 = 4 字节（fp32）
+# 真实系统把&quot;参数池&quot;和&quot;生命周期池&quot;分开：参数常驻，中间张量（activation）按需分配
+
+OPS = [(&#39;h&#39;,    [&#39;x&#39;],            1536),
+       (&#39;q&#39;,    [&#39;h&#39;, &#39;Wq&#39;],      1536),
+       (&#39;k&#39;,    [&#39;h&#39;, &#39;Wk&#39;],      1536),
+       (&#39;v&#39;,    [&#39;h&#39;, &#39;Wv&#39;],      1536),
+       (&#39;attn&#39;, [&#39;q&#39;, &#39;k&#39;],       1536),
+       (&#39;p&#39;,    [&#39;attn&#39;],         1536),
+       (&#39;o&#39;,    [&#39;p&#39;, &#39;v&#39;],       1536),
+       (&#39;mid&#39;,  [&#39;o&#39;, &#39;W1&#39;],      6144),
+       (&#39;act&#39;,  [&#39;mid&#39;],          6144),
+       (&#39;out&#39;,  [&#39;act&#39;, &#39;W2&#39;],    1536)]
+PARAMS = {&#39;x&#39;: 1536, &#39;Wq&#39;: 2304, &#39;Wk&#39;: 2304, &#39;Wv&#39;: 2304, &#39;W1&#39;: 18432, &#39;W2&#39;: 6144}
+KB = lambda n: n * 4 / 1024
+
+def lifespans(ops):
+    &quot;&quot;&quot;一次反向扫描：中间张量活到&quot;最后一次被读&quot;那一轮（可验证的近似，不是精确寿命）。&quot;&quot;&quot;
+    last = {}
+    for t, (out, deps, size) in enumerate(ops, 1):
+        for d in deps: last[d] = t
+    return {out: (t, last.get(out, t)) for t, (out, deps, size) in enumerate(ops, 1)}
+
+def free_intervals(active, high):
+    &quot;&quot;&quot;可用空洞 = [0, high) 减去所有&quot;仍活着&quot;的区间，再加上水位之后的尾巴。&quot;&quot;&quot;
+    free, end = [], 0
+    for a, b in sorted(active):
+        if a &gt; end: free.append((end, a - end))
+        end = max(end, b)
+    if end &lt; high: free.append((end, high - end))
+    return free
+
+def place(order, sizes, spans, inp=False, ops=None):
+    &quot;&quot;&quot;按给定顺序分配；inp=True 时允许&quot;输入最后一次被读&quot;的算子原地写回输入块。&quot;&quot;&quot;
+    last_read = {}
+    for t, (out, deps, sz) in enumerate(ops or [], 1):
+        for d in deps: last_read[d] = t
+    taken, high, table, inplace = [], 0, {}, []
+    sizes = dict(sizes)
+    for name in order:
+        cur, need = spans[name][0], sizes[name]
+        if inp and ops:
+            deps = next((d for o, d, _ in ops if o == name), [])
+            for d in deps:
+                if last_read.get(d) == cur and d in sizes and sizes[d] &gt;= need:
+                    table[name] = table[d]                 # 复用输入的块，不再新分配
+                    inplace.append((name, d)); need = None; break
+        if need is None: continue
+        active = [(a, b) for a, b, rel in taken if rel &gt;= cur]
+        off = next((a for a, sz in free_intervals(active, high) if sz &gt;= need), None)
+        if off is None: off, high = high, high + need
+        taken.append((off, off + need, spans[name][1]))
+        table[name] = (off, need)
+    return high, table, inplace
+
+def concurrency_lb(sizes, spans, params_total=0):
+    &quot;&quot;&quot;单时刻并发下界：任何 allocator 在那一刻都至少要占这么多。&quot;&quot;&quot;
+    tmax = max(r for _, r in spans.values())
+    return max(sum(sizes[n] for n, (b, r) in spans.items() if b &lt;= t &lt;= r) + params_total
+               for t in range(1, tmax + 1))
+
+if __name__ == &#39;__main__&#39;:
+    sizes = {out: s for out, deps, s in OPS}
+    spans = lifespans(OPS)
+    params_total = sum(PARAMS.values())
+
+    print(&#39;=== 0. 场景：512 token 的 Transformer 层（batch=1, d=768, ffn=3072, fp32）===&#39;)
+    print(f&#39;  参数 {len(PARAMS)} 个共 {params_total} 元素 = {KB(params_total):.1f} KiB（常驻）&#39;)
+    print(f&#39;  中间张量 {len(OPS)} 个共 {sum(sizes.values())} 元素 = {KB(sum(sizes.values())):.1f} KiB&#39;)
+    print(f&#39;  朴素做法（全都不释放）= {params_total + sum(sizes.values())} 元素 = &#39;
+          f&#39;{KB(params_total + sum(sizes.values())):.1f} KiB&#39;)
+
+    print(&#39;\n=== 1. 生命周期（中间张量：存活到&quot;最后一次被读&quot;那一轮）===&#39;)
+    for name, (b, r) in spans.items():
+        readers = [u for u, deps, _ in OPS if name in deps]
+        print(f&#39;  {name:&lt;5} 存活 [{b:&gt;2}, {r:&gt;2}]  {sizes[name]:&gt;5} 元素 = {KB(sizes[name]):5.1f} KiB&#39;
+              f&#39;   读者 {readers}&#39;)
+    lb = concurrency_lb(sizes, spans, params_total)
+    print(f&#39;\n  单时刻并发下界（allocator 躲不过的底线）= {lb} 元素 = {KB(lb):.1f} KiB&#39;)
+
+    print(&#39;\n=== 2. 贪心复用（执行序 = 出生序）===&#39;)
+    high1, tb1, _ = place(list(spans), sizes, spans)
+    print(f&#39;  {&quot;张量&quot;:&lt;6}{&quot;元素&quot;:&gt;6}{&quot;起始&quot;:&gt;7}{&quot;结束&quot;:&gt;7}   存活&#39;)
+    for nm, (off, s) in tb1.items():
+        print(f&#39;  {nm:&lt;6}{s:&gt;6}{off:&gt;7}{off + s:&gt;7}   {spans[nm]}&#39;)
+    print(f&#39;  中间池高水位 {high1} 元素 = {KB(high1):.1f} KiB；&#39;
+          f&#39;总峰值 = {KB(high1 + params_total):.1f} KiB（朴素 {KB(params_total + sum(sizes.values())):.1f} KiB，&#39;
+          f&#39;省 {100 * (1 - (high1 + params_total) / (params_total + sum(sizes.values()))):.1f}%）&#39;)
+
+    print(&#39;\n=== 3. 比&quot;换序&quot;更有效的一招：原地写回（in-place）===&#39;)
+    high3, tb3, ip = place(list(spans), sizes, spans, inp=True, ops=OPS)
+    print(f&#39;  允许&quot;输入最后一次被读&quot;的算子原地写回：{ip}&#39;)
+    print(f&#39;  中间池高水位 {high1} → {high3} 元素（{KB(high1):.1f} → {KB(high3):.1f} KiB）；&#39;
+          f&#39;总峰值 {KB(high3 + params_total):.1f} KiB&#39;)
+    print(f&#39;  这就是&quot;单时刻并发下界&quot;的价值：下界 {KB(lb - params_total):.1f} KiB（中间池部分），&#39;
+          f&#39;贪心 {KB(high1):.1f} KiB 已经贴住它；&#39;)
+    print(&#39;  想再降只能改图本身——融合掉中间张量（第 5 章），或让算子原地写（本课）——&#39;
+          &#39;而不是指望 allocator 更聪明。&#39;)
+    print(&#39;\n=== 4. 自检：复用不得制造别名冲突 ===&#39;)
+    last_read = {}
+    for t, (out, deps, sz) in enumerate(OPS, 1):
+        for d in deps: last_read[d] = t
+    for label, tb, ip in ((&#39;原序&#39;, tb1, []), (&#39;原地写回&#39;, tb3, ip)):
+        names, bad = list(tb), []
+        for i, n1 in enumerate(names):
+            for n2 in names[i + 1:]:
+                t_ov = not (spans[n1][1] &lt; spans[n2][0] or spans[n2][1] &lt; spans[n1][0])
+                (o1, s1), (o2, s2) = tb[n1], tb[n2]
+                if t_ov and not (o1 + s1 &lt;= o2 or o2 + s2 &lt;= o1): bad.append((n1, n2))
+        print(f&#39;  {label:&lt;6} 生命周期重叠且内存重叠的组合：&#39;
+              f&#39;{&quot;✅ 无&quot; if not bad else &quot;⚠ &quot; + str(bad) + &quot;（原地写回时这是允许的）&quot;}&#39;)
+        if ip:
+            wrong = [(o, d) for o, d in ip if last_read.get(d) != next(b for n, (b, r) in spans.items() if n == o)]
+            print(f&#39;  {label} 原地写回的前置条件自检：&#39;
+                  f&#39;{&quot;✅ 每个被覆盖的输入都在这之后不再被读&quot; if not wrong else &quot;❌ &quot; + str(wrong)}&#39;)
+            print(f&#39;  别名（输出与输入共用一块内存）：{ip}&#39;)</code></pre>
+<p>实际运行结果：</p>
+<pre data-lang="text"><code class="language-text">=== 0. 场景：512 token 的 Transformer 层（batch=1, d=768, ffn=3072, fp32）===
+  参数 6 个共 33024 元素 = 129.0 KiB（常驻）
+  中间张量 10 个共 24576 元素 = 96.0 KiB
+  朴素做法（全都不释放）= 57600 元素 = 225.0 KiB
+
+=== 1. 生命周期（中间张量：存活到&quot;最后一次被读&quot;那一轮）===
+  h     存活 [ 1,  4]   1536 元素 =   6.0 KiB   读者 [&#39;q&#39;, &#39;k&#39;, &#39;v&#39;]
+  q     存活 [ 2,  5]   1536 元素 =   6.0 KiB   读者 [&#39;attn&#39;]
+  k     存活 [ 3,  5]   1536 元素 =   6.0 KiB   读者 [&#39;attn&#39;]
+  v     存活 [ 4,  7]   1536 元素 =   6.0 KiB   读者 [&#39;o&#39;]
+  attn  存活 [ 5,  6]   1536 元素 =   6.0 KiB   读者 [&#39;p&#39;]
+  p     存活 [ 6,  7]   1536 元素 =   6.0 KiB   读者 [&#39;o&#39;]
+  o     存活 [ 7,  8]   1536 元素 =   6.0 KiB   读者 [&#39;mid&#39;]
+  mid   存活 [ 8,  9]   6144 元素 =  24.0 KiB   读者 [&#39;act&#39;]
+  act   存活 [ 9, 10]   6144 元素 =  24.0 KiB   读者 [&#39;out&#39;]
+  out   存活 [10, 10]   1536 元素 =   6.0 KiB   读者 []
+
+  单时刻并发下界（allocator 躲不过的底线）= 45312 元素 = 177.0 KiB
+
+=== 2. 贪心复用（执行序 = 出生序）===
+  张量        元素     起始     结束   存活
+  h       1536      0   1536   (1, 4)
+  q       1536   1536   3072   (2, 5)
+  k       1536   3072   4608   (3, 5)
+  v       1536   4608   6144   (4, 7)
+  attn    1536      0   1536   (5, 6)
+  p       1536   1536   3072   (6, 7)
+  o       1536      0   1536   (7, 8)
+  mid     6144   6144  12288   (8, 9)
+  act     6144      0   6144   (9, 10)
+  out     1536   6144   7680   (10, 10)
+  中间池高水位 12288 元素 = 48.0 KiB；总峰值 = 177.0 KiB（朴素 225.0 KiB，省 21.3%）
+
+=== 3. 比&quot;换序&quot;更有效的一招：原地写回（in-place）===
+  允许&quot;输入最后一次被读&quot;的算子原地写回：[(&#39;v&#39;, &#39;h&#39;), (&#39;attn&#39;, &#39;q&#39;), (&#39;p&#39;, &#39;attn&#39;), (&#39;o&#39;, &#39;p&#39;), (&#39;act&#39;, &#39;mid&#39;), (&#39;out&#39;, &#39;act&#39;)]
+  中间池高水位 12288 → 10752 元素（48.0 → 42.0 KiB）；总峰值 171.0 KiB
+  这就是&quot;单时刻并发下界&quot;的价值：下界 48.0 KiB（中间池部分），贪心 48.0 KiB 已经贴住它；
+  想再降只能改图本身——融合掉中间张量（第 5 章），或让算子原地写（本课）——而不是指望 allocator 更聪明。
+
+=== 4. 自检：复用不得制造别名冲突 ===
+  原序     生命周期重叠且内存重叠的组合：✅ 无
+  原地写回   生命周期重叠且内存重叠的组合：⚠ [(&#39;h&#39;, &#39;v&#39;), (&#39;q&#39;, &#39;attn&#39;), (&#39;attn&#39;, &#39;p&#39;), (&#39;p&#39;, &#39;o&#39;), (&#39;mid&#39;, &#39;act&#39;), (&#39;act&#39;, &#39;out&#39;)]（原地写回时这是允许的）
+  原地写回 原地写回的前置条件自检：✅ 每个被覆盖的输入都在这之后不再被读
+  别名（输出与输入共用一块内存）：[(&#39;v&#39;, &#39;h&#39;), (&#39;attn&#39;, &#39;q&#39;), (&#39;p&#39;, &#39;attn&#39;), (&#39;o&#39;, &#39;p&#39;), (&#39;act&#39;, &#39;mid&#39;), (&#39;out&#39;, &#39;act&#39;)]</code></pre>
+<p>四处可核对的结论：<strong>并发下界是硬底线</strong>（中间池那一刻至少要 48.0 KiB，贪心给出的 12288 元素恰好等于它：<code>mid</code> 6144 + <code>act</code> 6144）；<strong>复用把峰值从 225.0 降到 177.0 KiB</strong>（省 21.3%）；<strong>原地写回再省 6.0 KiB</strong>（把 <code>act</code> 写进 <code>mid</code> 的块，<code>out</code> 写进 <code>act</code> 的块）；<strong>别名必须逐条验</strong>——自检确认每个被覆盖的输入此后不再被读，否则就是读到脏数据的经典 bug。</p>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选，需自备 GPU 或云上按需开一台：看真实框架报出的峰值 ----
+# PyTorch 提供显存的 allocated / reserved 分解与峰值统计（统计口径以官方文档为准）：
+#   python3 -c &quot;import torch; print(torch.cuda.memory_stats().keys())&quot;
+#   TORCH_LOGS=graph_breaks,output_code python3 your_model.py   # 观察编译器是否复用缓冲
+# 只想看&quot;池子&quot;这一层：torch.cuda.memory_summary() 会列出 allocated/reserved 与历史峰值。
+# 没有 GPU 也能完成本课：上面的纯 Python 已经把生命周期、下界、贪心池与原地写回全算完了。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：把 <code>place</code> 的&quot;首次适配&quot;改成&quot;最佳适配&quot;（选够大的洞里最小的那个），在本课的图和第 3 节的小例上分别重跑，比较高水位。</li>
+<li><strong>解释</strong>：为什么 <code>mid</code>（24 KiB）与 <code>act</code>（24 KiB）能共用同一条 24576 元素的槽，而 <code>h</code> 与 <code>q</code> 不行？用第 1 节的存活区间直接回答。</li>
+<li><strong>对比/验证</strong>：把 <code>OPS</code> 里 <code>act</code> 的 <code>gelu</code> 换成 <code>add(act, 1.0)</code> 这类&quot;需要同时读两个输入&quot;的算子（例如 <code>mul(mid, out)</code>），重跑并观察原地写回列表与高水位怎么变；解释多输入算子为什么更难原地化。</li>
+<li><strong>思考</strong>：训练时 <code>mid</code> 与 <code>act</code> 必须活到反向对应层算完。如果沿用推理的生命周期表，峰值会被低估多少？给出一个估算方法（提示：把存活区间的右端点改成&quot;反向该层的更新时刻&quot;）。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Tianqi Chen et al., <em>TVM: An Automated End-to-End Optimizing Compiler for Deep Learning</em>（OSDI&#39;18；把&quot;静态内存规划&quot;列为图级优化三项之一，并给出编译期定偏移、运行时零分配的做法）：<a href="https://www.usenix.org/conference/osdi18/presentation/chen" target="_blank" rel="noopener noreferrer">https://www.usenix.org/conference/osdi18/presentation/chen</a></li>
+<li>MLIR 官方文档（<code>memref</code> 方言的 <code>alloc</code> / <code>dealloc</code> / <code>subview</code> / <code>reinterpret_cast</code> 与 bufferization 相关操作——内存规划在多层 IR 上的落点）：<a href="https://mlir.llvm.org/docs/Dialects/MemRef/" target="_blank" rel="noopener noreferrer">https://mlir.llvm.org/docs/Dialects/MemRef/</a></li>
+<li>Lianmin Zheng et al., <em>The Deep Learning Compiler: A Comprehensive Survey</em>（第 6 节内存分配与复用优化的分类，以及&quot;生命周期分析 → 偏移分配&quot;的流程）：<a href="https://arxiv.org/abs/2002.03794" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2002.03794</a></li>
+<li>PyTorch 官方文档 <em>torch.compiler 概览</em>（编译缓存与内存相关配置项；具体统计口径与 API 名以官方为准）：<a href="https://docs.pytorch.org/docs/stable/user_guide/torch_compiler/torch.compiler.html" target="_blank" rel="noopener noreferrer">https://docs.pytorch.org/docs/stable/user_guide/torch_compiler/torch.compiler.html</a></li>
+</ul>
+<p><a href="#/l/mlc-ch4-l4">下一课：优化的安全性：什么时候&quot;等价变换&quot;其实不等价</a></p>

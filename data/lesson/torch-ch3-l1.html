@@ -1,0 +1,87 @@
+<h2 id="h-nnmodule">nn.Module<a class="anchor" href="#h-nnmodule" aria-label="本节链接">#</a></h2>
+<p>前两章我们搞懂了张量与自动微分。但从零手写每个前向、每个 <code>backward()</code>、每个参数更新，很快就会变成灾难。<code>torch.nn</code> 就是来收拾这一切的，而它的地基是 <strong><code>nn.Module</code></strong>——所有网络层、所有模型，乃至整个损失函数，都继承自它。本课讲清 <code>nn.Module</code> 的三个职责：组织参数、定义前向、递归管理子模块。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-nnmodule-是什么">1. nn.Module 是什么<a class="anchor" href="#h-1-nnmodule-是什么" aria-label="本节链接">#</a></h4>
+<p><code>nn.Module</code> 是所有神经网络组件的基类。你写的模型是它，<code>nn.Linear</code>、<code>nn.Conv2d</code> 也是它。继承它并做两件事，就是一个合法模型：</p>
+<ol>
+<li>在 <code>__init__</code> 里用 <code>super().__init__()</code> 初始化，然后把子层注册为属性；</li>
+<li>实现 <code>forward(self, x)</code>，定义数据如何流过这些子层。</li>
+</ol>
+<p>只要把子层<strong>赋值给 <code>self.xxx</code></strong>，<code>nn.Module</code> 就能自动&quot;感知&quot;它们：收集它们的参数、递归管理它们的状态（如训练/评估模式）、把它们一起搬上 GPU。</p>
+<h4 id="h-2-关键机制自动参数收集">2. 关键机制：自动参数收集<a class="anchor" href="#h-2-关键机制自动参数收集" aria-label="本节链接">#</a></h4>
+<p><code>nn.Module</code> 会递归扫描所有子模块，把所有 <code>nn.Parameter</code>（第 3 课详述）汇总起来。于是：</p>
+<ul>
+<li><code>model.parameters()</code>：返回全部可学习参数（给优化器用）；</li>
+<li><code>model.named_parameters()</code>：带名字的参数（调试、精细控制用）；</li>
+<li><code>model.state_dict()</code>：参数名 → 张量的字典（保存/加载模型用）。</li>
+</ul>
+<p>这省掉了&quot;手动维护一张参数表&quot;的繁重劳动——你只管定义结构，参数管理由框架接管。图 3-1 展示了一个模块树如何被递归汇总。</p>
+<p><figure><img class="md-img" src="content/courses/pytorch-fundamentals/assets/chapter-3-figure-01.svg" alt="nn.Module 层次结构与参数收集示意" loading="lazy" decoding="async"><figcaption>nn.Module 层次结构与参数收集示意</figcaption></figure>
+</p>
+<h4 id="h-3-调用-modelx-到底发生了什么">3. 调用 model(x) 到底发生了什么<a class="anchor" href="#h-3-调用-modelx-到底发生了什么" aria-label="本节链接">#</a></h4>
+<p><code>model(x)</code> 会触发 <code>__call__</code>，而 <code>nn.Module.__call__</code> 内部做了若干统一的前后处理（例如钩子），再调用你写的 <code>forward</code>。所以：</p>
+<ul>
+<li>请实现 <code>forward</code>，而不是 <code>__call__</code>；</li>
+<li>调用时用 <code>model(x)</code>，不要直接 <code>model.forward(x)</code>（会绕过框架的后处理逻辑）。</li>
+</ul>
+<h4 id="h-4-为什么不用-nnsequential-时也要继承-nnmodule">4. 为什么不用 <code>nn.Sequential</code> 时也要继承 nn.Module<a class="anchor" href="#h-4-为什么不用-nnsequential-时也要继承-nnmodule" aria-label="本节链接">#</a></h4>
+<p><code>nn.Sequential</code> 只是 <code>nn.Module</code> 的一个便捷子类，适合&quot;一条直线&quot;的简单堆叠。一旦模型有分支、跳跃连接、共享权重或自定义逻辑，就必须继承 <code>nn.Module</code> 手写 <code>forward</code>。继承 <code>nn.Module</code> 是通用解，<code>Sequential</code> 是它的特例。</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<pre data-lang="python"><code class="language-python">import torch
+import torch.nn as nn
+
+# ---- 1. 自定义一个两层 MLP ----
+class Net(nn.Module):
+    def __init__(self, in_dim, hidden, out_dim):
+        super().__init__()                  # 必须调用父类初始化
+        self.fc1 = nn.Linear(in_dim, hidden)   # 子层注册为属性
+        self.fc2 = nn.Linear(hidden, out_dim)
+        self.act = nn.ReLU()
+
+    def forward(self, x):                   # 只定义前向，反向由 autograd 处理
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.fc2(x)
+        return x
+
+net = Net(in_dim=4, hidden=8, out_dim=1)
+print(net)                                  # 打印出模块树结构
+print(&quot;参数总数:&quot;, sum(p.numel() for p in net.parameters()))
+
+# ---- 2. 前向调用：直接 net(x)，不要 net.forward(x) ----
+x = torch.randn(2, 4)                       # 2 个样本，4 维特征
+out = net(x)
+print(&quot;\n输出形状:&quot;, out.shape)             # torch.Size([2, 1])
+
+# ---- 3. 参数汇总 ----
+print(&quot;\nnamed_parameters:&quot;)
+for name, p in net.named_parameters():
+    print(&quot;  &quot;, name, p.shape)
+
+# ---- 4. 训练/评估模式切换 ----
+net.train()                                 # 训练模式（Dropout、BN 生效）
+net.eval()                                  # 评估模式（Dropout、BN 行为改变）
+
+# ---- 5. Sequential：直线堆叠的快捷方式 ----
+seq = nn.Sequential(
+    nn.Linear(4, 8),
+    nn.ReLU(),
+    nn.Linear(8, 1),
+)
+print(&quot;\nSequential 输出形状:&quot;, seq(x).shape)   # torch.Size([2, 1])</code></pre>
+<p>运行要点：<code>print(net)</code> 会列出 <code>Net</code> 内部的两个 <code>Linear</code> 和一个 <code>ReLU</code>；<code>sum(p.numel() for p in net.parameters())</code> 应等于 <code>4*8+8 + 8*1+1 = 49</code>。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>自定义一个 <code>class MLP(nn.Module)</code>，输入 784 维，中间两层（256、128），输出 10 维，每层后接 ReLU，实现并打印 <code>model</code> 结构。</li>
+<li>对上面的 MLP，用 <code>named_parameters()</code> 统计：一共有几个参数张量？总参数量是多少？</li>
+<li>手写一个带&quot;跳跃连接&quot;的模块：<code>forward</code> 里返回 <code>x + self.fc2(self.act(self.fc1(x)))</code>（需保证形状可相加），说明为什么这种结构用 <code>Sequential</code> 无法表达、必须继承 <code>nn.Module</code>。</li>
+<li>判断题：<code>model(x)</code> 和 <code>model.forward(x)</code> 完全等价，可以随意混用。这句话为什么是错的？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>PyTorch 官方文档 · torch.nn.Module：<a href="https://pytorch.org/docs/stable/generated/torch.nn.Module.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/docs/stable/generated/torch.nn.Module.html</a></li>
+<li>PyTorch 官方文档 · torch.nn.Sequential：<a href="https://pytorch.org/docs/stable/generated/torch.nn.Sequential.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/docs/stable/generated/torch.nn.Sequential.html</a></li>
+<li>PyTorch 官方教程 · Build the Neural Network：<a href="https://pytorch.org/tutorials/beginner/basics/buildmodel_tutorial.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/tutorials/beginner/basics/buildmodel_tutorial.html</a></li>
+<li>PyTorch 官方教程 · What is torch.nn really?：<a href="https://pytorch.org/tutorials/beginner/nn_tutorial.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/tutorials/beginner/nn_tutorial.html</a></li>
+</ul>
+<p><a href="#/l/torch-ch3-l2">下一课：网络层</a></p>

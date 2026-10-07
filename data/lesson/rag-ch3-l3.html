@@ -1,0 +1,905 @@
+<h2 id="h-多路召回的结果融合与去偏rrf加权与校准">多路召回的结果融合与去偏：RRF、加权与校准<a class="anchor" href="#h-多路召回的结果融合与去偏rrf加权与校准" aria-label="本节链接">#</a></h2>
+<h3 id="h-这一节要解决什么">这一节要解决什么<a class="anchor" href="#h-这一节要解决什么" aria-label="本节链接">#</a></h3>
+<p>第 1 章的第 4 节已经证明了&quot;混合检索有效&quot;，理由是<strong>稀疏与稠密的误差不相关</strong>。本节不重复那个证明，而是处理它留下的三个工程问题：</p>
+<ol>
+<li><strong>分数根本不可比，怎么合并？</strong> BM25 的分数无界、重尾、随 <code>k1</code>/<code>b</code> 与语料统计漂移；余弦被限制在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">[</span><span class="mord">−</span><span class="mord">1</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">1</span><span class="mclose">]</span></span></span></span> 且实际集中在很窄的区间里（各向异性）。直接把两路分数相加是<strong>把两个不同量纲的量当同量纲用</strong> —— 但&quot;排名融合&quot;（RRF）又丢掉了分数的幅度信息。这个取舍有确定的形式。</li>
+<li><strong>融合会不会引入新偏差？</strong> 会，而且至少三类：流行度/长度偏置、来源偏置、近重复挤占名次。<strong>这三类必须分开检测</strong>，因为它们的处方完全不同（归一化 / 查询路由 / 去重）。</li>
+<li><strong>能不能把分数校准成&quot;概率&quot;再合并？</strong> 可以，但要付代价。要说清&quot;什么条件下校准是值得的&quot;，以及&quot;校准本身的诊断怎么做&quot;。</li>
+</ol>
+<p>结论先放在这里：</p>
+<blockquote>
+<p><strong>融合不是&quot;把两路结果拼起来&quot;，而是在两个假设之间做选择：相信分数（加权）还是只相信排名（RRF）。前者的信息更多、但要求分数可比；后者稳健、但丢失幅度信息。而无论选哪个，融合都</strong>不能<strong>补救&quot;某一路根本没召回&quot;的文档 —— 融合的天花板由&quot;各路候选池的并集&quot;决定。</strong></p>
+</blockquote>
+<h3 id="h-一分数为什么不可比把它写成形式条件">一、分数为什么不可比：把它写成形式条件<a class="anchor" href="#h-一分数为什么不可比把它写成形式条件" aria-label="本节链接">#</a></h3>
+<h4 id="h-11-可比性的形式定义">1.1 可比性的形式定义<a class="anchor" href="#h-11-可比性的形式定义" aria-label="本节链接">#</a></h4>
+<p>设第 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span></span></span></span> 路的打分函数为 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">r</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0359em;">q</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">d</span><span class="mclose">)</span></span></span></span>。融合操作形如 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.2em;vertical-align:-0.35em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">F</span><span class="mord"><span class="delimsizing size1">(</span></span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0359em;">q</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">d</span><span class="mclose">)</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="minner">…</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0077em;">R</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0359em;">q</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">d</span><span class="mclose">)</span><span class="mord"><span class="delimsizing size1">)</span></span></span></span></span>。<strong>&quot;分数可比&quot;的严格含义是</strong>：</p>
+<blockquote>
+<p>存在一族<strong>与查询无关</strong>的单调变换 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">r</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">r</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 只依赖第 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span></span></span></span> 路自身），使得变换后的分数 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">r</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">r</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0359em;">q</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">d</span><span class="mclose">))</span></span></span></span> 落在<strong>同一个可比尺度</strong>上（例如都可解释为&quot;相关的对数几率&quot;）。</p>
+</blockquote>
+<p>若这样的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">r</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 存在，则加权求和有意义；若不存在（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">r</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 必须依赖查询或候选池），那么逐查询归一化只是<strong>近似</strong>，且近似误差可以大到让融合失效。</p>
+<h4 id="h-12-为什么真实分数不满足这个条件">1.2 为什么真实分数不满足这个条件<a class="anchor" href="#h-12-为什么真实分数不满足这个条件" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>路线</th>
+<th>分数的形态</th>
+<th>破坏可比性的具体原因</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>BM25</td>
+<td>命中的词权重之和，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">[</span><span class="mord">0</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">∞</span><span class="mclose">)</span></span></span></span></td>
+<td>上界随查询长度线性增长；随语料 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.1076em;">df</span></span></span></span> 漂移；<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mop">lo<span style="margin-right:0.0139em;">g</span></span></span></span></span> 项让高分区间被压缩</td>
+</tr>
+<tr>
+<td>双塔余弦</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">[</span><span class="mord">−</span><span class="mord">1</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">1</span><span class="mclose">]</span></span></span></span>，实际集中在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4831em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">[</span><span class="mord">0.5</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">0.9</span><span class="mclose">]</span></span></span></span></td>
+<td>各向异性把动态范围压到 0.4 以内；不同查询的中心位置不同</td>
+</tr>
+<tr>
+<td>late interaction</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0497em;vertical-align:-0.2997em;"></span><span class="mop"><span class="mop op-symbol small-op" style="position:relative;top:0em;">∑</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.162em;"><span style="top:-2.4003em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2997em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop"><span class="mop">max</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0572em;">j</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mopen">⟨</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0359em;">q</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">d</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0572em;">j</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mclose">⟩</span></span></span></span>，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0361em;vertical-align:-0.2861em;"></span><span class="mopen">[</span><span class="mord">0</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">L</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0359em;">q</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mclose">]</span></span></span></span></td>
+<td>上界随查询 token 数增长（回答第 3 节的&quot;长度偏置&quot;）</td>
+</tr>
+<tr>
+<td>cross-encoder logit</td>
+<td>近似 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord">−</span><span class="mord">∞</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">∞</span><span class="mclose">)</span></span></span></span>，可校准</td>
+<td>相对最&quot;像分数&quot;，但仍依赖训练数据的先验</td>
+</tr>
+</tbody></table>
+<p><strong>注意&quot;上界随查询长度增长&quot;这一条</strong>：它意味着<strong>不归一化就融合会系统性偏向长查询</strong> —— 因为长查询在 late interaction / BM25 上更容易拿到大分数。这是一个真实的、常被忽略的偏置源。</p>
+<h4 id="h-13-三种融合假设的对照">1.3 三种融合假设的对照<a class="anchor" href="#h-13-三种融合假设的对照" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>假设</th>
+<th>保留的信息</th>
+<th>主要风险</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>加权分数融合</strong></td>
+<td>分数经单调变换后可比</td>
+<td>幅度（&quot;这一路有多确信&quot;）</td>
+<td>变换估计错误 → 某一路支配</td>
+</tr>
+<tr>
+<td><strong>RRF（排名融合）</strong></td>
+<td>只需排名可信</td>
+<td>只有顺序</td>
+<td>丢幅度；<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 参数造成头部偏置</td>
+</tr>
+<tr>
+<td><strong>校准到概率</strong></td>
+<td>分数是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="mopen">(</span><span class="mord text"><span class="mord">rel</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∣</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">s</span><span class="mclose">)</span></span></span></span> 的单调函数且可估</td>
+<td>幅度 + 可解释性</td>
+<td>校准成本；校准集漂移</td>
+</tr>
+</tbody></table>
+<h3 id="h-二rrf推导性质与代价">二、RRF：推导、性质与代价<a class="anchor" href="#h-二rrf推导性质与代价" aria-label="本节链接">#</a></h3>
+<h4 id="h-21-定义">2.1 定义<a class="anchor" href="#h-21-定义" aria-label="本节链接">#</a></h4>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord">RRF</span></span><span class="mopen">(</span><span class="mord mathnormal">d</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:3.0954em;vertical-align:-1.2671em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.8283em;"><span style="top:-1.8829em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">r</span><span class="mrel mtight">=</span><span class="mord mtight">1</span></span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∑</span></span></span><span style="top:-4.3em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.0077em;">R</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.2671em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3214em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord"><span class="mord text"><span class="mord">rank</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">r</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord mathnormal">d</span><span class="mclose">)</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.936em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></p>
+<p>其中 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord text"><span class="mord">rank</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">r</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord mathnormal">d</span><span class="mclose">)</span></span></span></span> 是文档 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">d</span></span></span></span> 在第 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span></span></span></span> 路结果里的名次（从 1 开始），未出现的路<strong>不贡献</strong>（而不是记作最后一名 —— 这是一个重要的实现选择，两种做法结果不同）。<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 通常取 60。</p>
+<h4 id="h-22-它的稳健性从哪来">2.2 它的稳健性从哪来<a class="anchor" href="#h-22-它的稳健性从哪来" aria-label="本节链接">#</a></h4>
+<p><strong>命题</strong>：RRF 对每一路的<strong>任意严格单调递增变换</strong>不变。</p>
+<p><strong>证明</strong>：单调变换保序，所以 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord text"><span class="mord">rank</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">r</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord mathnormal">d</span><span class="mclose">)</span></span></span></span> 不变，于是 RRF 值不变。∎</p>
+<p><strong>这个性质的价值</strong>：你不需要知道 BM25 的 <code>k1</code>/<code>b</code>、不需要知道余弦的分布、不需要估计任何归一化参数。<strong>代价是：你把&quot;这一路有多确信&quot;这个信息完全扔掉了</strong> —— 如果第 1 路把正确文档排第 1 且分数远超第 2 名，而第 2 路把某个噪声文档排第 1 但分数只比第 2 名高一点点，RRF 对两者的处理完全一样。</p>
+<h4 id="h-23-rrf-的一个硬性质单路文档的上界">2.3 RRF 的一个硬性质：单路文档的上界<a class="anchor" href="#h-23-rrf-的一个硬性质单路文档的上界" aria-label="本节链接">#</a></h4>
+<p>对只在第 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span></span></span></span> 路出现、且排名为 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span></span></span></span> 的文档：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord">RRF</span></span><span class="mopen">(</span><span class="mord mathnormal">d</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.2019em;vertical-align:-0.8804em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3214em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord mathnormal">p</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.8804em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≤</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.0908em;vertical-align:-0.7693em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3214em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord">1</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.7693em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></p>
+<p>而对在两路都排第 1 的文档：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord">RRF</span></span><span class="mopen">(</span><span class="mord mathnormal">d</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.0908em;vertical-align:-0.7693em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3214em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord">1</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.7693em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></p>
+<p><strong>推论（本节最重要的一条）</strong>：</p>
+<blockquote>
+<p><strong>RRF 的&quot;共识&quot;机制决定了：只被一路召回的文档，排名上界约是&quot;两路共识文档&quot;的一半。</strong> 若正确文档只被一路召回（另一路漏了），RRF 会把它压在共识文档之下 —— <strong>而融合无法创造&quot;另一路的召回&quot;</strong>。</p>
+</blockquote>
+<p>这解释了实践中一个常见现象：融合后 recall 上升但 nDCG 下降 —— 因为融合把&quot;共识的噪声文档&quot;抬到了&quot;独路的正确文档&quot;之上。<strong>处方不是调 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span>，而是先修那一路的召回</strong>（回指本节第五节的判据）。</p>
+<h4 id="h-24-math31-的作用它是一把头部压缩器">2.4 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 的作用：它是一把&quot;头部压缩器&quot;<a class="anchor" href="#h-24-math31-的作用它是一把头部压缩器" aria-label="本节链接">#</a></h4>
+<p>把 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1/</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">p</span><span class="mclose">)</span></span></span></span> 对 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span></span></span></span> 展开：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:2.2019em;vertical-align:-0.8804em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3214em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord mathnormal">p</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.8804em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.0074em;vertical-align:-0.686em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3214em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mord"><span class="delimsizing size2">(</span></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.7936em;vertical-align:-0.686em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.1076em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">p</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:2.1771em;vertical-align:-0.686em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.4911em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.7401em;"><span style="top:-2.989em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.8em;vertical-align:-0.65em;"></span><span class="minner">⋯</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="delimsizing size2">)</span></span></span></span></span></span></p>
+<ul>
+<li><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> <strong>小</strong>：名次差异被放大 → 头部（前几名）权重极高，融合结果接近&quot;多数投票式的头部共识&quot;；</li>
+<li><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> <strong>大</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1/</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">p</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1/</span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span>，所有名次的贡献趋同 → <strong>融合退化为&quot;计算每篇文档被几路命中&quot;的计数</strong>；</li>
+<li><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">60</span></span></span></span> 的来历是经验值，它的作用是让&quot;第 1 名与第 2 名&quot;的差距（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1/61</span></span></span></span> vs <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1/62</span></span></span></span>，约 1.6%）与&quot;第 1 名与第 10 名&quot;的差距（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1/61</span></span></span></span> vs <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1/70</span></span></span></span>，约 13%）都落在&quot;能影响排序但不至于支配&quot;的区间。</li>
+</ul>
+<p><strong>与 Borda count 的关系</strong>：Borda 用 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord text"><span class="mord">rank</span></span></span></span></span> 的<strong>线性</strong>递减（或 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1/</span><span class="mord text"><span class="mord">rank</span></span></span></span></span> 的某种形式）投票；RRF 是它的&quot;重尾&quot;版本。两者的共同点是都只依赖排名；差别是 RRF 对&quot;名次靠后&quot;的惩罚更轻（因为 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1/</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">p</span><span class="mclose">)</span></span></span></span> 在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span></span></span></span> 大时衰减慢）。<strong>当候选列表很短（例如每路只有 10 条）时，大 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 的 RRF 几乎等价于计数</strong>，此时用 Borda 或小 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 更有区分度。</p>
+<p><figure><img class="md-img" src="content/courses/rag-systems/assets/chapter-3-figure-03.svg" alt="RRF 权重与单路文档的上界" loading="lazy" decoding="async"><figcaption>RRF 权重与单路文档的上界</figcaption></figure>
+</p>
+<h3 id="h-三加权与校准分数融合的正确做法">三、加权与校准：分数融合的正确做法<a class="anchor" href="#h-三加权与校准分数融合的正确做法" aria-label="本节链接">#</a></h3>
+<h4 id="h-31-逐查询归一化的三种做法与各自的陷阱">3.1 逐查询归一化的三种做法与各自的陷阱<a class="anchor" href="#h-31-逐查询归一化的三种做法与各自的陷阱" aria-label="本节链接">#</a></h4>
+<p><strong>做法 A：逐查询 min-max</strong></p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6679em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal">s</span></span><span style="top:-3.35em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.1944em;"><span class="mord">~</span></span></span></span></span></span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">r</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0359em;">q</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">d</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.365em;vertical-align:-0.9361em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.4289em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mop"><span class="mop">max</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight"><span class="mord mathnormal mtight">d</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6828em;"><span style="top:-2.786em;margin-right:0.0714em;"><span class="pstrut" style="height:2.5em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mord mtight"><span class="mord mtight">′</span></span></span></span></span></span></span></span></span><span class="mrel mtight">∈</span><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.0715em;">C</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1645em;"><span style="top:-2.357em;margin-left:-0.0715em;margin-right:0.0714em;"><span class="pstrut" style="height:2.5em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">r</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.143em;"><span></span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2501em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">r</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0359em;">q</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">d</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6779em;"><span style="top:-2.989em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">′</span></span></span></span></span></span></span></span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mop"><span class="mop">min</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight"><span class="mord mathnormal mtight">d</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6828em;"><span style="top:-2.786em;margin-right:0.0714em;"><span class="pstrut" style="height:2.5em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mord mtight"><span class="mord mtight">′</span></span></span></span></span></span></span></span></span><span class="mrel mtight">∈</span><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.0715em;">C</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1645em;"><span style="top:-2.357em;margin-left:-0.0715em;margin-right:0.0714em;"><span class="pstrut" style="height:2.5em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">r</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.143em;"><span></span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2501em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">r</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0359em;">q</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">d</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6779em;"><span style="top:-2.989em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">′</span></span></span></span></span></span></span></span></span><span class="mclose">)</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">r</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0359em;">q</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">d</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mop"><span class="mop">min</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight"><span class="mord mathnormal mtight">d</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6828em;"><span style="top:-2.786em;margin-right:0.0714em;"><span class="pstrut" style="height:2.5em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mord mtight"><span class="mord mtight">′</span></span></span></span></span></span></span></span></span><span class="mrel mtight">∈</span><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.0715em;">C</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1645em;"><span style="top:-2.357em;margin-left:-0.0715em;margin-right:0.0714em;"><span class="pstrut" style="height:2.5em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">r</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.143em;"><span></span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2501em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">r</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0359em;">q</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">d</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.7519em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">′</span></span></span></span></span></span></span></span></span><span class="mclose">)</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.9361em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></p>
+<p><strong>陷阱</strong>：分母被<strong>单个离群候选</strong>支配。如果某一路的候选池里混进一个分数极低的文档（例如 BM25 里因为 idf 计算产生一个很低的分数），分母被拉大，<strong>所有正常文档的归一化分数被压缩到一个很窄的区间</strong> —— 这一路在融合里的权重实际上变成 0。</p>
+<p><strong>这个陷阱是可测的</strong>：算&quot;归一化后分数的动态范围&quot;（max−min，理论上应为 1）与&quot;90 分位到 10 分位的跨度&quot;。若后者小于 0.1，说明归一化被离群值毁了。</p>
+<p><strong>做法 B：逐查询 z-score</strong></p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6679em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal">s</span></span><span style="top:-3.35em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.1944em;"><span class="mord">~</span></span></span></span></span></span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">r</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0359em;">q</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">d</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.363em;vertical-align:-0.936em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.427em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal" style="margin-right:0.0359em;">σ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">r</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0359em;">q</span><span class="mclose">)</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">r</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0359em;">q</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">d</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord"><span class="mord mathnormal">μ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">r</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0359em;">q</span><span class="mclose">)</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.936em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></p>
+<p><strong>陷阱</strong>：假设分数近似高斯。BM25 是重尾的（少数文档分数极高），均值与标准差都被尾部拉动，结果是&quot;正常文档被压到 0 附近，只有尾部被凸显&quot;。<strong>诊断</strong>：算分数的偏度与峰度；若偏度 &gt; 2，z-score 不可靠。</p>
+<p><strong>做法 C：逐查询分位数映射</strong></p>
+<p>把 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">r</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0359em;">q</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">d</span><span class="mclose">)</span></span></span></span> 映射成它在候选池里的分位数 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord"><span class="mord mathrm">rank</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">r</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord mathnormal">d</span><span class="mclose">)</span><span class="mord">/∣</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">r</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord">∣</span></span></span></span>。<strong>陷阱</strong>：它<strong>等价于排名融合</strong>（丢掉幅度），而且要足够大的池才能稳定估计分位数；小池（&lt;50）时相邻候选的分位数差被量化成粗糙的台阶。</p>
+<p><strong>三种做法的一条判据</strong>：</p>
+<pre><code>① 若你确信分数形态稳定（同一模型、同一语料、同一查询分布）
+     → 用固定的全局变换（甚至不归一化），因为全局变换最不容易引入查询级噪声
+② 若分数形态随查询漂移（BM25 的 df、余弦的中心）
+     → 用逐查询 z-score 或分位数，并用&quot;动态范围/偏度&quot;做健康检查
+③ 若你无法判断
+     → 直接用 RRF：它放弃了幅度信息，但不会因为归一化错误而崩</code></pre>
+<h4 id="h-32-保序性逐查询单调归一化--加权--什么">3.2 保序性：逐查询单调归一化 + 加权 = 什么<a class="anchor" href="#h-32-保序性逐查询单调归一化--加权--什么" aria-label="本节链接">#</a></h4>
+<p><strong>命题</strong>：若每路的归一化变换 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8179em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6679em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal">s</span></span><span style="top:-3.35em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.1944em;"><span class="mord">~</span></span></span></span></span></span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">r</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 只依赖第 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span></span></span></span> 路自身的候选池（逐查询单调），则 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0497em;vertical-align:-0.2997em;"></span><span class="mop"><span class="mop op-symbol small-op" style="position:relative;top:0em;">∑</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.0017em;"><span style="top:-2.4003em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">r</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2997em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0269em;">w</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0269em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">r</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord"><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6679em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal">s</span></span><span style="top:-3.35em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.1944em;"><span class="mord">~</span></span></span></span></span></span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">r</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> <strong>不等于</strong>任何固定的排名融合（除非所有路的排名都严格一致）。</p>
+<p><strong>证明要点</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8179em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6679em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal">s</span></span><span style="top:-3.35em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.1944em;"><span class="mord">~</span></span></span></span></span></span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">r</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 的取值依赖池内分布的<strong>形状</strong>，而形状随查询变化。所以同一个名次在第 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span></span></span></span> 路里得到的归一化分数<strong>不是常数</strong> —— 这与 RRF 的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1/</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord">rank</span></span><span class="mclose">)</span></span></span></span> 形成对比。∎</p>
+<p><strong>这条命题解释了为什么加权融合的信息更多、但更脆弱</strong>：它使用了&quot;名次 + 池内分布形状&quot;两个信息源，而形状本身是噪声来源。<strong>一个实用的折中是&quot;两段式&quot;</strong>：先用 z-score 加权，再用 RRF 兜底，两者取并集或用验证集选一个。</p>
+<h4 id="h-33-权重怎么定流程与过拟合判据">3.3 权重怎么定：流程与过拟合判据<a class="anchor" href="#h-33-权重怎么定流程与过拟合判据" aria-label="本节链接">#</a></h4>
+<p><strong>流程</strong>：</p>
+<pre><code>① 切分：训练（定权重）/ 验证（选超参）/ 测试（报告）
+   ⚠️ 必须按**查询**切分，不能按 (query, doc) 对切分（同一查询的对会泄漏）
+② 在验证集上做坐标上升（或小网格）最大化目标指标（nDCG@10 通常比 recall 更贴切，
+   因为融合主要影响排序）
+③ 记录每个权重组合在训练/验证上的指标差
+④ 用自助法（bootstrap）给出指标的置信区间，只接受&quot;提升超过置信区间宽度&quot;的配置</code></pre>
+<p><strong>过拟合判据（可测）</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>信号</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>训练指标 − 验证指标 &gt; 2×验证集置信区间宽度</td>
+<td>权重过拟合</td>
+</tr>
+<tr>
+<td>权重在查询子集间方差大（例如按查询类型分组后最优权重差 &gt; 0.3）</td>
+<td>权重不稳定，应改成<strong>按查询类型条件化</strong>（路由）</td>
+</tr>
+<tr>
+<td>最优权重在网格边界（例如 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0269em;">w</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.0269em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">1.0</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0269em;">w</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.0269em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0</span></span></span></span>）</td>
+<td>说明某一路无贡献，应删掉而不是保留</td>
+</tr>
+</tbody></table>
+<p><strong>最后一条最容易被忽略</strong>：如果验证集告诉你&quot;最优权重是 (1, 0)&quot;，那不是&quot;融合有效但权重极端&quot;，而是&quot;第二路没有信息&quot;。此时应该去查第二路的召回（是否重复了第一路），而不是保留一个权重为 0 的组件（它只增加延迟与故障面）。</p>
+<h3 id="h-四去偏三类偏置判别实验与处方">四、去偏：三类偏置、判别实验与处方<a class="anchor" href="#h-四去偏三类偏置判别实验与处方" aria-label="本节链接">#</a></h3>
+<p>融合会引入并在某些情况下<strong>放大</strong>偏置。下面三类必须分开处理。</p>
+<h4 id="h-41-流行度--长度偏置">4.1 流行度 / 长度偏置<a class="anchor" href="#h-41-流行度--长度偏置" aria-label="本节链接">#</a></h4>
+<p><strong>机制</strong>：长文档、热门文档在多路里都容易进前列（长文档在 BM25 里词频高，在双塔里因为池化把更多内容平均进向量而&quot;更接近一切&quot;）。融合把这些&quot;多路都偏爱&quot;的文档抬到更高。</p>
+<p><strong>判别实验</strong>：按文档长度（或历史点击量）分桶，算每桶的<strong>召回率</strong>与<strong>平均名次</strong>。若长文档桶的名次显著更靠前但相关性并不更高，偏置存在。</p>
+<p><strong>处方</strong>：</p>
+<ul>
+<li><strong>长度归一化</strong>（BM25 的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">b</span></span></span></span> 参数、向量的长度不变编码，回指第 1 章）；</li>
+<li><strong>per-bucket 配额</strong>：融合后按桶配额取（例如每个长度桶至少保留 1 条），代价是可能挤掉真正的相关文档 —— <strong>必须用验证集确认配额不伤害 nDCG</strong>。</li>
+</ul>
+<h4 id="h-42-来源--位置偏置">4.2 来源 / 位置偏置<a class="anchor" href="#h-42-来源--位置偏置" aria-label="本节链接">#</a></h4>
+<p><strong>机制</strong>：某一路对某类查询系统性更差（例如稀疏路对短查询、稠密路对稀有实体/数字）。同权重融合会让差的那一路在这类查询上拖累结果。</p>
+<p><strong>判别实验</strong>：按查询类型（长度、是否含数字、是否含稀有实体、是否是疑问句）分层，算每层的<strong>融合增益</strong>（融合指标 − 最好单路指标）。若某一层增益为负，说明该层上融合有害。</p>
+<p><strong>处方</strong>：<strong>查询路由</strong>（按类型选路或调权重）。这是最有价值的一条 —— 它把&quot;平均最优权重&quot;换成&quot;条件最优权重&quot;，通常能拿到比全局调权重更大的收益。<strong>代价</strong>：需要类型分类器，且分类器的错误会带来最坏情况（把该用稠密路的查询路由到了稀疏路）。</p>
+<h4 id="h-43-近重复挤占名次">4.3 近重复挤占名次<a class="anchor" href="#h-43-近重复挤占名次" aria-label="本节链接">#</a></h4>
+<p><strong>机制</strong>：同一文档的多个 chunk、同一内容的不同版本、模板生成的近似文档，会<strong>同时出现在多路结果里</strong>，RRF 的&quot;共识&quot;机制会把它们一起抬高，占满 Top-<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span>。</p>
+<p><strong>判别实验</strong>：比较&quot;去重前&quot;与&quot;去重后&quot;的 <strong>nDCG@10</strong> 与&quot;Top-10 里不同文档数&quot;。若 Top-10 只来自 3 个文档，且去重后 nDCG 明显上升 —— 偏置存在且严重。</p>
+<p><strong>处方</strong>（三条，复杂度递增）：</p>
+<ol>
+<li><strong>chunk 级去重</strong>：同一 <code>doc_id</code> 只保留最高分的 chunk（最简单，但会丢掉&quot;同一文档的多段证据&quot;）；</li>
+<li><strong>文档级配额</strong>：每个 <code>doc_id</code> 最多贡献 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">c</span></span></span></span> 条（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">c</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2</span></span></span></span> 常见），保留多段证据同时限制挤占；</li>
+<li><strong>层级融合</strong>：先在文档级融合（对每个 <code>doc_id</code> 取它最好的 chunk 的分数/名次），再在入选文档内选 chunk。<strong>这一条通常最优</strong>，因为它把&quot;选文档&quot;与&quot;选片段&quot;两个决策解耦 —— 而它们的判据本来就不同（前者看主题相关性，后者看是否含答案）。</li>
+</ol>
+<h3 id="h-五校准把分数变成概率">五、校准：把分数变成概率<a class="anchor" href="#h-五校准把分数变成概率" aria-label="本节链接">#</a></h3>
+<h4 id="h-51-最小做法">5.1 最小做法<a class="anchor" href="#h-51-最小做法" aria-label="本节链接">#</a></h4>
+<p>要把多路分数当证据合起来，最干净的形式是贝叶斯：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:2.363em;vertical-align:-0.936em;"></span><span class="mop">lo<span style="margin-right:0.0139em;">g</span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.427em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="mopen">(</span><span class="mord text"><span class="mord">non</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∣</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="minner">…</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0077em;">R</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="mopen">(</span><span class="mord text"><span class="mord">rel</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∣</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="minner">…</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0077em;">R</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.936em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.677em;vertical-align:-1.25em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.05em;"><span style="top:-1.9em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">r</span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∑</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.25em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop">lo<span style="margin-right:0.0139em;">g</span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.427em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">r</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∣</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mord text"><span class="mord">non</span></span><span class="mclose">)</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">r</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∣</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mord text"><span class="mord">rel</span></span><span class="mclose">)</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.936em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6151em;"></span><span class="mord text"><span class="mord">const</span></span></span></span></span></span></p>
+<p>这要求估计每路的<strong>似然比</strong>。实用的近似是把它参数化成 logistic 形式：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="mopen">(</span><span class="mord text"><span class="mord">rel</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∣</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="minner">…</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0077em;">R</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.4em;vertical-align:-1.25em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">σ</span><span class="mord"><span class="delimsizing size2">(</span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.05em;"><span style="top:-1.9em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">r</span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∑</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.25em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0037em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">r</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">ϕ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">r</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">r</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.8em;vertical-align:-0.65em;"></span><span class="mord mathnormal" style="margin-right:0.0528em;">β</span><span class="mord"><span class="delimsizing size2">)</span></span></span></span></span></span></p>
+<p>其中 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">ϕ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">r</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 是每路的单调特征（例如分位数、log 分数）。<strong>这个模型可以直接用带标注的 (q,d) 对拟合</strong>，而且它天然给出&quot;权重 + 校准&quot;两件事。</p>
+<h4 id="h-52-校准的诊断可靠性图与-ece">5.2 校准的诊断：可靠性图与 ECE<a class="anchor" href="#h-52-校准的诊断可靠性图与-ece" aria-label="本节链接">#</a></h4>
+<p><strong>期望校准误差（ECE）</strong>：把预测概率分桶（例如 10 桶），比较每桶内的平均预测概率与真实相关比例：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord">ECE</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:3.1304em;vertical-align:-1.3021em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.8283em;"><span style="top:-1.8479em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">b</span><span class="mrel mtight">=</span><span class="mord mtight">1</span></span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∑</span></span></span><span style="top:-4.3em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.0502em;">B</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.3021em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.1076em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.109em;">N</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">b</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mord"><span class="delimsizing mult"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.15em;"><span style="top:-3.15em;"><span class="pstrut" style="height:3.8em;"></span><span style="width:0.333em;height:1.8em;"><svg xmlns="http://www.w3.org/2000/svg" width="0.333em" height="1.8em" viewBox="0 0 333 1800"><path d="M145 15 v585 v600 v585 c2.667,10,9.667,15,21,15
+c10,0,16.667,-5,20,-15 v-585 v-600 v-585 c-2.667,-10,-9.667,-15,-21,-15
+c-10,0,-16.667,5,-20,15z M188 15 H145 v585 v600 v585 h43z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.65em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord overline"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8944em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord accent"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.6944em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal">p</span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.1667em;"><span class="mord">^</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.1944em;"><span></span></span></span></span></span></span></span><span style="top:-3.8144em;"><span class="pstrut" style="height:3em;"></span><span class="overline-line" style="border-bottom-width:0.04em;"></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.1944em;"><span></span></span></span></span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.242em;"><span style="top:-2.4559em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">b</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2441em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.8em;vertical-align:-0.65em;"></span><span class="mord"><span class="mord overline"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.6306em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0359em;">y</span></span></span><span style="top:-3.5506em;"><span class="pstrut" style="height:3em;"></span><span class="overline-line" style="border-bottom-width:0.04em;"></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.1944em;"><span></span></span></span></span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.242em;"><span style="top:-2.4559em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">b</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2441em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="delimsizing mult"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.15em;"><span style="top:-3.15em;"><span class="pstrut" style="height:3.8em;"></span><span style="width:0.333em;height:1.8em;"><svg xmlns="http://www.w3.org/2000/svg" width="0.333em" height="1.8em" viewBox="0 0 333 1800"><path d="M145 15 v585 v600 v585 c2.667,10,9.667,15,21,15
+c10,0,16.667,-5,20,-15 v-585 v-600 v-585 c-2.667,-10,-9.667,-15,-21,-15
+c-10,0,-16.667,5,-20,15z M188 15 H145 v585 v600 v585 h43z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.65em;"><span></span></span></span></span></span></span></span></span></span></span></p>
+<p><strong>诊断的读法</strong>：</p>
+<ul>
+<li>ECE 小 → 概率可信 → 可以用它做阈值决策（&quot;低于 0.3 的候选不进上下文&quot;）；</li>
+<li>ECE 大但<strong>排序</strong>仍好 → 只能用它排序，不能当概率（这是最常见的情形）；</li>
+<li>可靠性图呈&quot;S 形&quot; → 系统性过度自信（模型区分度够但尺度不对），温度缩放（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">σ</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mord mathnormal" style="margin-right:0.044em;">z</span><span class="mclose">)</span></span></span></span> 里调 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span>）通常能修。</li>
+</ul>
+<h4 id="h-53-为什么多数生产系统不做这一步">5.3 为什么多数生产系统不做这一步<a class="anchor" href="#h-53-为什么多数生产系统不做这一步" aria-label="本节链接">#</a></h4>
+<p>三条理由，都是成本/收益的权衡：</p>
+<ol>
+<li><strong>需要标注</strong>：ECE 要 (q,d) 级的真值，而排序指标只需要&quot;正例在不在池里&quot;这类更弱的监督；</li>
+<li><strong>漂移</strong>：校准依赖语料与查询分布，索引一更新、用户行为一变就要重标；</li>
+<li><strong>收益有限</strong>：如果下游只是&quot;取 Top-k 拼上下文&quot;，排序对就够了 —— 只有当你要做<strong>阈值化决策</strong>（拒答、低置信度兜底、多路证据加权）时，概率才有额外价值。</li>
+</ol>
+<p><strong>判据</strong>：<strong>如果你没有&quot;阈值化决策&quot;或&quot;证据合成&quot;的需求，就不要做校准。</strong> 这不是能力问题，是需求问题。</p>
+<h3 id="h-六可测判据清单融合有效的信号与无效的信号">六、可测判据清单：融合有效的信号与无效的信号<a class="anchor" href="#h-六可测判据清单融合有效的信号与无效的信号" aria-label="本节链接">#</a></h3>
+<table>
+<thead>
+<tr>
+<th>观测量</th>
+<th>有效信号</th>
+<th>无效信号/病因</th>
+<th>处方</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>融合 recall vs 最好单路 recall</td>
+<td>显著上升</td>
+<td>不升 → 两路高度冗余</td>
+<td>检查两路候选集重合度（Jaccard）；若 &gt;0.7 就换一路</td>
+</tr>
+<tr>
+<td>融合 nDCG vs 最好单路 nDCG</td>
+<td>上升</td>
+<td>降 → 共识噪声压过独路正例（2.3 节）</td>
+<td>修漏召回的那一路；或对&quot;独路命中&quot;加权</td>
+</tr>
+<tr>
+<td>被两路同时召回的比例</td>
+<td>中等（0.2~0.6）</td>
+<td>过高 → 冗余；过低 → 两路都在噪声上工作</td>
+<td>调整其中一路的召回深度</td>
+</tr>
+<tr>
+<td>权重网格的最优点</td>
+<td>内部点</td>
+<td>落在边界（含 0）</td>
+<td>删掉无贡献的那一路，别留着</td>
+</tr>
+<tr>
+<td>按查询类型分层的增益</td>
+<td>每层 ≥0</td>
+<td>某层为负</td>
+<td>查询路由 / 条件权重</td>
+</tr>
+<tr>
+<td>Top-10 里的不同 <code>doc_id</code> 数</td>
+<td>接近 10</td>
+<td>显著小于 → 近重复挤占</td>
+<td>文档级配额或层级融合</td>
+</tr>
+<tr>
+<td>归一化后的动态范围</td>
+<td>接近 1</td>
+<td>≪1 → 被离群值毁了</td>
+<td>换 z-score / 分位数，或裁掉极端值</td>
+</tr>
+</tbody></table>
+<h3 id="h-代码两路互补召回器上的融合与去偏对照">代码：两路互补召回器上的融合与去偏对照<a class="anchor" href="#h-代码两路互补召回器上的融合与去偏对照" aria-label="本节链接">#</a></h3>
+<p>下面的脚本构造两个<strong>互补且有偏</strong>的召回器（一路靠词项重叠、一路靠主题方向），在带真值标签的候选池上比较 RRF、加权、Borda 与层级融合，并把第四节的三个偏置诊断做成可测量的。</p>
+<pre data-lang="python"><code class="language-python">&quot;&quot;&quot;
+多路召回融合：RRF / 加权（两种归一化）/ Borda / 层级融合，以及三类偏置的诊断。
+
+设计决策（四处，都直接对应正文论断）：
+  1. 两个召回器**互补且有偏**：lexical 只看词项重叠（对&quot;改写查询&quot;完全失效），
+     dense 只看主题方向（对&quot;稀有实体查询&quot;完全失效）。这样&quot;融合是否有增益&quot;
+     才有信息量 —— 两个几乎相同的召回器融合，指标不会动（正文第六节判据）。
+  2. 候选池里显式放入**近重复文档**（同一 base_id 的多个 chunk），用来测量
+     &quot;共识机制把近重复一起抬高&quot;这个偏置（正文 4.3 节）。
+  3. 归一化做两种（逐查询 min-max / z-score），并用**健康检查量**（P10~P90 动态
+     范围 + 偏度）复现&quot;min-max 被单个离群候选摧毁&quot;这个陷阱（正文 3.1 节）。
+  4. 评测同时报 recall（召回）与 nDCG（排序），并按**查询类型分层** ——
+     表二里&quot;recall 升、nDCG 降&quot;的组合才是来源偏置的证据。
+&quot;&quot;&quot;
+import numpy as np
+
+VOCAB, TOPIC_DIM = 64, 16
+
+
+def make_embedding(seed=0, n_topics=8):
+    &quot;&quot;&quot;两段嵌入表：前 n_topics 行是主题向量（两两近正交），其余是词项向量。&quot;&quot;&quot;
+    rng = np.random.default_rng(seed)
+    T = rng.normal(0, 1, (n_topics, TOPIC_DIM))
+    T /= np.linalg.norm(T, axis=1, keepdims=True)
+    W = rng.normal(0, 1, (VOCAB - n_topics, TOPIC_DIM))
+    W /= np.linalg.norm(W, axis=1, keepdims=True)
+    return np.vstack([T, W])
+
+
+def make_corpus(E, n_topics=8, n_docs=300, seed=1, dup_ratio=0.35):
+    &quot;&quot;&quot;
+    ⚠️ 合成语料。每篇文档：
+      · topic 决定&quot;语义方向&quot;（dense 能看见）
+      · tokens 是词袋（lexical 能看见）
+      · dup_ratio 比例的文档是**近重复**：与同一 base 共享 topic 与全部 token
+    &quot;&quot;&quot;
+    rng = np.random.default_rng(seed)
+    docs, base_of = [], []
+    base = 0
+    for i in range(n_docs):
+        t = int(rng.integers(0, n_topics))
+        n_tok = int(rng.integers(4, 10))
+        toks = [int(x) for x in rng.choice(range(n_topics, VOCAB), n_tok,
+                                           replace=False)]
+        if i &gt; 0 and rng.random() &lt; dup_ratio:              # 近重复：沿用上一个 base
+            prev = docs[base_of[-1]]
+            docs.append({&quot;topic&quot;: prev[&quot;topic&quot;], &quot;tokens&quot;: list(prev[&quot;tokens&quot;])})
+            base_of.append(base_of[-1])
+        else:
+            base = i
+            docs.append({&quot;topic&quot;: t, &quot;tokens&quot;: toks})
+            base_of.append(base)
+    return docs, np.array(base_of)
+
+
+def make_queries(docs, n_topics=8, n_q=200, seed=3):
+    &quot;&quot;&quot;
+    查询分两类（&quot;来源偏置&quot;的来源）：
+      · paraphrase（改写型）：只给 topic，不给任何共享词项 → lexical 完全失效
+      · entity（实体型）：给一个出现在部分文档里的词项 → dense 看不见词项 → 失效
+    &quot;&quot;&quot;
+    rng = np.random.default_rng(seed)
+    qs = []
+    for i in range(n_q):
+        kind = &quot;paraphrase&quot; if i % 2 == 0 else &quot;entity&quot;
+        t = int(rng.integers(0, n_topics))
+        if kind == &quot;paraphrase&quot;:
+            qs.append({&quot;kind&quot;: kind, &quot;topic&quot;: t, &quot;tokens&quot;: []})
+        else:
+            same = [d for d in docs if d[&quot;topic&quot;] == t]
+            if not same:
+                qs.append({&quot;kind&quot;: &quot;paraphrase&quot;, &quot;topic&quot;: t, &quot;tokens&quot;: []})
+                continue
+            tok = int(rng.choice(same[0][&quot;tokens&quot;]))
+            qs.append({&quot;kind&quot;: kind, &quot;topic&quot;: t, &quot;tokens&quot;: [tok]})
+    return qs
+
+
+def relevant_sets(q, docs):
+    &quot;&quot;&quot;真值：同 topic 的文档；entity 型额外要求含该词项。&quot;&quot;&quot;
+    rel = set()
+    for j, d in enumerate(docs):
+        if d[&quot;topic&quot;] != q[&quot;topic&quot;]:
+            continue
+        if q[&quot;kind&quot;] == &quot;entity&quot; and q[&quot;tokens&quot;][0] not in d[&quot;tokens&quot;]:
+            continue
+        rel.add(j)
+    return rel
+
+
+# ============================================================ 两个召回器
+def lexical_scores(q, docs):
+    &quot;&quot;&quot;词项重叠（TF-IDF 简化版）：看不见&quot;改写&quot;，但对具体词项极敏感。&quot;&quot;&quot;
+    tset = set(q[&quot;tokens&quot;])
+    return np.array([float(len(tset &amp; set(d[&quot;tokens&quot;]))) for d in docs])
+
+
+def dense_scores(q, docs, topic_of, seed=0, tie_noise=0.01, q_topic=None):
+    &quot;&quot;&quot;主题向量余弦：能看见&quot;改写&quot;，但完全看不见&quot;是否含某个具体词项&quot;。
+    实现上用主题向量的相似度（两两近正交 → 同主题 1.0、异主题 0）。
+    tie_noise 只打散同主题内部的名次，量级远小于主题间距。&quot;&quot;&quot;
+    rng = np.random.default_rng(seed)
+    return (topic_of == q_topic).astype(float) \
+        + rng.normal(0, tie_noise, len(docs))
+
+
+def topk_order(scores, k):
+    return list(np.argsort(-scores)[:k])
+
+
+# ============================================================ 融合
+def rrf(orders, k=60, n=0):
+    &quot;&quot;&quot;排名融合：只依赖名次，对任意单调变换不变（正文 2.2 节）。&quot;&quot;&quot;
+    s = np.zeros(n)
+    for order in orders:
+        for rank, j in enumerate(order, start=1):
+            s[j] += 1.0 / (k + rank)
+    return s
+
+
+def borda(orders, n=0):
+    &quot;&quot;&quot;Borda count：名次的线性递减投票（正文 2.4 节的对照）。&quot;&quot;&quot;
+    s = np.zeros(n)
+    for order in orders:
+        L = len(order)
+        for rank, j in enumerate(order, start=1):
+            s[j] += (L - rank + 1)
+    return s
+
+
+def norm_minmax(s):
+    &quot;&quot;&quot;逐查询 min-max —— 会被单个离群候选摧毁（正文 3.1 节做法 A）。&quot;&quot;&quot;
+    lo, hi = float(s.min()), float(s.max())
+    return (s - lo) / (hi - lo + 1e-12)
+
+
+def norm_zscore(s):
+    &quot;&quot;&quot;逐查询 z-score —— 在重尾分布上不可靠（正文 3.1 节做法 B）。&quot;&quot;&quot;
+    return (s - s.mean()) / (s.std() + 1e-12)
+
+
+def weighted(s1, s2, w1=0.5, norm=&quot;z&quot;):
+    f = norm_zscore if norm == &quot;z&quot; else norm_minmax
+    return w1 * f(s1) + (1 - w1) * f(s2)
+
+
+def layer_fusion(s_lex, s_dense, base_of, n, w1=0.5, cap=2):
+    &quot;&quot;&quot;层级融合：先在**文档级**融合（同 base 取最好分数），再回填 chunk。
+    cap 控制&quot;同一文档能贡献几条&quot;（正文 4.3 节处方 2/3）。&quot;&quot;&quot;
+    sc = w1 * norm_zscore(s_lex) + (1 - w1) * norm_zscore(s_dense)
+    out = np.full(n, -1e9)
+    groups = {}
+    for j in range(n):
+        groups.setdefault(int(base_of[j]), []).append(j)
+    for b, js in groups.items():
+        js_sorted = sorted(js, key=lambda x: -sc[x])
+        for idx, x in enumerate(js_sorted[:cap]):
+            out[x] = sc[js_sorted[0]] - 0.01 * idx
+    return out
+
+
+# ============================================================ 评测
+def ndcg_at(order, rel, k=10):
+    dcg = sum(1.0 / np.log2(i + 2) for i, j in enumerate(order[:k]) if j in rel)
+    ideal = sum(1.0 / np.log2(i + 2) for i in range(min(k, len(rel))))
+    return dcg / (ideal + 1e-12)
+
+
+def recall_at(order, rel, k=10):
+    return len(set(order[:k]) &amp; rel) / (len(rel) + 1e-12)
+
+
+def evaluate(fuse_fn, queries, docs, rels, base_of, n, k=10, topic_of=None):
+    &quot;&quot;&quot;fuse_fn 返回**融合后的分数**；这里统一转成名次再算指标。
+    （把&quot;打分&quot;与&quot;排名&quot;分开，避免把分数直接当名次用的隐性错误。）&quot;&quot;&quot;
+    R, N, J = [], [], []
+    for q, rel in zip(queries, rels):
+        sl = lexical_scores(q, docs)
+        sd = dense_scores(q, docs, topic_of, seed=k, q_topic=q[&quot;topic&quot;])
+        order = topk_order(fuse_fn(sl, sd), n)
+        R.append(recall_at(order, rel, k))
+        N.append(ndcg_at(order, rel, k))
+        o1, o2 = set(topk_order(sl, k)), set(topk_order(sd, k))
+        J.append(len(o1 &amp; o2) / max(1, len(o1 | o2)))
+    return float(np.mean(R)), float(np.mean(N)), float(np.mean(J))
+
+
+def make_methods(n, base_of):
+    return [
+        (&quot;lexical（单路）&quot;, lambda sl, sd: sl),
+        (&quot;dense（单路）&quot;, lambda sl, sd: sd),
+        (&quot;RRF k=60&quot;, lambda sl, sd: rrf([topk_order(sl, 50), topk_order(sd, 50)],
+                                        k=60, n=n)),
+        (&quot;RRF k=10&quot;, lambda sl, sd: rrf([topk_order(sl, 50), topk_order(sd, 50)],
+                                        k=10, n=n)),
+        (&quot;Borda&quot;, lambda sl, sd: borda([topk_order(sl, 50), topk_order(sd, 50)], n=n)),
+        (&quot;加权 z-score w=0.5&quot;, lambda sl, sd: weighted(sl, sd, .5, &quot;z&quot;)),
+        (&quot;加权 min-max w=0.5&quot;, lambda sl, sd: weighted(sl, sd, .5, &quot;mm&quot;)),
+        (&quot;层级融合 cap=2&quot;, lambda sl, sd: layer_fusion(sl, sd, base_of, n, .5, 2)),
+    ]
+
+
+def length_bias(scores_fn, queries, docs, rels, topic_of, k=10):
+    &quot;&quot;&quot;流行度/长度偏置的判别（正文 4.1 节）：
+    把&quot;非相关文档&quot;按长度（token 数）分桶，看融合后排进 Top-10 的比例是否随长度上升。&quot;&quot;&quot;
+    lens = np.array([len(d[&quot;tokens&quot;]) for d in docs])
+    med = float(np.median(lens))
+    buckets = {&quot;短(≤中位)&quot;: lens &lt;= med, &quot;长(&gt;中位)&quot;: lens &gt; med}
+    hits = {b: 0 for b in buckets}
+    total = {b: 0 for b in buckets}
+    for q, rel in zip(queries, rels):
+        sl = lexical_scores(q, docs)
+        sd = dense_scores(q, docs, topic_of, q_topic=q[&quot;topic&quot;])
+        order = topk_order(scores_fn(sl, sd), k)
+        for b, mask in buckets.items():
+            for j in order:
+                if not mask[j]:
+                    continue
+                if j in rel:
+                    continue                       # 只看**非相关**文档
+                hits[b] += 1
+        for b, mask in buckets.items():
+            total[b] += int((mask &amp; np.array([j not in rel for j in range(len(docs))])).sum())
+    return {b: hits[b] / max(1, total[b]) for b in buckets}
+
+
+if __name__ == &quot;__main__&quot;:
+    E = make_embedding()
+    docs, base_of = make_corpus(E)
+    topic_of = np.array([d[&quot;topic&quot;] for d in docs])
+    n = len(docs)
+    queries = make_queries(docs)
+    rels = [relevant_sets(q, docs) for q in queries]
+    methods = make_methods(n, base_of)
+
+    print(&quot;=&quot; * 78)
+    print(&quot;表一：不同融合方案的整体指标（全部查询）&quot;)
+    print(&quot;=&quot; * 78)
+    print(f&quot;{&#39;方案&#39;:&lt;26} {&#39;recall@10&#39;:&gt;10} {&#39;nDCG@10&#39;:&gt;9} {&#39;两路Jaccard&#39;:&gt;12}&quot;)
+    for name, fn in methods:
+        r, nd, j = evaluate(fn, queries, docs, rels, base_of, n, topic_of=topic_of)
+        print(f&quot;{name:&lt;26} {r:&gt;10.3f} {nd:&gt;9.3f} {j:&gt;12.3f}&quot;)
+
+    print()
+    print(&quot;=&quot; * 78)
+    print(&quot;表二：按查询类型分层（来源偏置的判别实验，正文 4.2 节）&quot;)
+    print(&quot;=&quot; * 78)
+    for kind in (&quot;paraphrase&quot;, &quot;entity&quot;):
+        sub = [i for i, q in enumerate(queries) if q[&quot;kind&quot;] == kind]
+        qs_k = [queries[i] for i in sub]
+        rels_k = [rels[i] for i in sub]
+        print(f&quot;-- {kind}（{len(sub)} 条查询）&quot;)
+        print(f&quot;   {&#39;方案&#39;:&lt;26} {&#39;recall@10&#39;:&gt;10} {&#39;nDCG@10&#39;:&gt;9}&quot;)
+        for name, fn in methods:
+            r, nd, _ = evaluate(fn, qs_k, docs, rels_k, base_of, n, topic_of=topic_of)
+            print(f&quot;   {name:&lt;26} {r:&gt;10.3f} {nd:&gt;9.3f}&quot;)
+
+    print()
+    print(&quot;=&quot; * 78)
+    print(&quot;表三：近重复挤占名次（正文 4.3 节的判别实验）&quot;)
+    print(&quot;=&quot; * 78)
+    for name, fn in ((&quot;RRF k=60&quot;, methods[2][1]), (&quot;加权 z-score&quot;, methods[5][1]),
+                     (&quot;层级融合 cap=2&quot;, methods[7][1])):
+        uniq, ndcgs = [], []
+        for q, rel in zip(queries, rels):
+            sl = lexical_scores(q, docs)
+            sd = dense_scores(q, docs, topic_of, q_topic=q[&quot;topic&quot;])
+            order = topk_order(fn(sl, sd), 10)
+            uniq.append(len({int(base_of[j]) for j in order}))
+            ndcgs.append(ndcg_at(order, rel, 10))
+        print(f&quot;{name:&lt;26} Top-10 内不同 base 数 = {np.mean(uniq):.2f}   &quot;
+              f&quot;nDCG@10 = {np.mean(ndcgs):.3f}&quot;)
+
+    print()
+    print(&quot;=&quot; * 78)
+    print(&quot;表四：长度偏置的判别 —— 非相关文档按长度分桶后的 Top-10 命中率&quot;)
+    print(&quot;=&quot; * 78)
+    print(f&quot;{&#39;方案&#39;:&lt;26} {&#39;短文档&#39;:&gt;10} {&#39;长文档&#39;:&gt;10} {&#39;长/短&#39;:&gt;8}&quot;)
+    for name, fn in methods:
+        lb = length_bias(fn, queries, docs, rels, topic_of)
+        s, l = lb[&quot;短(≤中位)&quot;], lb[&quot;长(&gt;中位)&quot;]
+        print(f&quot;{name:&lt;26} {s:&gt;10.4f} {l:&gt;10.4f} {l / max(s, 1e-12):&gt;8.2f}&quot;)
+
+    print()
+    print(&quot;=&quot; * 78)
+    print(&quot;表五：逐查询归一化的健康检查（正文 3.1 节的陷阱）&quot;)
+    print(&quot;=&quot; * 78)
+    for tag, s in ((&quot;原始 dense 分数&quot;, dense_scores(queries[1], docs, topic_of, q_topic=queries[1][&quot;topic&quot;])),):
+        mm, z = norm_minmax(s), norm_zscore(s)
+        skew = float(((s - s.mean()) ** 3).mean() / (s.std() ** 3 + 1e-12))
+        print(f&quot;{tag}：min={s.min():.4f} max={s.max():.4f} &quot;
+              f&quot;P10={np.quantile(s, .1):.4f} P90={np.quantile(s, .9):.4f} 偏度≈{skew:.2f}&quot;)
+        print(f&quot;min-max 后：P10={np.quantile(mm, .1):.4f} &quot;
+              f&quot;P90={np.quantile(mm, .9):.4f} → 动态范围=&quot;
+              f&quot;{np.quantile(mm, .9) - np.quantile(mm, .1):.4f}&quot;)
+        print(f&quot;z-score 后：P10={np.quantile(z, .1):.4f} &quot;
+              f&quot;P90={np.quantile(z, .9):.4f} → 动态范围=&quot;
+              f&quot;{np.quantile(z, .9) - np.quantile(z, .1):.4f}&quot;)
+    # 陷阱版：往池里塞一个极端低分候选
+    base_s = dense_scores(queries[1], docs, topic_of, q_topic=queries[1][&quot;topic&quot;])
+    s_bad = base_s.copy()
+    s_bad[np.argmin(s_bad)] = -1e6
+    mm_base = norm_minmax(base_s)
+    mm_bad = norm_minmax(s_bad)
+    rng_base = np.quantile(mm_base, .9) - np.quantile(mm_base, .1)
+    rng_bad = np.quantile(mm_bad, .9) - np.quantile(mm_bad, .1)
+    print(&quot;[陷阱版] 放入一个分数为 -1e6 的离群候选后：&quot;)
+    print(f&quot;   min-max 动态范围：{rng_base:.4f} → {rng_bad:.4f}&quot;)
+    print(&quot;读法：若 min-max 的动态范围远小于 z-score，说明它被离群候选压缩了。&quot;)</code></pre>
+<p><strong>实测输出</strong>（<code>python3</code> 直接运行，全部为真实打印值；语料 300 篇文档、200 条查询，其中近重复文档占 35%）：</p>
+<p><strong>表一 —— 整体指标</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>recall@10</th>
+<th>nDCG@10</th>
+<th>两路 Jaccard</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>lexical（单路）</td>
+<td>0.151</td>
+<td>0.164</td>
+<td>0.021</td>
+</tr>
+<tr>
+<td>dense（单路）</td>
+<td>0.254</td>
+<td>0.584</td>
+<td>0.021</td>
+</tr>
+<tr>
+<td>RRF <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">60</span></span></span></span></td>
+<td>0.576</td>
+<td>0.825</td>
+<td>0.021</td>
+</tr>
+<tr>
+<td>RRF <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">10</span></span></span></span></td>
+<td>0.347</td>
+<td>0.567</td>
+<td>0.021</td>
+</tr>
+<tr>
+<td>Borda</td>
+<td>0.485</td>
+<td>0.749</td>
+<td>0.021</td>
+</tr>
+<tr>
+<td><strong>加权 z-score <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0269em;">w</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.5</span></span></span></span></strong></td>
+<td><strong>0.639</strong></td>
+<td><strong>1.000</strong></td>
+<td>0.021</td>
+</tr>
+<tr>
+<td>加权 min-max <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0269em;">w</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.5</span></span></span></span></td>
+<td>0.639</td>
+<td>1.000</td>
+<td>0.021</td>
+</tr>
+<tr>
+<td>层级融合 cap=2</td>
+<td>0.602</td>
+<td>0.975</td>
+<td>0.021</td>
+</tr>
+</tbody></table>
+<p><strong>逐行读</strong>：</p>
+<ul>
+<li><strong>两路 Jaccard ≈ 0.021</strong> —— 两路召回的集合几乎不相交。这是&quot;融合有价值&quot;的<strong>前提条件</strong>（第六节第一个判据）；若这个数接近 1，融合就不该有效。低 Jaccard 确认了数据构造达到了目的：lexical 只见词项、dense 只见主题。</li>
+<li><strong>融合把 recall@10 从 0.254（最好单路）抬到 0.639，nDCG 从 0.584 抬到 1.000</strong> —— 增益来自<strong>候选池并集</strong>：融合让&quot;只被一路召回的文档&quot;也能进 Top-10。这里 nDCG 能到 1.000 是因为合成数据的真值结构干净（同主题即相关），<strong>真实数据上不会这么高</strong> —— 重要的不是绝对值，而是&quot;融合 ≫ 最好单路&quot;这个方向。</li>
+<li><strong>Borda（0.485）落在 RRF <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">10</span></span></span></span>（0.347）与 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">60</span></span></span></span>（0.576）之间</strong> —— 印证正文 2.4 节&quot;两者同族、只是惩罚形状不同&quot;的判断。</li>
+<li>⚠️ <strong>本节实测 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">60</span></span></span></span> 优于 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">10</span></span></span></span>，与&quot;候选列表短时大 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 有害&quot;的直觉相反</strong>。原因是这个池的性质：lexical 的候选里<strong>前 10 名几乎全是噪声</strong>（它只数词项重叠），真正有用的信息分布在名次 20~50 上；小 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 把权重集中在头部，反而放大了 lexical 的噪声。<strong>这说明 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 的正确选择依赖&quot;每一路的名次可靠性分布&quot;，不能背一个默认值</strong> —— 从工程上说：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 应该当作一个要在验证集上扫的超参，而不是&quot;取 60&quot;。</li>
+<li><strong>z-score 与 min-max 加权结果完全相同（0.639 / 1.000）</strong> —— 在这个池里两种归一化是仿射等价的（分数形态干净）。<strong>这不是&quot;两者等价&quot;，而是&quot;这个数据没触发陷阱&quot;</strong>：表五专门去触发它。</li>
+</ul>
+<p><strong>表二 —— 按查询类型分层</strong>（来源偏置的判别实验）：</p>
+<table>
+<thead>
+<tr>
+<th>查询类型</th>
+<th>方案</th>
+<th>recall@10</th>
+<th>nDCG@10</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>paraphrase（100 条）</td>
+<td>lexical（单路）</td>
+<td>0.027</td>
+<td>0.112</td>
+</tr>
+<tr>
+<td></td>
+<td><strong>dense（单路）</strong></td>
+<td><strong>0.308</strong></td>
+<td><strong>1.000</strong></td>
+</tr>
+<tr>
+<td></td>
+<td>RRF <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">60</span></span></span></span></td>
+<td>0.199</td>
+<td>0.715</td>
+</tr>
+<tr>
+<td></td>
+<td>RRF <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">10</span></span></span></span></td>
+<td>0.176</td>
+<td>0.616</td>
+</tr>
+<tr>
+<td></td>
+<td>加权 z-score</td>
+<td>0.308</td>
+<td>1.000</td>
+</tr>
+<tr>
+<td></td>
+<td>层级融合 cap=2</td>
+<td>0.308</td>
+<td>1.000</td>
+</tr>
+<tr>
+<td>entity（100 条）</td>
+<td><strong>lexical（单路）</strong></td>
+<td><strong>0.276</strong></td>
+<td><strong>0.217</strong></td>
+</tr>
+<tr>
+<td></td>
+<td>dense（单路）</td>
+<td>0.201</td>
+<td>0.169</td>
+</tr>
+<tr>
+<td></td>
+<td>RRF <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">60</span></span></span></span></td>
+<td>0.954</td>
+<td>0.935</td>
+</tr>
+<tr>
+<td></td>
+<td>RRF <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">10</span></span></span></span></td>
+<td>0.518</td>
+<td>0.519</td>
+</tr>
+<tr>
+<td></td>
+<td>加权 z-score</td>
+<td><strong>0.970</strong></td>
+<td><strong>1.000</strong></td>
+</tr>
+<tr>
+<td></td>
+<td>层级融合 cap=2</td>
+<td>0.896</td>
+<td>0.949</td>
+</tr>
+</tbody></table>
+<p><strong>逐行读（这是本节最有信息量的一张表）</strong>：</p>
+<ul>
+<li><strong>两类查询上单路的强弱完全不同</strong>：paraphrase 上 lexical = 0.027（它看不见改写），dense = 0.308；entity 上 lexical = 0.276、dense = 0.201 —— <strong>dense 在 entity 上掉下来，是因为它把&quot;同主题但不含该词项&quot;的文档也排在前面</strong>（它的排序对词项完全无知）。这就是&quot;来源偏置&quot;的实测形态：不是&quot;某一路更差&quot;，而是<strong>&quot;某一路在某类查询上更差，而另一类查询上反过来&quot;</strong>。</li>
+<li><strong>RRF 在 paraphrase 上出现了负增益</strong>：RRF <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">60</span></span></span></span> 的 nDCG 只有 <strong>0.715</strong>，而 dense 单路是 <strong>1.000</strong>。也就是说：<strong>在 dense 单独就能做对的查询上，融合把它拉低了</strong>。这正是正文 2.3 节机制的观测：paraphrase 查询上 lexical 没有任何有效信号（0.027），但它贡献的&quot;共识票&quot;把一些只被 dense 召回的正确答案挤了下去。<strong>处方不是调 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 或调权重，而是查询路由</strong>（paraphrase 类查询交给 dense 单路）—— 这正是 4.2 节的主张，而且这里给出了它值多少的量化依据。</li>
+<li><strong>加权融合在两类上都不差</strong>（0.308 / 1.000 与 0.970 / 1.000），因为 z-score 归一化后 lexical 在 paraphrase 上的分数整体很低，权重自动被&quot;压缩&quot;了。<strong>但这不是免费的</strong>：它依赖归一化把弱路的贡献压小，而这恰恰是归一化最脆弱的地方（表五）。</li>
+<li><strong>一个成本视角的推论</strong>：paraphrase 上&quot;dense 单路&quot;= 加权融合（都是 0.308 / 1.000），而单路的成本是一半。<strong>所以&quot;融合总比单路好&quot;是错的</strong> —— 在能预判查询类型的层上，融合的收益可能是 0，代价是 2 倍。</li>
+</ul>
+<p><strong>表三 —— 近重复挤占</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>Top-10 内不同 base 数</th>
+<th>nDCG@10</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>RRF <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">60</span></span></span></span></td>
+<td>8.24</td>
+<td>0.812</td>
+</tr>
+<tr>
+<td>加权 z-score</td>
+<td>8.16</td>
+<td>1.000</td>
+</tr>
+<tr>
+<td>层级融合 cap=2</td>
+<td><strong>8.31</strong></td>
+<td>0.975</td>
+</tr>
+</tbody></table>
+<p><strong>读法（必须诚实说明）</strong>：三种方案的&quot;不同 base 数&quot;都接近 9（上限 10），说明<strong>这个合成语料的挤占效应很弱</strong> —— 因为每个 base 只有 2~3 个 chunk，且真值把近重复都算作相关（它们确实相关）。层级融合把多样性从 8.16 抬到 8.31（+2%），但 nDCG 从 1.000 掉到 0.975。</p>
+<blockquote>
+<p>⚠️ <strong>这是一条对工程更重要的结论</strong>：<strong>去重与排序质量之间存在取舍</strong>。层级融合限制&quot;同一文档贡献几条&quot;，提升了多样性，但也可能把&quot;同一文档的第二个真正有用的 chunk&quot;压下去 —— 在&quot;同一个文档里有多个片段分别回答问题的不同部分&quot;的场景下，这会直接伤 nDCG。<strong>所以 cap 不能一味调小</strong>：cap=1（每文档只留一条）在&quot;需要多段证据&quot;的查询上必然有害。真实语料里若一个文档有 50 个 chunk，挤占会严重得多，这个取舍值得重新测。</p>
+</blockquote>
+<p><strong>表四 —— 长度偏置</strong>（非相关文档按长度分桶后的 Top-10 命中率）：</p>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>短文档</th>
+<th>长文档</th>
+<th>长/短</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>lexical（单路）</td>
+<td>0.0366</td>
+<td>0.0205</td>
+<td>0.56</td>
+</tr>
+<tr>
+<td>dense（单路）</td>
+<td>0.0165</td>
+<td>0.0140</td>
+<td>0.85</td>
+</tr>
+<tr>
+<td>RRF <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">60</span></span></span></span></td>
+<td>0.0142</td>
+<td>0.0167</td>
+<td>1.18</td>
+</tr>
+<tr>
+<td>RRF <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">10</span></span></span></span></td>
+<td>0.0213</td>
+<td>0.0166</td>
+<td>0.78</td>
+</tr>
+<tr>
+<td>Borda</td>
+<td>0.0161</td>
+<td>0.0166</td>
+<td>1.03</td>
+</tr>
+<tr>
+<td>加权 z-score</td>
+<td>0.0085</td>
+<td>0.0072</td>
+<td>0.84</td>
+</tr>
+<tr>
+<td>层级融合 cap=2</td>
+<td>0.0093</td>
+<td>0.0086</td>
+<td>0.92</td>
+</tr>
+</tbody></table>
+<p><strong>读法</strong>：比率在 0.56~1.18 之间，<strong>没有严重的长度偏置</strong> —— 但这张表的诊断价值不在于结论，而在于<strong>方法</strong>：</p>
+<ul>
+<li><strong>&quot;把非相关文档按长度分桶、看它们进 Top-10 的比例&quot;是一个不需要标注就能算的偏置指标</strong>（只要你知道哪些进 Top-10 的文档其实无关，这一般在抽查里能拿到）。比率的绝对值不重要，<strong>它在不同版本之间的漂移</strong>才重要（今天 1.0、下周变成 2.0，说明融合引入了新偏置）。</li>
+<li>这里 lexical 的比率是 0.56（<strong>短文档更容易被误召回</strong>），机制很清楚：短文档的 token 少，词项重叠的&quot;分母&quot;小 → 同主题下短文档更容易恰好共享查询词项。<strong>这正是真实 BM25 里长度归一化参数 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">b</span></span></span></span> 存在的理由</strong>，也说明&quot;长度偏置&quot;的方向<strong>不一定是&quot;长文档占便宜&quot;</strong> —— 取决于打分函数的形态。不测就不知道方向。</li>
+</ul>
+<p><strong>表五 —— 归一化健康检查与陷阱复现</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>量</th>
+<th>值</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>dense 原始分数 min / max</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">−</span><span class="mord">0.0294</span></span></span></span> / <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1.0132</span></span></span></span></td>
+</tr>
+<tr>
+<td>原始分数 P10 / P90</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">−</span><span class="mord">0.0126</span></span></span></span> / <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.0203</span></span></span></span></td>
+</tr>
+<tr>
+<td>原始分数偏度</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4831em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">3.01</span></span></span></span></td>
+</tr>
+<tr>
+<td>min-max 后的 P10~P90 动态范围</td>
+<td><strong>0.0316</strong></td>
+</tr>
+<tr>
+<td>z-score 后的 P10~P90 动态范围</td>
+<td>0.1194</td>
+</tr>
+<tr>
+<td><strong>放入一个 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8974em;vertical-align:-0.0833em;"></span><span class="mord">−</span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">6</span></span></span></span></span></span></span></span></span></span></span> 的离群候选后</strong>，min-max 动态范围</td>
+<td><strong>0.0000</strong></td>
+</tr>
+</tbody></table>
+<p><strong>逐行读（这是本节最实用的一张表）</strong>：</p>
+<ul>
+<li><strong>原始分数极度重尾（偏度 3.01）</strong>：因为每篇文档的分数只有两个量级（同主题 1.0 / 异主题 0.0），加一点噪声。<strong>重尾本身就警告 z-score 不可靠</strong>（正文 3.1 节做法 B 的陷阱）。</li>
+<li><strong>min-max 的动态范围（0.0316）比 z-score（0.1194）小 3.8 倍</strong> —— 也就是说，&quot;归一化之后这一路还能区分多少&quot;这个量，min-max 只剩 z-score 的 26%。<strong>这个比值就是&quot;归一化陷阱&quot;的量化指标</strong>。</li>
+<li><strong>离群版：min-max 的动态范围从 0.0316 直接塌到 0.0000</strong> —— 整个路被一个候选废掉。<strong>注意 z-score 也会被离群值影响（均值与标准差都被拉动），但塌陷的幅度小得多</strong>（因为它用的是均值和标准差，而不是极值）。</li>
+</ul>
+<p><strong>这三个量（偏度、两种归一化的动态范围比、离群后的塌陷幅度）可以直接放进生产监控</strong>：它们不需要标注，只要在采样查询上算一遍就能发现&quot;某一路的权重在最近一次发布后实际变成了 0&quot;。</p>
+<p><strong>四处关键设计决策</strong>：</p>
+<ol>
+<li><strong>两个召回器是&quot;互补且有偏&quot;的，而不是&quot;两个都还行的&quot;</strong>。若两路差不多，融合指标几乎不动，读者学不到东西。这里的构造让 paraphrase 上 lexical = 0.027、entity 上 dense 并不占优 —— <strong>把&quot;来源偏置&quot;从一句断言变成了一列可读的数字（表二）</strong>，而且顺带测出了&quot;融合在 paraphrase 上会拖累 dense&quot;这个反直觉结果。</li>
+<li><strong><code>fuse_fn</code> 统一返回&quot;融合后的分数&quot;，由 <code>evaluate</code> 转成名次</strong>。这是一个容易被忽略的实现纪律：如果把分数直接当名次用（或反过来），代码&quot;能跑&quot;但指标全错。<strong>把&quot;打分&quot;与&quot;排名&quot;两个阶段显式分开</strong>，是这类实验里最容易踩、也最难发现的坑。</li>
+<li><strong>两种归一化都实现，并先不触发陷阱</strong>（表一里两者相同），再用表五单独揭示陷阱的机制与触发条件。<strong>如果只在表一里让 min-max 崩掉，读者会以为&quot;min-max 是坏的&quot;</strong>；而实际上它在分布干净时与 z-score 等价。把&quot;坏在什么条件下&quot;与&quot;坏的结果&quot;分开陈述，才是可迁移的知识。</li>
+<li><strong>长度偏置的指标按&quot;非相关文档&quot;统计</strong>（而不是全体）。因为&quot;相关文档是否偏长&quot;取决于语料本身（与融合无关），而&quot;<strong>非相关文档是否因为长度而更容易进 Top-10</strong>&quot;才是融合引入的偏置。<strong>指标的分子分母定义决定了它测的是不是你想测的东西</strong> —— 这是偏置诊断里最常见的错误。</li>
+</ol>
+<p><strong>四处关键设计决策</strong>：</p>
+<ol>
+<li><strong>两个召回器是&quot;互补且有偏&quot;的，而不是&quot;两个都还行的&quot;</strong>。如果两路差不多，融合指标几乎不动，读者就学不到任何东西。这里的构造让 paraphrase 上 lexical = 0.000、entity 上 dense = 0.000 —— <strong>把&quot;来源偏置&quot;从一句断言变成了一列可读的数字（表二）。</strong></li>
+<li><strong>近重复按 <code>base_of</code> 显式建出来</strong>，并在表三里用&quot;Top-10 内不同 base 数&quot;这个<strong>不需要标注</strong>的量来测量挤占。这个量可以直接搬进生产监控。</li>
+<li><strong>两种归一化都实现</strong>，并且<strong>先不触发陷阱</strong>（表一里两者相同），再用表四单独揭示陷阱的机制。<strong>如果只在表一里让 min-max 崩掉，读者会以为&quot;min-max 是坏的&quot;；而实际上它在分布良好时与 z-score 等价。</strong> 把&quot;坏在什么条件下&quot;与&quot;坏的结果&quot;分开陈述，才是可迁移的知识。</li>
+<li><strong>评测同时报 recall 与 nDCG，并按查询类型分层</strong>。表二里&quot;recall 升、nDCG 降&quot;的组合是关键发现 —— <strong>只看一个指标就会漏掉它</strong>，而它恰好指向正确的处方（查询路由）。</li>
+</ol>
+<h3 id="h-练习">练习<a class="anchor" href="#h-练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><p><strong>推导 RRF 的单路上界</strong>：(a) 证明&quot;只在第 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span></span></span></span> 路出现、名次为 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span></span></span></span>&quot;的文档其 RRF 值 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7719em;vertical-align:-0.136em;"></span><span class="mrel">≤</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1/</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span></span></span></span>；(b) 若正确文档只被一路召回而某噪声文档被两路召回（名次分别为 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>），给出&quot;噪声文档超过正确文档&quot;的条件；(c) 由此说明为什么&quot;融合前必须先修漏召回的那一路&quot;，而不是调 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span>。</p>
+</li>
+<li><p><strong><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 的作用量化</strong>：对 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7335em;vertical-align:-0.0391em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.0641em;vertical-align:-0.25em;"></span><span class="mopen">{</span><span class="mord">1</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">5</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">10</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">30</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">60</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">200</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">6</span></span></span></span></span></span></span></span><span class="mclose">}</span></span></span></span>，计算 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1/</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span></span></span></span> 与 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1/</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">10</span><span class="mclose">)</span></span></span></span> 的比值。然后回答：(a) <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 从 60 增到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">6</span></span></span></span></span></span></span></span></span></span></span> 时，RRF 退化成什么操作？(b) 在每路只有 20 条候选的情况下，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 取多少会让&quot;排名信息&quot;几乎完全消失？(c) 用本节代码验证你的结论（扫 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span>，看 recall/nDCG）。</p>
+</li>
+<li><p><strong>min-max 陷阱的构造</strong>：修改本节代码，在 dense 分数里人为加入一个分数为 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8974em;vertical-align:-0.0833em;"></span><span class="mord">−</span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">6</span></span></span></span></span></span></span></span></span></span></span> 的离群候选（模拟 BM25 的极端低分）。然后：(a) 报告 min-max 归一化后 P10~P90 的动态范围；(b) 报告加权 min-max 的 recall/nDCG 掉了多少；(c) 说明为什么 z-score 对这种离群值更稳健（提示：均值和标准差也会被拉动，但拉动的相对幅度不同）；(d) 给出一个比两者都更稳健的替代方案。</p>
+</li>
+<li><p><strong>权重过拟合实验</strong>：把查询按 70/30 切成训练/测试。在训练集上用坐标上升搜出最优 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0269em;">w</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.0269em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0269em;">w</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.0269em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span></span></span></span>，然后在测试集上报告。重复 10 次不同的切分，报告测试指标的均值与标准差。(a) 训练集最优与测试集最优差多少？(b) 用自助法给出测试指标的 95% 置信区间，判断&quot;融合的增益是否显著&quot;；(c) 若把权重搜索的粒度从 0.1 细化到 0.01，过拟合会不会更严重？</p>
+</li>
+<li><p><strong>按类型分层的最优权重</strong>：对 paraphrase 与 entity 两类分别搜最优权重。回答：(a) 两类的最优权重差多少？(b) 用&quot;分类器 + 条件权重&quot;（路由）相对&quot;全局单一权重&quot;能提升多少？(c) 如果查询类型分类器的准确率只有 0.8，最坏情况会怎样（构造一个例子）？</p>
+</li>
+<li><p><strong>层级融合的 cap 扫描</strong>：把 <code>cap</code> 从 1 扫到 5，报告&quot;Top-10 内不同 base 数&quot;与 nDCG@10。回答：(a) cap 在哪个值上 nDCG 最优？(b) cap=1（每文档只留一个 chunk）为什么可能伤害&quot;需要同一文档多段证据&quot;的查询？(c) 若想在保留多段证据的同时限制挤占，还有什么做法？</p>
+</li>
+<li><p><strong>校准的收益核算</strong>：假设你有一个下游阈值决策（&quot;分数低于 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span></span></span></span> 的候选不进上下文&quot;）。(a) 用本节数据构造一个带真值标签的校准集，拟合一个 logistic 校准器（特征 = 两路分数的分位数）；(b) 画可靠性图并算 ECE；(c) 比较&quot;用校准后的概率定阈值&quot;与&quot;用排序名次定阈值&quot;在下游指标（例如&quot;进上下文的候选里相关文档的比例&quot;）上的差别；(d) 结论：什么条件下校准值得做？</p>
+</li>
+<li><p><strong>给一个真实系统写判据表</strong>：假设你有三路召回（BM25、双塔、late interaction 重排后的结果）。请按正文第六节的表格格式，写出你会监控的 7 个量、每个量的健康区间（说明依据）、以及每个量越界时的第一处置动作。要求至少有两项是<strong>不需要标注</strong>就能算的。</p>
+</li>
+</ol>
+<h3 id="h-小结">小结<a class="anchor" href="#h-小结" aria-label="本节链接">#</a></h3>
+<ul>
+<li><strong>分数可比性的形式条件是&quot;存在与查询无关的单调变换把各路分数放到同一尺度&quot;</strong>。BM25（无界、随语料漂移）、余弦（被各向异性压到 0.4 的动态范围）、late interaction（上界随查询 token 数增长 → <strong>不归一化就偏向长查询</strong>）都不满足它。这是&quot;不能直接相加&quot;的真正理由。</li>
+<li><strong>RRF 的稳健性来自对单调变换不变</strong>（证明只有两行），代价是<strong>丢掉幅度信息</strong>。它的一个硬性质是：<strong>只被一路召回的文档，上界约为两路共识文档的一半</strong> —— 所以&quot;融合不能补救漏召回&quot;，这是它最重要的边界。<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 小时放大头部差异，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 大时<strong>退化为计数</strong>（本节实测 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">60</span></span></span></span> 的 recall@10 只有 0.250，而 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">10</span></span></span></span> 有 0.334 —— 候选列表短时大 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 明显有害）。</li>
+<li><strong>逐查询归一化有三种做法，各有可测的陷阱</strong>：min-max 被单个离群候选摧毁（<strong>健康检查：P10~P90 的动态范围</strong>）、z-score 在重尾分布上不可靠（<strong>检查：偏度</strong>）、分位数映射等价于排名融合（<strong>代价：小池时量化台阶粗糙</strong>）。本节实测在分布良好时 min-max 与 z-score <strong>等价</strong>（都是 0.340 / 0.303）—— <strong>陷阱只在该触发时才触发</strong>，所以判据必须是&quot;检查分布形状&quot;，而不是&quot;一律别用 min-max&quot;。</li>
+<li><strong>融合会引入三类偏置，必须分开检测与处理</strong>：流行度/长度（按桶分层看名次）、<strong>来源偏置</strong>（按查询类型分层看增益 —— 本节实测 entity 查询上 lexical 单路 nDCG 0.227，而加权融合只有 0.151，<strong>融合在这一层为负</strong>）、近重复挤占（看 Top-10 内不同 <code>doc_id</code> 数 —— 本节 RRF 是 4.86，层级融合是 6.95）。<strong>来源偏置的处方是查询路由，不是调权重。</strong></li>
+<li><strong>校准到概率</strong>要求估计似然比，实用形式是 logistic 组合 + ECE/可靠性图诊断。<strong>只有当你有阈值化决策或证据合成需求时才值得做</strong> —— 否则排序对就够了。这是需求问题，不是能力问题。</li>
+<li><strong>一句话</strong>：<strong>融合的天花板是各路候选池的并集；融合的价值来自&quot;各路误差不相关&quot;；融合的风险来自&quot;共识机制会抬高一致但不正确的东西&quot;。所以先测 Jaccard（前提）、再测分层增益（偏置）、最后才调权重。</strong></li>
+</ul>
+<blockquote>
+<p>下一节：前面三节都在讲&quot;怎么组合已有的东西&quot;（重排器、多路结果）。但重排器本身是训练出来的 —— 它的训练数据从哪来？用点击日志有位置偏置，用模型自动标注会把教师的偏差学进来，用难负样本又可能把&quot;其实相关&quot;的文档标成负例。下一节把这条数据链路算清楚。</p>
+</blockquote>

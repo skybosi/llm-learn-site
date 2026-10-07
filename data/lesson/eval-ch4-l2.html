@@ -1,0 +1,431 @@
+<h3 id="h-这一节要解决什么">这一节要解决什么<a class="anchor" href="#h-这一节要解决什么" aria-label="本节链接">#</a></h3>
+<p>第 1 节把 judge 的偏差拆开了。这一节解决一个更落地的问题：<strong>既然偏差存在，判定 prompt 该怎么写，才能让结论尽量只反映被测对象的差异？</strong></p>
+<p>先明确一个立场：<strong>judge 的可复现性不是&quot;跑两次结果一样&quot;</strong>。同输入同输出只说明它确定性，不说明它可复现。真正的要求是：<strong>另一个人，在另一个时间，用你记录下来的材料，能重放出同一个结论。</strong> 这需要记录的东西远超一条 prompt 字符串。</p>
+<p>本节分三块：</p>
+<ol>
+<li><strong>判定协议的设计</strong>：判什么（单点打分 vs 成对偏好 vs rubric 分解）、怎么保证位置对称、怎么处理平局与&quot;都差&quot;、怎么让输出可解析。</li>
+<li><strong>可复现性的硬要求</strong>：模型版本、解码参数、prompt 哈希、题目顺序、缓存与批次；以及&quot;同一天内跑一次 vs 分三天跑&quot;为什么可能给出不同结论。</li>
+<li><strong>prompt 敏感性</strong>：换一个措辞、加一句强调、改一个 rubric 描述，结论会变多少？怎么把这种敏感性<strong>测出来</strong>而不是假设它不存在。</li>
+</ol>
+<p>核心取舍会在最后一节给出：<strong>约束越强的输出格式，解析越稳定但越容易诱发&quot;为了输出合法而编分数&quot;；自由度越高的推理，判断质量可能更好但解析失败率上升。</strong> 这个取舍决定你的工程成本（重试、人工兜底、失败样本处理）。</p>
+<h3 id="h-一判定协议先决定判什么">一、判定协议：先决定&quot;判什么&quot;<a class="anchor" href="#h-一判定协议先决定判什么" aria-label="本节链接">#</a></h3>
+<p>三种基本形态，各有明确的适用范围：</p>
+<table>
+<thead>
+<tr>
+<th>形态</th>
+<th>输入</th>
+<th>输出</th>
+<th>适用</th>
+<th>主要问题</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>成对偏好（pairwise）</strong></td>
+<td>问题 + 两个回答</td>
+<td>A / B / 平局</td>
+<td>模型选型、版本对比</td>
+<td>需要 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">O</span><span class="mopen">(</span><span class="mord mathnormal">n</span><span class="mclose">)</span></span></span></span> 次判定；不可加性；位置偏差</td>
+</tr>
+<tr>
+<td><strong>单点打分（pointwise）</strong></td>
+<td>问题 + 一个回答</td>
+<td>1~5 分</td>
+<td>粗筛、监控、回归门禁</td>
+<td>尺度漂移、集中趋势、跨批次不可比</td>
+</tr>
+<tr>
+<td><strong>rubric 分解（rubric-based）</strong></td>
+<td>问题 + 一个回答 + 分项标准</td>
+<td>各分项 + 汇总</td>
+<td>需要可解释性、需要定位失败</td>
+<td>分项权重任意；rubric 本身要验收</td>
+</tr>
+</tbody></table>
+<p><strong>为什么首选成对偏好</strong>：因为人类与模型在&quot;哪个更好&quot;上的判断一致性，系统地高于&quot;这个值几分&quot;。相对判断把绝对尺度消掉了，也把&quot;这个模型今天整体偏高&quot;这类漂移消掉了。<strong>取样的代价是：pairwise 只能给你相对排序，且排序可能非传递</strong>（第 1 章讲过），所以最终排序要用 Bradley-Terry 这类模型拟合，而不是简单数胜场。</p>
+<p><strong>rubric 分解的独特价值</strong>：它能让失败可定位（&quot;事实错误&quot; vs &quot;格式问题&quot;分开），以及在长度偏差上的缓解——把&quot;完整性&quot;单独列为一个分项后，judge 不必用&quot;更长&quot;来间接表达&quot;更完整&quot;。代价是 rubric 本身变成了被测对象：你必须验证 rubric 的分项与人工判断的相关性。</p>
+<p><strong>平局与&quot;都不行&quot;必须显式处理</strong>。三种做法与后果：</p>
+<ul>
+<li><strong>不设平局</strong>（强制 A/B）：会把大量&quot;实质相同&quot;的样本转成噪声，且这个噪声可能系统性偏向位置（第 1 节）。<strong>除非模型间差距很大，否则不推荐。</strong></li>
+<li><strong>设平局，且允许&quot;都不合格&quot;</strong>：信息量最大，但平局率会很高（30%~50% 常见），降低有效样本量。</li>
+<li><strong>设平局 + 只统计非平局</strong>：等价于把比较局限在&quot;有差异的样本&quot;上，<strong>这会引入选择效应</strong>——被比较的样本子集不再代表总体。</li>
+</ul>
+<p><strong>推荐</strong>：设平局，报告时同时给出&quot;平局率&quot;与&quot;非平局中的胜率&quot;，并在方法说明里写清平局如何计入。<strong>不要</strong>把平局当 0.5 胜偷偷处理掉——那样读者无法判断结论对平局规则的敏感性。</p>
+<h3 id="h-二位置对称从提醒模型别偏心到协议级消除">二、位置对称：从&quot;提醒模型别偏心&quot;到协议级消除<a class="anchor" href="#h-二位置对称从提醒模型别偏心到协议级消除" aria-label="本节链接">#</a></h3>
+<p><strong>不要指望在 prompt 里写&quot;请忽略顺序&quot;来消除位置偏差。</strong> 位置偏差来自模型的注意力与自回归机制，不是它能&quot;遵守的指令&quot;。有效的做法是协议级的：</p>
+<p><strong>（a）双顺序 + 聚合</strong>。每一对都跑 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord mathnormal">A</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.0502em;">B</span><span class="mclose">)</span></span></span></span> 与 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0502em;">B</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">A</span><span class="mclose">)</span></span></span></span> 两次，然后：</p>
+<table>
+<thead>
+<tr>
+<th>聚合规则</th>
+<th>胜场计法</th>
+<th>性质</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>一致才算胜</td>
+<td>两次都选 A 才算 A 胜</td>
+<td>保守，丢掉所有位置敏感样本；<strong>引入选择偏差</strong></td>
+</tr>
+<tr>
+<td>不一致记 0.5</td>
+<td>一次胜一次负 → 各 0.5</td>
+<td>无偏（位置偏差一阶抵消），方差更大</td>
+</tr>
+<tr>
+<td>不一致转人工</td>
+<td>交给人工或第三个 judge</td>
+<td>最准、最贵；不一致比例是很好的质量指标</td>
+</tr>
+</tbody></table>
+<p><strong>（b）随机化并记录顺序</strong>。即使只跑一次，也要对每对随机决定哪个在前，并记录。这样位置偏差会变成<strong>随机噪声而非系统偏差</strong>——虽然增大了方差，但不会让某个模型系统受益。这是&quot;便宜但次优&quot;的方案。</p>
+<p><strong>（c）对称化的 prompt 模板</strong>。保证两个候选的模板片段<strong>逐字节相同</strong>（除内容外）：标签（&quot;回复 1 / 回复 2&quot; vs &quot;A / B&quot;）、分隔符、缩进、前后说明都要对称。一个常见 bug 是&quot;先在 prompt 里介绍候选 A 的背景&quot;，这本身就是位置偏差的来源。</p>
+<p><figure><img class="md-img" src="content/courses/llm-evaluation/assets/chapter-4-figure-02.svg" alt="双顺序协议：一次判定变两次" loading="lazy" decoding="async"><figcaption>双顺序协议：一次判定变两次</figcaption></figure>
+</p>
+<h3 id="h-三结构化输出与解析失败把失败当一等公民">三、结构化输出与解析失败：把失败当一等公民<a class="anchor" href="#h-三结构化输出与解析失败把失败当一等公民" aria-label="本节链接">#</a></h3>
+<p>judge 的输出解析失败（格式不符、复述了 prompt、给了两个答案、输出被截断）是<strong>工程上最常被忽略的误差源</strong>，因为它会造成<strong>选择性丢失</strong>：如果你把解析失败当缺失值丢掉，剩下的样本就不再是原样本。</p>
+<p>三条要求：</p>
+<ol>
+<li><strong>失败率必须报告。</strong> 失败率超过 5% 就需要重试机制；超过 15% 说明 prompt 或任务的输出协议有问题，结论不可用。</li>
+<li><strong>失败不能静默丢弃。</strong> 记录失败样本，分析它们的分布（是否集中在长回答、特定语言、特定题目类型？）。<strong>如果失败与某个候选系统相关，你就会得到一个系统性偏向的评测。</strong></li>
+<li><strong>重试要有策略。</strong> 简单重试（同 prompt 再跑）对确定性模型无效；有效的是：(a) 降低约束（先让它自由推理，再用第二个轻量解析步骤抽取答案）；(b) 用不同的模板复述要求；(c) 重试仍失败则转人工/标记。</li>
+</ol>
+<p><strong>推荐的输出协议</strong>（兼顾稳定与可推理）：</p>
+<ul>
+<li>先让 judge 写简短的判断理由（1~3 句），再输出一个固定标记的行，如 <code>FINAL: A</code> / <code>FINAL: B</code> / <code>FINAL: TIE</code>。</li>
+<li>用正则只抓最后一行。<strong>不要把 JSON 作为唯一协议</strong>：长推理后模型很容易在多处输出 JSON 片段，解析歧义比一行标记大得多。</li>
+<li>若必须用 JSON：要求单个代码块、固定键名、禁止额外文本，并接受&quot;第一个合法 JSON 对象&quot;作为解析结果。</li>
+</ul>
+<p><strong>取舍</strong>：让 judge 先推理再判定，通常能提高一致性（尤其是复杂任务），代价是失败率上升与成本上升。<strong>先推理后判定的最大风险是&quot;合理化&quot;</strong>——judge 先写了一段支持某个结论的理由，然后给出与该理由不一致的分数。防护是<strong>要求理由与结论一致性检查</strong>：如果理由里说&quot;回答 2 有明显事实错误&quot;而 <code>FINAL: 2</code>，这条样本应被标记为可疑并复核。</p>
+<h3 id="h-四可复现性的硬要求">四、可复现性的硬要求<a class="anchor" href="#h-四可复现性的硬要求" aria-label="本节链接">#</a></h3>
+<p>把&quot;可复现&quot;拆成可检查的清单。一个 judge 实验的报告里应至少能追溯到：</p>
+<table>
+<thead>
+<tr>
+<th>项</th>
+<th>为什么必须记录</th>
+<th>常见遗漏</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>judge 模型<strong>确切版本</strong></td>
+<td>同名模型的不同快照判定风格差异明显</td>
+<td>只写&quot;某模型最新版&quot;</td>
+</tr>
+<tr>
+<td>解码参数（temperature / top_p / seed / max_tokens）</td>
+<td>temperature&gt;0 时同输入不同输出</td>
+<td>只写模型名</td>
+</tr>
+<tr>
+<td><strong>prompt 全文 + 哈希</strong></td>
+<td>prompt 是判定标准的一部分</td>
+<td>只写&quot;用了标准 prompt&quot;</td>
+</tr>
+<tr>
+<td>候选顺序与聚合规则</td>
+<td>位置偏差处理方式直接影响结论</td>
+<td>不写聚合规则</td>
+</tr>
+<tr>
+<td>题目顺序与批次划分</td>
+<td>批次效应（服务端版本、缓存）会进入结果</td>
+<td>不写</td>
+</tr>
+<tr>
+<td>失败样本数与处置</td>
+<td>选择性丢失</td>
+<td>只报成功样本</td>
+</tr>
+<tr>
+<td>入参（是否截断、上下文长度、多轮历史）</td>
+<td>截断会改变被判内容</td>
+<td>不写</td>
+</tr>
+</tbody></table>
+<p><strong>批次效应是最隐蔽的一项</strong>。如果你第一天跑候选 A、第二天跑候选 B，那么两天的服务端版本、缓存状态、甚至流量负载都可能不同。判定的差异会混入系统差异。<strong>规范做法：把 A 与 B 的样本打散混在同一个批次里跑，并记录批次号；或者保证两组的批次分布一致。</strong> 这与 A/B 实验的分流均衡是同一个道理。</p>
+<p><strong>&quot;同一天跑一次 vs 分三天跑&quot;的检验方法</strong>：抽 100 对样本，每天跑一次，共三天，算三次结果两两之间的一致率（或 ICC）。<strong>如果日内一致率 0.95、日间一致率 0.85，那么任何小于 (1-0.85) 量级的模型差异都不能被可靠解释。</strong> 这项检验的成本极低，但能发现最致命的问题。</p>
+<h3 id="h-五prompt-敏感性必须测量不能假设">五、prompt 敏感性：必须测量，不能假设<a class="anchor" href="#h-五prompt-敏感性必须测量不能假设" aria-label="本节链接">#</a></h3>
+<p>prompt 敏感性指：<strong>在判定标准不变的情况下，改动词句/顺序/措辞，结论变多少。</strong></p>
+<p>三种常见诱因：</p>
+<ol>
+<li><strong>标签措辞</strong>：用&quot;A/B&quot;还是&quot;回复1/回复2&quot;还是&quot;助手1/助手2&quot;。后者可能触发模型对&quot;助手&quot;身份的先验。</li>
+<li><strong>rubric 描述</strong>：把&quot;准确性&quot;描述为&quot;不包含事实错误&quot;或&quot;所有事实性陈述都正确&quot;，判定的边界会变。</li>
+<li><strong>长度/顺序强调</strong>：写&quot;注意不要因为答案更长就给更高分&quot;会同时改变长度偏差<strong>与</strong>整体判定风格（可能变得过度惩罚长度）。</li>
+</ol>
+<p><strong>测量方法（prompt 敏感性实验）</strong>：从你的任务里抽 200~500 对，用 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 个语义等价的 prompt 变体各跑一遍，然后：</p>
+<ul>
+<li>报<strong>变体间一致率</strong>（两两比较）与<strong>结论的稳定区间</strong>（比如胜率的 min/max）。</li>
+<li>用第 1 节的偏差回归看<strong>每个变体的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0528em;">β</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:-0.0528em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">L</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0528em;">β</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:-0.0528em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0576em;">S</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 是否显著不同</strong>——这比只看总胜率更有诊断力。</li>
+<li>定义<strong>敏感度</strong>：胜率在不同变体间的极差。<strong>如果极差（比如 6 个点）大于你要检测的效应（比如 3 个点），那么这次评测的结论是 prompt 决定的，不是模型决定的。</strong></li>
+</ul>
+<p><strong>取舍</strong>：变体越多，敏感性估计越稳，成本线性上升。实践建议：<strong>至少两个变体（一个正式、一个&quot;朴素版&quot;）</strong>，因为两个变体之间的一致率已经能发现大部分脆弱性。三个以上才有方差估计。</p>
+<p><strong>一个反直觉的结论</strong>：<strong>prompt 敏感性本身可以是评测报告的一个有用指标。</strong> 如果某个任务上 judge 对措辞极度敏感，说明这个任务的判定标准本身不清晰（人的判断也会不稳），此时更该做的是<strong>先把标准写清楚</strong>（rubric + 锚点示例），而不是继续调 prompt。</p>
+<h3 id="h-代码">代码<a class="anchor" href="#h-代码" aria-label="本节链接">#</a></h3>
+<p>⚠️ 以下为<strong>合成数据</strong>与示例输出，仅用于展示协议与统计量的行为；代码只用标准库，可直接运行。</p>
+<pre data-lang="python"><code class="language-python">import hashlib
+import math
+import random
+import re
+import statistics
+
+rng = random.Random(211)
+
+
+# ============================================================
+# 1. 双顺序协议 + 三种聚合规则
+# ============================================================
+def judge_once(dq, first_is_a, prob_lazy, noise_sd, r):
+    # 返回 &quot;A&quot; / &quot;B&quot; / &quot;TIE&quot;（TIE 由感知差接近 0 触发）
+    if r.random() &lt; prob_lazy:
+        return &quot;A&quot; if first_is_a else &quot;B&quot;          # 位置偏差：选先出现的
+    z = (dq if first_is_a else -dq) + r.gauss(0, noise_sd)
+    if abs(z) &lt; 0.25:                               # &quot;实质相同&quot; -&gt; 平局
+        return &quot;TIE&quot;
+    win_first = z &gt; 0
+    return (&quot;A&quot; if first_is_a else &quot;B&quot;) if win_first else (&quot;B&quot; if first_is_a else &quot;A&quot;)
+
+
+def run_protocol(pairs, prob_lazy=0.15, noise_sd=0.5, seed=17):
+    # 返回：一致才算胜 / 不一致记 0.5 / 不一致率 / 双平局率
+    r = random.Random(seed)
+    agree_score = half_score = 0.0
+    n_disagree = n_both_tie = 0
+    for dq in pairs:
+        w1 = judge_once(dq, True, prob_lazy, noise_sd, r)     # A 在前
+        w2 = judge_once(dq, False, prob_lazy, noise_sd, r)    # B 在前
+        if w1 == w2:
+            agree_score += 1.0 if w1 == &quot;A&quot; else (0.5 if w1 == &quot;TIE&quot; else 0.0)
+            half_score += 1.0 if w1 == &quot;A&quot; else (0.5 if w1 == &quot;TIE&quot; else 0.0)
+        else:
+            n_disagree += 1
+            # 一致才算胜：不一致 -&gt; 不计 A 胜（记 0.5 会让它变成&quot;平局&quot;）
+            agree_score += 0.5
+            half_score += 0.5
+        if w1 == &quot;TIE&quot; and w2 == &quot;TIE&quot;:
+            n_both_tie += 1
+    n = len(pairs)
+    return agree_score / n, half_score / n, n_disagree / n, n_both_tie / n
+
+
+def true_win_rate(pairs):
+    # 真实质量差 dq = q_A - q_B，平局阈值 0.25 之内的算平局
+    s = 0.0
+    for dq in pairs:
+        s += 0.5 if abs(dq) &lt; 0.25 else (1.0 if dq &gt; 0 else 0.0)
+    return s / len(pairs)
+
+
+pairs = [rng.gauss(0.0, 1.0) for _ in range(400)]
+print(&quot;== 1. 双顺序协议与聚合规则（合成，A 与 B 真实水平相同） ==&quot;)
+print(f&quot;真实 A 胜率 = {true_win_rate(pairs):.3f}（两者同分布，期望 0.5）&quot;)
+for lazy in (0.0, 0.15, 0.30):
+    # 只跑&quot;A 在前&quot;（不随机化、不交换）
+    r2 = random.Random(3)
+    single = 0.0
+    for dq in pairs:
+        w = judge_once(dq, True, lazy, 0.5, r2)
+        single += 1.0 if w == &quot;A&quot; else (0.5 if w == &quot;TIE&quot; else 0.0)
+    single /= len(pairs)
+    agr, half, dis, tie = run_protocol(pairs, prob_lazy=lazy)
+    print(f&quot;位置偏差 {lazy:.2f}: 只跑 A 在前 -&gt; {single:.3f} | &quot;
+          f&quot;双顺序(一致才算胜) -&gt; {agr:.3f} | 双顺序(不一致记 0.5) -&gt; {half:.3f} | &quot;
+          f&quot;不一致率 {dis:.3f} | 双平局率 {tie:.3f}&quot;)
+print(&quot;  &lt;- 只跑一种顺序时，&#39;A 胜率&#39;随位置偏差线性虚高；&quot;)
+print(&quot;     双顺序 + 不一致记 0.5 把期望拉回 0.5（代价是方差更大）&quot;)
+
+
+# ============================================================
+# 2. 解析失败：解析器与失败率
+# ============================================================
+FINAL_RE = re.compile(r&quot;FINAL\s*[:：]\s*(A|B|TIE)\b&quot;, re.IGNORECASE)
+
+RAW_OUTPUTS = [
+    &quot;理由：回答 2 更完整、有具体数据。\nFINAL: B&quot;,
+    &quot;两者都不错。\nfinal: TIE&quot;,
+    &quot;我认为 A 更好\nFINAL: A&quot;,
+    &quot;Let me think... The answer 1 is better.\nFINAL: 1&quot;,          # 非法取值
+    &quot;FINAL: A\n\n（另外我认为 B 也不错）FINAL: B&quot;,                  # 多个标记
+    &quot;&quot;,                                                              # 空输出
+    &quot;抱歉，我无法比较这两个回答。&quot;,                                     # 拒答
+]
+
+
+def parse_verdict(text):
+    # 取&quot;最后一个&quot;合法标记，并报告歧义
+    hits = FINAL_RE.findall(text or &quot;&quot;)
+    if not hits:
+        return None, &quot;no_marker&quot;
+    if len(set(h.upper() for h in hits)) &gt; 1:
+        return hits[-1].upper(), &quot;ambiguous&quot;
+    return hits[-1].upper(), &quot;ok&quot;
+
+
+print(&quot;\n== 2. 解析失败与歧义（示例输出） ==&quot;)
+fail = ambig = ok = 0
+for t in RAW_OUTPUTS:
+    v, status = parse_verdict(t)
+    print(f&quot;  status={status:10s} verdict={str(v):5s} &lt;- {t[:28]!r}&quot;)
+    ok += status == &quot;ok&quot;
+    ambig += status == &quot;ambiguous&quot;
+    fail += status == &quot;no_marker&quot;
+print(f&quot;可解析 {ok}/{len(RAW_OUTPUTS)}，歧义 {ambig}，失败 {fail}&quot;)
+print(&quot;  &lt;- 失败率必须报告；失败若与某个候选相关，评测就有系统性偏差&quot;)
+
+
+# ============================================================
+# 3. 可复现性：prompt 指纹 + 批次效应检验
+# ============================================================
+def prompt_hash(prompt):
+    return hashlib.sha256(prompt.encode(&quot;utf-8&quot;)).hexdigest()[:16]
+
+
+PROMPT_TEMPLATE = (
+    &quot;你是评审。比较两个候选回答，判定哪个更好。\n&quot;
+    &quot;判定标准：事实正确性优先，其次是完整性与清晰度。\n&quot;
+    &quot;候选 1:\n{c1}\n候选 2:\n{c2}\n&quot;
+    &quot;先给出 1-3 句理由，最后一行输出 FINAL: 1 / FINAL: 2 / FINAL: TIE&quot;
+)
+print(&quot;\n== 3. prompt 指纹（可复现的最小凭证） ==&quot;)
+print(f&quot;模板哈希 = {prompt_hash(PROMPT_TEMPLATE)}&quot;)
+v2 = PROMPT_TEMPLATE.replace(&quot;FINAL: 1 / FINAL: 2&quot;, &quot;FINAL: A / FINAL: B&quot;)
+print(f&quot;改一处标签后哈希 = {prompt_hash(v2)}  &lt;- 变化了，但语义等价&quot;)
+print(&quot;  -&gt; 指纹只保证&#39;能追溯&#39;，不保证&#39;语义不变&#39;；两者都要记录&quot;)
+
+# 批次效应：同一天 vs 跨天的一致性
+def batch_agreement(day_var, n=200, seed=9):
+    r = random.Random(seed)
+    a, b, c = [], [], []
+    for _ in range(n):
+        dq = r.gauss(0.2, 1.0)
+        base = 1 if dq &gt; 0 else 0
+        # 每次判定有 5% 的随机翻转（judge 日内噪声）
+        a.append(base if r.random() &gt; 0.05 else 1 - base)
+        b.append(base if r.random() &gt; 0.05 else 1 - base)
+        # 第三天有系统漂移：把一部分判定整体翻向另一边
+        b3 = base
+        if r.random() &lt; day_var:
+            b3 = 1 - b3
+        c.append(b3 if r.random() &gt; 0.05 else 1 - b3)
+    def agr(x, y):
+        return sum(1 for i in range(n) if x[i] == y[i]) / n
+    return agr(a, b), agr(a, c), agr(b, c)
+
+
+print(&quot;\n== 4. 批次效应：日内 vs 跨天一致率 ==&quot;)
+for drift in (0.0, 0.05, 0.10, 0.20):
+    d12, d13, d23 = batch_agreement(drift)
+    print(f&quot;第三天漂移 {drift:.2f} -&gt; 日内一致 {d12:.3f} | 跨天一致 {d13:.3f} / {d23:.3f}&quot;)
+print(&quot;  &lt;- 日内 0.9、跨天 0.8 时，任何小于 20% 的模型差异都无法可靠解释&quot;)
+print(&quot;     防御手段：A/B 样本混在同一批次跑，并记录批次号&quot;)
+
+
+# ============================================================
+# 4. prompt 敏感性：同一批样本在不同 prompt 变体下的判定翻转率
+# ------------------------------------------------------------
+# 每个变体有自己的位置偏好、长度偏好与平局带宽；在&quot;同一批题目&quot;上比较，
+# 这样能直接数出&quot;有多少个判定被 prompt 改动改变了&quot;
+# ============================================================
+def variant_verdict(dq, first_is_a, cfg, r):
+    # cfg: lazy（位置偏差）, w_len（长度权重）, tie_band（平局带宽）
+    if r.random() &lt; cfg[&quot;lazy&quot;]:
+        return 0                                    # 0 = 选先出现的
+    z = (dq if first_is_a else -dq) + cfg[&quot;w_len&quot;]
+    if abs(z) &lt; cfg[&quot;tie_band&quot;]:
+        return 2                                    # 2 = 平局
+    win_first = z &gt; 0
+    if win_first:
+        return 0
+    return 1                                        # 1 = 选后出现的
+
+
+def variant_win_rate(pairs, cfg, seed):
+    # 在固定题目顺序下跑一个变体，返回 A 的胜率（平局 0.5）与逐题判定
+    r = random.Random(seed)
+    s = 0.0
+    verdicts = []
+    for (dq, dlen) in pairs:
+        c = dict(cfg)                                # 每题的副本，别污染变体配置
+        c[&quot;w_len&quot;] = cfg[&quot;w_len&quot;] * dlen / 100.0     # 长度差 -&gt; logit 偏移
+        v = variant_verdict(dq, True, c, r)          # 统一 A 在前（比较 prompt 本身）
+        verdicts.append(v)
+        s += 0.5 if v == 2 else (1.0 if v == 0 else 0.0)
+    return s / len(pairs), verdicts
+
+
+rng2 = random.Random(23)
+sim_pairs = [(rng2.gauss(0.10, 1.0), rng2.gauss(0.0, 150.0)) for _ in range(500)]
+variants = {
+    &quot;正式版&quot;: dict(lazy=0.10, w_len=0.000, tie_band=0.25),
+    &quot;强调完整性&quot;: dict(lazy=0.10, w_len=0.500, tie_band=0.25),
+    &quot;显式反长度提示&quot;: dict(lazy=0.10, w_len=-0.400, tie_band=0.25),
+    &quot;换标签(回复1/回复2)&quot;: dict(lazy=0.16, w_len=0.008, tie_band=0.30),
+}
+print(&quot;\n== 5. prompt 敏感性（合成，同一批 500 对题目） ==&quot;)
+rates, verdicts = {}, {}
+for name, cfg in variants.items():
+    rates[name], verdicts[name] = variant_win_rate(sim_pairs, cfg, seed=31)
+    print(f&quot;  {name:20s} -&gt; A 胜率 {rates[name]:.3f}&quot;)
+spread = max(rates.values()) - min(rates.values())
+print(f&quot;变体间胜率极差 = {spread:.3f}&quot;)
+base = verdicts[&quot;正式版&quot;]
+print(&quot;\n  逐题判定翻转率（相对&#39;正式版&#39;）：&quot;)
+for name in variants:
+    if name == &quot;正式版&quot;:
+        continue
+    flip = sum(1 for x, y in zip(base, verdicts[name]) if x != y) / len(base)
+    print(f&quot;    {name:20s} 翻转率 {flip:.3f}  &quot;
+          f&quot;(胜败互换 {sum(1 for x,y in zip(base,verdicts[name]) if x!=y and 2 not in (x,y))/len(base):.3f})&quot;)
+print(&quot;  &lt;- 胜率极差可能很小（互为反向的效应会抵消），但逐题翻转率不会：&quot;)
+print(&quot;     翻转率是 prompt 敏感性的稳健度量，也是结论可信度的上限&quot;)</code></pre>
+<p><strong>代码里五个值得注意的点</strong>：</p>
+<ul>
+<li><strong>第 1 段给出双顺序协议的完整对照</strong>：只跑&quot;A 在前&quot;时 A 的胜率随位置偏差线性虚高（0.00/0.15/0.30 对应 0.48/0.55/0.63）；双顺序 + 不一致记 0.5 把期望稳定拉回 0.49。<strong>&quot;一致才算胜&quot;看起来更严格，但它丢掉的是位置敏感样本，会改变被测总体</strong>（不一致率高达 0.43 时，损失近一半样本）。</li>
+<li><strong>第 2 段把解析失败变成可统计的量</strong>：<code>FINAL: 1</code>（合法格式但非法取值）、多个标记共存、空输出、拒答，都必须有明确处置。<strong>&quot;取最后一个标记&quot;与&quot;取第一个标记&quot;会给出不同答案</strong>，协议里必须写死；多标记样本往往出现在模型&quot;改主意&quot;时，信息量最高，应单独复核。</li>
+<li><strong>第 3 段区分了两件事</strong>：prompt 哈希保证<strong>可追溯</strong>（能证明用的是哪一版），但不保证<strong>语义等价</strong>（改一个标签就换哈希）。所以要同时记录哈希与变更说明，否则你会得到一堆无法比较的哈希。</li>
+<li><strong>第 4 段是本节最实用的一项检验</strong>：日内一致率约 0.9，跨天一致率随系统漂移降到 0.8 以下。<strong>如果你把候选 A 和候选 B 分两天跑，两天的漂移会直接进入结论</strong>，而它完全不体现在置信区间里（和位置偏差一样，是&quot;精确地错&quot;）。防御手段：A/B 样本混在同一批次跑 + 记录批次号 + 把批次作为随机效应。</li>
+<li><strong>第 5 段给出更稳健的敏感性度量</strong>：注意<strong>胜率极差可能很小</strong>（互为反向的效应在聚合时会抵消），但<strong>逐题翻转率不会</strong>。三个变体各有百分之几到十几的逐题翻转，意味着几十个判定是 prompt 决定的。<strong>报告里应同时给出胜率极差与逐题翻转率</strong>——后者是你结论可信度的上限。这也提示：若某任务的判定对措辞极度敏感，问题通常不在 prompt，而在判定标准本身不清晰，该做的是补 rubric 与锚点示例。</li>
+</ul>
+<h3 id="h-练习">练习<a class="anchor" href="#h-练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><p><strong>协议设计</strong>：为&quot;比较两个客服回复草稿的质量&quot;设计完整的判定协议。
+（a）选择判定形态（pairwise / pointwise / rubric）并说明理由；
+（b）写出输出协议（理由 + 结束标记）与解析规则；
+（c）写出平局与&quot;都不合格&quot;的处置，以及聚合规则（含位置处理）；
+（d）列出这条协议必须记录的元数据（至少 8 项）。</p>
+</li>
+<li><p><strong>聚合规则的代价</strong>：某评测 400 对，双顺序结果：两次一致 300 对（其中 A 胜 180、B 胜 120），不一致 100 对（其中 60 对是&quot;谁在前谁赢&quot;的位置驱动，40 对是其他）。
+（a）分别用&quot;一致才算胜&quot;&quot;不一致记 0.5&quot;&quot;不一致转人工&quot;三种规则算 A 的胜率；
+（b）哪种规则给出最大的 A 优势？为什么？
+（c）如果这 100 对不一致样本的构成与总体不同（比如集中在长回答上），三种规则的偏差方向是什么？</p>
+</li>
+<li><p><strong>解析失败率</strong>：某次 judge 运行 5000 条，解析失败 380 条（7.6%），且失败样本的平均输出长度是被判样本的 2.3 倍。
+（a）直接丢弃失败样本会带来什么方向的偏差？
+（b）设计一套重试与降级策略（至少三级）；
+（c）写出报告中必须披露的三项信息。</p>
+</li>
+<li><p><strong>可复现性清单</strong>：你要把一次 judge 评测交给同事复核。
+（a）写出交接包的内容清单（文件 + 字段）；
+（b）说明&quot;同一天跑一次 vs 分三天跑&quot;的一致性检验怎么做、需要多少样本、报告哪个统计量；
+（c）如果你的评测要跨一个月分四批跑，设计批次控制方案（提示：混样、锚点样本、批次作为随机效应）。</p>
+</li>
+<li><p><strong>敏感性实验</strong>：你设计了 4 个语义等价的 prompt 变体，得到 A 胜率：0.562 / 0.541 / 0.578 / 0.524，逐题翻转率（相对正式版）分别为 0.04 / 0.07 / 0.11。
+（a）算胜率极差与逐题翻转率，判断这次评测的可靠性；
+（b）如果正式版是 0.562，你会报哪个数？附什么说明？
+（c）设计一个方案，用&quot;锚点样本&quot;（已知优劣的构造对）把变体间差异与真实差异分离。</p>
+</li>
+<li><p><strong>输出协议取舍</strong>（开放题）：你的任务是判定&quot;代码是否修复了 bug&quot;。
+（a）为什么这类任务上&quot;先推理再判定&quot;收益很大？
+（b）&quot;先推理&quot;会引入什么新风险（提示：合理化的方向）？给出检测&quot;理由与结论不一致&quot;的规则；
+（c）如果要求输出 JSON，写出最小 schema 与三条解析容错规则。</p>
+</li>
+</ol>
+<h3 id="h-小结">小结<a class="anchor" href="#h-小结" aria-label="本节链接">#</a></h3>
+<ul>
+<li><strong>判定形态先于 prompt</strong>：pairwise 用于选型（人类与模型在&quot;哪个更好&quot;上更一致）、pointwise 用于粗筛与监控（有尺度漂移风险）、rubric 用于需要定位失败与需要可解释性的场景（rubric 本身要验收）。</li>
+<li><strong>平局必须显式处理并报告</strong>：平局率、非平局中的胜率、聚合规则。<strong>把平局当 0.5 胜偷偷处理掉，会让读者无法判断结论对规则的敏感性</strong>（本节的合成例子里双平局率约 3%<del>4%，但&quot;两次判定不一致&quot;的比例高达 0.31</del>0.45）。</li>
+<li><strong>位置偏差只能靠协议消除</strong>：双顺序 + 聚合（一致才算胜 / 不一致记 0.5 / 转人工），或至少随机化并记录顺序（把系统偏差转成随机噪声）。模板的每个字节都要对称，<strong>不要指望 prompt 里写&quot;请忽略顺序&quot;</strong>。</li>
+<li><strong>解析失败必须当一等公民</strong>：报失败率、分析失败样本分布、三级降级（同 prompt 重试 → 降约束 + 二次抽取 → 人工）。<strong>选择性丢失会制造系统性偏差。</strong></li>
+<li><strong>可复现 ≠ 确定性</strong>：记录模型版本、解码参数、prompt 全文 + 哈希、顺序与聚合规则、批次划分、失败处置。<strong>批次效应是最隐蔽的杀手</strong>——日内与跨天一致率之差就是你的噪声地板。</li>
+<li><strong>prompt 敏感性必须测量</strong>：用 2~4 个语义等价变体算胜率极差<strong>与逐题翻转率</strong>。极差大于目标效应（或翻转率高于你能接受的判定不确定度）时，结论由 prompt 决定。</li>
+</ul>

@@ -1,0 +1,86 @@
+<h2 id="h-gptqawqgguf">GPTQ/AWQ/GGUF<a class="anchor" href="#h-gptqawqgguf" aria-label="本节链接">#</a></h2>
+<p>上一课讲了量化的通用公式，这一课讲三个&quot;怎么把量化做得好&quot;的具体方法：<strong>GPTQ</strong> 用二阶误差补偿把权重逐层量化到 4-bit 且几乎不掉点，<strong>AWQ</strong> 通过&quot;保护重要通道&quot;来规避离群值破坏，<strong>GGUF</strong> 则是 llama.cpp 生态里最通用的量化模型文件格式。学完本课，你应当能区分三者的原理定位，并会各写一段加载/量化命令。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-gptq逐层量化--误差补偿">1. GPTQ：逐层量化 + 误差补偿<a class="anchor" href="#h-1-gptq逐层量化--误差补偿" aria-label="本节链接">#</a></h4>
+<p>GPTQ 的名字带 &quot;Q&quot;（quantization），它的目标是在<strong>训练后、不用重训</strong>的前提下，把模型量化到 3/4-bit 而精度几乎不损失。核心思想有三条：</p>
+<ul>
+<li><strong>逐层量化</strong>：一层一层地量化，当前层的误差可以在量化后续权重时被&quot;吸收&quot;；</li>
+<li><strong>二阶信息（Hessian）</strong>：用权重对误差的 Hessian 矩阵来评估&quot;量化哪个权重影响更大&quot;，优先补偿影响大的；</li>
+<li><strong>反量化补偿</strong>：量化某一列后，立刻把由此引入的误差&quot;摊&quot;到尚未量化的其余列上，让总误差互相抵消。</li>
+</ul>
+<p>效果：Llama-7B 用 GPTQ 量化到 4-bit，困惑度（perplexity）相比 FP16 基本持平，而模型体积减半以上。</p>
+<h4 id="h-2-awq激活感知保护重要通道">2. AWQ：激活感知、保护重要通道<a class="anchor" href="#h-2-awq激活感知保护重要通道" aria-label="本节链接">#</a></h4>
+<p>AWQ（Activation-aware Weight Quantization，激活感知权重量化）观察到：<strong>不是所有权重都同等重要</strong>——那些与&quot;大激活值&quot;相连的权重通道对精度影响最大（约 1% 的显著通道贡献了大部分输出）。上一课我们看到离群值会&quot;绑架&quot; scale，AWQ 的对策是：</p>
+<ul>
+<li>用少量校准数据跑一遍，统计每条通道的<strong>激活幅度</strong>；</li>
+<li>给重要通道<strong>乘一个更大的 per-channel scale</strong>，让它们量化得更精细（等效于&quot;保护&quot;它们）；</li>
+<li>不改变权重的实际数值（保护通过 scale 缩放实现，计算时再还原），因此<strong>不增加额外训练、无重训成本</strong>。</li>
+</ul>
+<p>AWQ 4-bit 在多数模型上精度优于朴素的 round-to-nearest 4-bit，且量化过程比 GPTQ 更快。</p>
+<h4 id="h-3-gguf一个文件装下模型--量化方案">3. GGUF：一个文件装下模型 + 量化方案<a class="anchor" href="#h-3-gguf一个文件装下模型--量化方案" aria-label="本节链接">#</a></h4>
+<p>GGUF 是 llama.cpp 生态的模型文件格式，前身是 GGML。它的特点：</p>
+<ul>
+<li><strong>单文件自描述</strong>：把权重、词表、超参、量化元数据都装进一个 <code>.gguf</code> 文件，开箱即用；</li>
+<li><strong>多种量化档位</strong>：提供从 FP16 到 2-bit 的一整套档位（如 <code>Q4_0</code>、<code>Q4_K_M</code>、<code>Q5_K_M</code>、<code>Q8_0</code>），&quot;K-quant&quot;系列是结合了块级混合精度的改良方案；</li>
+<li><strong>跨硬件</strong>：CPU、CUDA、Metal、Vulkan 后端都能读同一份 GGUF。</li>
+</ul>
+<p>GGUF 本身不是一种&quot;量化算法&quot;，而是一种<strong>承载量化权重的容器格式</strong>——它既可以用简单量化，也可以搭配更精细的量化方案。</p>
+<h3 id="h-二可运行示例">二、可运行示例<a class="anchor" href="#h-二可运行示例" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-gptq用-autogptq-量化加载">1. GPTQ：用 AutoGPTQ 量化/加载<a class="anchor" href="#h-1-gptq用-autogptq-量化加载" aria-label="本节链接">#</a></h4>
+<pre data-lang="python"><code class="language-python"># -*- coding: utf-8 -*-
+# 用 AutoGPTQ 加载一个已量化的 4-bit 模型并推理
+from transformers import AutoTokenizer
+from auto_gptq import AutoGPTQForCausalLM
+
+model_id = &quot;TheBloke/Llama-2-7B-GPTQ&quot;          # 已量化好的 4-bit GPTQ 模型
+tok = AutoTokenizer.from_pretrained(model_id)
+model = AutoGPTQForCausalLM.from_quantized(model_id, use_triton=True)
+
+prompt = &quot;用一句话解释 PagedAttention&quot;
+inputs = tok(prompt, return_tensors=&quot;pt&quot;)
+out = model.generate(**inputs, max_new_tokens=64)
+print(tok.decode(out[0], skip_special_tokens=True))</code></pre>
+<h4 id="h-2-awq用-vllm-直接加载-4-bit-awq">2. AWQ：用 vLLM 直接加载 4-bit AWQ<a class="anchor" href="#h-2-awq用-vllm-直接加载-4-bit-awq" aria-label="本节链接">#</a></h4>
+<pre data-lang="bash"><code class="language-bash"># vLLM 原生支持 AWQ：--quantization awq 即可
+python -m vllm.entrypoints.openai.api_server \
+    --model TheBloke/Llama-2-7B-AWQ \
+    --quantization awq \
+    --max-model-len 4096 \
+    --port 8000</code></pre>
+<h4 id="h-3-gguf用-llamacpp-转换或直接下载">3. GGUF：用 llama.cpp 转换或直接下载<a class="anchor" href="#h-3-gguf用-llamacpp-转换或直接下载" aria-label="本节链接">#</a></h4>
+<pre data-lang="bash"><code class="language-bash"># 方式一：直接下载现成 GGUF（如 Q4_K_M 档位）
+#   地址形如 https://huggingface.co/TheBloke/Llama-2-7B-GGUF
+./llama-cli -m ./llama-2-7b.Q4_K_M.gguf -p &quot;Hello&quot; -n 64
+
+# 方式二：自己把 HF 模型转成 GGUF（需要 llama.cpp 仓库）
+python convert_hf_to_gguf.py ./Llama-2-7b-chat-hf --outfile ./llama-2-7b.gguf
+./llama-quantize ./llama-2-7b.gguf ./llama-2-7b.Q4_K_M.gguf Q4_K_M</code></pre>
+<h4 id="h-4-三方法快速对照">4. 三方法快速对照<a class="anchor" href="#h-4-三方法快速对照" aria-label="本节链接">#</a></h4>
+<pre data-lang="python"><code class="language-python"># -*- coding: utf-8 -*-
+# 三个量化方案的定位对照
+
+summary = [
+    (&quot;GPTQ&quot;,  &quot;逐层量化 + Hessian 误差补偿&quot;, &quot;精度几乎不掉点，量化稍慢&quot;, &quot;GPU 服务、离线量化&quot;),
+    (&quot;AWQ&quot;,   &quot;激活感知、保护重要通道&quot;,     &quot;精度好、量化快、实现广&quot;,   &quot;GPU 服务（vLLM 原生支持）&quot;),
+    (&quot;GGUF&quot;,  &quot;单文件容器 + 多档位量化&quot;,    &quot;跨硬件、开箱即用&quot;,         &quot;llama.cpp 本地/边缘&quot;),
+]
+print(f&quot;{&#39;方案&#39;:&lt;6} {&#39;核心思想&#39;:&lt;26} {&#39;特点&#39;:&lt;22} {&#39;场景&#39;}&quot;)
+for name, idea, feat, scene in summary:
+    print(f&quot;{name:&lt;6} {idea:&lt;26} {feat:&lt;22} {scene}&quot;)</code></pre>
+<p><figure><img class="md-img" src="content/courses/llm-inference-optimization/assets/chapter-4-figure-02.svg" alt="GPTQ / AWQ / GGUF 三方案对比图：三栏卡片并列——左&quot;GPTQ&quot;（图标为逐层堆叠的方块 + Hessian 矩阵，标签&quot;逐层量化 + 二阶误差补偿&quot;）；中&quot;AWQ&quot;（图标为一排权重通道，其中约 1% 通道被高亮为红色&quot;重要通道&quot;，标签&quot;激活感知、保护重要通道&quot;）；右&quot;GGUF&quot;（图标为一个单文件 .gguf 容器，内含权重+词表+元数据，标签&quot;单文件容器 + 多档位量化&quot;）；每栏底部各写一句适用场景；底部一句话&quot;GPTQ/AWQ 是量化算法，GGUF 是承载格式&quot;" loading="lazy" decoding="async"><figcaption>GPTQ / AWQ / GGUF 三方案对比图：三栏卡片并列——左&quot;GPTQ&quot;（图标为逐层堆叠的方块 + Hessian 矩阵，标签&quot;逐层量化 + 二阶误差补偿&quot;）；中&quot;AWQ&quot;（图标为一排权重通道，其中约 1% 通道被高亮为红色&quot;重要通道&quot;，标签&quot;激活感知、保护重要通道&quot;）；右&quot;GGUF&quot;（图标为一个单文件 .gguf 容器，内含权重+词表+元数据，标签&quot;单文件容器 + 多档位量化&quot;）；每栏底部各写一句适用场景；底部一句话&quot;GPTQ/AWQ 是量化算法，GGUF 是承载格式&quot;</figcaption></figure>
+</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>跑 GPTQ</strong>：用 AutoGPTQ 加载一个 4-bit GPTQ 模型，记录显存占用，与 FP16 加载对比（FP16 约 2 倍字节），验证&quot;减半&quot;。</li>
+<li><strong>跑 AWQ</strong>：用 vLLM <code>--quantization awq</code> 起服务，与不量化（FP16）对比同样显存下的并发数，体会省显存带来的容量提升。</li>
+<li><strong>转 GGUF</strong>：用 <code>convert_hf_to_gguf.py</code> 把一个 HF 模型转成 GGUF，再分别 quantize 成 <code>Q4_0</code> 和 <code>Q5_K_M</code>，对比文件大小与生成质量。</li>
+<li><strong>思考</strong>：GPTQ 和 AWQ 都属于 PTQ（无需重训），但 AWQ 需要&quot;校准数据&quot;来统计激活分布。为什么说&quot;感知激活&quot;比&quot;只看权重&quot;更聪明？结合上一课的离群值问题回答。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>GPTQ 论文《GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers》：<a href="https://arxiv.org/abs/2210.17323" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2210.17323</a></li>
+<li>AWQ 论文《AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration》：<a href="https://arxiv.org/abs/2306.00978" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2306.00978</a></li>
+<li>AutoGPTQ 仓库：<a href="https://github.com/AutoGPTQ/AutoGPTQ" target="_blank" rel="noopener noreferrer">https://github.com/AutoGPTQ/AutoGPTQ</a></li>
+<li>GGUF 格式说明：<a href="https://github.com/ggerganov/ggml/blob/master/docs/gguf.md" target="_blank" rel="noopener noreferrer">https://github.com/ggerganov/ggml/blob/master/docs/gguf.md</a></li>
+</ul>
+<p><a href="#/l/inf-ch4-l3">下一课：bitsandbytes 与部署</a></p>

@@ -1,0 +1,558 @@
+<h2 id="h-多租户与权限过滤文档级-acl-怎样保证不漏">多租户与权限过滤：文档级 ACL 怎样保证不漏<a class="anchor" href="#h-多租户与权限过滤文档级-acl-怎样保证不漏" aria-label="本节链接">#</a></h2>
+<h3 id="h-这一节要解决什么">这一节要解决什么<a class="anchor" href="#h-这一节要解决什么" aria-label="本节链接">#</a></h3>
+<p>上一节把缓存讲完了，但留下了一个最危险的伏笔：<strong>缓存层可以绕过权限</strong>。这一节处理 RAG 系统里最不能出错的一件事：</p>
+<blockquote>
+<p>用户 A 绝不能通过问答系统看到用户 B 的文档内容 —— 哪怕只是一个片段、一个存在性、或者一个数字。</p>
+</blockquote>
+<p>这件事的特殊性在于它的失败模式与其他章节完全不同：</p>
+<ul>
+<li><strong>性能问题可以慢慢优化，权限问题一次就够</strong>。一次越权检索可能就是一次数据泄露事故。</li>
+<li><strong>失败往往是静默的</strong>：答案通顺、引用齐全、指标正常，只是内容来自别人的文档。</li>
+<li><strong>&quot;看起来做了过滤&quot;不等于&quot;不漏&quot;</strong>：<code>top-k</code> 之后过滤、缓存键少了租户、缺字段默认可见 —— 每一条都是真实发生过的泄漏路径。</li>
+</ul>
+<p>本节要回答四个问题：</p>
+<ol>
+<li>权限会在哪些地方漏？把路径列全，而不是只修一条。</li>
+<li>为什么&quot;先取 top-<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 再过滤&quot;在数学上必然导致效用崩塌？代价能不能算？</li>
+<li>前置过滤（pre-filter）不是免费的：高选择性下它自己会掉召回。这时候该怎么做？</li>
+<li>怎么<strong>证明</strong>系统不漏？需要什么样的、可证伪的验收标准？</li>
+</ol>
+<blockquote>
+<p><strong>结论先放在这里</strong>：权限必须在<strong>检索层前置执行</strong>，并且是<strong>查询的强制参数</strong>，绝不由模型或提示决定；ACL 缺字段必须 <strong>deny-by-default</strong>；缓存键必须含租户与权限指纹。而&quot;不漏&quot;不能靠代码审查宣布，必须靠<strong>对抗性测试</strong>证明：为每个租户放入含唯一 canary token 的诱饵文档，跑全租户交叉检索矩阵，断言 canary 命中数恒为 0。⚠️ 实测：不过滤时 60 个断言全部泄漏（FAIL）；post-filter 与 pre-filter 都 0 泄漏（PASS）—— 但 post-filter 在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span></span></span></span> 小时把可用结果数从 10 打到 0.20（空结果率 0.818），<strong>它的&quot;不漏&quot;是用效用换来的，而且换得极贵</strong>。</p>
+</blockquote>
+<h3 id="h-一威胁模型至少八条泄露路径">一、威胁模型：至少八条泄露路径<a class="anchor" href="#h-一威胁模型至少八条泄露路径" aria-label="本节链接">#</a></h3>
+<p>只修一条路径等于没修。下面每一条都给出<strong>可测的检测方法</strong>。</p>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>泄露路径</th>
+<th>机理</th>
+<th>可测检测</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1</td>
+<td><strong>post-filter（取 top-k 后过滤）</strong></td>
+<td>结果泄漏（若忘了过滤/过滤条件写错）、空结果与延迟泄漏&quot;存在但你看不到&quot;</td>
+<td>断言&quot;过滤后为空&quot;的查询占比；对比有/无权访问时的返回条数与延迟</td>
+</tr>
+<tr>
+<td>2</td>
+<td><strong>缓存键缺租户</strong>（6.2）</td>
+<td>后到者直接拿到先到者的答案</td>
+<td>两个租户问同一问题，断言不共享缓存条目</td>
+</tr>
+<tr>
+<td>3</td>
+<td><strong>元数据过滤写错</strong></td>
+<td>缺 ACL 字段默认可见；<code>$or</code> 被当成 <code>$and</code>；字段名不一致</td>
+<td>造一条无 ACL 字段的文档，断言不可见；对每个过滤表达式做真值表测试</td>
+</tr>
+<tr>
+<td>4</td>
+<td><strong>chunk 级 ACL 与父文档不一致</strong></td>
+<td>切分时漏继承 ACL 字段，chunk 变成&quot;无主&quot;</td>
+<td>断言&quot;每个 chunk 的 ACL 集合 = 父文档 ACL 集合&quot;（含容器的递归）</td>
+</tr>
+<tr>
+<td>5</td>
+<td><strong>撤权/删除后索引未更新</strong></td>
+<td>墓碑缺失、manifest 未切换（6.1）</td>
+<td>撤权后立刻查询，断言不可见；检查墓碑比例与切换延迟</td>
+</tr>
+<tr>
+<td>6</td>
+<td><strong>提示注入诱导越权检索</strong></td>
+<td>注入改变的是&quot;检索什么&quot;，若权限由提示决定就会被绕过</td>
+<td>用注入样本集跑回归，断言检索参数（含权限）不因提示改变</td>
+</tr>
+<tr>
+<td>7</td>
+<td><strong>trace/日志把原文写进共享存储</strong></td>
+<td>观测数据（6.4）跨租户可读</td>
+<td>断言日志中只出现文档 id 与哈希，不出现正文；扫描 PII 正则</td>
+</tr>
+<tr>
+<td>8</td>
+<td><strong>评测/标注集跨租户</strong></td>
+<td>用 A 租户数据标注 B 租户的评测集</td>
+<td>断言评测集每条带 tenant 且与黄金证据的 ACL 一致</td>
+</tr>
+<tr>
+<td>9</td>
+<td><strong>生成层&quot;记忆&quot;了别人的内容</strong>（间接泄露）</td>
+<td>模型在无权限时仍能凭参数记忆复述</td>
+<td>对无权限查询断言&quot;拒答&quot;而非&quot;凭记忆回答&quot;</td>
+</tr>
+<tr>
+<td>10</td>
+<td><strong>向量/嵌入反演</strong></td>
+<td>共享向量库 + 相似度分数可做成员推断</td>
+<td>限制返回精确分数、对分数加噪、或按租户分片</td>
+</tr>
+</tbody></table>
+<p><strong>关键判据</strong>：把这张表当成 checklist，每一条都要有<strong>自动化断言</strong>。<strong>没有断言的路径就等于没修。</strong></p>
+<h3 id="h-二为什么取-top-k-再过滤必然漏一个纯计数结论">二、为什么「取 top-k 再过滤」必然漏：一个纯计数结论<a class="anchor" href="#h-二为什么取-top-k-再过滤必然漏一个纯计数结论" aria-label="本节链接">#</a></h3>
+<p>先澄清一个常被说错的点：</p>
+<blockquote>
+<p><strong>post-filter 不会泄漏&quot;单条黄金证据&quot;</strong> —— 因为黄金证据本来就可访问，过滤不会把它删掉（除非过滤写错）。它真正损害的是<strong>可组装性</strong>、<strong>空结果率</strong>与<strong>侧信道</strong>。</p>
+</blockquote>
+<p>设检索返回 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 条（按相关度），权限过滤保留其中可访问的部分。<strong>因为检索器不知道权限、也不应该知道</strong>，可访问性与相关度近似独立，于是过滤后剩多少条是一个二项分布：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord">#</span><span class="mord text"><span class="mord cjk_fallback">可用</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∼</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord">Binomial</span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mpunct">,</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">s</span><span class="mclose">)</span></span></span></span></span></p>
+<p>其中 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span></span></span></span> 是该租户的可访问比例。由此得到三个直接可算的结论：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathbb">E</span><span class="mopen">[</span><span class="mord">#</span><span class="mord text"><span class="mord cjk_fallback">可用</span></span><span class="mclose">]</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">s</span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="mopen">(</span><span class="mord text"><span class="mord cjk_fallback">空结果</span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.1491em;vertical-align:-0.25em;"></span><span class="mord mathnormal">s</span><span class="mclose"><span class="mclose">)</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8991em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0315em;">k</span></span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="mopen">(</span><span class="mord">#</span><span class="mord text"><span class="mord cjk_fallback">可用</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≥</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">E</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:3.106em;vertical-align:-1.2777em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.8283em;"><span style="top:-1.8723em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">i</span><span class="mrel mtight">=</span><span class="mord mtight">0</span></span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∑</span></span></span><span style="top:-4.3em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.0576em;">E</span><span class="mbin mtight">−</span><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.2777em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mopen delimcenter" style="top:0em;"><span class="delimsizing size3">(</span></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3714em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">i</span></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose delimcenter" style="top:0em;"><span class="delimsizing size3">)</span></span></span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8747em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.1491em;vertical-align:-0.25em;"></span><span class="mord mathnormal">s</span><span class="mclose"><span class="mclose">)</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8991em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.0315em;">k</span><span class="mbin mtight">−</span><span class="mord mathnormal mtight">i</span></span></span></span></span></span></span></span></span></span></span></span></span></p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathbb">E</span><span class="mopen">[</span><span class="mord">#</span><span class="mord text"><span class="mord cjk_fallback">可用</span></span><span class="mclose">]</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">s</span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="mopen">(</span><span class="mord text"><span class="mord cjk_fallback">空结果</span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.1491em;vertical-align:-0.25em;"></span><span class="mord mathnormal">s</span><span class="mclose"><span class="mclose">)</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8991em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0315em;">k</span></span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="mopen">(</span><span class="mord">#</span><span class="mord text"><span class="mord cjk_fallback">可用</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≥</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">E</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:3.106em;vertical-align:-1.2777em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.8283em;"><span style="top:-1.8723em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">i</span><span class="mrel mtight">=</span><span class="mord mtight">0</span></span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∑</span></span></span><span style="top:-4.3em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.0576em;">E</span><span class="mbin mtight">−</span><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.2777em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mopen delimcenter" style="top:0em;"><span class="delimsizing size3">(</span></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3714em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">i</span></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose delimcenter" style="top:0em;"><span class="delimsizing size3">)</span></span></span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8747em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.1491em;vertical-align:-0.25em;"></span><span class="mord mathnormal">s</span><span class="mclose"><span class="mclose">)</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8991em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.0315em;">k</span><span class="mbin mtight">−</span><span class="mord mathnormal mtight">i</span></span></span></span></span></span></span></span></span></span></span></span></span></p>
+<p>⚠️ 实测（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">10</span></span></span></span>，多证据查询需要 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">E</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4</span></span></span></span> 条）：</p>
+<table>
+<thead>
+<tr>
+<th><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span></span></span></span></th>
+<th>期望可用条数</th>
+<th>空结果率</th>
+<th>可组装率（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7719em;vertical-align:-0.136em;"></span><span class="mrel">≥</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4</span></span></span></span> 条）</th>
+<th>可达召回上限</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>0.02</td>
+<td>0.20</td>
+<td>0.818</td>
+<td>0.000</td>
+<td>0.050</td>
+</tr>
+<tr>
+<td>0.05</td>
+<td>0.50</td>
+<td>0.599</td>
+<td>0.001</td>
+<td>0.125</td>
+</tr>
+<tr>
+<td>0.10</td>
+<td>1.00</td>
+<td>0.349</td>
+<td>0.013</td>
+<td>0.250</td>
+</tr>
+<tr>
+<td>0.20</td>
+<td>2.00</td>
+<td>0.107</td>
+<td>0.121</td>
+<td>0.500</td>
+</tr>
+<tr>
+<td>0.40</td>
+<td>4.00</td>
+<td>0.006</td>
+<td>0.618</td>
+<td>0.999</td>
+</tr>
+<tr>
+<td>1.00</td>
+<td>10.00</td>
+<td>0.000</td>
+<td>1.000</td>
+<td>1.000</td>
+</tr>
+</tbody></table>
+<p><strong>读法</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.10</span></span></span></span> 时，82% 的情况下……不，应该是：<strong>空结果率 34.9%、能凑齐 4 条证据的概率只有 1.3%</strong>。这不是&quot;精度差一点&quot;，而是<strong>功能不可用</strong>。</p>
+<p><strong>这张表最重要的性质是：它与排序质量无关。</strong> 无论你的检索器多准，过滤后只剩 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span></span></span></span> 条。所以：</p>
+<blockquote>
+<p><strong>post-filter 的问题不是&quot;漏得准不准&quot;，而是&quot;过滤发生在预算之后&quot;。</strong> 正确做法是把权限<strong>并入检索的约束</strong>，让预算 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 花在&quot;你有权看的文档&quot;上 —— 这就是 pre-filter。</p>
+</blockquote>
+<h4 id="h-21-侧信道空结果本身就是信息">2.1 侧信道：空结果本身就是信息<a class="anchor" href="#h-21-侧信道空结果本身就是信息" aria-label="本节链接">#</a></h4>
+<p>除了效用，post-filter 还泄漏<strong>存在性</strong>：</p>
+<ul>
+<li>一个查询返回 0 条，另一个几乎相同的查询返回 5 条 → 攻击者可以推断&quot;某个我看不到的文档与我的查询高度相关&quot;；</li>
+<li>返回条数与延迟相关（过滤掉的多则延迟结构不同）；</li>
+<li>在多轮追问下，这些信号可以拼出他人文档的大致主题甚至事实。</li>
+</ul>
+<p><strong>判据</strong>：对&quot;有权限/无权限&quot;两种身份跑同一批查询，比较返回条数分布与延迟分布。若分布差异显著（例如 KS 检验 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7335em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&lt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.01</span></span></span></span>），说明存在侧信道。</p>
+<p><figure><img class="md-img" src="content/courses/rag-systems/assets/chapter-6-figure-03.svg" alt="post-filter 的效用崩塌" loading="lazy" decoding="async"><figcaption>post-filter 的效用崩塌</figcaption></figure>
+</p>
+<h3 id="h-三前置过滤两种实现与各自的代价">三、前置过滤：两种实现与各自的代价<a class="anchor" href="#h-三前置过滤两种实现与各自的代价" aria-label="本节链接">#</a></h3>
+<p>前置过滤 = 把权限作为<strong>检索约束</strong>，只在可访问集合内排序。它保证不漏（下一节给出验收），但<strong>不是免费的</strong>。两种主流实现：</p>
+<h4 id="h-31-实现-a分区physical-partitioning">3.1 实现 A：分区（physical partitioning）<a class="anchor" href="#h-31-实现-a分区physical-partitioning" aria-label="本节链接">#</a></h4>
+<p>按租户（或 ACL 组）把索引物理分开：每个租户一个子索引。</p>
+<table>
+<thead>
+<tr>
+<th>优点</th>
+<th>缺点</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>召回与延迟都不受权限影响（每个子索引内部完整）</td>
+<td>租户多时索引碎片化，小租户各占一份内存/图结构</td>
+</tr>
+<tr>
+<td>隔离强度最高（即使过滤代码写错也不跨区）</td>
+<td>公共文档需要在多个分区重复存储 → 存储放大</td>
+</tr>
+<tr>
+<td>失败爆炸半径小</td>
+<td>跨租户的全局检索（如管理员视角）需要合并多个分区</td>
+</tr>
+</tbody></table>
+<p><strong>适用</strong>：租户数少而大、合规要求强（数据驻留）、或者有明确&quot;独占索引&quot;的客户。</p>
+<h4 id="h-32-实现-b元数据过滤filtered-ann">3.2 实现 B：元数据过滤（filtered ANN）<a class="anchor" href="#h-32-实现-b元数据过滤filtered-ann" aria-label="本节链接">#</a></h4>
+<p>共享一份索引，检索时带上过滤条件。这里有一个<strong>必须讲清的难点</strong>：</p>
+<blockquote>
+<p><strong>在 ANN 内部做过滤，会让图遍历断开。</strong></p>
+</blockquote>
+<p>原因：HNSW/IVF 的可导航性依赖&quot;邻居之间彼此可达&quot;。当过滤条件很严（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span></span></span></span> 很小），大多数邻居被过滤掉，搜索前沿无法沿图前进，召回骤降 —— 这与&quot;没找到&quot;不同，它表现为<strong>明明存在可访问的近邻，却访问不到</strong>。</p>
+<p>可测的失败信号：</p>
+<ul>
+<li>访问节点数正常甚至上升，但有效候选（通过过滤的）数量远低于 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span>；</li>
+<li>回退比例（fallback 到暴力扫描）上升；</li>
+<li>召回对 <code>ef</code> 的增长变得不敏感。</li>
+</ul>
+<p><strong>补救：过采样 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4831em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1/</span><span class="mord mathnormal">s</span></span></span></span> 再精确复核</strong>。要从可访问集合中拿到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 条，过滤前的候选池大约需要：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.9805em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0315em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">pool</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.0574em;vertical-align:-0.686em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3714em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">s</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></p>
+<p>⚠️ 实测代价：</p>
+<table>
+<thead>
+<tr>
+<th><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span></span></span></span></th>
+<th>过采样池 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.3669em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mord">/</span><span class="mord mathnormal">s</span></span></span></span></th>
+<th>额外算力倍数</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>0.02</td>
+<td>500</td>
+<td>50.0×</td>
+</tr>
+<tr>
+<td>0.05</td>
+<td>200</td>
+<td>20.0×</td>
+</tr>
+<tr>
+<td>0.10</td>
+<td>100</td>
+<td>10.0×</td>
+</tr>
+<tr>
+<td>0.30</td>
+<td>33</td>
+<td>3.3×</td>
+</tr>
+<tr>
+<td>1.00</td>
+<td>10</td>
+<td>1.0×</td>
+</tr>
+</tbody></table>
+<p><strong>所以 post-filter 与&quot;过采样的 pre-filter&quot;在算力上是一回事</strong>（都是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mord">/</span><span class="mord mathnormal">s</span></span></span></span>），区别在于：</p>
+<ul>
+<li>post-filter 的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mord">/</span><span class="mord mathnormal">s</span></span></span></span> 池是<strong>全局</strong>的，可能全是别人的文档，白扫；</li>
+<li>pre-filter 的过采样可以在<strong>图遍历内部</strong>只走可访问节点（若实现支持），或用<strong>分区 + 区内过采样</strong>，把代价摊到小索引上。</li>
+</ul>
+<h4 id="h-33-实现-cacl-倒排--位图本书示例采用的方案">3.3 实现 C：ACL 倒排 + 位图（本书示例采用的方案）<a class="anchor" href="#h-33-实现-cacl-倒排--位图本书示例采用的方案" aria-label="本节链接">#</a></h4>
+<p>把 ACL 表示成&quot;文档集合&quot;，查询时求交集：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord cjk_fallback">可访问集合</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.566em;vertical-align:-1.516em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.05em;"><span style="top:-1.809em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">p</span><span class="mrel mtight">∈</span><span class="mord text mtight"><span class="mord mtight">principal</span></span><span class="mopen mtight">(</span><span class="mord mathnormal mtight" style="margin-right:0.0359em;">q</span><span class="mclose mtight">)</span></span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">⋃</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.516em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">docs</span></span><span class="mopen">(</span><span class="mord mathnormal">p</span><span class="mclose">)</span></span></span></span></span></p>
+<ul>
+<li>每个 principal（用户/组/角色）对应一个位图，第 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6595em;"></span><span class="mord mathnormal">i</span></span></span></span> 位表示第 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6595em;"></span><span class="mord mathnormal">i</span></span></span></span> 篇文档是否可见；</li>
+<li>一次访问者的位图 = 其所有 principal 位图的<strong>按位或</strong>；</li>
+<li>检索时只在该位图内排序（先按主题相似度取候选池，再用位图筛，或直接用位图构造候选集）。</li>
+</ul>
+<table>
+<thead>
+<tr>
+<th>优点</th>
+<th>缺点</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>前置、可解释、可审计（&quot;为什么可见&quot;能回答）</td>
+<td>位图随文档数线性增长（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mord">/8</span></span></span></span> 字节/principal）</td>
+</tr>
+<tr>
+<td>支持&quot;组&quot;与&quot;角色&quot;的任意组合</td>
+<td>需要维护文档 ↔ principal 的双向更新</td>
+</tr>
+<tr>
+<td>与墓碑、版本天然兼容（位图也分段）</td>
+<td>超大 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span></span></span></span>（亿级）需要压缩位图（Roaring 等）</td>
+</tr>
+</tbody></table>
+<p><strong>位图的关键优势在可证伪性</strong>：<code>canary in visible_bitmap</code> 是一个可以写成断言的布尔判断，不需要&quot;信任过滤逻辑写得对&quot;。</p>
+<h3 id="h-四保证不漏工程约束与对抗验收">四、保证不漏：工程约束与对抗验收<a class="anchor" href="#h-四保证不漏工程约束与对抗验收" aria-label="本节链接">#</a></h3>
+<h4 id="h-41-六条硬约束">4.1 六条硬约束<a class="anchor" href="#h-41-六条硬约束" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>约束</th>
+<th>具体做法</th>
+<th>违反的后果</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>deny-by-default</strong></td>
+<td>缺 ACL 字段 = 不可见；并监控&quot;不可见率异常上升&quot;</td>
+<td>新文档自动对所有人可见</td>
+</tr>
+<tr>
+<td><strong>权限是强制参数</strong></td>
+<td>由服务层从认证令牌解析，<strong>不由模型/提示决定</strong></td>
+<td>提示注入可越权</td>
+</tr>
+<tr>
+<td><strong>检索层统一执行</strong></td>
+<td>不允许&quot;某些路径忘了过滤&quot;；对外的检索 API 只提供一个入口</td>
+<td>旁路（导出、评测、调试接口）泄漏</td>
+</tr>
+<tr>
+<td><strong>缓存键含权限指纹</strong></td>
+<td>见 6.2 §4</td>
+<td>跨租户缓存泄漏</td>
+</tr>
+<tr>
+<td><strong>撤权传播有 SLA</strong></td>
+<td>撤销 → 墓碑 + manifest 切换 → 生效；定义为分钟级</td>
+<td>离职员工的文档仍可被检索</td>
+</tr>
+<tr>
+<td><strong>审计日志只记 id</strong></td>
+<td>记 <code>(who, when, query_hash, doc_ids)</code>，不记正文</td>
+<td>日志本身成为泄漏源</td>
+</tr>
+</tbody></table>
+<h4 id="h-42-可证伪的验收canary-对抗测试">4.2 可证伪的验收：canary 对抗测试<a class="anchor" href="#h-42-可证伪的验收canary-对抗测试" aria-label="本节链接">#</a></h4>
+<p><strong>这是本节最重要的工程实践。</strong> 做法：</p>
+<ol>
+<li>为每个租户放入 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">c</span></span></span></span> 篇<strong>诱饵文档</strong>（canary），每篇含一个<strong>全局唯一、不可猜测</strong>的 token（如 <code>CANARY-tenant7-a3f9</code>）；</li>
+<li>生成&quot;全租户 × 全 canary&quot;的交叉查询矩阵：以租户 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6151em;"></span><span class="mord mathnormal">t</span></span></span></span> 的身份，查询租户 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">u</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel"><span class="mrel"><span class="mord vbox"><span class="thinbox"><span class="rlap"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="inner"><span class="mord"><span class="mrel"></span></span></span><span class="fix"></span></span></span></span></span><span class="mspace nobreak"></span><span class="mrel">=</span></span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6151em;"></span><span class="mord mathnormal">t</span></span></span></span> 的每个 canary token；</li>
+<li>断言：<strong>任何一次交叉查询的结果中都不出现任何 canary 文档</strong>（命中数恒为 0）；</li>
+<li>把该测试放进 <strong>CI/发布门禁</strong>，每次索引或权限代码变更都跑。</li>
+</ol>
+<p>⚠️ 实测结果（6 租户 × 10 个交叉 canary = 60 个断言）：</p>
+<pre><code>no_filter    断言数= 60  泄漏=60  FAIL
+post_filter  断言数= 60  泄漏= 0  PASS
+pre_filter   断言数= 0   泄漏= 0  PASS</code></pre>
+<p>（表中 <code>pre_filter</code> 断言数 60、泄漏 0。）<strong>这个测试的价值在于它是&quot;可证伪&quot;的</strong>：只要泄漏一次就 FAIL，不需要 reviewer 相信任何人的判断。<strong>没有 canary 测试的权限系统，只能算&quot;我们尽力了&quot;。</strong></p>
+<h4 id="h-43-一次真实的对照">4.3 一次真实的对照<a class="anchor" href="#h-43-一次真实的对照" aria-label="本节链接">#</a></h4>
+<p>⚠️ 用 canary 查询（诱饵文档在全局排序中居首）比较三种策略（tenant1 查询 tenant0 的 canary）：</p>
+<pre><code>无过滤(错误)    返回 10 条  命中 tenant0 canary=2
+post-filter    返回  1 条  命中 tenant0 canary=0
+pre-filter     返回 10 条  命中 tenant0 canary=0</code></pre>
+<p><strong>这三行把本节的取舍讲完了</strong>：</p>
+<ul>
+<li>不过滤 → 泄漏（无法接受）；</li>
+<li>post-filter → 不漏，但返回条数从 10 塌到 1（效用不可接受，见 §2 的 0.20~1.00）；</li>
+<li>pre-filter → 不漏，且返回 10 条。</li>
+</ul>
+<h4 id="h-44-边界与权衡">4.4 边界与权衡<a class="anchor" href="#h-44-边界与权衡" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>分区</th>
+<th>元数据过滤</th>
+<th>ACL 位图</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>隔离强度</td>
+<td>最高</td>
+<td>中（依赖过滤正确性）</td>
+<td>中高（可断言）</td>
+</tr>
+<tr>
+<td>召回损失</td>
+<td>无</td>
+<td>高选择性时严重（需 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1/</span><span class="mord mathnormal">s</span></span></span></span> 过采样）</td>
+<td>取决于实现（可分区 + 位图组合）</td>
+</tr>
+<tr>
+<td>存储</td>
+<td>高（公共文档重复）</td>
+<td>低</td>
+<td>中（位图）</td>
+</tr>
+<tr>
+<td>租户数上限</td>
+<td>低（数百）</td>
+<td>高（百万级）</td>
+<td>高</td>
+</tr>
+<tr>
+<td>跨租户全局检索</td>
+<td>需合并</td>
+<td>天然支持</td>
+<td>天然支持</td>
+</tr>
+<tr>
+<td>运维复杂度</td>
+<td>高（每租户一套）</td>
+<td>低</td>
+<td>中</td>
+</tr>
+</tbody></table>
+<p><strong>没有一种方案在所有维度最优。</strong> 正确的组合通常是：<strong>按&quot;大租户/强合规客户&quot;分区，其余用共享索引 + 位图前置过滤</strong>，并对共享部分跑 canary 测试。</p>
+<h3 id="h-代码">代码<a class="anchor" href="#h-代码" aria-label="本节链接">#</a></h3>
+<pre data-lang="python"><code class="language-python"># -*- coding: utf-8 -*-
+&quot;&quot;&quot;⚠️ 合成数据：文档级 ACL —— post-filter 效用崩塌 / pre-filter 正确性 / canary 对抗测试。&quot;&quot;&quot;
+import numpy as np
+
+N_DOC, N_TENANT, K, E_NEED = 800, 6, 10, 4
+rng = np.random.default_rng(7)
+
+# 每个租户随机可访问一部分文档（含公共文档），每租户 2 篇 canary 诱饵
+public = set(rng.choice(N_DOC, size=60, replace=False).tolist())
+access = {}
+for t in range(N_TENANT):
+    s_t = float(rng.choice([0.02, 0.05, 0.12, 0.3, 0.6, 1.0]))
+    own = set(rng.choice(N_DOC, size=max(E_NEED, int(s_t * N_DOC)), replace=False).tolist())
+    access[t] = own | public
+canary_docs = {t: [N_DOC + 10 * t + j for j in range(2)] for t in range(N_TENANT)}
+for t in range(N_TENANT):                       # canary 文档只对该租户可见
+    for cd in canary_docs[t]:
+        access[t].add(cd)
+        for u in range(N_TENANT):
+            if u != t: access[u].discard(cd)
+
+def accessible(doc, t): return doc in access[t]
+
+print(&quot;== 租户可访问比例 ==&quot;)
+for t in range(N_TENANT):
+    print(f&quot;  tenant{t}: |own|={len(access[t])} / {N_DOC + 2*N_TENANT}  &quot;
+          f&quot;s={len(access[t])/(N_DOC+2*N_TENANT):.3f}&quot;)
+
+# ---- (1) 缺失 ACL 字段：默认可见 vs deny-by-default ----
+print(&quot;\n== (1) 缺失 ACL 字段的默认策略 ==&quot;)
+docs_meta = [{&quot;id&quot;: d, &quot;acl&quot;: access[0] if d in access[0] else None} for d in range(5)]
+for policy in (&quot;missing=public&quot;, &quot;deny-by-default&quot;):
+    visible = [m[&quot;id&quot;] for m in docs_meta
+               if (m[&quot;acl&quot;] is not None and 0 in m[&quot;acl&quot;])
+               or (m[&quot;acl&quot;] is None and policy == &quot;missing=public&quot;)]
+    print(f&quot;  {policy:&lt;18} 租户0 可见文档 = {visible}&quot;)
+
+# ---- (2) post-filter：可组装上限 ~ Binomial(k, s) ----
+print(&quot;\n== (2) post-filter：可组装的上限随 s 崩塌（k=10，需证据 E=4）==&quot;)
+print(f&quot;{&#39;s&#39;:&gt;6} {&#39;期望可用条数&#39;:&gt;12} {&#39;空结果率&#39;:&gt;9} {&#39;可组装率(≥4条)&#39;:&gt;14} {&#39;可达召回上限&#39;:&gt;13}&quot;)
+for s in (0.02, 0.05, 0.10, 0.20, 0.40, 0.70, 1.00):
+    draws = rng.binomial(K, s, 200000)
+    print(f&quot;{s:&gt;6.2f} {draws.mean():&gt;12.2f} {(draws == 0).mean():&gt;9.3f} &quot;
+          f&quot;{(draws &gt;= E_NEED).mean():&gt;14.3f} {min(1.0, draws.mean()/E_NEED):&gt;13.3f}&quot;)
+print(&quot;  推导对照：E[可用]=k*s；P(空)=(1-s)^k；P(≥E)=1-Σ_{i&lt;E} C(k,i) s^i (1-s)^(k-i)&quot;)
+
+# ---- (3) 三种策略：canary 查询对照 ----
+print(&quot;\n== (3) 检索策略比较（canary 查询：诱饵文档在全局排序居首）==&quot;)
+topics = rng.integers(0, 8, N_DOC + 2 * N_TENANT)
+q_topic = 3
+def global_rank(owner):
+    cand = [d for d in range(N_DOC + 2 * N_TENANT) if topics[d] == q_topic]
+    order = [cand[i] for i in np.argsort(-rng.normal(0, 1, len(cand)))]
+    front = canary_docs[owner]
+    return front + [d for d in order if d not in front]
+def no_filter(t, k=K, owner=None):  return global_rank(owner)[:k]
+def post_filter(t, k=K, owner=None):
+    return [d for d in global_rank(owner)[:k] if accessible(d, t)]
+def pre_filter(t, k=K, owner=None):
+    cand = [d for d in range(N_DOC + 2 * N_TENANT) if accessible(d, t)]
+    return [cand[i] for i in np.argsort(-rng.normal(0, 1, len(cand)))[:k]]
+
+for name, fn in ((&quot;无过滤(错误)&quot;, no_filter), (&quot;post-filter&quot;, post_filter), (&quot;pre-filter&quot;, pre_filter)):
+    res = fn(1, k=K, owner=0)                   # tenant1 问 tenant0 的 canary
+    leak = sum(1 for d in res if d in canary_docs[0])
+    print(f&quot;  {name:&lt;14} 返回 {len(res):&gt;2} 条  命中 tenant0 canary={leak}&quot;)
+
+# ---- (4) canary 对抗测试套件：全租户交叉矩阵 ----
+print(&quot;\n== (4) ACL 对抗测试：每个租户 × 每个 canary 断言不可见 ==&quot;)
+results = {&quot;no_filter&quot;: [], &quot;post_filter&quot;: [], &quot;pre_filter&quot;: []}
+for t in range(N_TENANT):
+    for u in range(N_TENANT):
+        if u == t: continue
+        for cd in canary_docs[u]:
+            for name, fn in results.items():
+                f = {&quot;no_filter&quot;: no_filter, &quot;post_filter&quot;: post_filter, &quot;pre_filter&quot;: pre_filter}[name]
+                results[name].append(cd in f(t, k=50, owner=u))
+for name, hits in results.items():
+    n_leak = sum(hits)
+    print(f&quot;  {name:&lt;12} 断言数={len(hits):&gt;3}  泄漏={n_leak:&gt;2}  &quot;
+          f&quot;{&#39;PASS&#39; if n_leak == 0 else &#39;FAIL&#39;}&quot;)
+
+# ---- (5) 高选择性下的过采样需求 ----
+print(&quot;\n== (5) 元数据过滤内嵌于 ANN：过采样因子 ~ 1/s ==&quot;)
+print(f&quot;{&#39;s&#39;:&gt;6} {&#39;过采样池=k/s&#39;:&gt;13} {&#39;池内期望可用&#39;:&gt;13} {&#39;额外算力倍数&#39;:&gt;13}&quot;)
+for s in (0.02, 0.05, 0.1, 0.3, 0.6, 1.0):
+    print(f&quot;{s:&gt;6.2f} {K/s:&gt;13.0f} {K:&gt;13.1f} {1/s:&gt;13.1f}&quot;)</code></pre>
+<pre data-lang="text"><code class="language-text">== 租户可访问比例 ==
+  tenant0: |own|=282 / 812  s=0.347
+  tenant1: |own|=152 / 812  s=0.187
+  tenant2: |own|=99 / 812  s=0.122
+  tenant3: |own|=77 / 812  s=0.095
+  tenant4: |own|=281 / 812  s=0.346
+  tenant5: |own|=77 / 812  s=0.095
+
+== (1) 缺失 ACL 字段的默认策略 ==
+  missing=public     租户0 可见文档 = [0, 1]
+  deny-by-default    租户0 可见文档 = []
+
+== (2) post-filter：可组装的上限随 s 崩塌（k=10，需证据 E=4）==
+     s       期望可用条数      空结果率      可组装率(≥4条)        可达召回上限
+  0.02         0.20     0.818          0.000         0.050
+  0.05         0.50     0.599          0.001         0.125
+  0.10         1.00     0.349          0.013         0.250
+  0.20         2.00     0.107          0.121         0.500
+  0.40         4.00     0.006          0.618         0.999
+  0.70         7.00     0.000          0.989         1.000
+  1.00        10.00     0.000          1.000         1.000
+
+== (3) 检索策略比较（canary 查询：诱饵文档在全局排序居首）==
+  无过滤(错误)        返回 10 条  命中 tenant0 canary=2
+  post-filter    返回  1 条  命中 tenant0 canary=0
+  pre-filter     返回 10 条  命中 tenant0 canary=0
+
+== (4) ACL 对抗测试：每个租户 × 每个 canary 断言不可见 ==
+  no_filter    断言数= 60  泄漏=60  FAIL
+  post_filter  断言数= 60  泄漏= 0  PASS
+  pre_filter   断言数= 60  泄漏= 0  PASS
+
+== (5) 元数据过滤内嵌于 ANN：过采样因子 ~ 1/s ==
+     s      过采样池=k/s        池内期望可用        额外算力倍数
+  0.02           500          10.0          50.0
+  0.05           200          10.0          20.0
+  0.10           100          10.0          10.0
+  0.30            33          10.0           3.3
+  0.60            17          10.0           1.7
+  1.00            10          10.0           1.0</code></pre>
+<p><strong>关键设计决策</strong>：验收标准写成&quot;<strong>canary 命中数 == 0</strong>&quot;这个断言，而不是&quot;我们检查过过滤逻辑&quot;。这是本节的中心思想：<strong>权限正确性必须是可证伪的布尔断言，而不是一段需要被信任的代码。</strong> 另外，把&quot;不过滤&quot;的基线也放进同一张表，是为了让&quot;post-filter 也不漏&quot;这个结论<strong>不被误读</strong>——它确实不漏，但它在 §2 的表里用 0.818 的空结果率换来的；两个表必须一起看，否则会得出&quot;post-filter 能用&quot;的错误结论。</p>
+<h3 id="h-练习">练习<a class="anchor" href="#h-练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><p><strong>推导 §2 的三个公式</strong>。证明过滤后可用条数服从 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord">Binomial</span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">s</span><span class="mclose">)</span></span></span></span> 所需的前提（可访问性与相关度独立）是什么；然后去掉这个前提，给出一个&quot;可访问性与相关度强相关&quot;的场景，说明此时 post-filter 反而可能不差。<strong>关键</strong>：这个场景在真实多租户系统里成立吗？为什么？</p>
+</li>
+<li><p><strong>侧信道检测</strong>。设计一个统计检验来发现&quot;空结果泄漏存在性&quot;：以两种身份（有权/无权）对同一批查询统计返回条数，写出检验统计量与判定阈值，并估计需要的查询数量。用模拟生成&quot;有侧信道&quot;与&quot;无侧信道&quot;两组数据验证你的检验。</p>
+</li>
+<li><p><strong>位图的存储账</strong>。<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">7</span></span></span></span></span></span></span></span></span></span></span> 篇文档、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">4</span></span></span></span></span></span></span></span></span></span></span> 个 principal。计算原始位图总大小、稀疏情形下用&quot;倒排列表（doc_id 列表）&quot;的大小，并给出选择阈值（当某 principal 的可见文档少于多少时用倒排更省）。</p>
+</li>
+<li><p><strong>chunk 继承测试</strong>。写一个测试：对每个文档，断言其所有 chunk 的 ACL 集合等于父文档 ACL（考虑容器/文件夹递归）。构造三种 bug（漏字段、字段为空、继承错父节点），验证测试能捕获它们。</p>
+</li>
+<li><p><strong>过滤导致图断裂的判据</strong>。设计一个实验：在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span></span></span></span> 从 1.0 降到 0.01 时，记录 (a) 有效候选数、(b) 访问节点数、(c) 回退到暴力扫描的比例、(d) recall@10。给出&quot;何时必须改用分区&quot;的判据（提示：找有效候选数不随 <code>ef</code> 增长的拐点）。</p>
+</li>
+<li><p><strong>撤权传播 SLA</strong>。设撤权操作要经过&quot;标记 → 墓碑 → manifest 切换 → 各缓存失效&quot;。列出每一步的耗时来源，给出端到端 SLA 的估算公式，并指出哪一步最可能成为瓶颈。如果 SLA 要求 60 秒，哪些步骤必须做成同步？</p>
+</li>
+<li><p><strong>权限与评测集的一致性</strong>。设计一个校验脚本：读评测集（每条带查询、黄金证据 id、租户），断言&quot;黄金证据对该租户可见&quot;。回答：如果断言失败，评测结果会怎样被污染（提示：本来就不可能召回的题被判为失败，压低基线）？</p>
+</li>
+<li><p><strong>组合方案设计</strong>。给定：1000 个租户，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">7</span></span></span></span></span></span></span></span></span></span></span> 篇文档，其中 5 个大租户各占 10%，其余为小租户；有 3 个租户要求数据驻留。给出你的索引架构（分区 + 共享 + 位图）、每种路径的召回/延迟预期、以及 canary 测试的覆盖方案。</p>
+</li>
+</ol>
+<h3 id="h-小结">小结<a class="anchor" href="#h-小结" aria-label="本节链接">#</a></h3>
+<ul>
+<li><strong>权限必须在检索层前置执行，且是查询的强制参数</strong>（由服务层从令牌解析，绝不由模型/提示决定）。否则提示注入可以直接绕过。</li>
+<li><strong>威胁模型至少 10 条路径</strong>：post-filter、缓存键缺租户、元数据过滤写错、chunk 未继承 ACL、撤权未传播、提示注入、日志泄漏、评测集跨租户、模型记忆间接泄漏、向量反演。<strong>没有自动化断言的路径等于没修。</strong></li>
+<li><strong>post-filter 的失效是纯计数结论</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord">#</span><span class="mord text"><span class="mord cjk_fallback">可用</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∼</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord">Binomial</span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">s</span><span class="mclose">)</span></span></span></span>，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6889em;"></span><span class="mord mathbb">E</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mord mathnormal">s</span></span></span></span>，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="mopen">(</span><span class="mord text"><span class="mord cjk_fallback">空</span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.0991em;vertical-align:-0.25em;"></span><span class="mord mathnormal">s</span><span class="mclose"><span class="mclose">)</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8491em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0315em;">k</span></span></span></span></span></span></span></span></span></span></span>。⚠️ <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">10</span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">E</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4</span></span></span></span> 时：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.10</span></span></span></span> → 期望 1.00 条、空结果率 0.349、可组装率 0.013；<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.02</span></span></span></span> → 空结果率 0.818。<strong>与排序质量无关。</strong></li>
+<li><strong>post-filter 不泄漏单条黄金证据</strong>（它可访问），它损害的是<strong>多证据可组装性、空结果率、侧信道</strong>。把它说成&quot;会泄漏&quot;是错的，但据此认为&quot;能用&quot;同样是错的。</li>
+<li><strong>前置过滤有三种实现</strong>：分区（隔离最强、碎片化）、元数据过滤（共享、但<strong>高选择性下图遍历断连</strong>，需 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mord">/</span><span class="mord mathnormal">s</span></span></span></span> 过采样）、ACL 位图（可断言、可解释）。⚠️ <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.02</span></span></span></span> 时过采样代价 50×。</li>
+<li><strong>deny-by-default</strong>：缺 ACL 字段 = 不可见。⚠️ 实测：<code>missing=public</code> 让 2 篇无 ACL 文档对租户 0 可见；deny-by-default 下为 0 篇。</li>
+<li><strong>验收必须可证伪</strong>：per-tenant canary 诱饵 + 全租户交叉检索矩阵 + <strong>断言命中数 == 0</strong> + 进 CI。⚠️ 实测：不过滤 60/60 泄漏（FAIL），post-filter 与 pre-filter 均 0 泄漏（PASS）；但同一实验里 post-filter 只返回 1 条而 pre-filter 返回 10 条。</li>
+<li><strong>缓存键必须含租户与权限指纹</strong>（6.2 §4），否则缓存层就是最方便的越权路径。</li>
+<li><strong>一句话</strong>：<strong>权限不是&quot;过滤一下结果&quot;，而是&quot;决定检索在哪个集合里发生&quot;。先取 top-k 再过滤，本质上是把检索预算花在了别人有权访问的文档上 —— 它既漏信息（侧信道），又漏能力（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mord mathnormal">s</span></span></span></span> 条结果）。</strong></li>
+</ul>
+<blockquote>
+<p>下一节：权限不漏了，缓存也稳了。但当线上真的答错一条，你怎么知道错在召回、排序还是生成？下一节建立&quot;每次问答的证据链&quot;与可重放的反事实归因。</p>
+</blockquote>

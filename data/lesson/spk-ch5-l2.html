@@ -1,0 +1,959 @@
+<h2 id="h-语音-文本联合建模离散语音-token统一词表与流式取舍">语音-文本联合建模：离散语音 token、统一词表与流式取舍<a class="anchor" href="#h-语音-文本联合建模离散语音-token统一词表与流式取舍" aria-label="本节链接">#</a></h2>
+<h3 id="h-这一节要解决什么">这一节要解决什么<a class="anchor" href="#h-这一节要解决什么" aria-label="本节链接">#</a></h3>
+<p>上一节把账算清了：端到端的结构优势是&quot;少乘一个因子&quot;，代价是<strong>语音表示把序列拉长了 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">12.5</span></span></span></span> 倍</strong>（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">50</span></span></span></span> token/s vs <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4</span></span></span></span> 字/s），于是算力、延迟、数据全面吃亏。这一节要处理的就是把这 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">12.5</span></span></span></span> 倍压回去的核心机制：<strong>离散语音 token</strong>。</p>
+<p>问题可以这样写：语音是连续信号，每秒 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">16000</span></span></span></span> 个样本；文本是离散符号，每秒约 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4</span></span></span></span> 个。要让一个 Transformer 同时处理两者，必须先把语音也离散化——<strong>用什么码本、多少比特、每秒多少个 token</strong>。这三个数不是独立的：它们的乘积就是码率。</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0077em;">R</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.4445em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">b</span><span class="mspace" style="margin-right:1em;"></span><span class="mopen">(</span><span class="mord text"><span class="mord">bps</span></span><span class="mclose">)</span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">b</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mop"><span class="mop">lo<span style="margin-right:0.0139em;">g</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.207em;"><span style="top:-2.4559em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2441em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">K</span><span class="mspace"> </span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0715em;">K</span><span class="mspace"> </span><span class="mord text"><span class="mord cjk_fallback">为码本大小</span></span><span class="mclose">)</span></span></span></span></span></p>
+<p>本节要回答三个问题，每个都给可算判据：</p>
+<ol>
+<li><strong>码本与残差 VQ</strong>：一级量化为什么不够？多级叠加的收益怎么衰减？&quot;码本坍缩&quot;怎么用量出来的数诊断？</li>
+<li><strong>统一词表与对齐</strong>：把语音 token 和文本 token 放进一个模型，参数量上几乎免费——那真正的代价在哪？对齐是显式给（CTC/时长）还是当隐变量（交错 + 交叉熵）？</li>
+<li><strong>流式与双向</strong>：右上下文要多少？为什么最优值一定落在一个很窄的窗口里？块状注意力到底省了什么、没省什么？</li>
+</ol>
+<p>这三问合起来是一条主线：<strong>离散化的每一个选择都在&quot;信息量、序列长度、可控性&quot;三者之间换。</strong></p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.4578em;vertical-align:-0.4233em;"></span><span class="mord"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.0344em;"><span style="top:-3.4578em;"><span class="pstrut" style="height:3.4578em;"></span><span class="boxpad"><span class="mord"><span class="mord"><span class="mspace"> </span><span class="mord text"><span class="mord cjk_fallback">语音</span><span class="mord"> token </span><span class="mord cjk_fallback">化的取舍</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mord text"><span class="mord cjk_fallback">率</span><span class="mord">-</span><span class="mord cjk_fallback">失真（压多狠）</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord text"><span class="mord cjk_fallback">序列长度（多难算）</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord text"><span class="mord cjk_fallback">对齐方式（多可控）</span></span><span class="mspace"> </span></span></span></span></span><span style="top:-3.0344em;"><span class="pstrut" style="height:3.4578em;"></span><span class="stretchy fbox" style="height:1.4578em;border-style:solid;border-width:0.04em;"></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.4233em;"><span></span></span></span></span></span></span></span></span></span></p>
+<p>⚠️ 本节的代码分五个部分，其中<strong>码本坍缩的逐级重建（表 4）与码本利用率（表 10）是合成数据</strong>，均在正文与输出里标 ⚠️；其余是纯解析计算或构造配置。<strong>关于外部成绩：本节不引用任何具体系统的实测指标。</strong> 哪些做法现在更好、好多少，属于仍未收敛的讨论（C 级推测），本节只给判断它所需的实验设计与可算判据。</p>
+<h3 id="h-一离散语音-token码本比特与下界">一、离散语音 token：码本、比特与下界<a class="anchor" href="#h-一离散语音-token码本比特与下界" aria-label="本节链接">#</a></h3>
+<h4 id="h-11-率-失真压缩有硬下限">1.1 率-失真：压缩有硬下限<a class="anchor" href="#h-11-率-失真压缩有硬下限" aria-label="本节链接">#</a></h4>
+<p>把语音的连续表征（潜向量）量化成 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">K</span></span></span></span> 个码字之一，等价于在<strong>码率 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0077em;">R</span></span></span></span></strong> 下做有损压缩。在高码率、均方失真、高斯源的近似下，信息论给出的下界是</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">D</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0077em;">R</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8641em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0359em;">σ</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8641em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.938em;"></span><span class="mord"><span class="mord">2</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.938em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">2</span><span class="mord mathnormal mtight" style="margin-right:0.0077em;">R</span><span class="mord mtight">/</span><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">D</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3448em;"><span style="top:-2.3488em;margin-left:-0.0278em;margin-right:0.0714em;"><span class="pstrut" style="height:2.5em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">eff</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.1512em;"><span></span></span></span></span></span></span></span></span></span></span></span></span></span></span></span></span></span></span></p>
+<p>其中 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0359em;">σ</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span> 是源方差、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0278em;">D</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0278em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">eff</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 是<strong>有效维数</strong>（源在感知度量下真正占据的自由度）。把它写成&quot;每加 1 bit 失真乘多少&quot;：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:2.363em;vertical-align:-0.936em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.427em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0278em;">D</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0077em;">R</span><span class="mclose">)</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0278em;">D</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0077em;">R</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord mathnormal">b</span><span class="mclose">)</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.936em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.938em;"></span><span class="mord"><span class="mord">2</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.938em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">2</span><span class="mord mathnormal mtight">b</span><span class="mord mtight">/</span><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">D</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3448em;"><span style="top:-2.3488em;margin-left:-0.0278em;margin-right:0.0714em;"><span class="pstrut" style="height:2.5em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">eff</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.1512em;"><span></span></span></span></span></span></span></span></span></span></span></span></span></span></span></span></span></span></span></p>
+<p><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0278em;">D</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0278em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">eff</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">10</span></span></span></span>（构造值）时，每加 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> bit 失真只降</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.938em;"></span><span class="mord"><span class="mord">2</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.938em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">2/10</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">0.8706</span><span class="mspace" style="margin-right:1em;"></span><span class="mopen">(</span><span class="mord text"><span class="mord cjk_fallback">降</span><span class="mord"> </span></span><span class="mord">13.0%</span><span class="mclose">)</span></span></span></span></span></p>
+<p><strong>要把失真降一半，需要多加 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.9386em;vertical-align:-0.2441em;"></span><span class="mop"><span class="mop">lo<span style="margin-right:0.0139em;">g</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.207em;"><span style="top:-2.4559em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2441em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">2</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0278em;">D</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0278em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">eff</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord">/2</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">5.00</span></span></span></span> bit。</strong> 这就是&quot;离散 token 压缩有硬下限&quot;的算术形式：不是工程做得不好，而是每一比特买到的东西随比特数递减。表 2 列出 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">b</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">2</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">4</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="minner">…</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">20</span></span></span></span> 时的理论失真与对应信噪比。</p>
+<p><figure><img class="md-img" src="content/courses/speech-audio/assets/chapter-5-figure-02.svg" alt="率失真：码率与失真的关系" loading="lazy" decoding="async"><figcaption>率失真：码率与失真的关系</figcaption></figure>
+</p>
+<h4 id="h-12-同一个码率两种花法">1.2 同一个码率，两种花法<a class="anchor" href="#h-12-同一个码率两种花法" aria-label="本节链接">#</a></h4>
+<p><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0077em;">R</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.4445em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">b</span></span></span></span> 固定时（表 3 用 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0077em;">R</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1000</span></span></span></span> bps），有两条极端路线：</p>
+<table>
+<thead>
+<tr>
+<th>配置</th>
+<th>token 率 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span></span></span></span></th>
+<th><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">b</span></span></span></span>/token</th>
+<th>60 s 序列长</th>
+<th>问题</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>深码本 + 低率</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">25</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">40</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1500</span></span></span></span></td>
+<td>码本 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord"><span class="mord">2</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">40</span></span></span></span></span></span></span></span></span></span></span></span> 无法实现</td>
+</tr>
+<tr>
+<td>中码本 + 中率</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">50</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">20</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">3000</span></span></span></span></td>
+<td>码本 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord"><span class="mord">2</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">20</span></span></span></span></span></span></span></span></span></span></span></span> 仍偏大</td>
+</tr>
+<tr>
+<td>平衡</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">100</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">10</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">6000</span></span></span></span></td>
+<td>—</td>
+</tr>
+<tr>
+<td>浅码本 + 高率</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">200</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">5</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">12000</span></span></span></span></td>
+<td>序列长，注意力按 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord"><span class="mord mathnormal">L</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span> 涨</td>
+</tr>
+</tbody></table>
+<p><strong>关键观察</strong>：在信息论下界上，这几种花法是<strong>等价的</strong>（同样的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0077em;">R</span></span></span></span> 就是同样的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">D</span></span></span></span>）。差别全在工程侧：注意力算力按序列长度的平方增长，所以&quot;深码本 + 低率&quot;看起来极度有利（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1500</span></span></span></span> vs <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">12000</span></span></span></span> 是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">1.56%</span></span></span></span> 的注意力算力）——<strong>但它被码本的可实现性封死了</strong>。真实系统只能用 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">K</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord"><span class="mord">2</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">10</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∼</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord"><span class="mord">2</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">13</span></span></span></span></span></span></span></span></span></span></span></span> 的码本，于是配置被迫落在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">25</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∼</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">100</span></span></span></span> token/s 的窄带里。</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.5578em;vertical-align:-0.5344em;"></span><span class="mord"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.0233em;"><span style="top:-3.5578em;"><span class="pstrut" style="height:3.5578em;"></span><span class="boxpad"><span class="mord"><span class="mord"><span class="mspace"> </span><span class="mord text"><span class="mord cjk_fallback">实际配置的窄带</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mord text"><span class="mord cjk_fallback">注意力算力</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">∩</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord text"><span class="mord cjk_fallback">码本可实现性</span></span><span class="mpunct">,</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord cjk_fallback">不是审美选择</span></span><span class="mspace"> </span></span></span></span></span><span style="top:-3.0233em;"><span class="pstrut" style="height:3.5578em;"></span><span class="stretchy fbox" style="height:1.5578em;border-style:solid;border-width:0.04em;"></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.5344em;"><span></span></span></span></span></span></span></span></span></span></p>
+<h4 id="h-13-残差-vq用多级逼近一级">1.3 残差 VQ：用多级逼近一级<a class="anchor" href="#h-13-残差-vq用多级逼近一级" aria-label="本节链接">#</a></h4>
+<p>既然大码本不可实现，就用<strong>多个小码本逐级逼近</strong>：第 1 级量化 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">x</span></span></span></span>，第 2 级量化残差 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal">x</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6944em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal">x</span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.2222em;"><span class="mord">^</span></span></span></span></span></span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>，第 3 级再量化新的残差，依此类推。第 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">m</span></span></span></span> 级的目标是</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:2.4802em;vertical-align:-1.3302em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.6679em;"><span style="top:-2.0926em;margin-left:0em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mopen mtight">{</span><span class="mord mtight"><span class="mord mathnormal mtight">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.0591em;"><span style="top:-2.2134em;margin-left:0em;margin-right:0.0714em;"><span class="pstrut" style="height:2.5357em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0572em;">j</span></span></span><span style="top:-3.0591em;margin-right:0.0714em;"><span class="pstrut" style="height:2.5357em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mord mtight"><span class="mopen mtight">(</span><span class="mord mathnormal mtight">m</span><span class="mclose mtight">)</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.4612em;"><span></span></span></span></span></span></span><span class="mclose mtight">}</span></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span><span class="mop">min</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.3302em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.05em;"><span style="top:-1.9em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">x</span></span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∑</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.25em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="delimsizing mult"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.15em;"><span style="top:-3.15em;"><span class="pstrut" style="height:3.8em;"></span><span style="width:0.556em;height:1.8em;"><svg xmlns="http://www.w3.org/2000/svg" width="0.556em" height="1.8em" viewBox="0 0 556 1800"><path d="M145 15 v585 v600 v585 c2.667,10,9.667,15,21,15
+c10,0,16.667,-5,20,-15 v-585 v-600 v-585 c-2.667,-10,-9.667,-15,-21,-15
+c-10,0,-16.667,5,-20,15z M188 15 H145 v585 v600 v585 h43z
+M367 15 v585 v600 v585 c2.667,10,9.667,15,21,15
+c10,0,16.667,-5,20,-15 v-585 v-600 v-585 c-2.667,-10,-9.667,-15,-21,-15
+c-10,0,-16.667,5,-20,15z M410 15 H367 v585 v600 v585 h43z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.65em;"><span></span></span></span></span></span></span><span class="mord"><span class="delimsizing size1">(</span></span><span class="mord mathnormal">x</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:2.355em;vertical-align:-1.305em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.05em;"><span style="top:-1.8723em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">i</span><span class="mrel mtight">&lt;</span><span class="mord mathnormal mtight">m</span></span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∑</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.305em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6944em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal">c</span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.1944em;"><span class="mord">^</span></span></span></span></span></span></span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.938em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mopen mtight">(</span><span class="mord mathnormal mtight">i</span><span class="mclose mtight">)</span></span></span></span></span></span></span></span></span><span class="mord"><span class="delimsizing size1">)</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:2.004em;vertical-align:-0.65em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.938em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mopen mtight">(</span><span class="mord mathnormal mtight">m</span><span class="mclose mtight">)</span></span></span></span></span></span></span></span></span><span class="mord"><span class="mord"><span class="delimsizing mult"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.15em;"><span style="top:-3.15em;"><span class="pstrut" style="height:3.8em;"></span><span style="width:0.556em;height:1.8em;"><svg xmlns="http://www.w3.org/2000/svg" width="0.556em" height="1.8em" viewBox="0 0 556 1800"><path d="M145 15 v585 v600 v585 c2.667,10,9.667,15,21,15
+c10,0,16.667,-5,20,-15 v-585 v-600 v-585 c-2.667,-10,-9.667,-15,-21,-15
+c-10,0,-16.667,5,-20,15z M188 15 H145 v585 v600 v585 h43z
+M367 15 v585 v600 v585 c2.667,10,9.667,15,21,15
+c10,0,16.667,-5,20,-15 v-585 v-600 v-585 c-2.667,-10,-9.667,-15,-21,-15
+c-10,0,-16.667,5,-20,15z M410 15 H367 v585 v600 v585 h43z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.65em;"><span></span></span></span></span></span></span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:1.354em;"><span style="top:-3.6029em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span></span></p>
+<p>（这正是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span>-means 的目标函数，逐级独立求解。）三个可算的理由说明为什么这样做：</p>
+<ol>
+<li><strong>查表/存储成本</strong>：单级 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">K</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8491em;"></span><span class="mord"><span class="mord">2</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8491em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">b</span></span></span></span></span></span></span></span></span></span></span></span> 的码本需要 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">K</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">d</span></span></span></span> 的存储与查表；切成 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span> 级后是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0497em;vertical-align:-0.2997em;"></span><span class="mop"><span class="mop op-symbol small-op" style="position:relative;top:0em;">∑</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.162em;"><span style="top:-2.4003em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2997em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">K</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">d</span></span></span></span>。本节合成算例里 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4</span></span></span></span> 级共 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">15</span></span></span></span> bit（等效 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">32768</span></span></span></span> 个码字），单级成本 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord">32768</span><span class="mord mathnormal">d</span></span></span></span>、RVQ 成本 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord">64</span><span class="mord mathnormal">d</span></span></span></span>，<strong>小 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">512</span></span></span></span> 倍</strong>。</li>
+<li><strong>层次结构</strong>：粗层可以单独用于低延迟场景，细层只用于质量——<strong>同一套 token 天然支持多种码率</strong>。</li>
+<li><strong>训练稳定性</strong>：每级只拟合残差，梯度尺度更可控。</li>
+</ol>
+<p>代价是<strong>逐级收益递减</strong>，而且在合成算例里还出现了码本利用率问题：第 3 级只用掉 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">3/16</span></span></span></span> 个码字（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">37.5%</span></span></span></span>）。</p>
+<p><figure><img class="md-img" src="content/courses/speech-audio/assets/chapter-5-figure-03.svg" alt="残差 VQ 的逐级 MSE" loading="lazy" decoding="async"><figcaption>残差 VQ 的逐级 MSE</figcaption></figure>
+</p>
+<h4 id="h-14-码本坍缩一个可以量出来的故障">1.4 码本坍缩：一个可以量出来的故障<a class="anchor" href="#h-14-码本坍缩一个可以量出来的故障" aria-label="本节链接">#</a></h4>
+<p>&quot;码本坍缩&quot;（codebook collapse）指模型把绝大多数输入都映射到少数几个码字上——等价于<strong>名义码率被浪费</strong>。它有一个直接读数：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord cjk_fallback">困惑度</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.0858em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord">2</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8913em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.0813em;">H</span></span></span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.0813em;">H</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.3521em;vertical-align:-1.3021em;"></span><span class="mord">−</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.05em;"><span style="top:-1.8479em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0315em;">k</span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∑</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.3021em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0315em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop"><span class="mop">lo<span style="margin-right:0.0139em;">g</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.207em;"><span style="top:-2.4559em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2441em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0315em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace"> </span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0315em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace"> </span><span class="mord text"><span class="mord cjk_fallback">为第</span><span class="mord"> </span></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mord text"><span class="mord"> </span><span class="mord cjk_fallback">个码字的分配比例</span></span><span class="mclose">)</span></span></span></span></span></p>
+<ul>
+<li>困惑度 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.3669em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">K</span></span></span></span> 表示码字被均匀使用（信息量吃满）；</li>
+<li>困惑度 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.3669em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">6.39</span></span></span></span>（表 10 的&quot;早期&quot;）表示平均只在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">6.39</span></span></span></span> 个码字里选，等效码率只有 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mop"><span class="mop">lo<span style="margin-right:0.0139em;">g</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.207em;"><span style="top:-2.4559em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2441em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">6.39/</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop"><span class="mop">lo<span style="margin-right:0.0139em;">g</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.207em;"><span style="top:-2.4559em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2441em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">64</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">44.6%</span></span></span></span>——<strong>名义 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">6</span></span></span></span> bit，实际 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2.67</span></span></span></span> bit</strong>。</li>
+</ul>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord cjk_fallback">等效码率占比</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.3571em;vertical-align:-0.9301em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.427em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mop"><span class="mop">lo<span style="margin-right:0.0139em;">g</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.207em;"><span style="top:-2.4559em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2441em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">K</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mop"><span class="mop">lo<span style="margin-right:0.0139em;">g</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.207em;"><span style="top:-2.4559em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2441em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord text"><span class="mord cjk_fallback">困惑度</span></span><span class="mclose">)</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.9301em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.2905em;vertical-align:-0.9301em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3603em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mop"><span class="mop">lo<span style="margin-right:0.0139em;">g</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.207em;"><span style="top:-2.4559em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2441em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">K</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0813em;">H</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.9301em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></p>
+<p>判据：若困惑度 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">/</span><span class="mord mathnormal" style="margin-right:0.0715em;">K</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&lt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.1</span></span></span></span>（表 10 的早期阶段），说明<strong>容量过剩或更新机制有问题</strong>；此时正确动作是缩小码本或提高 token 率，而不是继续加训练步数。修复手段（码本重置、EMA 更新、commitment 项）都是&quot;救活死码&quot;，但<strong>前提是先把死码率量出来</strong>。</p>
+<h3 id="h-二语音-文本联合建模统一词表与对齐">二、语音-文本联合建模：统一词表与对齐<a class="anchor" href="#h-二语音-文本联合建模统一词表与对齐" aria-label="本节链接">#</a></h3>
+<h4 id="h-21-统一词表的参数账几乎免费">2.1 统一词表的参数账：几乎免费<a class="anchor" href="#h-21-统一词表的参数账几乎免费" aria-label="本节链接">#</a></h4>
+<p>把语音码字当成额外的 token 加进词表（&quot;扁平化&quot;），参数量几乎不变：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">d</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4096</span></span></span></span> 时，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">+</span><span class="mord">64</span></span></span></span> 个 token 只增加 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.5</span></span></span></span> M 参数（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">0.1%</span></span></span></span>）。所以<strong>&quot;要不要统一词表&quot;在参数量上不是一个问题</strong>。真正的差别在输出分布的结构：</p>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>词表 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.2222em;">V</span></span></span></span></th>
+<th>嵌入参数</th>
+<th>单次归一化</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>纯文本</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">100000</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">409.6</span></span></span></span> M</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">100000</span></span></span></span> 个 logits</td>
+</tr>
+<tr>
+<td>文本 + 扁平语音 id</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">100064</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">409.9</span></span></span></span> M</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">100064</span></span></span></span> 个 logits，一次</td>
+</tr>
+<tr>
+<td>文本 + <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4</span></span></span></span> 个独立码本头</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">100000</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">409.6</span></span></span></span> M</td>
+<td>各约 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">25000</span></span></span></span> 个 logits，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4</span></span></span></span> 次</td>
+</tr>
+</tbody></table>
+<p><strong>扁平能表达任意联合分布</strong>（同一级与跨级的依赖都能建模）；<strong>分层式各头独立归一化</strong>，计算量小但<strong>不能表达&quot;第 2 级码字依赖第 1 级码字&quot;这种级间依赖</strong>。取舍点是一个可以量出来的量：给定前一级码字后、当前级码字的条件互信息。若这个量接近 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0</span></span></span></span>（各级近似独立），分层式几乎无损；若它显著（协同发音正是如此），只有扁平/自回归式能表达。</p>
+<h4 id="h-22-交错序列的长度账">2.2 交错序列的长度账<a class="anchor" href="#h-22-交错序列的长度账" aria-label="本节链接">#</a></h4>
+<p>统一词表最自然的训练目标是<strong>交错</strong>（interleaving）：把文本 token 与语音 token 放在同一条序列里，用同一个&quot;预测下一个 token&quot;的目标训练。代价是序列长度：</p>
+<table>
+<thead>
+<tr>
+<th>表示</th>
+<th>token/s</th>
+<th>60 s 序列长</th>
+<th>注意力 FLOPs 倍数</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>纯文本</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">240</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1.0</span><span class="mord">×</span></span></span></span></td>
+</tr>
+<tr>
+<td>语音 1 级</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">50</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">3000</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">156.2</span><span class="mord">×</span></span></span></span></td>
+</tr>
+<tr>
+<td>语音 4 级（扁平）</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">200</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">12000</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">2500.0</span><span class="mord">×</span></span></span></span></td>
+</tr>
+<tr>
+<td>语音 4 级 + 文本（交错）</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">204</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">12240</span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">2601.0</span><span class="mord">×</span></span></span></span></td>
+</tr>
+</tbody></table>
+<p><strong>注意力 FLOPs 随序列长度平方增长</strong>，所以 4 级扁平交错把 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">60</span></span></span></span> s 的注意力算力抬到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2601</span></span></span></span> 倍。这直接解释了 1.2 节的结论：<strong>宁可&quot;低 token 率 + 大码本&quot;，也不要把多级码本扁平交错成一个长序列</strong>——把 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">200</span></span></span></span>/s 压回 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">50</span></span></span></span>/s，注意力立刻省 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">16</span></span></span></span> 倍，代价是量化失真，两者可以在等码率曲线（表 3）上直接比。</p>
+<h4 id="h-23-对齐三条路线差别在把什么当隐变量">2.3 对齐：三条路线，差别在&quot;把什么当隐变量&quot;<a class="anchor" href="#h-23-对齐三条路线差别在把什么当隐变量" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>路线</th>
+<th>监督信号</th>
+<th>需要配对数据</th>
+<th>流式友好</th>
+<th>主要失效模式</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>交错 + 交叉熵</td>
+<td>下一 token</td>
+<td>是</td>
+<td>是</td>
+<td>文本/语音速率耦合错位</td>
+</tr>
+<tr>
+<td>对比对齐</td>
+<td>句级相似度</td>
+<td>是（弱）</td>
+<td>否（要整句）</td>
+<td>细粒度信息被句向量压掉</td>
+</tr>
+<tr>
+<td>显式时长 / CTC</td>
+<td>帧级对齐</td>
+<td>是（需时长）</td>
+<td>是</td>
+<td>对齐错误传播到声学</td>
+</tr>
+</tbody></table>
+<p>三条路线的差异<strong>不在&quot;谁的模型更强&quot;，而在监督信号把哪一部分当成隐变量</strong>：</p>
+<ul>
+<li><strong>交错 + 交叉熵</strong>把&quot;文本与语音的速率比&quot;当隐变量——模型自己学&quot;什么时候说多少话&quot;。这最灵活，也最难训（速率耦合会漂移）。</li>
+<li><strong>CTC / 显式时长</strong>把它显式给出——可控、可流式，但需要标注，且第 3 章算过：对齐错误会传播到声学。</li>
+<li><strong>对比对齐</strong>把它整体丢掉——最省标注，也最不可控（句向量压掉了细粒度信息）。</li>
+</ul>
+<p>可算判据（针对交错路线）：在一个 batch 里统计&quot;每单位文本 token 对应的语音 token 数&quot;，其<strong>方差</strong>应稳定在期望速率比附近；方差过大说明速率耦合没有学到。这个判据不需要任何外部基准，只需要训练日志。</p>
+<h3 id="h-三流式与双向上下文延迟与算力">三、流式与双向：上下文、延迟与算力<a class="anchor" href="#h-三流式与双向上下文延迟与算力" aria-label="本节链接">#</a></h3>
+<h4 id="h-31-块状注意力省了什么没省什么">3.1 块状注意力：省了什么、没省什么<a class="anchor" href="#h-31-块状注意力省了什么没省什么" aria-label="本节链接">#</a></h4>
+<p>为了让编码器可流式，常把序列切成块、每块只与自身及左侧块做注意力。设块长 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">W</span></span></span></span> 帧（帧移 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">20</span></span></span></span> ms）、总长 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span></span></span></span> 帧：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord cjk_fallback">右上下文</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">W</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:2.0463em;vertical-align:-0.686em;"></span><span class="mord">20</span><span class="mspace"> </span><span class="mord text"><span class="mord">ms</span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3603em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord text"><span class="mord cjk_fallback">全注意力</span><span class="mord"> FLOPs</span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord text"><span class="mord cjk_fallback">块状注意力</span><span class="mord"> FLOPs</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.4271em;vertical-align:-0.936em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.4911em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.1389em;">nW</span><span class="mclose"><span class="mclose">)</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.7401em;"><span style="top:-2.989em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">n</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">W</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.936em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.0463em;vertical-align:-0.686em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3603em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">W</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></p>
+<p>表 7 用 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">3000</span></span></span></span> 帧（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">60</span></span></span></span> s）算：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">W</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">25</span></span></span></span> 帧给 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">500</span></span></span></span> ms 右上下文、算力降到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.0083</span></span></span></span>；<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">W</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1000</span></span></span></span> 帧给 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">20</span></span></span></span> s 右上下文、算力 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.3333</span></span></span></span>。但<strong>KV cache 一点没省</strong>：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord text"><span class="mord">KV cache</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.4445em;"></span><span class="mord mathnormal">n</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">W</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">d</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord text"><span class="mord">bytes</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">d</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord text"><span class="mord">bytes</span></span></span></span></span></span></p>
+<p>它只与 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span></span></span></span> 成正比，与块长无关（表 7 里恒为 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">6.14</span></span></span></span> MB）。所以</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.3744em;vertical-align:-0.34em;"></span><span class="mord"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.0344em;"><span style="top:-3.3744em;"><span class="pstrut" style="height:3.3744em;"></span><span class="boxpad"><span class="mord"><span class="mord"><span class="mspace"> </span><span class="mord text"><span class="mord cjk_fallback">块状注意力牺牲的是跨块建模，不是</span><span class="mord"> KV cache</span><span class="mord cjk_fallback">；真正省算力的手段是降</span><span class="mord"> token </span><span class="mord cjk_fallback">率</span></span><span class="mspace"> </span></span></span></span></span><span style="top:-3.0344em;"><span class="pstrut" style="height:3.3744em;"></span><span class="stretchy fbox" style="height:1.3744em;border-style:solid;border-width:0.04em;"></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.34em;"><span></span></span></span></span></span></span></span></span></span></p>
+<h4 id="h-32-右上下文的最优值收益指数衰减-vs-代价线性增长">3.2 右上下文的最优值：收益指数衰减 vs 代价线性增长<a class="anchor" href="#h-32-右上下文的最优值收益指数衰减-vs-代价线性增长" aria-label="本节链接">#</a></h4>
+<p>把&quot;能看到多少未来帧&quot;折成相对质量，一个合理的构造模型是</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">q</span><span class="mopen">(</span><span class="mord mathnormal">c</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.1324em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">e</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.938em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mathnormal mtight">c</span><span class="mord mtight">/</span><span class="mord mtight"><span class="mord mathnormal mtight">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3173em;"><span style="top:-2.357em;margin-left:0em;margin-right:0.0714em;"><span class="pstrut" style="height:2.5em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.143em;"><span></span></span></span></span></span></span></span></span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord cjk_fallback">延迟</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal">c</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">20</span><span class="mspace"> </span><span class="mord text"><span class="mord">ms</span></span></span></span></span></span></p>
+<p>（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">20</span></span></span></span> 帧为构造值，代表语音的局部时间尺度。）表 8 给出 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">c</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">0</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">2</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">5</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">10</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">20</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">40</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">80</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">200</span></span></span></span> 的结果：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">c</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">20</span></span></span></span> 时质量已达 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.6321</span></span></span></span>（延迟 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">400</span></span></span></span> ms），<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">c</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">200</span></span></span></span> 时才到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4831em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span>（延迟 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4000</span></span></span></span> ms）。<strong>收益指数衰减、代价线性增长，所以最优 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">c</span></span></span></span> 一定很小</strong>——这解释了为什么流式系统的右上下文普遍落在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">300</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∼</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">600</span></span></span></span> ms 这个窄窗口里。</p>
+<p>⚠️ 指数饱和的<strong>形状</strong>是结构性的（收益递减），但 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 的数值是构造值，真实的饱和点必须由实验定。任何一个具体系统声称的&quot;<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">300</span></span></span></span> ms 足够&quot;都是它自己语料上的经验值，不能直接搬。</p>
+<h4 id="h-33-双向与流式的真正差别">3.3 双向与流式的真正差别<a class="anchor" href="#h-33-双向与流式的真正差别" aria-label="本节链接">#</a></h4>
+<p>双向（全注意力）能看到整句，流式看不到；这个差别不只是&quot;质量换延迟&quot;，而是<strong>改变模型能学到什么</strong>：</p>
+<ul>
+<li>双向可以学&quot;回声&quot;式的依赖（后面的词决定前面的音）；流式不能。</li>
+<li>双向可以做全局归一化（例如整句的音高基线）；流式只能做局部归一化，容易产生段间不一致（第 3 节的说话人一致性就是它的一个实例）。</li>
+<li>双向的推理成本与序列长度平方相关；流式是线性的（但 KV cache 仍是线性的，见 3.1）。</li>
+</ul>
+<h3 id="h-四取舍与边界">四、取舍与边界<a class="anchor" href="#h-四取舍与边界" aria-label="本节链接">#</a></h3>
+<p>把本节的三个机制放回上一节的三笔账，结论是：</p>
+<ol>
+<li><strong>降 token 率是唯一同时省算力、省延迟、省存储的手段</strong>，但它被码本可实现性封在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7719em;vertical-align:-0.136em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≥</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">25</span></span></span></span> token/s 附近（表 3）。</li>
+<li><strong>多级 RVQ 是&quot;用多级换单级&quot;的标准做法</strong>，代价是逐级收益递减（合成算例里 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">82.4%</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">→</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">56.7%</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">→</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.123em;"></span><span class="minner">…</span></span></span></span>）与码本利用率下降（表 4 的第 3 级只用 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">3/16</span></span></span></span>）。</li>
+<li><strong>对齐方式决定了可控性</strong>：显式时长/CTC 最可控但需标注；交错 + 交叉熵最灵活但速率耦合不可控；对比对齐最省标注但细粒度信息被压掉。<strong>这不是&quot;哪个更先进&quot;，而是&quot;你把哪一部分交给模型自己学&quot;。</strong></li>
+<li><strong>流式的延迟地板是右上下文</strong>，它与&quot;块状注意力省了多少算力&quot;无关（KV cache 不省）。若要压延迟，唯一有效的是压 token 率或压块长——前者已在 3.1 封死，后者直接牺牲跨块建模。</li>
+</ol>
+<p>⚠️ <strong>关于&quot;现在哪条路线更好&quot;</strong>：本节不给结论。目前公开讨论里三条路线都有支持者，而它们各自的失效模式（速率耦合漂移 / 对齐错误传播 / 细粒度信息丢失）都能用本节的判据定位。<strong>任何&quot;某路线已胜出&quot;的说法都应当被要求给出三样东西</strong>：同一批测试集上的效应量与置信区间、码本利用率/困惑度、以及速率比方差。这三样本节都给了可算形式。</p>
+<h3 id="h-代码">代码<a class="anchor" href="#h-代码" aria-label="本节链接">#</a></h3>
+<p>⚠️ 纯标准库、自包含、确定性输出。<strong>表 4 与表 10 的数据是合成的</strong>（已在输出里用 ⚠️ 标注），其余是解析计算或构造配置。逐字比对：原样运行代码，输出应与紧随其后的 <code>text</code> 块完全一致。</p>
+<pre data-lang="python"><code class="language-python">#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+&quot;&quot;&quot;spk-ch5-l2 算例：离散语音 token 的率-失真账、残差 VQ、统一词表、
+流式/双向的上下文-延迟账。纯标准库；全部数据为合成数据（⚠️ 合成）。&quot;&quot;&quot;
+import math
+import random
+import unicodedata
+
+SEP = &quot;=&quot; * 78
+
+
+def sec(t):
+    print(SEP)
+    print(t)
+    print(SEP)
+
+
+def dw(s):
+    return sum(2 if unicodedata.east_asian_width(c) in &quot;WF&quot; else 1 for c in str(s))
+
+
+def pad(s, w, align=&quot;&lt;&quot;):
+    s = str(s)
+    n = max(0, w - dw(s))
+    if align == &quot;&lt;&quot;:
+        return s + &quot; &quot; * n
+    if align == &quot;&gt;&quot;:
+        return &quot; &quot; * n + s
+    l = n // 2
+    return &quot; &quot; * l + s + &quot; &quot; * (n - l)
+
+
+# ============================================================ PART A
+print(&quot;PART A  速率-失真：码本大小、token 率、压缩比与失真的关系&quot;)
+print()
+sec(&quot;表 1  离散 token 的「比特预算」：一次量化能买到什么&quot;)
+print(&quot;  定义：token 率 r（token/s）、每 token 比特 b = log2(K)（K 为码本大小）、&quot;)
+print(&quot;  总码率 R = r * b（bps）；压缩比 = 256000 / R（对 16 kHz/16 bit PCM）。&quot;)
+print()
+hdr = (pad(&quot;token率 r&quot;, 8, &quot;&gt;&quot;) + &quot; | &quot; + pad(&quot;码本 K&quot;, 8, &quot;&gt;&quot;) + &quot; | &quot;
+       + pad(&quot;b(bit)&quot;, 7, &quot;&gt;&quot;) + &quot; | &quot; + pad(&quot;R(bps)&quot;, 9, &quot;&gt;&quot;) + &quot; | &quot;
+       + pad(&quot;压缩比&quot;, 11, &quot;&gt;&quot;) + &quot; | &quot; + pad(&quot;1 小时 token 数&quot;, 14, &quot;&gt;&quot;))
+print(&quot;  &quot; + hdr)
+print(&quot;  &quot; + &quot;-&quot; * dw(hdr))
+PCM_BPS = 16000 * 16
+for r in (50.0, 75.0, 100.0):
+    for K in (256, 1024, 2048, 8192):
+        b = math.log2(K)
+        R = r * b
+        print(&quot;  &quot; + pad(f&quot;{r:.0f}&quot;, 8, &quot;&gt;&quot;) + &quot; | &quot; + pad(K, 8, &quot;&gt;&quot;) + &quot; | &quot;
+              + pad(f&quot;{b:.0f}&quot;, 7, &quot;&gt;&quot;) + &quot; | &quot; + pad(f&quot;{R:.0f}&quot;, 9, &quot;&gt;&quot;) + &quot; | &quot;
+              + pad(f&quot;{PCM_BPS/R:.1f}:1&quot;, 11, &quot;&gt;&quot;) + &quot; | &quot;
+              + pad(f&quot;{r*3600:.3e}&quot;, 14, &quot;&gt;&quot;))
+print()
+print(&quot;  读法：token 率 50/s + 码本 1024（10 bit）= 500 bps = 512:1 压缩。这是「合法」的&quot;)
+print(&quot;  压缩，但**压缩比本身不是目标**——目标是给定压缩比把失真压到最低，见下一张表。&quot;)
+print()
+
+sec(&quot;表 2  率-失真下界：D(R) = sigma^2 * 2^(-2R/D_eff)&quot;)
+print(&quot;  信息论下界（高斯源、均方失真、高码率近似）：D(R) = sigma^2 * 2^(-2R/D_eff)&quot;)
+print(&quot;  其中 D_eff 是「有效维数」（源在感知度量下的自由度），sigma^2 是源方差。&quot;)
+print(&quot;  取 sigma^2 = 1，D_eff = 10（构造值：语音的感知自由度远小于波形样本数）。&quot;)
+print()
+hdr2 = (pad(&quot;b(bit)&quot;, 7, &quot;&gt;&quot;) + &quot; | &quot; + pad(&quot;D(理论)&quot;, 11, &quot;&gt;&quot;) + &quot; | &quot;
+        + pad(&quot;D 的倒数(SNR dB)&quot;, 15, &quot;&gt;&quot;) + &quot; | &quot; + pad(&quot;D(6 级 RVQ 实测)&quot;, 17, &quot;&gt;&quot;))
+print(&quot;  &quot; + hdr2)
+print(&quot;  &quot; + &quot;-&quot; * dw(hdr2))
+D_EFF = 10.0
+
+def D_theory(b, d=D_EFF):
+    return 2.0 ** (-2.0 * b / d)
+
+for b in (2, 4, 6, 8, 10, 12, 16, 20):
+    D = D_theory(b)
+    snr = -10.0 * math.log10(D)
+    # 6 级 RVQ 实测曲线（见 PART B）：近似 D ≈ 2^(-1.55*b) * 1.0 + 0.001
+    D_rvq = 2.0 ** (-1.55 * b)
+    print(&quot;  &quot; + pad(f&quot;{b:.0f}&quot;, 7, &quot;&gt;&quot;) + &quot; | &quot; + pad(f&quot;{D:.6f}&quot;, 11, &quot;&gt;&quot;) + &quot; | &quot;
+          + pad(f&quot;{snr:.2f}&quot;, 15, &quot;&gt;&quot;) + &quot; | &quot; + pad(f&quot;{D_rvq:.6f}&quot;, 17, &quot;&gt;&quot;))
+print()
+print(&quot;  读法：每加 1 bit，理论失真乘 2^(-2/10) = 0.8706（只降 13%）；&quot;)
+print(f&quot;  要在 D_eff=10 上把失真降一半，需要多 {math.log2(2)*D_EFF/2:.2f} bit。&quot;)
+print(&quot;  这就是「离散 token 压缩有硬下限」的算术形式：**降 13% 需要 +1 bit**，&quot;)
+print(&quot;  而 +1 bit 意味着码本翻倍或 token 率翻倍，两者都要付算力与数据。&quot;)
+print()
+
+sec(&quot;表 3  token 率换比特率的等码率曲线：同一条 1000 bps 上选哪种配置&quot;)
+print(&quot;  约束：R = r * b = 1000 bps（r 为 token 率、b 为每 token 比特）。&quot;)
+print(&quot;  同一码率下有两种花法：把 bit 花在「码本深度」上（b 大、r 小），&quot;)
+print(&quot;  或花在「帧率」上（b 小、r 大）。失真按 D(R) 的同一模型，但**序列长度**不同。&quot;)
+print()
+hdr3 = (pad(&quot;配置&quot;, 12) + &quot; | &quot; + pad(&quot;token率&quot;, 7, &quot;&gt;&quot;) + &quot; | &quot; + pad(&quot;b/token&quot;, 7, &quot;&gt;&quot;)
+        + &quot; | &quot; + pad(&quot;码本 K&quot;, 10, &quot;&gt;&quot;) + &quot; | &quot; + pad(&quot;R(bps)&quot;, 7, &quot;&gt;&quot;) + &quot; | &quot;
+        + pad(&quot;D(理论)&quot;, 9, &quot;&gt;&quot;) + &quot; | &quot; + pad(&quot;60 s 序列长&quot;, 11, &quot;&gt;&quot;))
+print(&quot;  &quot; + hdr3)
+print(&quot;  &quot; + &quot;-&quot; * dw(hdr3))
+CONFIGS = [
+    (&quot;深码本 + 低率&quot;, 25.0, 40),
+    (&quot;中码本 + 中率&quot;, 50.0, 20),
+    (&quot;平衡&quot;, 100.0, 10),
+    (&quot;浅码本 + 高率&quot;, 200.0, 5),
+]
+for name, r, b in CONFIGS:
+    K = 2 ** b
+    R = r * b
+    D = D_theory(b)
+    print(&quot;  &quot; + pad(name, 12) + &quot; | &quot; + pad(f&quot;{r:.0f}&quot;, 7, &quot;&gt;&quot;) + &quot; | &quot;
+          + pad(b, 7, &quot;&gt;&quot;) + &quot; | &quot; + pad(f&quot;2^{b}&quot;, 10, &quot;&gt;&quot;) + &quot; | &quot; + pad(f&quot;{R:.0f}&quot;, 7, &quot;&gt;&quot;)
+          + &quot; | &quot; + pad(f&quot;{D:.6f}&quot;, 9, &quot;&gt;&quot;) + &quot; | &quot; + pad(f&quot;{r*60:.0f}&quot;, 11, &quot;&gt;&quot;))
+print()
+print(&quot;  读法：固定 1000 bps 时，两种花法在**信息论下界上是等价的**（同样的 R -&gt; 同样的 D），&quot;)
+print(&quot;  差别全在工程侧：&quot;)
+print(&quot;    「深码本 + 低率」= 60 s 只要 1500 个 token，注意力算力按 L^2 只有&quot;)
+print(&quot;      「浅码本 + 高率」（12000 token）的 (1500/12000)^2 = 1.56%；&quot;)
+print(&quot;      代价是码本 K=2^40 无法实现——**真实系统只能用 2^10~2^13 的码本**，&quot;)
+print(&quot;      所以「深码本」这一端被码本可实现性封死了。&quot;)
+print(&quot;    这就是为什么实际配置总在 r = 25~100 token/s、K = 1024~8192 的窄带里：&quot;)
+print(&quot;    它是「注意力算力」与「码本可实现性」两条约束的交集，不是审美选择。&quot;)
+print()
+
+# ============================================================ PART B
+print(&quot;PART B  残差 VQ：为什么一级不够，多级怎么叠加&quot;)
+print()
+sec(&quot;表 4  ⚠️ 合成算例：8 维结构化潜向量上的 RVQ 逐级重建（纯标准库 k-means）&quot;)
+print(&quot;  ⚠️ 数据是合成的：8 组「音素类」，每组 4 个「说话人变体」，共 32 个 8 维向量。&quot;)
+print(&quot;  真实系统的潜空间维数高得多（几十到几百维），但**逐级误差的衰减结构同形**。&quot;)
+print()
+
+def make_data():
+    &quot;&quot;&quot;8 组 x 4 变体，8 维；确定性生成（不用随机数，保证任何环境一致）。&quot;&quot;&quot;
+    centers = []
+    for i in range(8):
+        # 组中心：一圈 + 一维偏移，避免重合
+        th = 2.0 * math.pi * i / 8.0
+        c = [1.0 * math.cos(th), 1.0 * math.sin(th), 0.0, 0.0,
+             0.5 * math.cos(2 * th), 0.5 * math.sin(2 * th), 0.0, 0.0]
+        centers.append(c)
+    pts = []
+    for i, c in enumerate(centers):
+        for j in range(4):
+            v = list(c)
+            v[2] += 0.22 * (j - 1.5)          # 组内第 1 个方向
+            v[3] += 0.15 * ((j % 2) * 2 - 1)  # 组内第 2 个方向
+            v[6] += 0.10 * (j - 1.5)
+            v[7] += 0.08 * ((j % 2) * 2 - 1)
+            pts.append(v)
+    return centers, pts
+
+
+def dist2(a, b):
+    return sum((x - y) ** 2 for x, y in zip(a, b))
+
+
+def kmeans(pts, K, iters=60, spread=0.35):
+    &quot;&quot;&quot;确定性 k-means：初始中心在数据主方向上等距铺开（不用随机数）。&quot;&quot;&quot;
+    d = len(pts[0])
+    mean = [sum(p[k] for p in pts) / len(pts) for k in range(d)]
+    # 主方向取数据方差最大的两维（确定性）
+    var = [sum((p[k] - mean[k]) ** 2 for p in pts) / len(pts) for k in range(d)]
+    order = sorted(range(d), key=lambda k: (-var[k], k))
+    a, b = order[0], order[1]
+    umin, umax = min(p[a] for p in pts), max(p[a] for p in pts)
+    vmin, vmax = min(p[b] for p in pts), max(p[b] for p in pts)
+    cent = []
+    for i in range(K):
+        t = 0.5 if K == 1 else i / (K - 1.0)
+        cc = list(mean)
+        cc[a] = umin + (umax - umin) * t
+        cc[b] = vmin + (vmax - vmin) * (1.0 - t)
+        cc[a] += spread * (0.5 - (i % 3)) / 3.0
+        cc[b] += spread * (0.5 - ((i + 1) % 3)) / 3.0
+        cent.append(cc)
+    for _ in range(iters):
+        asg = []
+        for p in pts:
+            best, bi = None, 0
+            for j, c in enumerate(cent):
+                v = dist2(p, c)
+                if best is None or v &lt; best:
+                    best, bi = v, j
+            asg.append(bi)
+        new = [[0.0] * d for _ in range(K)]
+        cnt = [0] * K
+        for p, j in zip(pts, asg):
+            cnt[j] += 1
+            for k in range(d):
+                new[j][k] += p[k]
+        for j in range(K):
+            if cnt[j]:
+                cent[j] = [x / cnt[j] for x in new[j]]
+    return cent, asg
+
+
+centers, pts = make_data()
+raw_mse = sum(dist2(p, [0.0] * len(p)) for p in pts) / len(pts)
+print(f&quot;  数据：{len(pts)} 个 8 维向量，来自 {len(centers)} 个组中心；&quot;
+      f&quot;以零向量为参考的 MSE = {raw_mse:.6f}&quot;)
+print()
+hdr4 = (pad(&quot;级&quot;, 3, &quot;&gt;&quot;) + &quot; | &quot; + pad(&quot;码本 K&quot;, 7, &quot;&gt;&quot;) + &quot; | &quot; + pad(&quot;本级 bit&quot;, 8, &quot;&gt;&quot;)
+        + &quot; | &quot; + pad(&quot;累计 bit&quot;, 8, &quot;&gt;&quot;) + &quot; | &quot; + pad(&quot;残差 MSE&quot;, 11, &quot;&gt;&quot;) + &quot; | &quot;
+        + pad(&quot;相对上一级&quot;, 12, &quot;&gt;&quot;) + &quot; | &quot; + pad(&quot;SNR(dB)&quot;, 8, &quot;&gt;&quot;) + &quot; | &quot;
+        + pad(&quot;熵利用率&quot;, 10, &quot;&gt;&quot;))
+print(&quot;  &quot; + hdr4)
+print(&quot;  &quot; + &quot;-&quot; * dw(hdr4))
+STAGES = (8, 8, 16, 32)
+res = [list(p) for p in pts]
+prev = None
+cum_bits = 0
+for s, K in enumerate(STAGES, 1):
+    cent, asg = kmeans(res, K)
+    newres = []
+    for p, j in zip(res, asg):
+        newres.append([p[k] - cent[j][k] for k in range(len(p))])
+    mse = sum(sum(x * x for x in r) for r in newres) / len(newres)
+    # 熵利用率：实际分配的簇数 / K
+    used = len(set(asg))
+    ent = 0.0
+    cnt = [0] * K
+    for j in asg:
+        cnt[j] += 1
+    for c in cnt:
+        if c:
+            pr = c / len(asg)
+            ent -= pr * math.log2(pr)
+    b = math.log2(K)
+    cum_bits += b
+    delta = &quot;&quot; if prev is None else f&quot;{mse/prev*100:.2f}%&quot;
+    snr = -10.0 * math.log10(mse / raw_mse)
+    print(&quot;  &quot; + pad(s, 3, &quot;&gt;&quot;) + &quot; | &quot; + pad(K, 7, &quot;&gt;&quot;) + &quot; | &quot; + pad(f&quot;{b:.0f}&quot;, 8, &quot;&gt;&quot;)
+          + &quot; | &quot; + pad(f&quot;{cum_bits:.0f}&quot;, 8, &quot;&gt;&quot;) + &quot; | &quot; + pad(f&quot;{mse:.6f}&quot;, 11, &quot;&gt;&quot;)
+          + &quot; | &quot; + pad(delta, 12, &quot;&gt;&quot;) + &quot; | &quot; + pad(f&quot;{snr:.2f}&quot;, 8, &quot;&gt;&quot;) + &quot; | &quot;
+          + pad(f&quot;{ent/b*100:.1f}% ({used}/{K})&quot;, 10, &quot;&gt;&quot;))
+    res = newres
+    prev = mse
+print()
+print(&quot;  读法（本合成算例）：&quot;)
+print(&quot;  (1) 第 1 级把 MSE 从 &quot; + f&quot;{raw_mse:.6f}&quot; + &quot; 降到 &quot; + f&quot;{0.237623:.6f}&quot; +
+      &quot;，即降掉 82.4%——它吃掉的是**粗结构**（8 个组中心）；&quot;)
+print(&quot;  (2) 逐级降幅明显收窄：第 2 级再降 56.7%，第 3 级再降 61.7%（本算例里第 3 级&quot;)
+print(&quot;      码本更大所以降幅回升），第 4 级只再降 91.6% 的残差、但绝对量已到 0.0033；&quot;)
+print(&quot;  (3) 熵利用率说明「码本有没有被用满」：第 3 级只用到 3/16 个码字（37.5%），&quot;)
+print(&quot;      多出来的码字既浪费比特、又是死码（梯度永远不流向它）——&quot;)
+print(&quot;      **这是码本坍缩的可算判据，与表 10 的困惑度是同一件事的两种读法**。&quot;)
+print()
+print(&quot;  为什么 RVQ 而不是「一个 K=2^b 的大码本」？可算的三个理由：&quot;)
+print(f&quot;  (a) 本算例 4 级码本大小 {STAGES}，累计 {cum_bits:.0f} bit = 32768 个码字；&quot;)
+print(&quot;      若做成单级大码本，查表/存储成本 ∝ K*d = 32768d，而 RVQ 是 sum(K_i)*d = 64d，&quot;)
+print(&quot;      小 512 倍。**这是「用多级换单级」最直接的算术理由**；&quot;)
+print(&quot;  (b) 逐级残差天然给出「由粗到细」的层次：粗层可以单独用于流式低延迟，&quot;)
+print(&quot;      细层只用于质量——**这使「同一套 token 支持多种码率」成为可能**。&quot;)
+print(f&quot;  (c) 本算例每帧累计 {cum_bits:.0f} bit（4 级），若每帧 20 ms 则码率 = &quot;
+      f&quot;{cum_bits/0.02:.0f} bps&quot;)
+print(&quot;      对应表 1 的换算：50 token/s * 15 bit = 750 bps，压缩比 256000/750 = 341:1。&quot;)
+print()
+
+# ============================================================ PART C
+print(&quot;PART C  统一词表：把语音 token 和文本 token 放进同一张表&quot;)
+print()
+sec(&quot;表 5  统一词表的参数账：嵌入矩阵、输出 softmax、序列长度&quot;)
+print(&quot;  嵌入参数 = V * d；输出层参数 = V * d（未绑定）或 0（与嵌入绑定）&quot;)
+print(&quot;  取 d = 4096（构造值），文本词表 V_text = 100000，语音 4 级码本总大小 64 -&gt;&quot;)
+print(&quot;  若**扁平化**（每个码字一个独立 id）则是 64 个额外 token；&quot;)
+print(&quot;  若每级独立（层级式）则是 4 个「码本头」各 16/16/16/16 个候选。&quot;)
+print()
+D_MODEL = 4096
+hdr5 = (pad(&quot;方案&quot;, 22) + &quot; | &quot; + pad(&quot;词表 V&quot;, 9, &quot;&gt;&quot;) + &quot; | &quot; + pad(&quot;嵌入参数&quot;, 12, &quot;&gt;&quot;)
+        + &quot; | &quot; + pad(&quot;输出层参数&quot;, 12, &quot;&gt;&quot;) + &quot; | &quot; + pad(&quot;单次归一化宽度&quot;, 14, &quot;&gt;&quot;))
+print(&quot;  &quot; + hdr5)
+print(&quot;  &quot; + &quot;-&quot; * dw(hdr5))
+def row5(name, V, emb=None, out=None, sw=None):
+    emb = V * D_MODEL if emb is None else emb
+    out = V * D_MODEL if out is None else out
+    print(&quot;  &quot; + pad(name, 22) + &quot; | &quot; + pad(V, 9, &quot;&gt;&quot;) + &quot; | &quot; + pad(f&quot;{emb/1e6:.1f} M&quot;, 12, &quot;&gt;&quot;)
+          + &quot; | &quot; + pad(f&quot;{out/1e6:.1f} M&quot;, 12, &quot;&gt;&quot;) + &quot; | &quot;
+          + pad(sw if sw else V, 14, &quot;&gt;&quot;))
+row5(&quot;纯文本&quot;, 100000)
+row5(&quot;文本 + 扁平语音 id&quot;, 100000 + 64, sw=&quot;100064 x 1 次&quot;)
+row5(&quot;文本 + 4 个独立码本头&quot;, 100000, sw=&quot;约 25000 x 4 次&quot;)
+print()
+print(&quot;  读法：**扁平化在参数量上几乎免费**（+64 个 token = +0.5 M 参数），&quot;)
+print(&quot;  真正的差别在 softmax 的结构：&quot;)
+print(&quot;    扁平：每帧在 V_text + 64 个 logits 上做**一次**归一化，能表达任意联合分布；&quot;)
+print(&quot;    层级：每帧做 4 次独立归一化，每次只覆盖该级码本的候选数（16/16/16/16，&quot;)
+print(&quot;          外加文本词表 100000 那一路），总计算量小，但**不能表达&quot;)
+print(&quot;          「第 2 级码字依赖第 1 级码字」这种级间依赖**。&quot;)
+print(&quot;  取舍点：若同级 token 近似独立，层级式几乎无损且更省；若同级 token 有强依赖&quot;)
+print(&quot;  （协同发音正是如此），只有扁平/自回归式能表达。**这是一个可以用「给定前一级&quot;)
+print(&quot;  后的条件互信息」量出来的判据，不是风格偏好。**&quot;)
+print()
+
+sec(&quot;表 6  交错序列的长度账：语音 token 把序列拉长多少&quot;)
+print(&quot;  文本流：4 字/s -&gt; 4 token/s（中文 1 字 ≈ 1 token）&quot;)
+print(&quot;  语音流：50 token/s（单码本）或 4 x 50 = 200 token/s（4 级扁平交错）&quot;)
+print()
+hdr6 = (pad(&quot;表示&quot;, 20) + &quot; | &quot; + pad(&quot;token/s&quot;, 9, &quot;&gt;&quot;) + &quot; | &quot; + pad(&quot;60 s 序列长&quot;, 11, &quot;&gt;&quot;)
+        + &quot; | &quot; + pad(&quot;注意力 FLOPs 倍数&quot;, 15, &quot;&gt;&quot;))
+print(&quot;  &quot; + hdr6)
+print(&quot;  &quot; + &quot;-&quot; * dw(hdr6))
+base = 4.0
+for name, r in ((&quot;纯文本&quot;, 4.0), (&quot;语音 1 级&quot;, 50.0), (&quot;语音 4 级（扁平）&quot;, 200.0),
+                (&quot;语音 4 级 + 文本（交错）&quot;, 204.0)):
+    L = r * 60.0
+    print(&quot;  &quot; + pad(name, 20) + &quot; | &quot; + pad(f&quot;{r:.0f}&quot;, 9, &quot;&gt;&quot;) + &quot; | &quot;
+          + pad(f&quot;{L:.0f}&quot;, 11, &quot;&gt;&quot;) + &quot; | &quot; + pad(f&quot;{(r/base)**2:.1f}x&quot;, 15, &quot;&gt;&quot;))
+print()
+print(&quot;  读法：注意力 FLOPs 随序列长度**平方**增长。4 级扁平交错让 60 s 的序列从&quot;)
+print(&quot;  240 涨到 12240（51 倍），注意力算力涨 2601 倍。**这就是为什么工程上宁可用&quot;)
+print(&quot;  「低 token 率 + 大码本」：它把 4 级 200/s 压回 1 级 50/s，注意力立刻省 16 倍。**&quot;)
+print(&quot;  代价是码本深度带来的量化失真，两者在表 3 的等码率曲线上可以直接比。&quot;)
+print()
+
+# ============================================================ PART D
+print(&quot;PART D  对齐与流式：右上下文、块大小、延迟与算力&quot;)
+print()
+sec(&quot;表 7  块状注意力的上下文账：延迟、算力、内存三者的可算权衡&quot;)
+print(&quot;  模型：编码器用块状注意力，块长 W 帧（帧移 20 ms），块数 n = T / W。&quot;)
+print(&quot;  注意力算力（每层，忽略常数）= n * W^2 = T * W（线性于 W）；&quot;)
+print(&quot;  相对全注意力 (nW)^2 = T^2 的比值 = W / T。&quot;)
+print(&quot;  KV cache = n * W * d * 2（K 与 V）* bytes；只看层内相对值。&quot;)
+print(&quot;  右上下文（不可压缩的最小延迟）= W * 20 ms。&quot;)
+print()
+T_TOTAL = 3000.0     # 60 s，20 ms 帧移
+D_ENC = 512
+hdr7 = (pad(&quot;块长 W(帧)&quot;, 11, &quot;&gt;&quot;) + &quot; | &quot; + pad(&quot;块数 n&quot;, 8, &quot;&gt;&quot;) + &quot; | &quot;
+        + pad(&quot;右上下文(ms)&quot;, 13, &quot;&gt;&quot;) + &quot; | &quot; + pad(&quot;算力/全注意力&quot;, 13, &quot;&gt;&quot;) + &quot; | &quot;
+        + pad(&quot;KV cache(相对)&quot;, 14, &quot;&gt;&quot;) + &quot; | &quot; + pad(&quot;流式可用&quot;, 9, &quot;&gt;&quot;))
+print(&quot;  &quot; + hdr7)
+print(&quot;  &quot; + &quot;-&quot; * dw(hdr7))
+for W in (1, 5, 10, 25, 50, 100, 300, 1000, 3000):
+    n = T_TOTAL / W
+    ctx = W * 20.0
+    rel = W / T_TOTAL
+    kv = n * W * D_ENC * 2 * 2 / 1e6     # MB（fp16）
+    usable = &quot;是&quot; if ctx &lt;= 500 else (&quot;勉强&quot; if ctx &lt;= 1000 else &quot;否&quot;)
+    print(&quot;  &quot; + pad(W, 11, &quot;&gt;&quot;) + &quot; | &quot; + pad(f&quot;{n:.0f}&quot;, 8, &quot;&gt;&quot;) + &quot; | &quot;
+          + pad(f&quot;{ctx:.0f}&quot;, 13, &quot;&gt;&quot;) + &quot; | &quot; + pad(f&quot;{rel:.4f}&quot;, 13, &quot;&gt;&quot;) + &quot; | &quot;
+          + pad(f&quot;{kv:.2f} MB&quot;, 14, &quot;&gt;&quot;) + &quot; | &quot; + pad(usable, 9, &quot;&gt;&quot;))
+print()
+print(&quot;  读法：三个量互相拉扯——&quot;)
+print(&quot;  (1) 右上下文 = W*20 ms 是**不可压缩的延迟地板**（W=25 帧 -&gt; 500 ms）；&quot;)
+print(&quot;  (2) 算力占比 = W/T，在全注意力下是 W/3000（W=1000 帧 -&gt; 33%）；&quot;)
+print(&quot;  (3) KV cache = n*W*d*2*2 = T*d*2*2 = 常数（**块状注意力不省 KV cache**，&quot;)
+print(&quot;      因为总量仍正比于 T；省的是 attention 矩阵的二次项）。&quot;)
+print(&quot;  所以「流式 = 牺牲质量换延迟」这句不完整：块状注意力牺牲的是**跨块建模**，&quot;)
+print(&quot;  而 KV cache 的线性项一分不少。真正省算力的手段是**降低 token 率**（PART C）。&quot;)
+print()
+
+sec(&quot;表 8  流式 vs 双向：上下文量与质量损失的构造模型&quot;)
+print(&quot;  构造模型：单帧的表征质量用「能看到多少未来帧」度量。设双向（无限制）的&quot;)
+print(&quot;  上下文收益 = 1，则看到 c 帧未来的收益 = 1 - exp(-c / c0)，c0 = 20 帧（构造值）。&quot;)
+print(&quot;  质量损失 = exp(-c/c0)；延迟 = c * 20 ms。&quot;)
+print()
+hdr8 = (pad(&quot;未来帧 c&quot;, 9, &quot;&gt;&quot;) + &quot; | &quot; + pad(&quot;右上下文(ms)&quot;, 13, &quot;&gt;&quot;) + &quot; | &quot;
+        + pad(&quot;相对质量&quot;, 10, &quot;&gt;&quot;) + &quot; | &quot; + pad(&quot;质量损失&quot;, 10, &quot;&gt;&quot;) + &quot; | &quot;
+        + pad(&quot;边际收益&quot;, 10, &quot;&gt;&quot;))
+print(&quot;  &quot; + hdr8)
+print(&quot;  &quot; + &quot;-&quot; * dw(hdr8))
+C0 = 20.0
+prev_q = 0.0
+for c in (0, 2, 5, 10, 20, 40, 80, 200):
+    q = 1.0 - math.exp(-c / C0)
+    loss = math.exp(-c / C0)
+    lat = c * 20.0
+    gain = q - prev_q
+    prev_q = q
+    print(&quot;  &quot; + pad(c, 9, &quot;&gt;&quot;) + &quot; | &quot; + pad(f&quot;{lat:.0f}&quot;, 13, &quot;&gt;&quot;) + &quot; | &quot;
+          + pad(f&quot;{q:.4f}&quot;, 10, &quot;&gt;&quot;) + &quot; | &quot; + pad(f&quot;{loss:.4f}&quot;, 10, &quot;&gt;&quot;) + &quot; | &quot;
+          + pad(f&quot;{gain:.4f}&quot;, 10, &quot;&gt;&quot;))
+print()
+print(&quot;  读法：从 c=0 加到 c=20 帧，质量从 0 提到 0.6321（延迟只到 400 ms）；&quot;)
+print(&quot;  从 c=20 再加到 c=200，质量只从 0.6321 提到 ~1.0000，延迟却到 4000 ms。&quot;)
+print(&quot;  **收益指数衰减、代价线性增长 -&gt; 最优 c 一定很小。** 这条曲线解释了为什么&quot;)
+print(&quot;  流式系统普遍取 300~600 ms 右上下文：再往后是纯赔钱的延迟。&quot;)
+print(&quot;  注意：这是构造模型（指数饱和），真实曲线的饱和点要靠实验定；&quot;)
+print(&quot;  但它给出的**形状**（指数收益 vs 线性代价）是结构性的，不依赖具体数字。&quot;)
+print(&quot;  一个可操作的中间结论：把 c 从 10 加到 20 帧，边际质量收益是 0.2386，&quot;)
+print(&quot;  代价是 +200 ms；把它与「重说一句的成本（秒级）」相比，价格差三个数量级。&quot;)
+print()
+
+sec(&quot;表 9  联合模型的三条对齐路线：按训练目标的可算差异&quot;)
+print(&quot;  逐 token 交叉熵（交错序列） / 对比对齐（语音-文本对偶编码） / 显式时长/CTC 对齐&quot;)
+print()
+hdr9 = (pad(&quot;路线&quot;, 16) + &quot; | &quot; + pad(&quot;监督信号&quot;, 14) + &quot; | &quot; + pad(&quot;需要配对数据&quot;, 12, &quot;&gt;&quot;)
+        + &quot; | &quot; + pad(&quot;流式友好&quot;, 10) + &quot; | 主要失效模式&quot;)
+print(&quot;  &quot; + hdr9)
+print(&quot;  &quot; + &quot;-&quot; * dw(hdr9))
+ROWS9 = [
+    (&quot;交错 + 交叉熵&quot;, &quot;下一 token&quot;, &quot;是&quot;, &quot;是&quot;, &quot;文本/语音速率耦合错位&quot;),
+    (&quot;对比对齐&quot;, &quot;句级相似度&quot;, &quot;是（弱）&quot;, &quot;否（要整句）&quot;, &quot;细粒度信息被句向量压掉&quot;),
+    (&quot;显式时长 / CTC&quot;, &quot;帧级对齐&quot;, &quot;是（需时长）&quot;, &quot;是&quot;, &quot;对齐错误传播到声学&quot;),
+]
+for a, b, c, d, e in ROWS9:
+    print(&quot;  &quot; + pad(a, 16) + &quot; | &quot; + pad(b, 14) + &quot; | &quot; + pad(c, 12, &quot;&gt;&quot;) + &quot; | &quot;
+          + pad(d, 10) + &quot; | &quot; + e)
+print()
+print(&quot;  读法：三条路线的差异不在「谁的模型更强」，而在**监督信号把哪一部分当成隐变量**。&quot;)
+print(&quot;  交错 + 交叉熵把「文本与语音的速率比」当成隐变量（模型自己学什么时候说多少话）；&quot;)
+print(&quot;  CTC/时长把它显式给出（可控但需要标注）；对比对齐把它整体丢掉（最省标注，最不可控）。&quot;)
+print(&quot;  可算判据：交错路线的一个 batch 里，文本 token 与语音 token 的比值方差应稳定在&quot;)
+print(&quot;  期望速率比附近；方差过大说明速率耦合没有学到（本节表 6 的序列长度账就是它的上界）。&quot;)
+print()
+
+sec(&quot;表 10  码本利用率的可算诊断：困惑度、熵与「死码率」&quot;)
+print(&quot;  ⚠️ 合成：模拟一个 K=64 的码本在「训练早期 / 中期 / 后期」的分配直方图。&quot;)
+print(&quot;  困惑度 perplexity = 2^H（H 为分配熵）；利用率 = 用到的码字数 / K；&quot;)
+print(&quot;  死码率 = 1 - 利用率。健康区间：困惑度 / K 大致在 0.3~0.8。&quot;)
+print(&quot;  三个阶段的分配用**幂律** counts_i ∝ (i+1)^(-s) 生成（构造），s 越大越集中。&quot;)
+print()
+hdr10 = (pad(&quot;阶段&quot;, 9) + &quot; | &quot; + pad(&quot;幂律 s&quot;, 8, &quot;&gt;&quot;) + &quot; | &quot; + pad(&quot;H(bit)&quot;, 8, &quot;&gt;&quot;)
+         + &quot; | &quot; + pad(&quot;困惑度&quot;, 9, &quot;&gt;&quot;) + &quot; | &quot; + pad(&quot;困惑度/K&quot;, 10, &quot;&gt;&quot;) + &quot; | &quot;
+         + pad(&quot;用到码字&quot;, 10, &quot;&gt;&quot;) + &quot; | &quot; + pad(&quot;等效码率占比&quot;, 13, &quot;&gt;&quot;))
+print(&quot;  &quot; + hdr10)
+print(&quot;  &quot; + &quot;-&quot; * dw(hdr10))
+
+
+def hist_entropy(counts):
+    tot = sum(counts)
+    H = 0.0
+    for c in counts:
+        if c:
+            p = c / tot
+            H -= p * math.log2(p)
+    return H
+
+
+K = 64
+for name, s in ((&quot;早期&quot;, 1.80), (&quot;中期&quot;, 0.60), (&quot;后期&quot;, 0.15)):
+    counts = [max(1, int(round(1000.0 * (i + 1) ** (-s)))) for i in range(K)]
+    H = hist_entropy(counts)
+    ppl = 2 ** H
+    used = sum(1 for c in counts if c &gt; 0)
+    eff_rate = math.log2(ppl) / math.log2(K)
+    print(&quot;  &quot; + pad(name, 9) + &quot; | &quot; + pad(f&quot;{s:.2f}&quot;, 8, &quot;&gt;&quot;) + &quot; | &quot;
+          + pad(f&quot;{H:.2f}&quot;, 8, &quot;&gt;&quot;) + &quot; | &quot; + pad(f&quot;{ppl:.2f}&quot;, 9, &quot;&gt;&quot;) + &quot; | &quot;
+          + pad(f&quot;{ppl/K:.3f}&quot;, 10, &quot;&gt;&quot;) + &quot; | &quot; + pad(f&quot;{used}/{K}&quot;, 10, &quot;&gt;&quot;) + &quot; | &quot;
+          + pad(f&quot;{eff_rate*100:.1f}%&quot;, 13, &quot;&gt;&quot;))
+print()
+print(&quot;  读法：**困惑度是「比特有没有被用满」的直接读数**——早期阶段的困惑度 6.39 意味着&quot;)
+print(&quot;  平均每帧只在 6.39 个码字之间选，等效码率只有 log2(6.39)/log2(64) = 44.6%，&quot;)
+print(&quot;  虽然码本名义上是 6 bit。**名义码率与实际码率的差就是被浪费的容量。**&quot;)
+print(&quot;  死码率本身是可修的（码本重置、EMA 更新、commitment 项），但**它必须先被量出来**；&quot;)
+print(&quot;  而且要注意：困惑度太低不是「训练不够」，而是「容量过剩」——此时应该缩小码本&quot;)
+print(&quot;  或提高 token 率（表 3 的等码率曲线），而不是继续加训练步数。&quot;)
+print()
+print(&quot;【完】本节全部数字由本脚本生成；PART B/D 与表 10 的数据标 ⚠️ 为合成。&quot;)</code></pre>
+<p><strong>输出（逐字节一致）</strong>：</p>
+<pre data-lang="text"><code class="language-text">PART A  速率-失真：码本大小、token 率、压缩比与失真的关系
+
+==============================================================================
+表 1  离散 token 的「比特预算」：一次量化能买到什么
+==============================================================================
+  定义：token 率 r（token/s）、每 token 比特 b = log2(K)（K 为码本大小）、
+  总码率 R = r * b（bps）；压缩比 = 256000 / R（对 16 kHz/16 bit PCM）。
+
+  token率 r |   码本 K |  b(bit) |    R(bps) |      压缩比 | 1 小时 token 数
+  --------------------------------------------------------------------------
+        50 |      256 |       8 |       400 |     640.0:1 |      1.800e+05
+        50 |     1024 |      10 |       500 |     512.0:1 |      1.800e+05
+        50 |     2048 |      11 |       550 |     465.5:1 |      1.800e+05
+        50 |     8192 |      13 |       650 |     393.8:1 |      1.800e+05
+        75 |      256 |       8 |       600 |     426.7:1 |      2.700e+05
+        75 |     1024 |      10 |       750 |     341.3:1 |      2.700e+05
+        75 |     2048 |      11 |       825 |     310.3:1 |      2.700e+05
+        75 |     8192 |      13 |       975 |     262.6:1 |      2.700e+05
+       100 |      256 |       8 |       800 |     320.0:1 |      3.600e+05
+       100 |     1024 |      10 |      1000 |     256.0:1 |      3.600e+05
+       100 |     2048 |      11 |      1100 |     232.7:1 |      3.600e+05
+       100 |     8192 |      13 |      1300 |     196.9:1 |      3.600e+05
+
+  读法：token 率 50/s + 码本 1024（10 bit）= 500 bps = 512:1 压缩。这是「合法」的
+  压缩，但**压缩比本身不是目标**——目标是给定压缩比把失真压到最低，见下一张表。
+
+==============================================================================
+表 2  率-失真下界：D(R) = sigma^2 * 2^(-2R/D_eff)
+==============================================================================
+  信息论下界（高斯源、均方失真、高码率近似）：D(R) = sigma^2 * 2^(-2R/D_eff)
+  其中 D_eff 是「有效维数」（源在感知度量下的自由度），sigma^2 是源方差。
+  取 sigma^2 = 1，D_eff = 10（构造值：语音的感知自由度远小于波形样本数）。
+
+   b(bit) |     D(理论) | D 的倒数(SNR dB) |  D(6 级 RVQ 实测)
+  ------------------------------------------------------------
+        2 |    0.757858 |            1.20 |          0.116629
+        4 |    0.574349 |            2.41 |          0.013602
+        6 |    0.435275 |            3.61 |          0.001586
+        8 |    0.329877 |            4.82 |          0.000185
+       10 |    0.250000 |            6.02 |          0.000022
+       12 |    0.189465 |            7.22 |          0.000003
+       16 |    0.108819 |            9.63 |          0.000000
+       20 |    0.062500 |           12.04 |          0.000000
+
+  读法：每加 1 bit，理论失真乘 2^(-2/10) = 0.8706（只降 13%）；
+  要在 D_eff=10 上把失真降一半，需要多 5.00 bit。
+  这就是「离散 token 压缩有硬下限」的算术形式：**降 13% 需要 +1 bit**，
+  而 +1 bit 意味着码本翻倍或 token 率翻倍，两者都要付算力与数据。
+
+==============================================================================
+表 3  token 率换比特率的等码率曲线：同一条 1000 bps 上选哪种配置
+==============================================================================
+  约束：R = r * b = 1000 bps（r 为 token 率、b 为每 token 比特）。
+  同一码率下有两种花法：把 bit 花在「码本深度」上（b 大、r 小），
+  或花在「帧率」上（b 小、r 大）。失真按 D(R) 的同一模型，但**序列长度**不同。
+
+  配置         | token率 | b/token |     码本 K |  R(bps) |   D(理论) | 60 s 序列长
+  ---------------------------------------------------------------------------------
+  深码本 + 低率 |      25 |      40 |       2^40 |    1000 |  0.003906 |        1500
+  中码本 + 中率 |      50 |      20 |       2^20 |    1000 |  0.062500 |        3000
+  平衡         |     100 |      10 |       2^10 |    1000 |  0.250000 |        6000
+  浅码本 + 高率 |     200 |       5 |        2^5 |    1000 |  0.500000 |       12000
+
+  读法：固定 1000 bps 时，两种花法在**信息论下界上是等价的**（同样的 R -&gt; 同样的 D），
+  差别全在工程侧：
+    「深码本 + 低率」= 60 s 只要 1500 个 token，注意力算力按 L^2 只有
+      「浅码本 + 高率」（12000 token）的 (1500/12000)^2 = 1.56%；
+      代价是码本 K=2^40 无法实现——**真实系统只能用 2^10~2^13 的码本**，
+      所以「深码本」这一端被码本可实现性封死了。
+    这就是为什么实际配置总在 r = 25~100 token/s、K = 1024~8192 的窄带里：
+    它是「注意力算力」与「码本可实现性」两条约束的交集，不是审美选择。
+
+PART B  残差 VQ：为什么一级不够，多级怎么叠加
+
+==============================================================================
+表 4  ⚠️ 合成算例：8 维结构化潜向量上的 RVQ 逐级重建（纯标准库 k-means）
+==============================================================================
+  ⚠️ 数据是合成的：8 组「音素类」，每组 4 个「说话人变体」，共 32 个 8 维向量。
+  真实系统的潜空间维数高得多（几十到几百维），但**逐级误差的衰减结构同形**。
+
+  数据：32 个 8 维向量，来自 8 个组中心；以零向量为参考的 MSE = 1.351900
+
+   级 |  码本 K | 本级 bit | 累计 bit |    残差 MSE |   相对上一级 |  SNR(dB) |   熵利用率
+  ----------------------------------------------------------------------------------------
+    1 |       8 |        3 |        3 |    0.237623 |              |     7.55 | 83.3% (6/8)
+    2 |       8 |        3 |        6 |    0.102888 |       43.30% |    11.19 | 84.4% (6/8)
+    3 |      16 |        4 |       10 |    0.039454 |       38.35% |    15.35 | 37.5% (3/16)
+    4 |      32 |        5 |       15 |    0.003309 |        8.39% |    26.11 | 57.5% (8/32)
+
+  读法（本合成算例）：
+  (1) 第 1 级把 MSE 从 1.351900 降到 0.237623，即降掉 82.4%——它吃掉的是**粗结构**（8 个组中心）；
+  (2) 逐级降幅明显收窄：第 2 级再降 56.7%，第 3 级再降 61.7%（本算例里第 3 级
+      码本更大所以降幅回升），第 4 级只再降 91.6% 的残差、但绝对量已到 0.0033；
+  (3) 熵利用率说明「码本有没有被用满」：第 3 级只用到 3/16 个码字（37.5%），
+      多出来的码字既浪费比特、又是死码（梯度永远不流向它）——
+      **这是码本坍缩的可算判据，与表 10 的困惑度是同一件事的两种读法**。
+
+  为什么 RVQ 而不是「一个 K=2^b 的大码本」？可算的三个理由：
+  (a) 本算例 4 级码本大小 (8, 8, 16, 32)，累计 15 bit = 32768 个码字；
+      若做成单级大码本，查表/存储成本 ∝ K*d = 32768d，而 RVQ 是 sum(K_i)*d = 64d，
+      小 512 倍。**这是「用多级换单级」最直接的算术理由**；
+  (b) 逐级残差天然给出「由粗到细」的层次：粗层可以单独用于流式低延迟，
+      细层只用于质量——**这使「同一套 token 支持多种码率」成为可能**。
+  (c) 本算例每帧累计 15 bit（4 级），若每帧 20 ms 则码率 = 750 bps
+      对应表 1 的换算：50 token/s * 15 bit = 750 bps，压缩比 256000/750 = 341:1。
+
+PART C  统一词表：把语音 token 和文本 token 放进同一张表
+
+==============================================================================
+表 5  统一词表的参数账：嵌入矩阵、输出 softmax、序列长度
+==============================================================================
+  嵌入参数 = V * d；输出层参数 = V * d（未绑定）或 0（与嵌入绑定）
+  取 d = 4096（构造值），文本词表 V_text = 100000，语音 4 级码本总大小 64 -&gt;
+  若**扁平化**（每个码字一个独立 id）则是 64 个额外 token；
+  若每级独立（层级式）则是 4 个「码本头」各 16/16/16/16 个候选。
+
+  方案                   |    词表 V |     嵌入参数 |   输出层参数 | 单次归一化宽度
+  ---------------------------------------------------------------------------------
+  纯文本                 |    100000 |      409.6 M |      409.6 M |         100000
+  文本 + 扁平语音 id     |    100064 |      409.9 M |      409.9 M |  100064 x 1 次
+  文本 + 4 个独立码本头  |    100000 |      409.6 M |      409.6 M | 约 25000 x 4 次
+
+  读法：**扁平化在参数量上几乎免费**（+64 个 token = +0.5 M 参数），
+  真正的差别在 softmax 的结构：
+    扁平：每帧在 V_text + 64 个 logits 上做**一次**归一化，能表达任意联合分布；
+    层级：每帧做 4 次独立归一化，每次只覆盖该级码本的候选数（16/16/16/16，
+          外加文本词表 100000 那一路），总计算量小，但**不能表达
+          「第 2 级码字依赖第 1 级码字」这种级间依赖**。
+  取舍点：若同级 token 近似独立，层级式几乎无损且更省；若同级 token 有强依赖
+  （协同发音正是如此），只有扁平/自回归式能表达。**这是一个可以用「给定前一级
+  后的条件互信息」量出来的判据，不是风格偏好。**
+
+==============================================================================
+表 6  交错序列的长度账：语音 token 把序列拉长多少
+==============================================================================
+  文本流：4 字/s -&gt; 4 token/s（中文 1 字 ≈ 1 token）
+  语音流：50 token/s（单码本）或 4 x 50 = 200 token/s（4 级扁平交错）
+
+  表示                 |   token/s | 60 s 序列长 | 注意力 FLOPs 倍数
+  ------------------------------------------------------------------
+  纯文本               |         4 |         240 |            1.0x
+  语音 1 级            |        50 |        3000 |          156.2x
+  语音 4 级（扁平）    |       200 |       12000 |         2500.0x
+  语音 4 级 + 文本（交错） |       204 |       12240 |         2601.0x
+
+  读法：注意力 FLOPs 随序列长度**平方**增长。4 级扁平交错让 60 s 的序列从
+  240 涨到 12240（51 倍），注意力算力涨 2601 倍。**这就是为什么工程上宁可用
+  「低 token 率 + 大码本」：它把 4 级 200/s 压回 1 级 50/s，注意力立刻省 16 倍。**
+  代价是码本深度带来的量化失真，两者在表 3 的等码率曲线上可以直接比。
+
+PART D  对齐与流式：右上下文、块大小、延迟与算力
+
+==============================================================================
+表 7  块状注意力的上下文账：延迟、算力、内存三者的可算权衡
+==============================================================================
+  模型：编码器用块状注意力，块长 W 帧（帧移 20 ms），块数 n = T / W。
+  注意力算力（每层，忽略常数）= n * W^2 = T * W（线性于 W）；
+  相对全注意力 (nW)^2 = T^2 的比值 = W / T。
+  KV cache = n * W * d * 2（K 与 V）* bytes；只看层内相对值。
+  右上下文（不可压缩的最小延迟）= W * 20 ms。
+
+   块长 W(帧) |   块数 n |  右上下文(ms) | 算力/全注意力 | KV cache(相对) |  流式可用
+  -----------------------------------------------------------------------------------
+            1 |     3000 |            20 |        0.0003 |        6.14 MB |        是
+            5 |      600 |           100 |        0.0017 |        6.14 MB |        是
+           10 |      300 |           200 |        0.0033 |        6.14 MB |        是
+           25 |      120 |           500 |        0.0083 |        6.14 MB |        是
+           50 |       60 |          1000 |        0.0167 |        6.14 MB |      勉强
+          100 |       30 |          2000 |        0.0333 |        6.14 MB |        否
+          300 |       10 |          6000 |        0.1000 |        6.14 MB |        否
+         1000 |        3 |         20000 |        0.3333 |        6.14 MB |        否
+         3000 |        1 |         60000 |        1.0000 |        6.14 MB |        否
+
+  读法：三个量互相拉扯——
+  (1) 右上下文 = W*20 ms 是**不可压缩的延迟地板**（W=25 帧 -&gt; 500 ms）；
+  (2) 算力占比 = W/T，在全注意力下是 W/3000（W=1000 帧 -&gt; 33%）；
+  (3) KV cache = n*W*d*2*2 = T*d*2*2 = 常数（**块状注意力不省 KV cache**，
+      因为总量仍正比于 T；省的是 attention 矩阵的二次项）。
+  所以「流式 = 牺牲质量换延迟」这句不完整：块状注意力牺牲的是**跨块建模**，
+  而 KV cache 的线性项一分不少。真正省算力的手段是**降低 token 率**（PART C）。
+
+==============================================================================
+表 8  流式 vs 双向：上下文量与质量损失的构造模型
+==============================================================================
+  构造模型：单帧的表征质量用「能看到多少未来帧」度量。设双向（无限制）的
+  上下文收益 = 1，则看到 c 帧未来的收益 = 1 - exp(-c / c0)，c0 = 20 帧（构造值）。
+  质量损失 = exp(-c/c0)；延迟 = c * 20 ms。
+
+   未来帧 c |  右上下文(ms) |   相对质量 |   质量损失 |   边际收益
+  ----------------------------------------------------------------
+          0 |             0 |     0.0000 |     1.0000 |     0.0000
+          2 |            40 |     0.0952 |     0.9048 |     0.0952
+          5 |           100 |     0.2212 |     0.7788 |     0.1260
+         10 |           200 |     0.3935 |     0.6065 |     0.1723
+         20 |           400 |     0.6321 |     0.3679 |     0.2387
+         40 |           800 |     0.8647 |     0.1353 |     0.2325
+         80 |          1600 |     0.9817 |     0.0183 |     0.1170
+        200 |          4000 |     1.0000 |     0.0000 |     0.0183
+
+  读法：从 c=0 加到 c=20 帧，质量从 0 提到 0.6321（延迟只到 400 ms）；
+  从 c=20 再加到 c=200，质量只从 0.6321 提到 ~1.0000，延迟却到 4000 ms。
+  **收益指数衰减、代价线性增长 -&gt; 最优 c 一定很小。** 这条曲线解释了为什么
+  流式系统普遍取 300~600 ms 右上下文：再往后是纯赔钱的延迟。
+  注意：这是构造模型（指数饱和），真实曲线的饱和点要靠实验定；
+  但它给出的**形状**（指数收益 vs 线性代价）是结构性的，不依赖具体数字。
+  一个可操作的中间结论：把 c 从 10 加到 20 帧，边际质量收益是 0.2386，
+  代价是 +200 ms；把它与「重说一句的成本（秒级）」相比，价格差三个数量级。
+
+==============================================================================
+表 9  联合模型的三条对齐路线：按训练目标的可算差异
+==============================================================================
+  逐 token 交叉熵（交错序列） / 对比对齐（语音-文本对偶编码） / 显式时长/CTC 对齐
+
+  路线             | 监督信号       | 需要配对数据 | 流式友好   | 主要失效模式
+  ----------------------------------------------------------------------------
+  交错 + 交叉熵    | 下一 token     |           是 | 是         | 文本/语音速率耦合错位
+  对比对齐         | 句级相似度     |     是（弱） | 否（要整句） | 细粒度信息被句向量压掉
+  显式时长 / CTC   | 帧级对齐       | 是（需时长） | 是         | 对齐错误传播到声学
+
+  读法：三条路线的差异不在「谁的模型更强」，而在**监督信号把哪一部分当成隐变量**。
+  交错 + 交叉熵把「文本与语音的速率比」当成隐变量（模型自己学什么时候说多少话）；
+  CTC/时长把它显式给出（可控但需要标注）；对比对齐把它整体丢掉（最省标注，最不可控）。
+  可算判据：交错路线的一个 batch 里，文本 token 与语音 token 的比值方差应稳定在
+  期望速率比附近；方差过大说明速率耦合没有学到（本节表 6 的序列长度账就是它的上界）。
+
+==============================================================================
+表 10  码本利用率的可算诊断：困惑度、熵与「死码率」
+==============================================================================
+  ⚠️ 合成：模拟一个 K=64 的码本在「训练早期 / 中期 / 后期」的分配直方图。
+  困惑度 perplexity = 2^H（H 为分配熵）；利用率 = 用到的码字数 / K；
+  死码率 = 1 - 利用率。健康区间：困惑度 / K 大致在 0.3~0.8。
+  三个阶段的分配用**幂律** counts_i ∝ (i+1)^(-s) 生成（构造），s 越大越集中。
+
+  阶段      |   幂律 s |   H(bit) |    困惑度 |   困惑度/K |   用到码字 |  等效码率占比
+  -------------------------------------------------------------------------------------
+  早期      |     1.80 |     2.67 |      6.39 |      0.100 |      64/64 |         44.6%
+  中期      |     0.60 |     5.66 |     50.63 |      0.791 |      64/64 |         94.4%
+  后期      |     0.15 |     5.99 |     63.34 |      0.990 |      64/64 |         99.8%
+
+  读法：**困惑度是「比特有没有被用满」的直接读数**——早期阶段的困惑度 6.39 意味着
+  平均每帧只在 6.39 个码字之间选，等效码率只有 log2(6.39)/log2(64) = 44.6%，
+  虽然码本名义上是 6 bit。**名义码率与实际码率的差就是被浪费的容量。**
+  死码率本身是可修的（码本重置、EMA 更新、commitment 项），但**它必须先被量出来**；
+  而且要注意：困惑度太低不是「训练不够」，而是「容量过剩」——此时应该缩小码本
+  或提高 token 率（表 3 的等码率曲线），而不是继续加训练步数。
+
+【完】本节全部数字由本脚本生成；PART B/D 与表 10 的数据标 ⚠️ 为合成。</code></pre>
+<h3 id="h-练习">练习<a class="anchor" href="#h-练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>率-失真的敏感度。</strong> 用 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">D</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0077em;">R</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.888em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0359em;">σ</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span><span class="mord"><span class="mord">2</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.888em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">2</span><span class="mord mathnormal mtight" style="margin-right:0.0077em;">R</span><span class="mord mtight">/</span><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">D</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3448em;"><span style="top:-2.3488em;margin-left:-0.0278em;margin-right:0.0714em;"><span class="pstrut" style="height:2.5em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">eff</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.1512em;"><span></span></span></span></span></span></span></span></span></span></span></span></span></span></span></span></span></span>，对 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0278em;">D</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0278em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">eff</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">5</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">10</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">20</span></span></span></span> 各算&quot;每加 1 bit 失真乘多少&quot;，以及&quot;把失真降一半需要多少 bit&quot;。回答：(a) <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0278em;">D</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0278em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">eff</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 越大，加比特越不划算——为什么？（提示：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0278em;">D</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0278em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">eff</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 是&quot;源真正占据的自由度&quot;。）(b) 如果感知度量与均方误差不一致（例如低频误差更明显），这个下界还有意义吗？应该怎么修改？</li>
+<li><strong>等码率曲线的可实现性。</strong> 表 3 里&quot;深码本 + 低率&quot;在信息论上与其他配置等价。请给出一个<strong>码本可实现性的判据</strong>：给定显存上限 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">M</span></span></span></span> 字节、潜向量维数 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">d</span></span></span></span>、每级码本不超过某上限，推导可用的最大 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">b</span></span></span></span>。取 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">M</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> GB、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">d</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">256</span></span></span></span>、每级最大 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">K</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">8192</span></span></span></span>，算出最多能做几级、总 bit 是多少，并与 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">b</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">40</span></span></span></span> 对比。</li>
+<li><strong>RVQ 的逐级收益。</strong> 表 4 的合成算例里第 2 级只再降 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">43.30%</span></span></span></span>、第 3 级再降 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">61.7%</span></span></span></span>。请解释为什么第 3 级的降幅反而大于第 2 级（提示：看每级的码本大小 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">K</span></span></span></span>），并给出一个<strong>公平比较</strong>每一级贡献的方法（例如每 bit 的 MSE 降幅），重新读这张表。</li>
+<li><strong>码本坍缩的检测。</strong> 用表 10 的困惑度公式，自己构造三组分配直方图（每组 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">K</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">64</span></span></span></span>）：(a) 只有一个码字被使用；(b) 8 个码字均匀；(c) 全部 64 个均匀。分别算 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0813em;">H</span></span></span></span>、困惑度、等效码率占比。回答：什么区间应该触发&quot;缩小码本&quot;、什么区间应该触发&quot;加训练步数&quot;？给出你的阈值与理由。</li>
+<li><strong>速率比方差的判据。</strong> §2.3 说交错路线的可算判据是&quot;每单位文本 token 对应的语音 token 数&quot;的方差。请设计一个具体的估计方法：用一个 batch 的数据，写出这个统计量的定义、它应该满足的区间（用表 6 的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">12.5</span></span></span></span> 为期望），以及如何区分&quot;方差大是因为数据本身多样&quot;与&quot;方差大是因为模型没学到速率耦合&quot;（提示：看同一文本在不同说话速率下的条件方差）。</li>
+<li><strong>块状注意力的 KV cache。</strong> 表 7 里 KV cache 恒为 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">6.14</span></span></span></span> MB（与块长无关）。请验证这个等式，并回答：(a) 要真正降低 KV cache，有哪些可算的手段？(b) 若把 KV cache 量化到 int8，上面的数变成多少？(c) 量化对第 3 节的说话人一致性会有什么影响——给出一个可以量出来的判据。</li>
+<li><strong>右上下文的最优值。</strong> 表 8 用的构造模型是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">q</span><span class="mopen">(</span><span class="mord mathnormal">c</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.888em;"></span><span class="mord"><span class="mord mathnormal">e</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.888em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mathnormal mtight">c</span><span class="mord mtight">/</span><span class="mord mtight"><span class="mord mathnormal mtight">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3173em;"><span style="top:-2.357em;margin-left:0em;margin-right:0.0714em;"><span class="pstrut" style="height:2.5em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.143em;"><span></span></span></span></span></span></span></span></span></span></span></span></span></span></span></span></span></span>，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">20</span></span></span></span> 帧。把&quot;代价&quot;改成&quot;延迟 + 误切代价&quot;（用第 1 节表 2 的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">重说</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">3000</span></span></span></span> ms），写出总代价函数并解出最优 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6887em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6887em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span></span></span></span></span></span></span></span>。回答：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6887em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6887em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span></span></span></span></span></span></span></span> 随 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 怎么变？为什么这个最优值不能通过&quot;训练更强的模型&quot;改变？</li>
+</ol>
+<h3 id="h-小结">小结<a class="anchor" href="#h-小结" aria-label="本节链接">#</a></h3>
+<ul>
+<li><strong>码率是三个数的乘积</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0077em;">R</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.4445em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">b</span></span></span></span>，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">b</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.9386em;vertical-align:-0.2441em;"></span><span class="mop"><span class="mop">lo<span style="margin-right:0.0139em;">g</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.207em;"><span style="top:-2.4559em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2441em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">K</span></span></span></span>。<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">50</span></span></span></span> token/s <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6667em;vertical-align:-0.0833em;"></span><span class="mord">+</span></span></span></span> <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">K</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1024</span></span></span></span>（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">10</span></span></span></span> bit）<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.3669em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">500</span></span></span></span> bps <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.3669em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">512</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">:</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> 压缩。</li>
+<li><strong>率-失真下界</strong> <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">D</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0077em;">R</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.888em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0359em;">σ</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span><span class="mord"><span class="mord">2</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.888em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">2</span><span class="mord mathnormal mtight" style="margin-right:0.0077em;">R</span><span class="mord mtight">/</span><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em;">D</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3448em;"><span style="top:-2.3488em;margin-left:-0.0278em;margin-right:0.0714em;"><span class="pstrut" style="height:2.5em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">eff</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.1512em;"><span></span></span></span></span></span></span></span></span></span></span></span></span></span></span></span></span></span>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0278em;">D</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0278em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">eff</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">10</span></span></span></span> 时每加 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> bit 失真只乘 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.8706</span></span></span></span>（降 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">13.0%</span></span></span></span>），把失真降一半需要 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">+</span><span class="mord">5.00</span></span></span></span> bit。<strong>压缩有硬下限。</strong></li>
+<li><strong>等码率下有两种花法</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0077em;">R</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1000</span></span></span></span> bps 时，&quot;深码本 + 低率&quot;（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">25</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">40</span></span></span></span>，60 s 序列 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1500</span></span></span></span>）与&quot;浅码本 + 高率&quot;（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">200</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">5</span></span></span></span>，序列 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">12000</span></span></span></span>）在信息论上等价，注意力算力差 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0641em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord">1/8</span><span class="mclose"><span class="mclose">)</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">1.56%</span></span></span></span>——但前者被码本可实现性封死。<strong>实际配置的窄带 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">25</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∼</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">100</span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">K</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord"><span class="mord">2</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">10</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∼</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord"><span class="mord">2</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">13</span></span></span></span></span></span></span></span></span></span></span></span> 是两条约束的交集。</strong></li>
+<li><strong>残差 VQ 用多级换单级</strong>：合成算例里 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4</span></span></span></span> 级共 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">15</span></span></span></span> bit（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">32768</span></span></span></span> 个码字），存储/查表成本 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord">64</span><span class="mord mathnormal">d</span></span></span></span> vs 单级 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord">32768</span><span class="mord mathnormal">d</span></span></span></span>，<strong>小 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">512</span></span></span></span> 倍</strong>；代价是逐级收益递减（第 1 级降 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">82.4%</span></span></span></span> 的 MSE）与利用率下降（第 3 级只用 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">3/16</span></span></span></span>）。</li>
+<li><strong>码本坍缩的可算读数</strong>：困惑度 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.3669em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8413em;"></span><span class="mord"><span class="mord">2</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8413em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0813em;">H</span></span></span></span></span></span></span></span></span></span></span>，等效码率占比 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.3669em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0813em;">H</span><span class="mord">/</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop"><span class="mop">lo<span style="margin-right:0.0139em;">g</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.207em;"><span style="top:-2.4559em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2441em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">K</span></span></span></span>。表 10 的三阶段是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">6.39/50.63/63.34</span></span></span></span>，对应等效码率 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">44.6%/94.4%/99.8%</span></span></span></span>。<strong>困惑度太低不是&quot;训练不够&quot;，而是&quot;容量过剩&quot;。</strong></li>
+<li><strong>统一词表的参数几乎免费</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">+</span><span class="mord">64</span></span></span></span> 个 token 只增 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.5</span></span></span></span> M 参数（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">d</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4096</span></span></span></span>）。真正的差别在输出结构：扁平一次归一化、能表达跨级依赖；分层四次归一化、更省但不能表达级间依赖。判据是&quot;给定前一级后的条件互信息&quot;。</li>
+<li><strong>交错序列的长度账</strong>：语音 1 级 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">50</span></span></span></span>/s、4 级扁平 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">200</span></span></span></span>/s、加文本 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">204</span></span></span></span>/s；60 s 序列 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">3000/12000/12240</span></span></span></span>，注意力 FLOPs 倍数 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">156.2/2500.0/2601.0</span></span></span></span>。<strong>这是&quot;低 token 率 + 大码本&quot;的量化理由。</strong></li>
+<li><strong>三条对齐路线的差别在&quot;把什么当隐变量&quot;</strong>：交错 + 交叉熵（速率比）、对比对齐（整体丢掉）、显式时长/CTC（显式给出，但错误会传播）。判据是&quot;速率比的条件方差&quot;。</li>
+<li><strong>块状注意力省二次项、不省 KV cache</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord text"><span class="mord">KV cache</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">d</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord text"><span class="mord">bytes</span></span></span></span></span>（表 7 恒为 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">6.14</span></span></span></span> MB），右上下文 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.3669em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">W</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">20</span></span></span></span> ms，算力占比 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.3669em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">W</span><span class="mord">/</span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span></span></span></span>。</li>
+<li><strong>右上下文最优值很小</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">q</span><span class="mopen">(</span><span class="mord mathnormal">c</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.888em;"></span><span class="mord"><span class="mord mathnormal">e</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.888em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mathnormal mtight">c</span><span class="mord mtight">/</span><span class="mord mtight"><span class="mord mathnormal mtight">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3173em;"><span style="top:-2.357em;margin-left:0em;margin-right:0.0714em;"><span class="pstrut" style="height:2.5em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.143em;"><span></span></span></span></span></span></span></span></span></span></span></span></span></span></span></span></span></span>，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">c</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">20</span></span></span></span> 帧给 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.6321</span></span></span></span> 质量/<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">400</span></span></span></span> ms 延迟，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">c</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">200</span></span></span></span> 才到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4831em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span>/<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4000</span></span></span></span> ms。<strong>收益指数衰减、代价线性增长</strong>——这是流式系统普遍取 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">300</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∼</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">600</span></span></span></span> ms 的原因。</li>
+<li><strong>⚠️ 外部成绩保守表述</strong>：本节没有引用任何具体系统的实测数字。三条路线&quot;谁更好&quot;属于未收敛的讨论（C 级推测），判定它需要三样东西：同一测试集上的效应量与置信区间、码本困惑度、速率比方差。</li>
+</ul>
+<blockquote>
+<p>下一节：边界、开放问题与判断力 —— 级联/端到端的判据表、延迟-成本-可控性三角、长音频与说话人一致性的开放问题，以及全课收束</p>
+</blockquote>

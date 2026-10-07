@@ -1,0 +1,605 @@
+<h2 id="h-多文档融合与证据聚合覆盖冲突与去重">多文档融合与证据聚合：覆盖、冲突与去重<a class="anchor" href="#h-多文档融合与证据聚合覆盖冲突与去重" aria-label="本节链接">#</a></h2>
+<h3 id="h-这一节要解决什么">这一节要解决什么<a class="anchor" href="#h-这一节要解决什么" aria-label="本节链接">#</a></h3>
+<p>上游把一批候选排好序交过来了 —— 可能来自稀疏与稠密两路（第 3 章），可能来自多跳迭代（上一节），也可能来自并列分解的多个子查询。现在要做的动作看起来很简单：</p>
+<pre data-lang="python"><code class="language-python">context = &quot;\n\n&quot;.join(top_k_chunks)</code></pre>
+<p><strong>这一步是绝大多数 RAG 系统的隐性失效点</strong>，因为它把&quot;相关性排序&quot;当成了&quot;证据装配&quot;。两者的目标函数不同：</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>排序</th>
+<th>装配</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>目标</td>
+<td>把相关的<strong>排前面</strong></td>
+<td>选一个<strong>集合</strong>最大化答案被支持的程度</td>
+</tr>
+<tr>
+<td>单元</td>
+<td>单个候选（独立打分）</td>
+<td>整个集合（<strong>项与项之间有交互</strong>）</td>
+</tr>
+<tr>
+<td>失效</td>
+<td>名次不对</td>
+<td><strong>覆盖不足 / 冗余挤占 / 冲突未消解</strong></td>
+</tr>
+</tbody></table>
+<p>三者的关系是<strong>独立</strong>的，必须分开测：</p>
+<pre><code>覆盖不足：需要 6 个事实，选进来的块只覆盖了 2 个   → 答不全
+冗余挤占：6 个名额里有 4 个在说同一件事           → 名额被浪费，等价于覆盖不足
+冲突未消解：同一事实有两个来源给出不同值，被静默合并 → 答得&quot;确定&quot;但可能错</code></pre>
+<p>这一节要回答四个问题：</p>
+<ol>
+<li><strong>装配的目标函数应该是什么？</strong> 为什么它是<strong>子模</strong>的，贪心的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1/</span><span class="mord mathnormal">e</span><span class="mclose">)</span></span></span></span> 保证说了什么、<strong>不</strong>说什么。</li>
+<li><strong>覆盖与冗余怎么同时度量？</strong> 为什么只看其中一个一定会被优化钻空子。</li>
+<li><strong>多个来源给出不同值时怎么办？</strong> 三种处方（时间、权威、显式暴露）各自的适用条件与代价。</li>
+<li><strong>这套东西的边界在哪？</strong> 贪心修不了什么，以及它在真实系统里为什么需要一个&quot;需求集预测器&quot;。</li>
+</ol>
+<p>结论先放在这里：</p>
+<blockquote>
+<p><strong>装配的目标不是&quot;相关性之和最大&quot;，而是&quot;在预算内让必需信息被覆盖&quot;。</strong> 本节实测：同样 5 个块的预算，按分数取 top-<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 的加权覆盖率是 <strong>0.325</strong>，而覆盖贪心是 <strong>0.932</strong>；但<strong>覆盖贪心用的是一个 oracle 需求集</strong>（它知道答案需要哪些事实）—— 所以真实收益取决于你能多准地预测&quot;这个问题需要哪些事实&quot;，而这正是上一节查询分解要解决的问题。</p>
+</blockquote>
+<h3 id="h-一目标函数的改变从排序到选集合">一、目标函数的改变：从排序到选集合<a class="anchor" href="#h-一目标函数的改变从排序到选集合" aria-label="本节链接">#</a></h3>
+<h4 id="h-11-为什么-top-math2-不是装配">1.1 为什么 top-<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 不是装配<a class="anchor" href="#h-11-为什么-top-math2-不是装配" aria-label="本节链接">#</a></h4>
+<p>top-<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 的隐含假设是<strong>候选之间独立</strong>：第 3 个块的价值不因第 2 个块被选中而改变。装配里这个假设直接失效：</p>
+<ul>
+<li>如果第 2 个块已经覆盖了事实 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span></span></span></span>，那么第 3 个块里关于 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span></span></span></span> 的内容<strong>边际价值为零</strong>（甚至为负，因为它占用预算并制造干扰）；</li>
+<li>反过来，如果第 2 个块覆盖了 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span></span></span></span> 的一半（例如只给了冲突值中的一个），第 3 个块覆盖另一半时的价值<strong>高于</strong>它单独出现时的平均价值。</li>
+</ul>
+<p><strong>这就是&quot;交互&quot;</strong>：价值取决于集合的当前状态。一个只按单点打分的排序器<strong>结构上无法表达</strong>这件事。</p>
+<h4 id="h-12-形式化加权覆盖是子模函数">1.2 形式化：加权覆盖是子模函数<a class="anchor" href="#h-12-形式化加权覆盖是子模函数" aria-label="本节链接">#</a></h4>
+<p>设候选集合为 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathcal" style="margin-right:0.0583em;">C</span></span></span></span>，每个候选 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">c</span></span></span></span> 覆盖一个事实集合 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">F</span><span class="mopen">(</span><span class="mord mathnormal">c</span><span class="mclose">)</span></span></span></span>；查询需要的需求集为 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6887em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">F</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6887em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mbin mtight">⋆</span></span></span></span></span></span></span></span></span></span></span>，每个需求 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span></span></span></span> 有权重 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7167em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0269em;">w</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0269em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.1076em;">f</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span></span>。定义</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathrm" style="margin-right:0.0139em;">Cov</span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.4882em;vertical-align:-1.4382em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.05em;"><span style="top:-1.8479em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.1076em;">f</span><span class="mrel mtight">∈</span><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.1389em;">F</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6183em;"><span style="top:-2.786em;margin-right:0.0714em;"><span class="pstrut" style="height:2.5em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mbin mtight">⋆</span></span></span></span></span></span></span></span></span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∑</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.4382em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0269em;">w</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0269em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.1076em;">f</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:3.0717em;vertical-align:-1.3217em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:-0.1667em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="minner"><span class="mopen delimcenter" style="top:0em;"><span class="delimsizing size4">[</span></span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∈</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.05em;"><span style="top:-1.8557em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">c</span><span class="mrel mtight">∈</span><span class="mord mathnormal mtight" style="margin-right:0.0576em;">S</span></span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">⋃</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.3217em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">F</span><span class="mopen">(</span><span class="mord mathnormal">c</span><span class="mclose">)</span><span class="mclose delimcenter" style="top:0em;"><span class="delimsizing size4">]</span></span></span></span></span></span></span></p>
+<p><strong>性质 1（单调）</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8193em;vertical-align:-0.136em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">⊆</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">⇒</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathrm" style="margin-right:0.0139em;">Cov</span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≤</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathrm" style="margin-right:0.0139em;">Cov</span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="mclose">)</span></span></span></span>。多选一个块不会让覆盖变差。</p>
+<p><strong>性质 2（子模）</strong>：对任意 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8193em;vertical-align:-0.136em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">⊆</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span></span></span></span> 与 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">c</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel"><span class="mord"><span class="mrel">∈</span></span><span class="mord vbox"><span class="thinbox"><span class="llap"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="inner"><span class="mord"><span class="mord">/</span><span class="mspace" style="margin-right:0.0556em;"></span></span></span><span class="fix"></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span></span></span></span>，</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathrm" style="margin-right:0.0139em;">Cov</span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">∪</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">{</span><span class="mord mathnormal">c</span><span class="mclose">})</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathrm" style="margin-right:0.0139em;">Cov</span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span><span class="mclose">)</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≥</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathrm" style="margin-right:0.0139em;">Cov</span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">∪</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">{</span><span class="mord mathnormal">c</span><span class="mclose">})</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathrm" style="margin-right:0.0139em;">Cov</span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="mclose">)</span></span></span></span></span></p>
+<p>即<strong>边际收益递减</strong>。证明只需看每一项：某个 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span></span></span></span> 在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span></span></span></span> 中未被覆盖而在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span></span></span></span> 中已被覆盖时，左边贡献 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7167em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0269em;">w</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0269em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.1076em;">f</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span></span>、右边贡献 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0</span></span></span></span>；其余情形两边相同。<strong>所以&quot;覆盖&quot;天然是子模的</strong>，这不是建模选择，是集合并运算的性质。</p>
+<p><strong>性质 3（贪心的保证）</strong>：对单调子模函数在基数约束 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">∣</span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span><span class="mord">∣</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≤</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0502em;">B</span></span></span></span> 下最大化，贪心（每步选边际增益最大的元素）满足</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0361em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathrm" style="margin-right:0.0139em;">Cov</span></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0576em;">S</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0576em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">greedy</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≥</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.4em;vertical-align:-0.95em;"></span><span class="minner"><span class="mopen delimcenter" style="top:0em;"><span class="delimsizing size3">(</span></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3214em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">e</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mclose delimcenter" style="top:0em;"><span class="delimsizing size3">)</span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathrm" style="margin-right:0.0139em;">Cov</span></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0576em;">S</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.7387em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mbin mtight">⋆</span></span></span></span></span></span></span></span><span class="mclose">)</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.632</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathrm" style="margin-right:0.0139em;">Cov</span></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0576em;">S</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.7387em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mbin mtight">⋆</span></span></span></span></span></span></span></span><span class="mclose">)</span></span></span></span></span></p>
+<p><strong>这个保证的准确含义（必须说清，否则会被误用）</strong>：</p>
+<ul>
+<li>它是<strong>最坏情况</strong>下界，不是典型表现。本节实测（表三）：在 150 个随机实例上，<strong>贪心/最优 = 1.000（最小值也是 1.000）</strong> —— 贪心一次次都拿到了最优。</li>
+<li>它是<strong>近似比</strong>，不是&quot;达到 63% 就够用&quot;的目标。当最优覆盖率是 0.4 时，63% 意味着 0.25 —— 一个在业务上可能完全不可用的数字。</li>
+<li>它<strong>只对覆盖目标成立</strong>。一旦目标里加了冲突暴露、指令预算、去重等其它项，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1/</span><span class="mord mathnormal">e</span><span class="mclose">)</span></span></span></span> 就不再适用（那些目标未必子模，或约束不再是纯基数）。</li>
+</ul>
+<p>表三里的人造实例说明这个下界不是空的：全集 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">{</span><span class="mord">1</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="minner">…</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">6</span><span class="mclose">}</span></span></span></span>，候选集合 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">{</span><span class="mord">1</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">2</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">3</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">4</span><span class="mclose">}</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mopen">{</span><span class="mord">1</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">2</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">5</span><span class="mclose">}</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mopen">{</span><span class="mord">3</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">4</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">6</span><span class="mclose">}</span></span></span></span>，预算 2。<strong>贪心先吃掉最大的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">{</span><span class="mord">1</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">2</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">3</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">4</span><span class="mclose">}</span></span></span></span>，之后只能再拿 1 个新元素，覆盖 5；最优是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">{</span><span class="mord">1</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">2</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">5</span><span class="mclose">}</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">{</span><span class="mord">3</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">4</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">6</span><span class="mclose">}</span></span></span></span>，覆盖 6</strong> —— 比值 0.833。构造更大的实例可以把比值压到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1/</span><span class="mord mathnormal">e</span></span></span></span>。</p>
+<h4 id="h-13-一个不能省的工程前提需求集从哪来">1.3 一个不能省的工程前提：需求集从哪来<a class="anchor" href="#h-13-一个不能省的工程前提需求集从哪来" aria-label="本节链接">#</a></h4>
+<p>上面的式子需要一个 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6887em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">F</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6887em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mbin mtight">⋆</span></span></span></span></span></span></span></span></span></span></span> —— <strong>&quot;回答这个问题需要哪些事实&quot;</strong>。真实系统里它不可得，只能<strong>预测</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>来源</th>
+<th>做法</th>
+<th>可靠性</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>查询分解（第 1 节）</td>
+<td>把查询拆成子问题，每个子问题一个需求</td>
+<td>中（分解质量决定一切）</td>
+</tr>
+<tr>
+<td>查询类型模板</td>
+<td>比较型 / 聚合型 / 枚举型各自的需求结构</td>
+<td>高（但覆盖面窄）</td>
+</tr>
+<tr>
+<td>标注</td>
+<td>在黄金集上人工标&quot;黄金证据&quot;</td>
+<td>高（只有评测集有）</td>
+</tr>
+</tbody></table>
+<p><strong>这就是本节所有实验都标 <code>(oracle)</code> 的原因</strong>：表一、表二、表四里的覆盖贪心<strong>直接使用了答案的需求集</strong>，所以它给出的是&quot;<strong>如果需求集已知，装配层还有多少收益</strong>&quot;的上界。<strong>真实收益 = 这个上界 × 需求集预测的准确率。</strong> 把这两件事混起来谈，就是&quot;论文里的覆盖贪心在我们线上没效果&quot;的最常见原因。</p>
+<h3 id="h-二覆盖率与冗余率必须同时看">二、覆盖率与冗余率：必须同时看<a class="anchor" href="#h-二覆盖率与冗余率必须同时看" aria-label="本节链接">#</a></h3>
+<h4 id="h-21-定义">2.1 定义<a class="anchor" href="#h-21-定义" aria-label="本节链接">#</a></h4>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord cjk_fallback">覆盖率</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.7365em;vertical-align:-1.1218em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.6147em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mop"><span class="mop op-symbol small-op" style="position:relative;top:0em;">∑</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1864em;"><span style="top:-2.4003em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.1076em;">f</span><span class="mrel mtight">∈</span><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.1389em;">F</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6183em;"><span style="top:-2.786em;margin-right:0.0714em;"><span class="pstrut" style="height:2.5em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mbin mtight">⋆</span></span></span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.4358em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0269em;">w</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0269em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.1076em;">f</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.8647em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mop"><span class="mop op-symbol small-op" style="position:relative;top:0em;">∑</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2253em;"><span style="top:-2.4003em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.1076em;">f</span><span class="mrel mtight">∈</span><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.1389em;">F</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6183em;"><span style="top:-2.786em;margin-right:0.0714em;"><span class="pstrut" style="height:2.5em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mbin mtight">⋆</span></span></span></span></span></span></span></span><span class="mbin mtight">∩</span><span class="mop op-symbol small-op mtight" style="position:relative;top:0em;">⋃</span><span class="mspace mtight" style="margin-right:0.1952em;"></span><span class="mord mathnormal mtight" style="margin-right:0.0576em;">S</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.4747em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0269em;">w</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0269em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.1076em;">f</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.1218em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord cjk_fallback">冗余率</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:2.363em;vertical-align:-0.936em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.427em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">∣</span><span class="mord text"><span class="mord cjk_fallback">选中的事实槽位</span></span><span class="mord">∣</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">∣</span><span class="mord text"><span class="mord cjk_fallback">选中的不同事实</span></span><span class="mord">∣</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.936em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord cjk_fallback">事实密度</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.363em;vertical-align:-0.936em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.427em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">∣</span><span class="mord text"><span class="mord cjk_fallback">选中的事实槽位</span></span><span class="mord">∣</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">∣</span><span class="mord text"><span class="mord cjk_fallback">选中的、属于</span><span class="mord"> </span></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">F</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6887em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mbin mtight">⋆</span></span></span></span></span></span></span></span><span class="mord text"><span class="mord"> </span><span class="mord cjk_fallback">的事实槽位</span></span><span class="mord">∣</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.936em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></p>
+<p><strong>为什么要三个而不是一个</strong>：</p>
+<ul>
+<li>只看覆盖率 → 系统会往上下文里塞大量块（覆盖上去了，干扰也上去了，第 5 章第 1 节）；</li>
+<li>只看冗余率 → 一个只选 1 个块的系统冗余率恒为 0，覆盖率也惨不忍睹；</li>
+<li><strong>事实密度</strong>是两个量的乘积效应的单一读数：它直接回答&quot;<strong>你喂进去的内容里，有多少是用得上的</strong>&quot;。</li>
+</ul>
+<h4 id="h-22-表一读数">2.2 表一读数<a class="anchor" href="#h-22-表一读数" aria-label="本节链接">#</a></h4>
+<p>200 条查询，预算 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0502em;">B</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">5</span></span></span></span> 个块，事实 300 个 / 块 900 个（每块含 1~4 个事实）：</p>
+<table>
+<thead>
+<tr>
+<th>策略</th>
+<th>加权覆盖率</th>
+<th>冗余率</th>
+<th>冲突暴露率</th>
+<th>事实密度</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>top-<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span></td>
+<td>0.325</td>
+<td>0.057</td>
+<td>0.012</td>
+<td>0.162</td>
+</tr>
+<tr>
+<td>top-<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> + 去重</td>
+<td>0.327</td>
+<td>0.052</td>
+<td>0.012</td>
+<td>0.157</td>
+</tr>
+<tr>
+<td>覆盖贪心(oracle)</td>
+<td><strong>0.932</strong></td>
+<td>0.011</td>
+<td>0.000</td>
+<td><strong>0.369</strong></td>
+</tr>
+<tr>
+<td>覆盖贪心 + 冲突(oracle)</td>
+<td>0.893</td>
+<td>0.032</td>
+<td><strong>0.280</strong></td>
+<td>0.373</td>
+</tr>
+</tbody></table>
+<p><strong>四处必须读出来的东西</strong>：</p>
+<ul>
+<li><strong>覆盖率 0.325 → 0.932</strong>：这是&quot;把目标从排序换成覆盖&quot;的全部价值。注意这不是&quot;换了一个更好的重排器&quot; —— 候选池和分数都没变，<strong>变的只是选择准则</strong>。</li>
+<li><strong>事实密度 0.162 → 0.369</strong>：同样 5 个块，喂给模型的内容里&quot;用得上&quot;的比例翻了一倍多。<strong>在固定 token 预算下，这等价于把有效上下文扩大了一倍。</strong></li>
+<li><strong><code>top-k + 去重</code> 几乎没有变化（0.325 → 0.327）</strong>：因为这份合成语料的块之间本来就几乎不重复（冗余率 0.057）。<strong>这是一个重要的边界提示</strong>：去重的价值完全取决于语料的近重复程度（第 3 章第 3 节的&quot;近重复挤占&quot;）。<strong>先测冗余率再决定要不要做去重</strong> —— 如果冗余率 &lt; 0.1，去重不会带来什么。</li>
+<li><strong>冲突感知把暴露率从 0.012 提到 0.280</strong>，代价是覆盖率 0.932 → 0.893、冗余率 0.011 → 0.032。<strong>这个交换是否值得，取决于业务对&quot;数值冲突&quot;的敏感度</strong>（见第 3 部分）。</li>
+</ul>
+<h4 id="h-23-边际收益与预算表二">2.3 边际收益与预算（表二）<a class="anchor" href="#h-23-边际收益与预算表二" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>预算 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0502em;">B</span></span></span></span></th>
+<th>top-<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 覆盖率</th>
+<th>覆盖贪心覆盖率</th>
+<th>贪心增益</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1</td>
+<td>0.148</td>
+<td>0.297</td>
+<td>0.149</td>
+</tr>
+<tr>
+<td>2</td>
+<td>0.214</td>
+<td>0.479</td>
+<td>0.265</td>
+</tr>
+<tr>
+<td>3</td>
+<td>0.264</td>
+<td>0.635</td>
+<td>0.371</td>
+</tr>
+<tr>
+<td>5</td>
+<td>0.345</td>
+<td>0.929</td>
+<td>0.584</td>
+</tr>
+<tr>
+<td>8</td>
+<td>0.426</td>
+<td><strong>1.000</strong></td>
+<td>0.574</td>
+</tr>
+</tbody></table>
+<p><strong>读法</strong>：贪心的增益随预算<strong>先增后平</strong>（0.149 → 0.584 → 0.574）—— 因为在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0502em;">B</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">8</span></span></span></span> 时<strong>贪心已经把需求集覆盖满了</strong>（1.000），再多的预算对它没有意义。而 top-<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 仍在缓慢爬升（0.426）：<strong>它把额外的预算花在了&quot;更多相关但重复的块&quot;上</strong>。</p>
+<p><strong>这条曲线的工程含义</strong>：装配层的收益与<strong>预算</strong>是强耦合的。</p>
+<ul>
+<li>预算紧（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8193em;vertical-align:-0.136em;"></span><span class="mord mathnormal" style="margin-right:0.0502em;">B</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≤</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2</span></span></span></span>）：装配策略的差别不大（0.149~0.265），因为名额太少，谁都覆盖不全 —— 此时应该先解决<strong>召回</strong>；</li>
+<li>预算中（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0502em;">B</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">3</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∼</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">5</span></span></span></span>）：装配策略的差别最大（0.371~0.584）—— <strong>这是最该做覆盖贪心的区间</strong>；</li>
+<li>预算松（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8193em;vertical-align:-0.136em;"></span><span class="mord mathnormal" style="margin-right:0.0502em;">B</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≥</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">8</span></span></span></span>）：贪心饱和，收益转向&quot;减少干扰&quot;（第 5 章第 1 节的干扰竞争）。</li>
+</ul>
+<p><figure><img class="md-img" src="content/courses/rag-systems/assets/chapter-4-figure-03.svg" alt="装配：选择准则决定覆盖率" loading="lazy" decoding="async"><figcaption>装配：选择准则决定覆盖率</figcaption></figure>
+</p>
+<h3 id="h-三冲突消解同一事实的多个值">三、冲突消解：同一事实的多个值<a class="anchor" href="#h-三冲突消解同一事实的多个值" aria-label="本节链接">#</a></h3>
+<h4 id="h-31-冲突的三个来源">3.1 冲突的三个来源<a class="anchor" href="#h-31-冲突的三个来源" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>来源</th>
+<th>例子</th>
+<th>特征</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>版本</strong></td>
+<td>同一文档的新旧两个版本给出不同的数值</td>
+<td>有时间戳可判</td>
+</tr>
+<tr>
+<td><strong>来源权威</strong></td>
+<td>官方文档 vs 第三方博客</td>
+<td>有来源分级可判</td>
+</tr>
+<tr>
+<td><strong>抽取错误</strong></td>
+<td>模型从同一段文本里抽出了不同的值</td>
+<td><strong>无外部信号可判</strong></td>
+</tr>
+</tbody></table>
+<p><strong>第三类最危险</strong>，因为它无法靠元数据解决：两个值看起来同等可信。<strong>它的正确处置不是&quot;选一个&quot;，而是&quot;暴露出来&quot;</strong> —— 因为选错的代价（用户按错误数值行动）通常远高于&quot;承认有分歧&quot;的代价。</p>
+<h4 id="h-32-三种处方与适用条件">3.2 三种处方与适用条件<a class="anchor" href="#h-32-三种处方与适用条件" aria-label="本节链接">#</a></h4>
+<p><strong>处方 A：时间戳优先</strong></p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.45em;vertical-align:-0.7em;"></span><span class="mord text"><span class="mord cjk_fallback">取</span><span class="mord"> </span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop">ar<span style="margin-right:0.0139em;">g</span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.4306em;"><span style="top:-2.4em;margin-left:0em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.0359em;">v</span></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span><span class="mop">max</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.7em;"><span></span></span></span></span></span><span class="mspace"> </span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathrm">ts</span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0359em;">v</span><span class="mclose">)</span></span></span></span></span></p>
+<p>适用条件：<strong>事实本身随时间变化</strong>（价格、政策、配置项）。判据：把同一事实的历史值按时间排开，若值随时间显著漂移 → 适用。<strong>边界</strong>：如果新版本是错的（发布事故），时间优先会放大错误 —— 所以它需要与&quot;回滚可感知&quot;配套（第 6 章第 1 节）。</p>
+<p><strong>处方 B：来源权威投票</strong></p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6944em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">v</span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.2222em;"><span class="mord">^</span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.4001em;vertical-align:-1.3501em;"></span><span class="mop">ar<span style="margin-right:0.0139em;">g</span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.4306em;"><span style="top:-2.4em;margin-left:0em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0359em;">v</span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span><span class="mop">max</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.7em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.05em;"><span style="top:-1.9em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">s</span><span class="mrel mtight">:</span><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.0359em;">v</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1645em;"><span style="top:-2.357em;margin-left:-0.0359em;margin-right:0.0714em;"><span class="pstrut" style="height:2.5em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mord mathnormal mtight">s</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.143em;"><span></span></span></span></span></span></span><span class="mrel mtight">=</span><span class="mord mathnormal mtight" style="margin-right:0.0359em;">v</span></span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∑</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.3501em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0037em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">s</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span></span></p>
+<p>适用条件：<strong>来源有稳定可信度分级</strong>，且冲突主要来自二手转载。判据：来源与正确率有单调关系（可在黄金集上验证）。<strong>边界</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0037em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">s</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 的估计本身会过拟合到历史；且当权威来源只覆盖一部分事实时，投票会退化成&quot;谁出现得多&quot;。</p>
+<p><strong>处方 C：显式暴露（不合并）</strong></p>
+<p>做法：把冲突作为<strong>输出的一部分</strong>呈现（&quot;来源 A 说是 X，来源 B 说是 Y&quot;），或在答案里标注不确定性。</p>
+<p>适用条件：<strong>抽取错误类冲突</strong>，以及任何&quot;选错的代价 &gt; 承认不确定的代价&quot;的场景。判据：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord cjk_fallback">暴露收益</span></span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="mopen">(</span><span class="mord text"><span class="mord cjk_fallback">冲突</span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="mopen">(</span><span class="mord text"><span class="mord cjk_fallback">选错</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∣</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord cjk_fallback">冲突</span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8778em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">错</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord cjk_fallback">暴露成本</span></span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7778em;vertical-align:-0.0833em;"></span><span class="mord text"><span class="mord cjk_fallback">额外的</span><span class="mord"> token</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord cjk_fallback">用户认知负担</span></span></span></span></span></span></p>
+<p><strong>本节实测的代价</strong>（表四，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0502em;">B</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">5</span></span></span></span>）：</p>
+<table>
+<thead>
+<tr>
+<th>冲突奖励</th>
+<th>加权覆盖率</th>
+<th>冲突暴露率</th>
+<th>冗余率</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>0.00</td>
+<td>1.000</td>
+<td>0.018</td>
+<td>0.048</td>
+</tr>
+<tr>
+<td>0.25</td>
+<td>1.000</td>
+<td><strong>0.775</strong></td>
+<td>0.094</td>
+</tr>
+<tr>
+<td>0.50</td>
+<td>1.000</td>
+<td>0.775</td>
+<td>0.094</td>
+</tr>
+<tr>
+<td>1.00</td>
+<td>0.998</td>
+<td>0.777</td>
+<td>0.094</td>
+</tr>
+<tr>
+<td>2.00</td>
+<td>0.920</td>
+<td>0.756</td>
+<td>0.116</td>
+</tr>
+<tr>
+<td>3.00</td>
+<td>0.920</td>
+<td>0.756</td>
+<td>0.116</td>
+</tr>
+</tbody></table>
+<p><strong>读数</strong>：把冲突暴露的边际权重从 0 提到 0.25，暴露率就从 0.018 跳到 <strong>0.775</strong>，而覆盖率几乎不动（1.000）。<strong>这是因为冲突暴露的边际收益极陡</strong>：一个已经覆盖了 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span></span></span></span> 的集合，再选一个含 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span></span></span></span> 另一个取值的块，其覆盖增益是 0 —— 所以在纯覆盖贪心里它永远不会被选中（暴露率 0.018）。<strong>加一点权重就足以改变选择</strong>。</p>
+<p>但继续加大权重（2.0、3.0）开始伤害覆盖率（0.920），<strong>因为装配名额是有限的：为冲突花掉的每个名额都是从覆盖里拿的</strong>。拐点就在 0.25~1.0 之间 —— 这也说明<strong>权重不需要精调，只要不是 0</strong>。</p>
+<h4 id="h-33-联合概率陷阱多事实聚合为什么是指数">3.3 联合概率陷阱：多事实聚合为什么是指数<a class="anchor" href="#h-33-联合概率陷阱多事实聚合为什么是指数" aria-label="本节链接">#</a></h4>
+<p>装配层还有一个必须显式处理的量。<strong>当答案需要 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">m</span></span></span></span> 个事实同时正确时，端到端正确率是乘积</strong>：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="mopen">(</span><span class="mord text"><span class="mord cjk_fallback">答案正确</span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.9291em;vertical-align:-1.2777em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.6514em;"><span style="top:-1.8723em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">i</span><span class="mrel mtight">=</span><span class="mord mtight">1</span></span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∏</span></span></span><span style="top:-4.3em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">m</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.2777em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.9088em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.7144em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">m</span></span></span></span></span></span></span></span></span></span></span></span></span></p>
+<p><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.9</span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">m</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">6</span></span></span></span> 时是 <strong>0.531</strong>；<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">m</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">10</span></span></span></span> 时降到 <strong>0.349</strong>。<strong>这个式子有两个直接后果</strong>：</p>
+<ol>
+<li><strong>&quot;多给证据&quot;不总是好事</strong>：每多一个必需事实，就多一个失败点。所以装配应该<strong>优先保证高权重（必需）事实的覆盖</strong>，而不是&quot;尽量多&quot; —— 这正是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7167em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0269em;">w</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0269em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.1076em;">f</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span></span> 存在的理由。</li>
+<li><strong>它解释了为什么&quot;引用多、覆盖全&quot;的答案反而更容易错</strong>：如果模型必须把 10 个事实拼起来，每一个都 90% 准，那么&quot;看起来证据充分&quot;的答案反而比&quot;只用一个事实&quot;的答案更不可靠。<strong>所以装配的目标不是覆盖最大化，而是&quot;覆盖必需项 + 承认非必需项的不确定&quot;。</strong></li>
+</ol>
+<h3 id="h-四边界这套方法修不了什么">四、边界：这套方法修不了什么<a class="anchor" href="#h-四边界这套方法修不了什么" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>它不修召回。</strong> 如果需求事实不在候选池里，任何装配策略都覆盖不到。判据：先算&quot;候选池对需求集的覆盖率上界&quot;（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord">Cov</span></span><span class="mopen">(</span><span class="mord mathcal" style="margin-right:0.0583em;">C</span><span class="mclose">)</span></span></span></span>）—— <strong>如果这个上界只有 0.5，装配做到最好也只有 0.5</strong>，此时应该回到检索层（第 2、3 章）。</li>
+<li><strong>它依赖需求集的预测。</strong> §1.3 已经说明：本节的所有覆盖实验都是 oracle 上界。真实收益 = 上界 × 预测准确率。<strong>所以&quot;先做查询分解、再谈装配&quot;是正确的顺序。</strong></li>
+<li><strong>它把干扰当成免费。</strong> 覆盖贪心只关心&quot;是否覆盖&quot;，不关心&quot;塞进去的块是否与必需事实竞争注意力&quot;。第 5 章第 1 节会证明干扰会让证据取用概率下降 —— <strong>所以覆盖率不是越高越好，而是&quot;在预算内、干扰可控的前提下尽量高&quot;。</strong> 本节表二里 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8193em;vertical-align:-0.136em;"></span><span class="mord mathnormal" style="margin-right:0.0502em;">B</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≥</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">8</span></span></span></span> 后贪心饱和而 top-<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 仍在涨，恰恰说明<strong>&quot;覆盖率&quot;这个单一指标在预算松时会失去指导意义</strong>。</li>
+<li><strong>冲突暴露率有天花板。</strong> 它只能在&quot;候选池里同时存在两个取值&quot;时被提升。如果检索只召回了其中一个来源，装配层无从知道有冲突 —— <strong>这需要检索层的多样性（多路召回、多来源索引），不是装配能解决的。</strong></li>
+</ol>
+<h3 id="h-代码覆盖冗余与冲突四个可测问题">代码：覆盖、冗余与冲突四个可测问题<a class="anchor" href="#h-代码覆盖冗余与冲突四个可测问题" aria-label="本节链接">#</a></h3>
+<p>⚠️ <strong>全部为合成事实库</strong>：块由随机事实集合构成，冲突事实按来源分布取值。它不模拟真实文本，只模拟&quot;覆盖 / 冗余 / 冲突&quot;三种结构与装配策略的交互。</p>
+<pre data-lang="python"><code class="language-python">&quot;&quot;&quot;
+多文档融合与证据聚合：覆盖、冗余、冲突。
+全部为合成事实库 ⚠️，只依赖 numpy。
+  表一 四种装配策略在等预算下的覆盖/冗余/冲突暴露（B=5）
+  表二 覆盖率随预算的边际收益（top-k vs 覆盖贪心）
+  表三 贪心的 (1-1/e) 下界检验（对 B=3 的 top-15 候选做穷举最优）
+  表四 冲突感知的代价：暴露率 vs 覆盖率
+&quot;&quot;&quot;
+import itertools
+import numpy as np
+
+N_FACT, N_CHUNK = 300, 900
+P_CONFLICT = 0.15          # 有多个来源给出不同取值的事实比例
+
+
+def make_facts(seed=1):
+    rng = np.random.default_rng(seed)
+    conflicted = rng.random(N_FACT) &lt; P_CONFLICT
+    w = np.ones(N_FACT)
+    w[rng.choice(N_FACT, 30, replace=False)] = 2.5      # 少数&quot;关键事实&quot;权重更高
+    return conflicted, w
+
+
+def make_chunks(rng, conflicted):
+    &quot;&quot;&quot;每个块提到 1~4 个事实；冲突事实的取值按来源分布抽。&quot;&quot;&quot;
+    chunks = []
+    for _ in range(N_CHUNK):
+        k = int(rng.integers(1, 5))
+        fs = rng.choice(N_FACT, k, replace=False)
+        items = {}
+        for f in fs:
+            f = int(f)
+            items[f] = int(rng.random() &lt; 0.7) if conflicted[f] else 0
+        chunks.append(items)
+    return chunks
+
+
+def make_query(rng, m=6):
+    gold = rng.choice(N_FACT, m, replace=False).astype(int)
+    return gold
+
+
+def chunk_scores(chunks, gold, w, rng, noise=1.2):
+    &quot;&quot;&quot;候选分数 = 与黄金事实集的加权重叠 + 噪声（top-k 因此是一个&quot;不错的&quot;基线）。&quot;&quot;&quot;
+    s = np.zeros(len(chunks))
+    gset = set(int(f) for f in gold)
+    for i, it in enumerate(chunks):
+        s[i] = sum(w[f] for f in it if f in gset) + noise * rng.normal()
+    return s
+
+
+# ---------------------------------------------------------------- 装配策略
+def pick_topk(chunks, score, B):
+    return list(np.argsort(-score)[:B])
+
+
+def pick_topk_dedup(chunks, score, B, thr=0.8):
+    out, seen = [], set()
+    for i in np.argsort(-score):
+        fs = set(chunks[i])
+        if fs and len(fs &amp; seen) / len(fs) &gt; thr:
+            continue
+        out.append(int(i))
+        seen |= fs
+        if len(out) == B:
+            break
+    return out
+
+
+def pick_greedy(chunks, score, B, w, gold, conflict_bonus=0.0, conflicted=None,
+                pool=None):
+    &quot;&quot;&quot;加权覆盖贪心；conflict_bonus&gt;0 时给&quot;引入第二个取值&quot;额外奖励。&quot;&quot;&quot;
+    gset = set(int(f) for f in gold)
+    cand = range(len(chunks)) if pool is None else pool
+    chosen, covered, vals = [], set(), {}
+    for _ in range(B):
+        best, best_gain = None, -np.inf
+        for i in cand:
+            it = chunks[i]
+            if i in chosen:
+                continue
+            gain = sum(w[f] for f in it if f in gset and f not in covered)
+            if conflict_bonus and conflicted is not None:
+                for f in it:
+                    if f in gset and conflicted[f] and f in covered:
+                        if vals.get(f) != it[f]:
+                            gain += conflict_bonus * w[f]
+            if score is not None:                    # 同分时用相关性分数打破平局
+                gain += 1e-6 * score[i]
+            if gain &gt; best_gain:
+                best, best_gain = i, gain
+        if best is None:
+            break
+        chosen.append(int(best))
+        for f in chunks[best]:
+            covered.add(f)
+            vals.setdefault(f, chunks[best][f])
+        if best_gain &lt;= 0:
+            break
+    return chosen
+
+
+# ---------------------------------------------------------------- 指标
+def metrics(chunks, chosen, gold, w, conflicted):
+    &quot;&quot;&quot;覆盖 / 冗余 / 冲突暴露 / 事实密度。&quot;&quot;&quot;
+    gset = set(int(f) for f in gold)
+    covered, allfacts, goldslots, slots, vals = set(), set(), 0, 0, {}
+    for i in chosen:
+        for f, v in chunks[i].items():
+            slots += 1
+            allfacts.add(f)
+            if f in gset:
+                covered.add(f)
+                goldslots += 1
+                vals.setdefault(f, set()).add(v)
+    coverage = sum(w[f] for f in covered) / sum(w[f] for f in gset)
+    redundancy = 1.0 - len(allfacts) / max(slots, 1)      # 块之间的重复内容
+    density = goldslots / max(slots, 1)                   # 选中内容里&quot;用得上&quot;的比例
+    conf = [f for f in gset if conflicted[f]]
+    exposed = sum(1 for f in conf if len(vals.get(f, ())) &gt;= 2)
+    conflict_rate = exposed / len(conf) if conf else float(&quot;nan&quot;)
+    return coverage, redundancy, conflict_rate, density
+
+
+def main():
+    rng = np.random.default_rng(0)
+    conflicted, w = make_facts()
+    chunks = make_chunks(rng, conflicted)
+    NQ, B = 200, 5
+    rows = {k: [] for k in (&quot;top-k&quot;, &quot;top-k+去重&quot;, &quot;覆盖贪心(oracle)&quot;,
+                            &quot;覆盖贪心+冲突(oracle)&quot;)}
+    for _ in range(NQ):
+        gold = make_query(rng)
+        sc = chunk_scores(chunks, gold, w, rng)
+        picks = {
+            &quot;top-k&quot;: pick_topk(chunks, sc, B),
+            &quot;top-k+去重&quot;: pick_topk_dedup(chunks, sc, B),
+            &quot;覆盖贪心(oracle)&quot;: pick_greedy(chunks, sc, B, w, gold),
+            &quot;覆盖贪心+冲突(oracle)&quot;: pick_greedy(chunks, sc, B, w, gold,
+                                                 conflict_bonus=1.0,
+                                                 conflicted=conflicted),
+        }
+        for k, ch in picks.items():
+            rows[k].append(metrics(chunks, ch, gold, w, conflicted))
+    print(&quot;=&quot; * 84)
+    print(f&quot;表一：四种装配策略（{NQ} 条查询，预算 B={B} 个块，&quot;
+          f&quot;事实 {N_FACT} 个/块 {N_CHUNK} 个）&quot;)
+    print(&quot;=&quot; * 84)
+    print(f&quot;{&#39;策略&#39;:&lt;18}{&#39;加权覆盖率&#39;:&gt;12}{&#39;冗余率&#39;:&gt;10}{&#39;冲突暴露率&#39;:&gt;13}{&#39;事实密度&#39;:&gt;11}&quot;)
+    for k, v in rows.items():
+        a = np.array(v, dtype=float)
+        print(f&quot;{k:&lt;18}{np.nanmean(a[:, 0]):&gt;12.3f}{np.nanmean(a[:, 1]):&gt;10.3f}&quot;
+              f&quot;{np.nanmean(a[:, 2]):&gt;13.3f}{np.nanmean(a[:, 3]):&gt;11.3f}&quot;)
+
+    print()
+    print(&quot;=&quot; * 84)
+    print(&quot;表二：覆盖率随预算的边际收益（同一批查询）&quot;)
+    print(&quot;=&quot; * 84)
+    print(f&quot;{&#39;预算 B&#39;:&gt;8}{&#39;top-k&#39;:&gt;12}{&#39;覆盖贪心&#39;:&gt;12}{&#39;贪心增益&#39;:&gt;12}&quot;)
+    for B in (1, 2, 3, 5, 8):
+        accs = {&quot;top-k&quot;: [], &quot;覆盖贪心&quot;: []}
+        r2 = np.random.default_rng(7)
+        for _ in range(120):
+            gold = make_query(r2)
+            sc = chunk_scores(chunks, gold, w, r2)
+            accs[&quot;top-k&quot;].append(metrics(chunks, pick_topk(chunks, sc, B),
+                                         gold, w, conflicted)[0])
+            accs[&quot;覆盖贪心&quot;].append(metrics(chunks, pick_greedy(chunks, sc, B, w, gold),
+                                            gold, w, conflicted)[0])
+        m1, m2 = np.mean(accs[&quot;top-k&quot;]), np.mean(accs[&quot;覆盖贪心&quot;])
+        print(f&quot;{B:&gt;8d}{m1:&gt;12.3f}{m2:&gt;12.3f}{m2 - m1:&gt;12.3f}&quot;)
+
+    print()
+    print(&quot;=&quot; * 84)
+    print(&quot;表三：贪心的 (1-1/e) 下界检验（B=3，只在相关性 Top-15 候选内穷举最优）&quot;)
+    print(&quot;=&quot; * 84)
+    r3 = np.random.default_rng(9)
+    ratios = []
+    for _ in range(150):
+        gold = make_query(r3)
+        sc = chunk_scores(chunks, gold, w, r3)
+        pool = [int(i) for i in np.argsort(-sc)[:15]]
+        g = metrics(chunks, pick_greedy(chunks, sc, 3, w, gold, pool=pool),
+                    gold, w, conflicted)[0]
+        best = max(metrics(chunks, list(c), gold, w, conflicted)[0]
+                   for c in itertools.combinations(pool, 3))
+        if best &gt; 0:
+            ratios.append(g / best)
+    ratios = np.array(ratios)
+    print(f&quot;随机实例：贪心/最优 均值 {ratios.mean():.3f}，最小值 {ratios.min():.3f}，&quot;
+          f&quot;低于 1-1/e={1 - 1 / np.e:.3f} 的比例 {np.mean(ratios &lt; 1 - 1 / np.e):.3f}&quot;)
+    # 一个人造实例：贪心确实会次优（说明这个下界不是空的）
+    sets = [{1, 2, 3, 4}, {1, 2, 5}, {3, 4, 6}]
+    cov, left = set(), 2
+    while left:
+        best = max(sets, key=lambda S: len(S - cov))
+        cov |= best
+        left -= 1
+    opt = max(len(a | b) for a, b in itertools.combinations(sets, 2))
+    print(f&quot;人造实例：贪心覆盖 {len(cov)}，最优 {opt}，比值 {len(cov) / opt:.3f}&quot;
+          f&quot;（贪心先吃了最大集合 {{1,2,3,4}}，最优是 {{1,2,5}}+{{3,4,6}}）&quot;)
+
+    print()
+    print(&quot;=&quot; * 84)
+    print(&quot;表四：冲突感知的代价（把 conflict_bonus 从 0 扫描到 3）&quot;)
+    print(&quot;=&quot; * 84)
+    print(f&quot;{&#39;冲突奖励&#39;:&gt;10}{&#39;加权覆盖率&#39;:&gt;12}{&#39;冲突暴露率&#39;:&gt;13}{&#39;冗余率&#39;:&gt;10}&quot;)
+    for bonus in (0.0, 0.25, 0.5, 1.0, 2.0, 3.0):
+        r4 = np.random.default_rng(13)
+        a = []
+        for _ in range(150):
+            gold = make_query(r4)
+            sc = chunk_scores(chunks, gold, w, r4)
+            ch = (pick_greedy(chunks, sc, B, w, gold) if bonus == 0 else
+                  pick_greedy(chunks, sc, B, w, gold, conflict_bonus=bonus,
+                              conflicted=conflicted))
+            a.append(metrics(chunks, ch, gold, w, conflicted))
+        a = np.array(a, dtype=float)
+        print(f&quot;{bonus:&gt;10.2f}{np.nanmean(a[:, 0]):&gt;12.3f}&quot;
+              f&quot;{np.nanmean(a[:, 2]):&gt;13.3f}{np.nanmean(a[:, 1]):&gt;10.3f}&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()</code></pre>
+<p><strong>实测输出</strong>：</p>
+<p><strong>表一 —— 四种装配策略（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0502em;">B</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">5</span></span></span></span>）</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>策略</th>
+<th>加权覆盖率</th>
+<th>冗余率</th>
+<th>冲突暴露率</th>
+<th>事实密度</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>top-<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span></td>
+<td>0.325</td>
+<td>0.057</td>
+<td>0.012</td>
+<td>0.162</td>
+</tr>
+<tr>
+<td>top-<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> + 去重</td>
+<td>0.327</td>
+<td>0.052</td>
+<td>0.012</td>
+<td>0.157</td>
+</tr>
+<tr>
+<td>覆盖贪心(oracle)</td>
+<td><strong>0.932</strong></td>
+<td>0.011</td>
+<td>0.000</td>
+<td>0.369</td>
+</tr>
+<tr>
+<td>覆盖贪心 + 冲突(oracle)</td>
+<td>0.893</td>
+<td>0.032</td>
+<td><strong>0.280</strong></td>
+<td>0.373</td>
+</tr>
+</tbody></table>
+<p><strong>表二 —— 边际收益</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0502em;">B</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">→</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">8</span></span></span></span> 时 top-<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 从 0.148 爬到 0.426，贪心从 0.297 到 <strong>1.000（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0502em;">B</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">8</span></span></span></span> 饱和）</strong>，增益 0.149 → 0.584 → 0.574。</p>
+<p><strong>表三 —— <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1/</span><span class="mord mathnormal">e</span><span class="mclose">)</span></span></span></span> 检验</strong>：随机实例上 <strong>贪心/最优 = 1.000（最小值 1.000，低于 0.632 的比例 0）</strong>；人造实例上 0.833。<strong>结论：最坏情况下界真实存在，但在结构良好的实例上它极松 —— 不要用它来论证&quot;贪心够用&quot;。</strong></p>
+<p><strong>表四 —— 冲突感知的代价</strong>：冲突奖励 0 → 0.25 时，暴露率 0.018 → <strong>0.775</strong>，覆盖率保持 1.000；奖励 ≥ 2.0 后覆盖率降到 0.920。<strong>拐点在 0.25~1.0，权重不需要精调，只要不为 0。</strong></p>
+<h3 id="h-练习">练习<a class="anchor" href="#h-练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><p><strong>在你的系统上测三个量。</strong> 挑 50 条需要多个事实的问题，人工标出&quot;必需事实集&quot;（黄金证据），然后对现有的 top-<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 装配计算：加权覆盖率、冗余率、事实密度。<strong>要求给出三个数字与它们的分布</strong>（不只均值），并回答：你的瓶颈是覆盖还是冗余？（提示：若冗余率 &lt; 0.1，去重不是优先项。）</p>
+</li>
+<li><p><strong>跑一次候选池上界实验。</strong> 用第 1 步的黄金事实集，算 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathrm" style="margin-right:0.0139em;">Cov</span></span><span class="mopen">(</span><span class="mord mathcal" style="margin-right:0.0583em;">C</span><span class="mclose">)</span></span></span></span>（候选池对需求集的覆盖率上界）。<strong>回答：装配层最多还能拿到多少？</strong> 如果上界低于 0.6，说明该做的事在检索层而不是装配层 —— 给出你的下一步动作。</p>
+</li>
+<li><p><strong>把 oracle 需求集换成预测需求集。</strong> 在表一的代码上，把 <code>gold</code>（需求集）替换成一个&quot;预测器&quot;：它以一个准确率 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7167em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">pred</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span></span> 正确命中每个需求事实，否则命中一个随机事实。<strong>扫描 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7167em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">pred</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span></span> 从 0.3 到 1.0，画出&quot;覆盖贪心的实际覆盖率&quot;曲线</strong>，并与 top-<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 比较，找出覆盖贪心开始不如 top-<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 的准确率门槛。</p>
+</li>
+<li><p><strong>给冲突权重定价。</strong> §3.2 的判据里出现了 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="mopen">(</span><span class="mord text"><span class="mord cjk_fallback">选错</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∣</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord cjk_fallback">冲突</span></span><span class="mclose">)</span></span></span></span> 与 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">错</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>。请为你的业务估出这两个量（可以用一个月的线上抽查），算出&quot;暴露收益&quot;，并与表四的覆盖率损失（0.932 → 0.893 量级）做对比，给出&quot;该不该开冲突暴露&quot;的结论。</p>
+</li>
+<li><p><strong>算一次联合概率。</strong> 取你系统里&quot;答案需要多个事实&quot;的查询，统计每题需要的必需事实数 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">m</span></span></span></span> 的分布，以及单事实的抽取准确率 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span></span></span></span>。算出 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8588em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6644em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">m</span></span></span></span></span></span></span></span></span></span></span> 的期望，并与实测的端到端正确率比较。<strong>回答：两者差多少？差值说明还有什么失败模式没被这个模型覆盖？</strong>（提示：考虑事实之间的相关性。）</p>
+</li>
+<li><p><strong>设计一个&quot;装配日志&quot;。</strong> 要求每次装配记录：需求集（预测的与实际的）、每个被选块的边际增益、最终覆盖率/冗余率/冲突暴露率、以及未覆盖的需求事实。<strong>说明这些字段能回答哪些线上问题</strong>，并与第 6 章第 4 节的 trace 设计对齐。</p>
+</li>
+</ol>
+<h3 id="h-小结">小结<a class="anchor" href="#h-小结" aria-label="本节链接">#</a></h3>
+<ul>
+<li><strong>装配与排序的目标函数不同</strong>：排序假设候选独立，装配的价值取决于集合的交互。<strong>&quot;把 top-<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 拼起来&quot;是一个隐性失效点</strong>：本节实测同样 5 个块，按分数的加权覆盖率 0.325，按覆盖选的是 0.932，事实密度 0.162 → 0.369。</li>
+<li><strong>加权覆盖是单调子模函数</strong>（边际收益递减），贪心在基数约束下有 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1/</span><span class="mord mathnormal">e</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.632</span></span></span></span> 的最坏情况下界。<strong>但这个下界极松</strong>：本节 150 个随机实例上贪心/最优 = <strong>1.000</strong>（最小值 1.000），只有人造实例降到 0.833。<strong><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1/</span><span class="mord mathnormal">e</span><span class="mclose">)</span></span></span></span> 是保证，不是预期，更不是目标。</strong></li>
+<li><strong>必须同时测覆盖率、冗余率与事实密度</strong>：单看覆盖率会鼓励往上下文塞块（干扰上升），单看冗余率会被&quot;只选一个块&quot;钻空子。<strong>事实密度（用得上 / 喂进去）是把两者合起来的单一读数</strong>，在本节里它从 0.162 提到 0.369，等价于固定预算下有效上下文翻倍。</li>
+<li><strong>去重的价值取决于语料</strong>：本节合成语料的冗余率只有 0.057，去重几乎无效（0.325 → 0.327）。<strong>先测冗余率再决定做不做</strong> —— 这与第 3 章第 3 节的&quot;近重复挤占&quot;是同一件事的两个位置。</li>
+<li><strong>装配的收益与预算强耦合</strong>：预算紧（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8193em;vertical-align:-0.136em;"></span><span class="mord mathnormal" style="margin-right:0.0502em;">B</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≤</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2</span></span></span></span>，增益 0.149<del>0.265）时先解决召回；预算中（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0502em;">B</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">3</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∼</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">5</span></span></span></span>，增益 0.371</del>0.584）是最该做覆盖贪心的区间；预算松（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8193em;vertical-align:-0.136em;"></span><span class="mord mathnormal" style="margin-right:0.0502em;">B</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≥</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">8</span></span></span></span>）贪心饱和（1.000），收益转向减少干扰。</li>
+<li><strong>冲突消解三种处方各有适用条件</strong>：时间戳优先（事实随时间变化）、来源权威投票（来源有稳定分级）、显式暴露（抽取错误类，以及&quot;选错代价 &gt; 承认不确定代价&quot;）。<strong>本节实测：把冲突权重从 0 提到 0.25，暴露率从 0.018 跳到 0.775 而覆盖率不动</strong> —— 因为纯覆盖贪心结构上永远不选&quot;无覆盖增益&quot;的块。<strong>拐点在 0.25~1.0，权重不需要精调。</strong></li>
+<li><strong>联合概率是指数</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">m</span></span></span></span> 个必需事实各 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.9</span></span></span></span> 时端到端 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6644em;"></span><span class="mord">0.</span><span class="mord"><span class="mord">9</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6644em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">m</span></span></span></span></span></span></span></span></span></span></span>（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">m</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">6</span></span></span></span> 是 0.531，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">m</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">10</span></span></span></span> 是 0.349）。所以装配的目标不是&quot;覆盖尽量多&quot;，而是&quot;<strong>覆盖必需项 + 优先高权重 + 承认非必需项的不确定</strong>&quot;。</li>
+<li><strong>边界</strong>：装配不修召回（先算候选池覆盖上界）、依赖需求集预测（本节全是 oracle 上界，真实收益 = 上界 × 预测准确率）、把干扰当免费（第 5 章第 1 节）、且冲突暴露率被检索层的多样性限制。</li>
+<li><strong>一句话</strong>：<strong>先把目标函数从&quot;分数之和&quot;换成&quot;必需信息的覆盖&quot;，再在覆盖、冗余、冲突三个量上分别设判据 —— 装配层的收益几乎全部来自这一步换目标，而不是来自调参。</strong></li>
+</ul>
+<blockquote>
+<p>下一节：证据终于凑齐、去重、冲突也处理了。但还有最后一关：<strong>用户凭什么相信这个答案？</strong> 一条断言如果追不到具体的块、版本与位置，那么它对了也无法核验，错了也无法定位 —— 系统在审计、追责与迭代面前等于不可用。下一节把&quot;引用&quot;从装饰变成可核验的证据链，给出引用粒度三级、三种引用失效的检出方式，以及引用一致率这个指标的自动化构造。</p>
+</blockquote>

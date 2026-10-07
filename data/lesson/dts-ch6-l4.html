@@ -1,0 +1,165 @@
+<h2 id="h-offload-与异构存储什么时候值得用">Offload 与异构存储：什么时候值得用<a class="anchor" href="#h-offload-与异构存储什么时候值得用" aria-label="本节链接">#</a></h2>
+<p>前三课的杠杆都在 GPU 内部：切分模型状态、重算激活、降低精度。这一课把优化器状态、甚至参数搬到 CPU 内存或 NVMe 上，用<strong>主机侧存储</strong>换显存。CPU 内存通常比显存大一个数量级，但硬约束是：<strong>搬家要走 PCIe 或 NVLink，而这条链路的带宽比显存带宽低一到两个数量级</strong>。Offload 的成败因此不是&quot;能不能放下&quot;，而是&quot;每次迭代搬的字节数乘上链路时间，能否被计算掩盖&quot;。</p>
+<p><figure><img class="md-img" src="content/courses/distributed-training-systems/assets/chapter-6-figure-02.svg" alt="四种省显存手段的边界：精度、重算、分片、搬出显存" loading="lazy" decoding="async"><figcaption>四种省显存手段的边界：精度、重算、分片、搬出显存</figcaption></figure>
+</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-三种存储三种带宽量级">1. 三种&quot;存储&quot;，三种带宽量级<a class="anchor" href="#h-1-三种存储三种带宽量级" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>层级</th>
+<th>容量量级</th>
+<th>带宽量级（示例）</th>
+<th>训练里放什么</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>显存（HBM）</td>
+<td>数十至上百 GB</td>
+<td>数 TB/s（片内）</td>
+<td>参数、梯度、激活、优化器状态</td>
+</tr>
+<tr>
+<td>主机内存（DDR）</td>
+<td>数百 GB 至数 TB</td>
+<td>取决于 PCIe/NVLink 连接</td>
+<td>优化器状态、参数副本、检查点缓冲</td>
+</tr>
+<tr>
+<td>本地 NVMe</td>
+<td>数 TB</td>
+<td>GB/s 级</td>
+<td>检查点、数据集、冷数据</td>
+</tr>
+</tbody></table>
+<p>关键数字是第二列的&quot;示例&quot;二字：<strong>请用自己机器上的实测值替代</strong>。PCIe 代际与通道数（x16 与 x8 差一倍）、CPU 到内存的 NUMA 位置、以及同机多卡是否共享同一条 PCIe，都会让同一个 offload 方案从可用变成不可用。测量层次是 <code>nvbandwidth</code>（设备↔主机带宽）、<code>ib_write_bw</code>（跨机 RDMA）这类工具，而不是看规格表。</p>
+<h4 id="h-2-一笔账一次-offload-到底要搬多少">2. 一笔账：一次 offload 到底要搬多少<a class="anchor" href="#h-2-一笔账一次-offload-到底要搬多少" aria-label="本节链接">#</a></h4>
+<p>设模型参数量 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">Ψ</span></span></span></span>，混合精度 Adam 的账本仍是上一课的 16 B/参数。ZeRO-Offload 式做法的典型流程是：反向算出梯度（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">2Ψ</span></span></span></span>）→ 梯度 reduce-scatter 到各卡 → 把梯度搬到 CPU（D2H）→ 在 CPU 上更新 fp32 主权重与优化器状态（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">12Ψ</span></span></span></span>）→ 把更新后的参数搬回 GPU（H2D）。</p>
+<p>以 8.72B 模型为例：参数 17.4 GB、梯度 17.4 GB、优化器状态 104.6 GB。一次往返的搬家量约 <strong>226.7 GB</strong>；在示例 PCIe Gen4 x16 的 25 GB/s 下需要 <strong>5580.8 ms/步</strong>，换成示例 50 GB/s 需要 2790.4 ms/步。</p>
+<p><strong>判据由此得到</strong>：要藏住搬家，单步计算时间必须 ≥ 搬家时间——PCIe Gen4 x16 示例值下这个门槛是 <strong>9068.8 ms/步</strong>（全量 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord">2Ψ</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">12Ψ</span></span></span></span> 口径）。真正可行的前提是搬家与计算重叠，而它受两个结构性限制：优化器更新必须等梯度 reduce-scatter 完成（顺序依赖），以及主机链路往往被同机所有卡共享。</p>
+<h4 id="h-3-分片与-offload-是乘法关系不是替代关系">3. 分片与 offload 是乘法关系，不是替代关系<a class="anchor" href="#h-3-分片与-offload-是乘法关系不是替代关系" aria-label="本节链接">#</a></h4>
+<p>Offload 不该替代 ZeRO，而应与它叠乘：优化器状态切成 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1/</span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span></span></span></span> 后每卡要搬的字节数也变成 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1/</span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span></span></span></span>（示例里 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">8</span></span></span></span> 时每卡 28.3 GB、约 1133.6 ms/步；<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">64</span></span></span></span> 时每卡 3.5 GB、约 141.7 ms/步）。但有个反直觉的结论：同一台机器上 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span></span></span></span> 个进程共享同一条 PCIe 时，每卡时间<strong>并不随 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span></span></span></span> 下降</strong>——每卡字节数变成 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1/</span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span></span></span></span>，能用的带宽也变成约 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1/</span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span></span></span></span>，两者正好抵消（示例输出里 1/2/4/8 个 rank 都停在 9068.8 ms/步）。要让 offload 随 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span></span></span></span> 变好，靠的是<strong>跨机</strong>：不同机器各自有一条 PCIe，主机链路才真正成为分布式资源。</p>
+<h4 id="h-4-什么时候值得用什么时候是陷阱">4. 什么时候值得用，什么时候是陷阱<a class="anchor" href="#h-4-什么时候值得用什么时候是陷阱" aria-label="本节链接">#</a></h4>
+<p>值得用的场景（越接近三条同时成立越好）：<strong>显存是硬墙、算力还有富余</strong>（GPU 利用率长期不满，用主机带宽换 batch 是净赚）；<strong>训练规模已到上限、想再多塞参数</strong>；<strong>计算/通信时间足够长</strong>，能把搬家藏进计算后面。是陷阱的场景：<strong>计算本来很快、GPU 已打满</strong>；<strong>同机多卡共享一条窄 PCIe</strong>（如上，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span></span></span></span> 变大也不能救）；<strong>只 offload 一小部分却有同步开销</strong>（每次搬家过一次主机往返，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span> 按每层累加）。</p>
+<h4 id="h-5-与-offload-相邻的另一笔工程账检查点">5. 与 offload 相邻的另一笔工程账：检查点<a class="anchor" href="#h-5-与-offload-相邻的另一笔工程账检查点" aria-label="本节链接">#</a></h4>
+<p>异构存储最稳妥的用法其实是<strong>检查点（checkpoint）</strong>：把训练状态定期写到 CPU 内存或 NVMe。一次全量检查点的字节数是&quot;参数 + 优化器状态&quot;（示例里 122.1 GB），收益是&quot;故障后少重算的步数&quot;。以整机 25 GB/s、单步 300 ms 为例：每 10 步存一次摊到每步是 <strong>162.8% 的吞吐损失</strong>（不可接受），每 100 步一次是 <strong>16.3%</strong>，每 1000 步一次只 <strong>1.6%</strong> 却要重算 1000 步。<strong>结论</strong>：频率是&quot;故障率 × 重算代价&quot;与&quot;写盘开销&quot;的权衡，不是越勤越好；大模型常用<strong>异步写</strong>（先拷到主机内存、由 CPU 慢慢落盘）来打破它。</p>
+<h4 id="h-6-常见坑">6. 常见坑<a class="anchor" href="#h-6-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>拿规格表带宽当可用带宽</strong>：PCIe 的有效带宽通常明显低于标称，且双向不对称。</li>
+<li><strong>在同机多卡场景下期待 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1/</span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span></span></span></span> 的线性收益</strong>：主机链路是共享资源。</li>
+<li><strong>把 offload 当&quot;免费扩容&quot;</strong>：它的价格是每步固定字节数的搬迁时间。</li>
+<li><strong>忘记异步</strong>：同步 offload 会把 GPU 挡住；工程实现要做预取与多流。</li>
+<li><strong>检查点只存参数不存优化器状态</strong>：恢复后动量为零，loss 曲线会出现可见的断裂。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>纯 Python，不需要 GPU。它把&quot;一次 offload 要搬多少、要多久&quot;和&quot;检查点频率的性价比&quot;都算成可读的数字。</p>
+<pre data-lang="python"><code class="language-python"># ===== 示例：Offload 值不值得 —— 把一次搬家算清（纯 Python，示例带宽） =====
+GB = 1e9
+def ms(nbytes, gbps):
+    return nbytes / (gbps * GB) * 1e3
+
+print(&quot;示例链路带宽（不是实测值，请用你自己机器上 nvbandwidth / ib_write_bw 的结果替换）：&quot;)
+links = ((&quot;PCIe Gen4 x16 单向（示例 25 GB/s）&quot;, 25.0),
+         (&quot;PCIe Gen5 x16 单向（示例 50 GB/s）&quot;, 50.0),
+         (&quot;NVLink 级设备间（示例 300 GB/s）&quot;, 300.0))
+for k, v in links:
+    print(f&quot;  {k:&lt;34} {v:6.1f} GB/s&quot;)
+
+N = 8.72e9
+param, grad, opt = 2 * N, 2 * N, 12 * N
+print(f&quot;\n8.72B 模型（混合精度 Adam）：参数 {param/GB:.1f} GB，梯度 {grad/GB:.1f} GB，&quot;
+      f&quot;优化器状态 {opt/GB:.1f} GB&quot;)
+print(f&quot;  一次 offload 往返要搬：优化器状态 D2H + 参数 H2D + 梯度 D2H = &quot;
+      f&quot;{(2*opt+grad)/GB:.1f} GB&quot;)
+
+print(&quot;\n不分片时，这一趟要多久（每步都要做，且不能与梯度归约重叠）：&quot;)
+for name, bw in links:
+    t = ms(opt, bw) + ms(param, bw) + ms(grad, bw)
+    print(f&quot;  {name:&lt;34} {t:9.1f} ms/步&quot;)
+
+print(&quot;\n分片到 P 卡（每卡只搬 1/P 的字节，链路带宽按 P 路复用后的每卡份额算）：&quot;)
+for P in (8, 64):
+    per_rank = (2 * opt + grad) / P
+    for name, bw in links[:2]:
+        print(f&quot;  P={P:&lt;3} {name:&lt;30} {ms(per_rank, bw):9.1f} ms/步（每卡搬 {per_rank/GB:6.2f} GB）&quot;)
+
+print(&quot;\n同一台机器上 P 个 rank 同时搬，共享的是一条 PCIe：&quot;)
+for P in (1, 2, 4, 8):
+    per_rank = (2 * opt + grad) / P
+    share = 25.0 / P
+    print(f&quot;  {P} 个 rank：每卡份额 {share:6.2f} GB/s，每卡 {ms(per_rank, share):9.1f} ms/步 &quot;
+          f&quot;（P 路复用下每卡时间不随 P 下降）&quot;)
+
+print(&quot;\n判据：把搬家时间藏进计算需要什么条件&quot;)
+for name, bw in links:
+    t = ms(2 * opt + grad, bw)
+    print(f&quot;  {name:&lt;34} 需要单步计算 ≥ {t:8.1f} ms 才能真正藏住&quot;)
+print(&quot;  （注意：优化器更新必须等梯度归约完，这段搬家通常只能与预取/通信重叠）&quot;)
+
+print(&quot;\ncheckpoint 的性价比：整机吞吐 25 GB/s（示例），单步 300 ms&quot;)
+ckpt = param + opt
+for interval in (10, 50, 100, 1000):
+    t_ck = ms(ckpt, 25.0)
+    step_ms = 300.0
+    ovh = t_ck / (interval * step_ms)
+    print(f&quot;  每 {interval:&gt;4} 步存一次（{ckpt/GB:5.1f} GB → {t_ck/1e3:6.2f} s）：&quot;
+          f&quot;摊到每步 {ovh:6.1%} 吞吐损失；故障后最多重算 {interval} 步&quot;)</code></pre>
+<p>在 Python 3.14.5（仅标准库）下实际运行结果：</p>
+<pre data-lang="text"><code class="language-text">示例链路带宽（不是实测值，请用你自己机器上 nvbandwidth / ib_write_bw 的结果替换）：
+  PCIe Gen4 x16 单向（示例 25 GB/s）         25.0 GB/s
+  PCIe Gen5 x16 单向（示例 50 GB/s）         50.0 GB/s
+  NVLink 级设备间（示例 300 GB/s）            300.0 GB/s
+
+8.72B 模型（混合精度 Adam）：参数 17.4 GB，梯度 17.4 GB，优化器状态 104.6 GB
+  一次 offload 往返要搬：优化器状态 D2H + 参数 H2D + 梯度 D2H = 226.7 GB
+
+不分片时，这一趟要多久（每步都要做，且不能与梯度归约重叠）：
+  PCIe Gen4 x16 单向（示例 25 GB/s）          5580.8 ms/步
+  PCIe Gen5 x16 单向（示例 50 GB/s）          2790.4 ms/步
+  NVLink 级设备间（示例 300 GB/s）               465.1 ms/步
+
+分片到 P 卡（每卡只搬 1/P 的字节，链路带宽按 P 路复用后的每卡份额算）：
+  P=8   PCIe Gen4 x16 单向（示例 25 GB/s）      1133.6 ms/步（每卡搬  28.34 GB）
+  P=8   PCIe Gen5 x16 单向（示例 50 GB/s）       566.8 ms/步（每卡搬  28.34 GB）
+  P=64  PCIe Gen4 x16 单向（示例 25 GB/s）       141.7 ms/步（每卡搬   3.54 GB）
+  P=64  PCIe Gen5 x16 单向（示例 50 GB/s）        70.8 ms/步（每卡搬   3.54 GB）
+
+同一台机器上 P 个 rank 同时搬，共享的是一条 PCIe：
+  1 个 rank：每卡份额  25.00 GB/s，每卡    9068.8 ms/步 （P 路复用下每卡时间不随 P 下降）
+  2 个 rank：每卡份额  12.50 GB/s，每卡    9068.8 ms/步 （P 路复用下每卡时间不随 P 下降）
+  4 个 rank：每卡份额   6.25 GB/s，每卡    9068.8 ms/步 （P 路复用下每卡时间不随 P 下降）
+  8 个 rank：每卡份额   3.12 GB/s，每卡    9068.8 ms/步 （P 路复用下每卡时间不随 P 下降）
+
+判据：把搬家时间藏进计算需要什么条件
+  PCIe Gen4 x16 单向（示例 25 GB/s）       需要单步计算 ≥   9068.8 ms 才能真正藏住
+  PCIe Gen5 x16 单向（示例 50 GB/s）       需要单步计算 ≥   4534.4 ms 才能真正藏住
+  NVLink 级设备间（示例 300 GB/s）           需要单步计算 ≥    755.7 ms 才能真正藏住
+  （注意：优化器更新必须等梯度归约完，这段搬家通常只能与预取/通信重叠）
+
+checkpoint 的性价比：整机吞吐 25 GB/s（示例），单步 300 ms
+  每   10 步存一次（122.1 GB →   4.88 s）：摊到每步 162.8% 吞吐损失；故障后最多重算 10 步
+  每   50 步存一次（122.1 GB →   4.88 s）：摊到每步  32.6% 吞吐损失；故障后最多重算 50 步
+  每  100 步存一次（122.1 GB →   4.88 s）：摊到每步  16.3% 吞吐损失；故障后最多重算 100 步
+  每 1000 步存一次（122.1 GB →   4.88 s）：摊到每步   1.6% 吞吐损失；故障后最多重算 1000 步</code></pre>
+<p>两条可直接用于决策的读数：<strong>8.72B 模型的一次 offload 往返是 226.7 GB，在示例 PCIe 上 5580.8 ms/步</strong>；<strong>同机多卡共享 PCIe 时分片不能让每卡时间下降</strong>。再加上&quot;每 1000 步一次检查点只花 1.6% 吞吐、但故障后要重算 1000 步&quot;，结论是：offload 只适合算力有富余的场景，检查点频率必须按故障率定。</p>
+<p><strong>可选，需要自备或云上按需 1~2 卡</strong>（无卡也能完成本课）：</p>
+<pre data-lang="bash"><code class="language-bash"># 量主机链路带宽（示例命令，具体参数以工具文档为准）
+nvidia-smi topo -m                  # 先确认 GPU 挂在哪个 PCIe/NUMA 上
+# nvbandwidth（NVIDIA 官方带宽测试工具）可分别测 D2H / H2D / D2D
+# 有 InfiniBand 时用 perftest 的 ib_write_bw / ib_write_lat 测跨机
+# 观察 GPU↔主机搬运动是否与计算重叠：nvidia-smi dmon 或 nsight systems 时间线</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：把示例里的 <code>links</code> 换成你自己机器实测的 D2H/H2D 带宽（用 <code>nvbandwidth</code> 两个方向分别测），重算 8.72B 模型的一次往返时间；若两方向差异明显，说明该给哪个方向留更大的预取缓冲。</li>
+<li><strong>解释</strong>：为什么&quot;分片到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span></span></span></span> 卡&quot;不能让同机 offload 的每卡时间按 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1/</span><span class="mord mathnormal" style="margin-right:0.1389em;">P</span></span></span></span> 下降？写出&quot;每卡字节数&quot;与&quot;每卡带宽份额&quot;两条式子对消一次。</li>
+<li><strong>对比/验证</strong>：分别取单步计算 200 ms、2000 ms、20000 ms，判断 offload 是否值得（门槛用示例 PCIe Gen4 的 5580.8 ms/步）；再说明&quot;值得&quot;的场景里 GPU 利用率大概是什么状态。</li>
+<li><strong>思考</strong>：把检查点从&quot;同步全量写&quot;改成&quot;异步写 + 每 100 步增量&quot;，吞吐损失与恢复时间会怎样变？列出两个必须监控的指标。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Microsoft DeepSpeed, <em>ZeRO-Offload</em>（把优化器状态与梯度搬到 CPU 的动机、流程与&quot;CPU 承担优化器计算&quot;的设计；本课第 2、4 节的工程依据）：<a href="https://www.deepspeed.ai/tutorials/zero-offload/" target="_blank" rel="noopener noreferrer">https://www.deepspeed.ai/tutorials/zero-offload/</a></li>
+<li>Microsoft DeepSpeed, <em>ZeRO Tutorial</em>（ZeRO 分片与 offload 的配置关系：<code>offload_optimizer</code> / <code>offload_param</code> 等开关的语义）：<a href="https://www.deepspeed.ai/tutorials/zero/" target="_blank" rel="noopener noreferrer">https://www.deepspeed.ai/tutorials/zero/</a></li>
+<li>NVIDIA, <em>CUDA C++ Best Practices Guide</em>（主机↔设备传输的开销口径与&quot;用异步传输重叠计算&quot;的官方建议；本课第 1、6 节）：<a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/contents.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/contents.html</a></li>
+<li>NVIDIA, <em>NCCL User Guide — Environment Variables</em>（<code>NCCL_DEBUG</code>、拓扑与通道相关环境变量；用于在本章的多卡场景里核对通信行为）：<a href="https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html</a></li>
+</ul>
+<p><a href="../chapter-7/index.md">下一章：Megatron / DeepSpeed 的并行组合与配置要点</a></p>

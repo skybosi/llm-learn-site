@@ -1,0 +1,246 @@
+<h2 id="h-内存序与可见性为什么有些-kernel-必须-fence">内存序与可见性：为什么有些 kernel 必须 fence<a class="anchor" href="#h-内存序与可见性为什么有些-kernel-必须-fence" aria-label="本节链接">#</a></h2>
+<p>&quot;我用了 atomic，为什么还是错的？&quot;——因为原子性（atomicity）和顺序性（ordering）是两件独立的事。<code>atomicAdd</code> 保证一次读-改-写不被打断，却不保证你之前写的<strong>别的</strong>变量已经对别人可见。本课把这件事讲到底：什么叫 happens-before、作用域为什么必须匹配、以及 <code>__threadfence()</code> 到底在保证什么。</p>
+<p><figure><img class="md-img" src="content/courses/gpu-cuda-kernels/assets/chapter-5-figure-02.svg" alt="一次发布订阅要过的四道关：原子性、顺序、作用域、fence" loading="lazy" decoding="async"><figcaption>一次发布订阅要过的四道关：原子性、顺序、作用域、fence</figcaption></figure>
+</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-一个-6-种执行的-litmus-test">1. 一个 6 种执行的 litmus test<a class="anchor" href="#h-1-一个-6-种执行的-litmus-test" aria-label="本节链接">#</a></h4>
+<p>取官方文档给出的最小例子：Block 0 的线程写 <code>x = 42</code>，然后置标志 <code>f = 1</code>；Block 1 的线程自旋等到 <code>f == 1</code>，再断言 <code>x == 42</code>。</p>
+<ul>
+<li>若 <code>f</code> 的 store 与 load 都是 <strong>relaxed</strong>（默认）语义，&quot;f 先落地、x 后落地&quot;是一种合法执行——读者看到 <code>f == 1</code> 却读到 <code>x == 0</code>。枚举两次 store 的落地顺序 × 两条 load 的插入位置共 6 种可行执行，其中 <strong>1 种</strong>失败。</li>
+<li>把 <code>f</code> 的 store 改成 <strong>release</strong>、load 改成 <strong>acquire</strong>，<strong>0 种</strong>失败。release/acquire 建立 happens-before 边：release 之前的全部写，对成功 acquire 到该值的线程可见。</li>
+<li>若 <code>f</code> 用 block 作用域而读方在另一个 block——<strong>又变成 1 种失败</strong>。两边都是原子的，但作用域不含对方线程，这不是顺序问题，而是<strong>数据竞争（data race），行为未定义</strong>。</li>
+</ul>
+<p>结论：<strong>原子性解决&quot;不丢更新&quot;，内存序解决&quot;顺序能否被观察到&quot;，作用域解决&quot;这套保证对谁有效&quot;</strong>——三者缺一不可。</p>
+<h4 id="h-2-模型happens-before-与作用域">2. 模型：happens-before 与作用域<a class="anchor" href="#h-2-模型happens-before-与作用域" aria-label="本节链接">#</a></h4>
+<p>C++ 内存模型的核心是两个关系：<strong>sequenced-before</strong>（同一线程内的程序顺序）与 <strong>synchronizes-with</strong>（跨线程的成对同步），二者组合出 happens-before。CUDA 的贡献是给 synchronizes-with 加了一个参数——作用域：</p>
+<table>
+<thead>
+<tr>
+<th>作用域</th>
+<th>覆盖范围</th>
+<th>典型用法</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>cuda::thread_scope_thread</code></td>
+<td>只有自己</td>
+<td>单线程内</td>
+</tr>
+<tr>
+<td><code>cuda::thread_scope_block</code></td>
+<td>同一个 block</td>
+<td><code>__syncthreads</code> 覆盖的那批线程</td>
+</tr>
+<tr>
+<td><code>cuda::thread_scope_device</code></td>
+<td>同一张卡上的所有线程（同一 memory synchronization domain）</td>
+<td>跨 block 的发布-订阅</td>
+</tr>
+<tr>
+<td><code>cuda::thread_scope_system</code></td>
+<td>整机，含 CPU 与其它 GPU</td>
+<td>多卡/与主机通信</td>
+</tr>
+</tbody></table>
+<p>官方对<strong>原子性</strong>的定义直接挂在这个参数上：只有操作的作用域包含了执行另一个操作的线程，两者才真正&quot;原子&quot;。所以 <code>thread_scope_block</code> 的 store 配 <code>thread_scope_device</code> 的 load 是未定义行为——即使两边都用了原子指令。</p>
+<h4 id="h-3-四种内存序各自买什么">3. 四种内存序，各自买什么<a class="anchor" href="#h-3-四种内存序各自买什么" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>内存序</th>
+<th>保证</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>relaxed</code></td>
+<td>只有原子性，无顺序</td>
+<td>最低</td>
+</tr>
+<tr>
+<td><code>acquire</code></td>
+<td>之后的读写不能上移到它前面</td>
+<td>中</td>
+</tr>
+<tr>
+<td><code>release</code></td>
+<td>之前的读写不能下移到它后面</td>
+<td>中</td>
+</tr>
+<tr>
+<td><code>acq_rel</code> / <code>seq_cst</code></td>
+<td>两个方向都有；<code>seq_cst</code> 额外要求全局单一总序</td>
+<td>最高</td>
+</tr>
+</tbody></table>
+<p>配套入口有三类：<code>cuda::atomic_ref&lt;T, Scope&gt;</code> 的 <code>load(acquire)</code> / <code>store(release)</code>、<code>cuda::atomic&lt;T, Scope&gt;</code>、以及 <code>__threadfence*()</code> 系列。分工是：<strong>前两个把顺序绑在某个具体原子变量上；fence 不绑变量，是一条作用于线程的顺序屏障</strong>。</p>
+<h4 id="h-4-三档-fence-与它们各自覆盖的范围">4. 三档 fence 与它们各自覆盖的范围<a class="anchor" href="#h-4-三档-fence-与它们各自覆盖的范围" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>入口</th>
+<th>保证的范围</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>__threadfence_block()</code></td>
+<td>本 block 内的内存操作顺序</td>
+</tr>
+<tr>
+<td><code>__threadfence()</code></td>
+<td>本 device 内的顺序（跨 block 的&quot;我写完了&quot;通知）</td>
+</tr>
+<tr>
+<td><code>__threadfence_system()</code></td>
+<td>含主机与其他 GPU 的系统范围顺序</td>
+</tr>
+</tbody></table>
+<p>&quot;写到 global 之后、置标志之前插一句 <code>__threadfence()</code>&quot;就是最经典的手写 release：<strong>本线程在这句之前发出的内存操作，在它之后发出的写之前完成并对 device 可见</strong>。它只是顺序保证、不是同步点：不等别的线程，也不保证对方&quot;已经到了&quot;。</p>
+<h4 id="h-5-顺序之外还有编译器">5. 顺序之外还有编译器<a class="anchor" href="#h-5-顺序之外还有编译器" aria-label="本节链接">#</a></h4>
+<p>顺序问题不只来自硬件，也来自编译器。&quot;自旋等标志位&quot;的典型编译结果是：标志位被读进寄存器，循环里再也不回内存——即使硬件已经把新值写进 L2，自旋也永远看不到。可复现的两个观测：</p>
+<ul>
+<li>普通（非 volatile）标志：自旋 99 步后仍超时，永远拿不到数据；</li>
+<li><code>volatile</code> 标志：第 3 步就看到了新值。</li>
+</ul>
+<p><code>volatile</code> 强制每次访问回到内存层面，但它<strong>不提供</strong>跨线程的 happens-before，也不构成同步。正确分工是：&quot;<code>volatile</code>（或 relaxed 的 <code>cuda::atomic_ref</code>）负责让每次自旋真的去读，release/acquire 或 fence 负责顺序&quot;。</p>
+<h4 id="h-6-常见坑">6. 常见坑<a class="anchor" href="#h-6-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>以为 <code>__syncthreads()</code> 能跨 block</strong>：它只覆盖 block 内部；跨 block 的顺序要 fence + 原子标志，或者第 3 课的 grid 同步。</li>
+<li><strong>per-thread 循环里自旋读原子量</strong>：每轮都是一次 L2 事务；用第 3 课讲的&quot;先读 shared 标志&quot;或退避把它压下来。</li>
+<li><strong>device 写、host 读却没加 <code>__threadfence_system()</code></strong>：mapped/pinned 内存上的通知会失效。</li>
+<li><strong>拿 <code>atomicAdd</code> 当 fence 用</strong>：默认语义是 relaxed，不传递任何顺序（除非显式指定 release）。</li>
+<li><strong>用 <code>cuda::atomic_ref</code> 忘了作用域参数</strong>：默认是 <code>thread_scope_system</code>，比实际需要的更贵，也会让习惯 device 语义的人读错代码。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>两段纯 Python 模拟（无 GPU）：枚举 litmus test 的全部可行执行、演示&quot;编译器缓存标志位&quot;的自旋失败与 <code>volatile</code> 修复，再给三种自旋做法的全局 load 次数。</p>
+<pre data-lang="python"><code class="language-python"># ===== 示例 1：litmus test —— 先写 x 再置 flag，对方能看到 x 吗？ =====
+from itertools import permutations
+
+def litmus(flag_order, scope_ok):
+    &quot;&quot;&quot;复现 CUDA Programming Guide §5.7.5 的 message passing 例子。
+    写方 Block 0：x=42 然后 f=1；读方 Block 1：等到 f==1 后读 x。
+    枚举写方两次 store 的落地顺序 × 读方两条 load 的插入位置 = 6 种可行执行。&quot;&quot;&quot;
+    bad = 0
+    for landed in permutations([(&quot;x&quot;, 42), (&quot;f&quot;, 1)]):
+        for insert in range(3):
+            sched = list(landed[:insert]) + [(&quot;load_f&quot;, 0), (&quot;load_x&quot;, 0)] + list(landed[insert:])
+            x = f = 0
+            seen_f = seen_x = None
+            for op, v in sched:
+                if op == &quot;x&quot;:
+                    x = v
+                elif op == &quot;f&quot;:
+                    f = v
+                elif op == &quot;load_f&quot;:
+                    seen_f = f
+                else:
+                    seen_x = x
+            if seen_f == 1 and seen_x != 42:
+                # 只有「f 是 release 且作用域覆盖读方」时，看到 f==1 才必然看到 x==42
+                if flag_order == &quot;relaxed&quot; or not scope_ok:
+                    bad += 1
+    return bad
+
+for name, order, scope in (
+    (&quot;relaxed store + relaxed load&quot;, &quot;relaxed&quot;, True),
+    (&quot;release store + acquire load&quot;, &quot;release&quot;, True),
+    (&quot;release/acquire，但用 block 作用域&quot;, &quot;release&quot;, False),
+):
+    bad = litmus(order, scope)
+    print(f&quot;{name:&lt;36} 6 种可行执行中有 {bad} 种读到 f==1 而 x==0 → {&#39;不安全&#39; if bad else &#39;不会发生&#39;}&quot;)
+
+# ===== 示例 2：普通标志被编译器缓存进寄存器，自旋永远看不到 =====
+def spin(flag_is_volatile, write_at):
+    &quot;&quot;&quot;生产者第 write_at 步把 flag 从 0 改成 1。
+    普通变量的典型编译结果：循环里只读一次进寄存器；volatile 每次都回内存读。&quot;&quot;&quot;
+    flag, data, cached, steps = 0, 0, 0, 0
+    cached = flag                      # 循环之前取进的寄存器副本
+    for step in range(1, 100):
+        if step == write_at:           # 生产者
+            data, flag = 42, 1
+        steps += 1
+        observed = flag if flag_is_volatile else cached
+        if observed == 1:
+            return steps, data
+    return steps, None
+
+for vol in (False, True):
+    steps, data = spin(vol, 3)
+    tag = &quot;volatile 标志&quot; if vol else &quot;普通标志&quot;
+    print(f&quot;{tag:&lt;14} 自旋 {steps:&gt;3} 步后读到 data = {data}&quot;
+          + (&quot;（超时，永远看不到）&quot; if data is None else &quot;&quot;))
+
+# ===== 示例 3：把自旋的全局 load 量降下来 =====
+def spin_loads(cycles, publish_every, mode):
+    n = 0
+    for c in range(1, cycles + 1):
+        if mode == &quot;每轮读全局&quot;:
+            n += 1
+        elif mode == &quot;先读 shared，命中再读全局&quot;:
+            n += 1 if c % publish_every == 0 else 0
+        elif mode == &quot;每轮读全局 + 8 轮退避&quot;:
+            n += 1 if (c % 8 == 0 or c % publish_every == 0) else 0
+    return n
+
+CYCLES, PUB = 4096, 32
+for mode in (&quot;每轮读全局&quot;, &quot;先读 shared，命中再读全局&quot;, &quot;每轮读全局 + 8 轮退避&quot;):
+    print(f&quot;{mode:&lt;22} 全局 load {spin_loads(CYCLES, PUB, mode):&gt;5} 次&quot;)</code></pre>
+<p>在 Python 3.14.5（纯标准库）下实际运行结果：</p>
+<pre data-lang="text"><code class="language-text">relaxed store + relaxed load         6 种可行执行中有 1 种读到 f==1 而 x==0 → 不安全
+release store + acquire load         6 种可行执行中有 0 种读到 f==1 而 x==0 → 不会发生
+release/acquire，但用 block 作用域         6 种可行执行中有 1 种读到 f==1 而 x==0 → 不安全
+普通标志           自旋  99 步后读到 data = None（超时，永远看不到）
+volatile 标志    自旋   3 步后读到 data = 42
+每轮读全局                  全局 load  4096 次
+先读 shared，命中再读全局       全局 load   128 次
+每轮读全局 + 8 轮退避          全局 load   512 次</code></pre>
+<p>第三段说明自旋优化的落点是<strong>减少 L2 事务次数</strong>（第 3 章的存储层次在这里兑现）：4096 轮只发布了 128 次新值，逐轮读全局要 4096 次 load，退避后降到 512 次，&quot;先查 shared 副本、只在疑似变更时才读全局&quot;降到 128 次——等于变更次数。</p>
+<p>对应的 CUDA 写法：release/acquire 的原子标志、以及等价的显式 fence 版本。</p>
+<pre data-lang="cuda"><code class="language-cuda">#include &lt;cuda/atomic&gt;
+
+// 版本 A：release/acquire —— 顺序绑在 flag 这个变量上
+__global__ void producerAcqRel(int* x, cuda::atomic&lt;int, cuda::thread_scope_device&gt;* flag) {
+    if (threadIdx.x == 0) {
+        *x = 42;                                            // 数据
+        flag-&gt;store(1, cuda::memory_order_release);          // 发布：x 的写先于 flag 可见
+    }
+}
+__global__ void consumerAcqRel(const int* x, cuda::atomic&lt;int, cuda::thread_scope_device&gt;* flag,
+                               int* ok) {
+    while (flag-&gt;load(cuda::memory_order_acquire) != 1) { }  // 订阅：等到就必须能看到 x
+    if (threadIdx.x == 0) *ok = (*x == 42);
+}</code></pre>
+<pre data-lang="cuda"><code class="language-cuda">// 版本 B：显式 fence —— 顺序不绑定任何变量，作用于本线程
+__global__ void producerFence(int* x, int* flag) {
+    if (threadIdx.x == 0) {
+        *x = 42;
+        __threadfence();          // 本 device 范围：x 的写在 flag 的写之前完成
+        *flag = 1;                // 普通写即可，顺序由上面那句保证
+    }
+}
+__global__ void consumerFence(const int* x, volatile int* flag, int* ok) {
+    while (*flag != 1) { }        // volatile：每次自旋真的回内存读
+    __threadfence();              // 读侧也要一句，拒绝把后面的读上移
+    if (threadIdx.x == 0) *ok = (*x == 42);
+}</code></pre>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选：需要 GPU。把上面两个版本各跑 10 万次，统计断言失败次数 ----
+# nvcc -O3 -arch=sm_90 -o litmus litmus.cu -I&lt;cccl&gt;/include   # cuda::atomic 随 CCCL 提供
+# for i in $(seq 1 100000); do ./litmus; done | sort | uniq -c
+# 期望：release/acquire 版本与 fence 版本都是 0 次失败；
+#       把 release 去掉（改 relaxed）后应能观察到非零失败次数——这就是两种写法的区别。
+# 复现前先确认本机 CCCL 头文件路径（cuda/std 与 cuda/atomic 的安装位置随 Toolkit/CCCL 版本变化）。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：把示例 1 的 <code>litmus</code> 改成&quot;写方先写 <code>x</code> 与 <code>y</code> 两个数据，再置标志&quot;，重新数一遍 relaxed / release-acquire 两种语义下的失败执行数，解释为什么数量会变。</li>
+<li><strong>解释</strong>：为什么&quot;两个操作都是原子的&quot;仍然可能构成数据竞争？把答案拆成&quot;原子性&quot;与&quot;作用域&quot;两句话。</li>
+<li><strong>对比/验证</strong>：把示例 2 的 <code>spin</code> 改成&quot;生产者每轮都改标志&quot;，比较 <code>volatile</code> 与非 <code>volatile</code> 的自旋步数；再给非 <code>volatile</code> 版本加上编译器屏障（<code>asm volatile(&quot;&quot; ::: &quot;memory&quot;)</code>）看能否修复，并说明这为什么不是可移植做法。</li>
+<li><strong>思考</strong>：一个 kernel 每 32 轮才需要发布一次进度，你会选&quot;每轮读全局标志&quot;还是&quot;先读 shared 副本&quot;？如果消费者与生产者不在同一个 block，共享内存方案是否还成立？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>NVIDIA, <em>CUDA Programming Guide</em> —「CUDA C++ Memory Model」的 Thread Scopes / Atomicity / Data Races / Example: Message Passing 各小节（本课 litmus test 与作用域标定的原始出处）：<a href="https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/cuda-cpp-memory-model.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/cuda-cpp-memory-model.html</a></li>
+<li>NVIDIA, <em>Parallel Thread Execution ISA</em> — Memory Consistency Model（<code>fence.sc</code>、<code>atom</code> 的 <code>.acquire</code> / <code>.release</code> / <code>.relaxed</code> 语义与 scope 的精确规则、litmus 测试清单）：<a href="https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#memory-consistency-model" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#memory-consistency-model</a></li>
+<li>NVIDIA, <em>Parallel Thread Execution ISA</em> — Scope（<code>.cta</code> / <code>.gpu</code> / <code>.sys</code> 三档作用域的定义与适用条件）：<a href="https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#memory-consistency-model-scope" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#memory-consistency-model-scope</a></li>
+<li>NVIDIA CCCL 文档 — <code>cuda::atomic_ref</code> / <code>cuda::atomic</code> 与内存序（把普通内存当原子对象用的 API 与 scope 模板参数；文档随 CCCL 版本更新，路径为 libcudacxx 的 synchronization primitives 一节）：<a href="https://nvidia.github.io/cccl/" target="_blank" rel="noopener noreferrer">https://nvidia.github.io/cccl/</a></li>
+</ul>
+<p><a href="#/l/cuda-ch5-l3">下一课：协作组与线程束特化（warp specialization）</a></p>

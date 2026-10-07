@@ -1,0 +1,307 @@
+<h2 id="h-pattern-匹配与融合边界点链--归约链">pattern 匹配与融合边界（点链 / 归约链）<a class="anchor" href="#h-pattern-匹配与融合边界点链--归约链" aria-label="本节链接">#</a></h2>
+<p>上一课算清了收益，但收益只在&quot;能融&quot;时存在。编译器凭什么决定哪两个算子可以融？<strong>判据不是&quot;相邻&quot;</strong>——<code>relu</code> 紧跟 <code>matmul</code> 就不能融，被两处读取的中间值也不能随手融进其中一处。本课用一个 40 行的图级 pass 跑通&quot;分类 → 沿生产者扩张 → 遇边界停下 → 写清理由&quot;，并给出多消费者下&quot;重算还是物化&quot;的利润公式。</p>
+<p><figure><img class="md-img" src="content/courses/ml-compilers/assets/chapter-5-figure-02.svg" alt="融合边界的判定：分类 → 扩张 → 边界 → 成簇" loading="lazy" decoding="async"><figcaption>融合边界的判定：分类 → 扩张 → 边界 → 成簇</figcaption></figure>
+</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-先给算子分类类别决定可融性">1. 先给算子分类：类别决定可融性<a class="anchor" href="#h-1-先给算子分类类别决定可融性" aria-label="本节链接">#</a></h4>
+<p>融合判定几乎都建立在一个分类上：<strong>逐元素</strong>（elementwise / injective，输出每个元素只依赖输入的对应位置，如 <code>add</code>/<code>relu</code>）、<strong>广播</strong>（broadcast，索引式改写）、<strong>归约</strong>（reduction，输出依赖输入的多个位置，如 <code>sum</code>）、<strong>不透明</strong>（opaque，如外部库实现的矩阵乘）。真实编译器里的 <code>OpPatternKind</code> 就是这张表——TVM 的融合流水线（<code>relax.FuseOps</code> + <code>relax.FuseTIR</code>）官方文档写到它&quot;把多个连续的张量算子融合成单个 kernel&quot;，能否融进同一个 kernel 取决于模式类别。</p>
+<table>
+<thead>
+<tr>
+<th>类别</th>
+<th>例子</th>
+<th>能融进什么</th>
+<th>为什么</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>逐元素</td>
+<td><code>add</code> <code>mul</code> <code>relu</code> <code>sigmoid</code></td>
+<td>逐元素、归约、归约的 epilogue</td>
+<td>每个输出只依赖对应输入，表达式可直接写进消费者的循环体</td>
+</tr>
+<tr>
+<td>广播</td>
+<td>加偏置</td>
+<td>逐元素、归约</td>
+<td>索引式改写，不增加数据依赖</td>
+</tr>
+<tr>
+<td>归约</td>
+<td><code>sum</code> <code>mean</code></td>
+<td>逐元素（epilogue）</td>
+<td>归约结果可在同一内核里继续做逐元素计算；<strong>归约不能融进归约</strong>（要重排归约树或两遍）</td>
+</tr>
+<tr>
+<td>不透明</td>
+<td>矩阵乘、extern kernel</td>
+<td>都不行</td>
+<td>外部实现不暴露循环结构，无法注入别的算子</td>
+</tr>
+</tbody></table>
+<h4 id="h-2-点链融合把生产者写进消费者的循环体">2. 点链融合：把生产者写进消费者的循环体<a class="anchor" href="#h-2-点链融合把生产者写进消费者的循环体" aria-label="本节链接">#</a></h4>
+<p>若生产者是逐元素、且结果<strong>只被这一个消费者使用</strong>，就可以把它&quot;内联&quot;进消费者的循环体：消费者不再读中间张量，而是现算。一条 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span></span></span></span> 个逐元素算子的链因此收成 1 个内核、1 趟访存。判据里两个条件缺一不可：类别允许、<strong>且中间值只有一个读者</strong>。后者是下节主角。</p>
+<h4 id="h-3-归约链的两个方向">3. 归约链的两个方向<a class="anchor" href="#h-3-归约链的两个方向" aria-label="本节链接">#</a></h4>
+<p>归约最容易搞反，它的两个方向收益不对称：</p>
+<ul>
+<li><strong>输入侧</strong>（逐元素 → 归约）：把生产者算进归约循环——归约本就要遍历输入，内联后中间值不落地。</li>
+<li><strong>输出侧 / epilogue</strong>（归约 → 逐元素）：归约结果继续在同一内核里做逐元素变换（<code>sum → ×2 → relu</code>）。代码里 <code>total</code> 把生产者 <code>proj</code> 融进来，成为一个内核 <code>[&#39;total&#39;, &#39;proj&#39;]</code>。</li>
+<li><strong>归约 → 归约</strong>：不许。外层归约要消费内层的全部结果，直接内联会让内层被重复求值，真实编译器普遍退回两遍或改成 split reduction。</li>
+</ul>
+<h4 id="h-4-边界从哪来">4. 边界从哪来<a class="anchor" href="#h-4-边界从哪来" aria-label="本节链接">#</a></h4>
+<p>边界有四类，代码逐条打印：</p>
+<ol>
+<li><strong>不透明算子</strong>：<code>q</code>/<code>k</code> 是矩阵乘，任何与 opaque 的组合都停住。本机 torch 2.3.1 调度器源码对应的拒绝是&quot;节点是 extern 或 nop 就不再尝试融合&quot;（<code>can_fuse</code> 的 <code>node1 is extern or nop</code> 分支）。</li>
+<li><strong>多消费者</strong>：中间值被两处读，融进其中一处会让另一处重算或继续读显存。<strong>这不等于禁止</strong>——两处若落在同一个簇里就只是&quot;算一次、用两次&quot;（CSE）；只有落在不同簇才要过利润模型。</li>
+<li><strong>归约 → 归约</strong>：见上。</li>
+<li><strong>已被别的簇吸收</strong>：一个值只有一个生产者，被吸收后其他路径要另找边界。</li>
+</ol>
+<p>四类边界在不同编译器里名字不同：XLA 在 HLO 层也做 producer-consumer 融合与 multi-output 融合（多个消费者合成一个多输出内核），依据同样是编译期的依赖与读者分析。</p>
+<h4 id="h-5-多消费者的利润模型">5. 多消费者的利润模型<a class="anchor" href="#h-5-多消费者的利润模型" aria-label="本节链接">#</a></h4>
+<p>设生产者链长 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">m</span></span></span></span>（每元素 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">m</span></span></span></span> 次运算）、消费者 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">c</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 个、中间张量 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">E</span></span></span></span> 个元素、带宽 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0502em;">B</span></span></span></span>、算力 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">F</span></span></span></span>（元素算子/秒）：</p>
+<p><span class="math-fallback math-fallback--block">t_{\text{物化}} = \frac{(2+n_c)\cdot 4E}{B},\qquad\rt_{\text{重算}} = \frac{n_c \cdot 4E}{B} + \frac{n_c\,mE}{F}</span></p>
+<p>令二者相等得 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6887em;"></span><span class="mord"><span class="mord mathnormal">m</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6887em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.1963em;vertical-align:-0.836em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3603em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">c</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord mathnormal" style="margin-right:0.0502em;">B</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">8</span><span class="mord mathnormal" style="margin-right:0.1389em;">F</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.836em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span>。代入示例参数（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0502em;">B</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1.5</span></span></span></span> TB/s、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">F</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">375</span></span></span></span> G 元素算子/s、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">c</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2</span></span></span></span>）得 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6887em;"></span><span class="mord"><span class="mord mathnormal">m</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6887em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1.0</span></span></span></span>：<strong>生产者只有 1 个算子时两者持平，再长就该物化</strong>。这就是&quot;多消费者&quot;是条件而非禁忌的原因，也说明结论随硬件算术强度变化。</p>
+<h4 id="h-6-常见坑">6. 常见坑<a class="anchor" href="#h-6-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>只看相邻不看读者数</strong>：会漏掉多消费者与不透明边界。</li>
+<li><strong>把归约当逐元素处理</strong>：两个归约融进一个内核只会重复计算、难以向量化。</li>
+<li><strong>忽略 epilogue</strong>：归约输出后的逐元素链不融，就白多一趟往返。</li>
+<li><strong>拿&quot;融得多&quot;当目标</strong>：簇越大，寄存器与 occupancy 越紧张（下一课），要与代价核算一起看。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>纯 Python（无第三方依赖）。图沿用第 3/4 课的节点表，类别写在节点上；pass 分两阶段：反向成簇（吸收生产者），再把&quot;外部消费者全落在同一簇&quot;的簇并进去（同一内核内的 CSE）；最后打印跨簇连边与理由。</p>
+<pre data-lang="python"><code class="language-python"># ---- 第 2 课示例：pattern 匹配与融合边界（纯 Python，无第三方依赖）----
+# 图表示沿用第 3/4 课的节点表：节点 = (名字, 类别, [输入])；类别决定&quot;能不能融&quot;
+NODES = [(&#39;h&#39;,      &#39;add&#39;,       [&#39;x&#39;, &#39;b&#39;]),
+         (&#39;q&#39;,      &#39;matmul&#39;,    [&#39;h&#39;, &#39;Wq&#39;]),
+         (&#39;k&#39;,      &#39;matmul&#39;,    [&#39;h&#39;, &#39;Wk&#39;]),
+         (&#39;score&#39;,  &#39;mul&#39;,       [&#39;q&#39;, &#39;k&#39;]),
+         (&#39;p&#39;,      &#39;sigmoid&#39;,   [&#39;score&#39;]),
+         (&#39;rowsum&#39;, &#39;sum&#39;,       [&#39;p&#39;]),
+         (&#39;norm&#39;,   &#39;mul&#39;,       [&#39;p&#39;, &#39;rowsum&#39;]),
+         (&#39;act&#39;,    &#39;relu&#39;,      [&#39;norm&#39;]),
+         (&#39;o&#39;,      &#39;matmul&#39;,    [&#39;act&#39;, &#39;Wv&#39;]),
+         (&#39;proj&#39;,   &#39;add&#39;,       [&#39;o&#39;, &#39;bo&#39;]),
+         (&#39;total&#39;,  &#39;sum&#39;,       [&#39;proj&#39;]),
+         (&#39;r2&#39;,     &#39;sum&#39;,       [&#39;total&#39;])]
+KIND = {&#39;matmul&#39;: &#39;opaque&#39;, &#39;add&#39;: &#39;pointwise&#39;, &#39;mul&#39;: &#39;pointwise&#39;, &#39;relu&#39;: &#39;pointwise&#39;,
+        &#39;sigmoid&#39;: &#39;pointwise&#39;, &#39;sum&#39;: &#39;reduction&#39;, &#39;broadcast&#39;: &#39;broadcast&#39;}
+DEPS = {n: list(d) for n, k, d in NODES}
+KIND_OF = {n: KIND[k] for n, k, d in NODES}
+ORDER = [n for n, k, d in NODES]
+EXT = {&#39;x&#39;: 1536, &#39;b&#39;: 1536, &#39;Wq&#39;: 2304, &#39;Wk&#39;: 2304, &#39;Wv&#39;: 2304, &#39;bo&#39;: 1536}
+ELEMS = {n: 1536 for n in ORDER}
+CONS = {n: [] for n in ORDER}
+for n in ORDER:
+    for d in DEPS[n]:
+        CONS.setdefault(d, []).append(n)
+
+# 规则表写成数据：真实编译器里它就是 OpPatternKind 的判定表
+RULES = [(&#39;pointwise&#39;, &#39;pointwise&#39;, &#39;逐元素融进逐元素：同一次遍历里算完&#39;),
+         (&#39;pointwise&#39;, &#39;reduction&#39;, &#39;逐元素融进归约：在归约循环里直接算&#39;),
+         (&#39;reduction&#39;, &#39;pointwise&#39;, &#39;归约融进逐元素：epilogue，结果直接往下用&#39;),
+         (&#39;broadcast&#39;, &#39;pointwise&#39;, &#39;广播融进逐元素：只是索引式改写&#39;),
+         (&#39;layout&#39;,    &#39;pointwise&#39;, &#39;布局视图可融，但访存连续性要另算（条件允许）&#39;),
+         (&#39;layout&#39;,    &#39;reduction&#39;, &#39;布局视图融进归约（同上）&#39;)]
+ALLOWED = {(p, c) for p, c, _ in RULES}
+
+print(&#39;=== 1. 先分类：一个算子能不能被融，由它的类别决定 ===&#39;)
+for n, k, d in NODES:
+    flag = &#39;  ← 融合边界（不透明）&#39; if KIND_OF[n] == &#39;opaque&#39; else &#39;&#39;
+    print(f&#39;  {n:&lt;7}{KIND_OF[n]:&lt;10}输入={str(d):&lt;18}{flag}&#39;)
+print(&#39;\n  规则表（生产者类别 → 消费者类别）：&#39;)
+for p, c, w in RULES:
+    print(f&#39;    {p:&lt;10} → {c:&lt;10}{w}&#39;)
+print(&#39;    不接受：任何 → opaque；opaque → 任何；reduction → reduction；跨簇的多消费者要过利润模型&#39;)
+
+# ---- 阶段 1：按执行序反向成簇（每个节点先自成一簇，再吸收生产者）----
+owner, groups = {}, {}
+for n in reversed(ORDER):
+    if n in owner:
+        continue
+    members, frontier = [n], [n]
+    owner[n] = n
+    if KIND_OF[n] != &#39;opaque&#39;:
+        while frontier:
+            c = frontier.pop()
+            for p in DEPS.get(c, []):
+                if p in EXT or p in owner:
+                    continue
+                if KIND_OF[p] == &#39;opaque&#39;:
+                    continue
+                if KIND_OF[p] == &#39;reduction&#39; and KIND_OF[c] == &#39;reduction&#39;:
+                    continue
+                if (KIND_OF[p], KIND_OF[c]) not in ALLOWED:
+                    continue
+                if len(CONS.get(p, [])) &gt; 1:
+                    continue
+                members.append(p); owner[p] = n; frontier.append(p)
+    groups[n] = members
+
+# ---- 阶段 2：整个簇的&quot;外部消费者&quot;若都落在同一个簇里，就并入那个簇（同一内核里做 CSE）----
+changed = True
+while changed:
+    changed = False
+    for head, members in list(groups.items()):
+        targets = {owner[c] for m in members for c in CONS.get(m, [])
+                   if c in owner and owner[c] != head}
+        if len(targets) != 1:
+            continue
+        G = targets.pop()
+        if G not in groups:
+            continue
+        ok = all((KIND_OF[m], KIND_OF[c]) in ALLOWED
+                 for m in members for c in CONS.get(m, []) if owner.get(c) == G)
+        if not ok:
+            continue
+        groups[G] = groups[G] + members
+        for m in members:
+            owner[m] = G
+        del groups[head]
+        changed = True
+        break
+
+# ---- 边界：所有&quot;生产者与消费者不在同一簇&quot;的连边，都记下原因 ----
+boundary = []
+for c in ORDER:
+    for p in DEPS[c]:
+        if p in EXT or owner.get(p) == owner.get(c):
+            continue
+        if KIND_OF[p] == &#39;opaque&#39;:
+            boundary.append((p, c, f&#39;生产者 {p} 是不透明算子&#39;))
+        elif KIND_OF[c] == &#39;opaque&#39;:
+            boundary.append((p, c, f&#39;消费者 {c} 是不透明算子（extern kernel 不吃 epilogue）&#39;))
+        elif KIND_OF[p] == &#39;reduction&#39; and KIND_OF[c] == &#39;reduction&#39;:
+            boundary.append((p, c, &#39;归约不能融进归约&#39;))
+        elif (KIND_OF[p], KIND_OF[c]) not in ALLOWED:
+            boundary.append((p, c, f&#39;{KIND_OF[p]} → {KIND_OF[c]} 不在规则表里&#39;))
+        elif len(CONS.get(p, [])) &gt; 1:
+            boundary.append((p, c, f&#39;生产者 {p} 的 {len(CONS[p])} 个消费者落在不同簇&#39;))
+        else:
+            boundary.append((p, c, &#39;所属簇不同&#39;))
+
+print(&#39;\n=== 2. 成簇结果（一个簇 = 一个内核）===&#39;)
+for head, members in groups.items():
+    tail = members[1:]
+    print(f&#39;  内核「{head}」：{members}&#39; + (f&#39;   融掉 {tail}&#39; if tail else &#39;   只有它自己&#39;))
+
+print(&#39;\n=== 3. 留下的边界（扩张在这里停住，以及为什么）===&#39;)
+seen = set()
+for p, c, r in boundary:
+    if (p, c, r) in seen:
+        continue
+    seen.add((p, c, r))
+    print(f&#39;    {p} → {c}: {r}&#39;)
+same = [n for n in ORDER if len(CONS.get(n, [])) &gt; 1
+        and len({owner[c] for c in CONS[n]}) == 1]
+print(f&#39;  多消费者但不算边界：{[(n, CONS[n]) for n in same]}&#39;
+      &#39; —— 它们落在同一个簇里，内核里算一次用两次（CSE），没有额外访存&#39;)
+
+fused = [n for head, m in groups.items() for n in m[1:]]
+print(f&#39;\n=== 4. 两笔账 ===&#39;)
+print(f&#39;  内核数：{len(ORDER)} → {len(groups)}&#39;)
+print(f&#39;  融掉、不再落地的中间张量：{fused}&#39;)
+print(f&#39;  省下的写 + 读 = {2 * sum(ELEMS[n] for n in fused) * 4 / 1024:.1f} KiB&#39;
+      f&#39;（每个被融掉的张量写一次、读一次，按 1536 元素 = 6 KiB 计）&#39;)
+
+print(&#39;\n=== 5. 多消费者的利润模型：重算还是物化？ ===&#39;)
+BW, OPS_PER_SEC = 1.5e12, 1.5e12 / 4        # 示例参数：带宽 1.5 TB/s、375 G 元素算子/s
+def cost(materialize, m_ops, n_cons, elems):
+    if materialize:                          # 写中间值 + 生产者读输入 + 每个消费者读中间值
+        return (2 + n_cons) * elems * 4 / BW
+    return n_cons * elems * 4 / BW + n_cons * m_ops * elems / OPS_PER_SEC
+elems, n_cons = 512 * 768, 2
+m_star = 8 * OPS_PER_SEC / (n_cons * BW)     # 由两条代价相等解出的临界生产者长度
+print(f&#39;  设消费者 {n_cons} 个、中间张量 {elems} 元素；&#39;
+      f&#39;临界生产者长度 m* = 8·F/(n_c·B) = {m_star:.1f} 个算子&#39;)
+for m_ops in (1, 2, 4, 16):
+    t_m, t_r = cost(True, m_ops, n_cons, elems), cost(False, m_ops, n_cons, elems)
+    verdict = &#39;重算更省&#39; if t_r &lt; t_m * 0.999 else (&#39;物化更省&#39; if t_m &lt; t_r * 0.999 else &#39;持平&#39;)
+    print(f&#39;    生产者 {m_ops:&gt;2} 个算子：物化 {t_m * 1e6:6.1f} us，&#39;
+          f&#39;重算 {t_r * 1e6:6.1f} us → {verdict}&#39;)
+print(&#39;  重算省掉&quot;最后写一次 + 多读一次&quot;，代价是生产者多算 n_c-1 遍；&#39;)
+print(f&#39;  生产者短于 {m_star:.1f} 个算子才值得重算；刚好相等时两者持平。&#39;)
+print(&#39;  多消费者不是禁忌，是要过账：这笔账的结论随带宽/算力比与消费者个数变化。&#39;)</code></pre>
+<p>本机实跑输出（Python 3.14，无第三方依赖）：</p>
+<pre data-lang="text"><code class="language-text">=== 1. 先分类：一个算子能不能被融，由它的类别决定 ===
+  h      pointwise 输入=[&#39;x&#39;, &#39;b&#39;]
+  q      opaque    输入=[&#39;h&#39;, &#39;Wq&#39;]         ← 融合边界（不透明）
+  k      opaque    输入=[&#39;h&#39;, &#39;Wk&#39;]         ← 融合边界（不透明）
+  score  pointwise 输入=[&#39;q&#39;, &#39;k&#39;]
+  p      pointwise 输入=[&#39;score&#39;]
+  rowsum reduction 输入=[&#39;p&#39;]
+  norm   pointwise 输入=[&#39;p&#39;, &#39;rowsum&#39;]
+  act    pointwise 输入=[&#39;norm&#39;]
+  o      opaque    输入=[&#39;act&#39;, &#39;Wv&#39;]       ← 融合边界（不透明）
+  proj   pointwise 输入=[&#39;o&#39;, &#39;bo&#39;]
+  total  reduction 输入=[&#39;proj&#39;]
+  r2     reduction 输入=[&#39;total&#39;]
+
+  规则表（生产者类别 → 消费者类别）：
+    pointwise  → pointwise 逐元素融进逐元素：同一次遍历里算完
+    pointwise  → reduction 逐元素融进归约：在归约循环里直接算
+    reduction  → pointwise 归约融进逐元素：epilogue，结果直接往下用
+    broadcast  → pointwise 广播融进逐元素：只是索引式改写
+    layout     → pointwise 布局视图可融，但访存连续性要另算（条件允许）
+    layout     → reduction 布局视图融进归约（同上）
+    不接受：任何 → opaque；opaque → 任何；reduction → reduction；跨簇的多消费者要过利润模型
+
+=== 2. 成簇结果（一个簇 = 一个内核）===
+  内核「r2」：[&#39;r2&#39;]   只有它自己
+  内核「total」：[&#39;total&#39;, &#39;proj&#39;]   融掉 [&#39;proj&#39;]
+  内核「o」：[&#39;o&#39;]   只有它自己
+  内核「act」：[&#39;act&#39;, &#39;norm&#39;, &#39;rowsum&#39;, &#39;p&#39;, &#39;score&#39;]   融掉 [&#39;norm&#39;, &#39;rowsum&#39;, &#39;p&#39;, &#39;score&#39;]
+  内核「k」：[&#39;k&#39;]   只有它自己
+  内核「q」：[&#39;q&#39;]   只有它自己
+  内核「h」：[&#39;h&#39;]   只有它自己
+
+=== 3. 留下的边界（扩张在这里停住，以及为什么）===
+    h → q: 消费者 q 是不透明算子（extern kernel 不吃 epilogue）
+    h → k: 消费者 k 是不透明算子（extern kernel 不吃 epilogue）
+    q → score: 生产者 q 是不透明算子
+    k → score: 生产者 k 是不透明算子
+    act → o: 消费者 o 是不透明算子（extern kernel 不吃 epilogue）
+    o → proj: 生产者 o 是不透明算子
+    total → r2: 归约不能融进归约
+  多消费者但不算边界：[(&#39;p&#39;, [&#39;rowsum&#39;, &#39;norm&#39;])] —— 它们落在同一个簇里，内核里算一次用两次（CSE），没有额外访存
+
+=== 4. 两笔账 ===
+  内核数：12 → 7
+  融掉、不再落地的中间张量：[&#39;proj&#39;, &#39;norm&#39;, &#39;rowsum&#39;, &#39;p&#39;, &#39;score&#39;]
+  省下的写 + 读 = 60.0 KiB（每个被融掉的张量写一次、读一次，按 1536 元素 = 6 KiB 计）
+
+=== 5. 多消费者的利润模型：重算还是物化？ ===
+  设消费者 2 个、中间张量 393216 元素；临界生产者长度 m* = 8·F/(n_c·B) = 1.0 个算子
+    生产者  1 个算子：物化    4.2 us，重算    4.2 us → 持平
+    生产者  2 个算子：物化    4.2 us，重算    6.3 us → 物化更省
+    生产者  4 个算子：物化    4.2 us，重算   10.5 us → 物化更省
+    生产者 16 个算子：物化    4.2 us，重算   35.7 us → 物化更省
+  重算省掉&quot;最后写一次 + 多读一次&quot;，代价是生产者多算 n_c-1 遍；
+  生产者短于 1.0 个算子才值得重算；刚好相等时两者持平。
+  多消费者不是禁忌，是要过账：这笔账的结论随带宽/算力比与消费者个数变化。</code></pre>
+<p>四处可核对：<strong>类别而非相邻决定可融性</strong>（<code>h → q</code>、<code>act → o</code> 相邻却被拒，因消费者是 extern 矩阵乘）；<strong>12 个节点收成 7 个内核、5 个中间张量不再落地、省 60 KiB 读写</strong>；<strong>多消费者在同一簇内不算边界</strong>（<code>p</code> 被同簇的 <code>rowsum</code> 与 <code>norm</code> 读，CSE 即可）；<strong>归约 → 归约永远切开</strong>。</p>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选，本机 CPU 即可跑：看真实编译器的边界怎么落在生成的内核名上 ----
+# 同一台机器（torch 2.3.1 + macOS CPU）上，y = relu(x @ w + b) → sigmoid → sum(dim=1) 生成：
+#   extern_kernels.addmm(...)              ← 不透明算子，自己一个内核
+#   cpp_fused_relu_sigmoid_sum_0(buf0, buf1)  ← relu + sigmoid + sum 融成一个
+# 多消费者场景 y = relu(x @ w)（y 同时被 sum 与 max 读）生成：
+#   extern_kernels.mm(...)
+#   cpp_fused_max_relu_sum_0(buf0, buf1, buf3)   ← 两个消费者被横向融进同一个内核
+# 换成 GPU（&#39;cuda&#39;）时内核名会变成 triton_* 前缀，边界判定的规则相同。
+# 想直接读规则本身：torch 2.3.1 的 torch/_inductor/scheduler.py 里 can_fuse 会以
+# &quot;node1 is extern or nop&quot; / &quot;no shared data&quot; / &quot;exceeds max fusion&quot; 等理由拒绝融合。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：给 <code>KIND</code> 加一个 <code>layout</code> 节点（<code>transpose</code> 视图），插在 <code>score</code> 与 <code>p</code> 之间，看它是否被吸收进「act」簇；再插到 <code>q</code> 与 <code>score</code> 之间并解释差异。</li>
+<li><strong>解释</strong>：为什么阶段 2 能写成不动点循环？没有这一步时 <code>p</code> 落在哪个簇、内核数与流量各是多少？</li>
+<li><strong>对比/验证</strong>：删掉 <code>RULES</code> 里的 <code>(&#39;reduction&#39;, &#39;pointwise&#39;, ...)</code>（模拟&quot;不做 epilogue 融合&quot;的编译器），重跑对比内核数与省下的读写，再估算该改动在真实模型上的代价。</li>
+<li><strong>思考</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6887em;"></span><span class="mord"><span class="mord mathnormal">m</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6887em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">8</span><span class="mord mathnormal" style="margin-right:0.1389em;">F</span><span class="mord">/</span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">c</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord mathnormal" style="margin-right:0.0502em;">B</span><span class="mclose">)</span></span></span></span> 随硬件变化。端侧（带宽低、算力低）与云侧（带宽高、算力高）各跑同一个模型，&quot;多消费者要不要重算&quot;的结论可能相反吗？给出推理与要实测的量。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Tianqi Chen et al., <em>TVM</em>（OSDI&#39;18；算子融合作为图级优化）与 TVM 设计文档 <em>Operator Fusion</em> 一节（融合算法与算子模式分类）：<a href="https://www.usenix.org/conference/osdi18/presentation/chen" target="_blank" rel="noopener noreferrer">https://www.usenix.org/conference/osdi18/presentation/chen</a> · <a href="https://tvm.apache.org/docs/arch/fusion.html" target="_blank" rel="noopener noreferrer">https://tvm.apache.org/docs/arch/fusion.html</a></li>
+<li>OpenXLA 官方文档（HLO 层的 producer-consumer 融合与 multi-output 融合）：<a href="https://openxla.org/xla" target="_blank" rel="noopener noreferrer">https://openxla.org/xla</a></li>
+<li>MLIR 官方文档与 <code>ElementwiseOpFusion.cpp</code>（linalg dialect 的逐元素算子融合实现，融合判据落在索引映射的可组合性上）：<a href="https://mlir.llvm.org/doxygen/ElementwiseOpFusion_8cpp.html" target="_blank" rel="noopener noreferrer">https://mlir.llvm.org/doxygen/ElementwiseOpFusion_8cpp.html</a></li>
+<li>PyTorch 源码 <em>torch/_inductor/scheduler.py</em>（<code>can_fuse</code> 的边界理由：extern/nop 拒绝、无共享数据拒绝、超过 <code>max_fusion_size</code> 拒绝；本课第 4 节的依据，本机 torch 2.3.1 实读）：<a href="https://github.com/pytorch/pytorch/blob/main/torch/_inductor/scheduler.py" target="_blank" rel="noopener noreferrer">https://github.com/pytorch/pytorch/blob/main/torch/_inductor/scheduler.py</a></li>
+</ul>
+<p><a href="#/l/mlc-ch5-l3">下一课：融合的代价核算：寄存器压力、occupancy 与实测回归</a></p>

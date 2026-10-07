@@ -1,0 +1,94 @@
+<h2 id="h-图文生成统一">图文生成统一<a class="anchor" href="#h-图文生成统一" aria-label="本节链接">#</a></h2>
+<p>上一课我们造出了一个&quot;能看图说话&quot;的模型，但它是<strong>单向</strong>的：输入图像+文本，输出文本。而你在前面章节学的扩散模型又是另一个方向：输入文本，输出图像。一个自然的问题出现了——<strong>能不能把&quot;理解&quot;和&quot;生成&quot;塞进同一个模型</strong>，让它既能读图、又能画图、还能一边写文章一边插图？这就是&quot;图文生成统一&quot;要回答的问题。本课时梳理它的技术路线，并以 Chameleon 为例讲解&quot;一个 Transformer 通吃图文&quot;的优雅方案。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-为什么要统一">1. 为什么要&quot;统一&quot;<a class="anchor" href="#h-1-为什么要统一" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>交错生成（interleaved）</strong>：真实内容往往是图文交织的——一篇教程、一条带表情的聊天记录、一份带示意图的报告。分立的&quot;文生图模型&quot;只能一次性生成单张图，无法在生成文本的中间自然地&quot;插图&quot;。</li>
+<li><strong>任意模态到任意模态（any-to-any）</strong>：用户可能给出文字要图片，给出图片要描述，给出&quot;图+文字&quot;要修改后的图。每加一种组合就训练一个新模型，工程上不可持续。</li>
+<li><strong>一个共享的语义空间</strong>：理解与生成本应共享同一套世界知识，分开训练等于把知识重复学两遍。</li>
+</ul>
+<h4 id="h-2-两条主要技术路线">2. 两条主要技术路线<a class="anchor" href="#h-2-两条主要技术路线" aria-label="本节链接">#</a></h4>
+<p>把图文统一，业界基本分两派：</p>
+<p><strong>路线 A：早融合，统一 token（early fusion / unified token）。</strong> 用一个图像 tokenizer 把图片离散化成&quot;图像 token&quot;，和文本 token 放进<strong>同一个词表</strong>，然后只训练一个 Transformer 做下一 token 预测。代表是 Chameleon、以及更早的 DALL-E（VQ-VAE + 自回归）。它的优点是架构极简、天然的任意模态交错；难点是把连续图像压成离散 token 会损失细节，且长序列训练难。</p>
+<p><strong>路线 B：模块化，冻结扩散（modular / frozen diffusion）。</strong> 语言模型负责&quot;理解 + 生成文本&quot;，当需要出图时，让 LLM 输出一个<strong>文本或嵌入形式的&quot;图描述&quot;</strong>，再交给一个冻结的扩散模型（如 Stable Diffusion）去真正画图。代表是 EMU2、GILL。优点是图像质量高（借用了扩散模型的能力）、训练改动小；缺点是交错生成不够&quot;原生&quot;，图文不是在同一套参数里学出来的。</p>
+<p><figure><img class="md-img" src="content/courses/multimodal-diffusion/assets/chapter-5-figure-03.svg" alt="图文生成统一的两条技术路线对比" loading="lazy" decoding="async"><figcaption>图文生成统一的两条技术路线对比</figcaption></figure>
+</p>
+<h4 id="h-3-chameleon一个-transformer-通吃图文">3. Chameleon：一个 Transformer 通吃图文<a class="anchor" href="#h-3-chameleon一个-transformer-通吃图文" aria-label="本节链接">#</a></h4>
+<p>Chameleon（Meta, 2024）是路线 A 的代表，值得重点拆解：</p>
+<ul>
+<li><strong>统一词表</strong>：它有一个图像 tokenizer 把图片切成离散的图像 token，还有一个文本 tokenizer；两者合并成<strong>一个共享词表</strong>，图像 token 和文字 token 在这个词表里地位完全平等。</li>
+<li><strong>一个 Transformer</strong>：只有一个标准的 Transformer 做下一 token 预测。输入序列可以是纯文本、纯图像，或&quot;文本-图像-文本&quot;任意交错，模型逐个 token 地预测下一个。</li>
+<li><strong>训练稳定的关键技巧</strong>：把连续图像离散化、又把图像 token 和文本 token 混在一起训练，数值上极不稳定。Chameleon 用两个技巧压住训练发散：<strong>QK-Norm</strong>（在注意力计算的 query 和 key 上加 LayerNorm，抑制 logits 尖峰）和 <strong>z-loss</strong>（一个正则项，把输出 logits 的整体尺度往下拉）。这给&quot;一个 Transformer 训到底&quot;铺平了路。</li>
+</ul>
+<p><figure><img class="md-img" src="content/courses/multimodal-diffusion/assets/chapter-5-figure-04.svg" alt="统一词表：文本 token 与图像 token 共享同一个词表" loading="lazy" decoding="async"><figcaption>统一词表：文本 token 与图像 token 共享同一个词表</figcaption></figure>
+</p>
+<p>它的效果证明：统一模型能做图文交错生成（给定文本生成图、看图说话、按图续写文字等），而且规模越大能力越强——这正是&quot;统一&quot;路线的核心吸引力。</p>
+<h4 id="h-4-扩散与自回归的握手">4. 扩散与自回归的&quot;握手&quot;<a class="anchor" href="#h-4-扩散与自回归的握手" aria-label="本节链接">#</a></h4>
+<p>你可能好奇：前面花三章学的扩散模型在这里扮演什么角色？答案是——它没被抛弃，而是变成了统一生态里的一环：</p>
+<ul>
+<li>路线 B 直接<strong>把扩散模型当作画图后端</strong>：LLM 负责语义理解和编排，扩散模型负责像素级生成。</li>
+<li>即便在路线 A 里，&quot;图像 tokenizer + 自回归&quot;也只是图像生成的一种实现；扩散模型仍然是目前<strong>单张高保真文生图</strong>质量的天花板。</li>
+<li>所以一个完整的多模态系统，往往是&quot;LLM 当大脑、扩散模型当画笔&quot;，两者分工协作。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<h4 id="h-示例-1用-diffusers-完成一次文生图生成侧">示例 1：用 diffusers 完成一次文生图（生成侧）<a class="anchor" href="#h-示例-1用-diffusers-完成一次文生图生成侧" aria-label="本节链接">#</a></h4>
+<p>先复习你已经熟悉的生成能力，作为统一模型的&quot;画笔&quot;部分。</p>
+<pre data-lang="python"><code class="language-python">from diffusers import StableDiffusionPipeline
+import torch
+
+# 加载 Stable Diffusion (该模型在第三章已详细介绍)
+pipe = StableDiffusionPipeline.from_pretrained(
+    &quot;runwayml/stable-diffusion-v1-5&quot;, torch_dtype=torch.float16
+)
+pipe = pipe.to(&quot;cuda&quot;)
+
+prompt = &quot;a cute corgi wearing a red scarf, cartoon style&quot;
+image = pipe(prompt, num_inference_steps=25, guidance_scale=7.5).images[0]
+image.save(&quot;corgi.png&quot;)
+print(&quot;已生成图片 corgi.png&quot;)</code></pre>
+<h4 id="h-示例-2从零理解统一-token的交错生成思路">示例 2：从零理解&quot;统一 token&quot;的交错生成思路<a class="anchor" href="#h-示例-2从零理解统一-token的交错生成思路" aria-label="本节链接">#</a></h4>
+<p>下面不加载大模型，用一个极简的张量实验演示 Chameleon 的核心：文字 token 与图像 token 在<strong>同一条序列、同一个词表</strong>里被预测。</p>
+<pre data-lang="python"><code class="language-python">import torch
+
+# 假设我们有一个统一词表:
+#   0..999   是文本 token (来自文本 tokenizer)
+#   1000..1999 是图像 token (来自图像 tokenizer, 每张图用若干 token 表示)
+vocab_size = 2000
+n_img_tokens_per_image = 4   # 示意: 每张图离散成 4 个图像 token
+
+# 一个&quot;交错生成&quot;的目标序列:
+#   [文本] &quot;下面是一只狗: &quot;  -&gt;  [图像 token x4]  -&gt;  [文本] &quot; 它的毛色是金色。&quot;
+# 我们用 token id 拼出这条序列
+text_a = [12, 34, 56, 78]                        # &quot;下面是一只狗: &quot; 的 token id
+image  = [1000 + i for i in range(n_img_tokens_per_image)]  # 4 个图像 token
+text_b = [90, 91, 92, 93, 94]                    # &quot; 它的毛色是金色。&quot; 的 token id
+
+sequence = text_a + image + text_b
+print(&quot;统一序列的 token id:&quot;, sequence)
+print(&quot;序列里既有文本 token(&lt;1000)也有图像 token(&gt;=1000):&quot;,
+      any(t &gt;= 1000 for t in sequence) and any(t &lt; 1000 for t in sequence))
+
+# 训练时, 模型对每个位置预测下一个 token; 损失只来自&quot;预测的分布 vs 真实下一 token&quot;
+# 例如位置 len(text_a) 处, 模型要预测的是一个&quot;图像 token id&quot;, 而不是文本 token
+targets = sequence[1:] + [0]   # 右移一位, 0 是填充
+print(&quot;训练目标(下一 token):&quot;, targets)</code></pre>
+<p>关键点在第 <code>targets = sequence[1:]</code>：当模型读到文本部分时，它预测的是<strong>图像 token id</strong>；读到图像部分时又预测文本 token id。因为两者在同一个词表里，损失函数不需要任何特殊处理——<strong>这就是&quot;统一&quot;在实现上的极致简洁</strong>。</p>
+<blockquote>
+<p>真正的 Chameleon 远比这复杂：图像 tokenizer 用 VQ 量化把连续图像变成离散码本索引，训练还要加 QK-Norm 和 z-loss 稳定数值。但&quot;图文 token 同词表、共用一个自回归目标&quot;这一核心思想，上面的骨架已经完整体现了。</p>
+</blockquote>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>路线辨析</strong>：用自己的话说明&quot;早融合统一 token&quot;与&quot;模块化冻结扩散&quot;两条路线的本质区别，并各举一个代表模型。</li>
+<li><strong>动手实验</strong>：在示例 2 中，把序列改造成&quot;图像在前、文本在后&quot;（比如&quot;看图写说明&quot;任务），写出对应的 <code>sequence</code> 与 <code>targets</code>，观察训练目标的变化。</li>
+<li><strong>权衡分析</strong>：统一 token 路线要先把图像离散化，这会带来什么信息损失？结合第三章学到的 VAE/潜空间压缩，谈谈扩散模型为什么能规避&quot;离散化损失细节&quot;这个问题。</li>
+<li><strong>思考题</strong>：如果让你设计一个&quot;图文交错生成&quot;的聊天应用，你会选路线 A 还是路线 B？从图像质量、交错自然度、工程成本三个角度说明理由。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Chameleon 论文（Chameleon: Mixed-Modal Early-Fusion Foundation Models）：<a href="https://arxiv.org/abs/2405.09818" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2405.09818</a></li>
+<li>DALL-E 论文（Zero-Shot Text-to-Image Generation）：<a href="https://arxiv.org/abs/2102.12092" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2102.12092</a></li>
+<li>EMU2 论文（Generative Multimodal Models are In-Context Learners）：<a href="https://arxiv.org/abs/2312.13286" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2312.13286</a></li>
+<li>GILL 论文（Generating Images with Multimodal Language Models）：<a href="https://arxiv.org/abs/2305.17216" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2305.17216</a></li>
+<li>Hugging Face diffusers 文档：<a href="https://huggingface.co/docs/diffusers/index" target="_blank" rel="noopener noreferrer">https://huggingface.co/docs/diffusers/index</a></li>
+</ul>
+<p><a href="#/l/mm-ch5-l3">下一课：视频/音频多模态</a></p>

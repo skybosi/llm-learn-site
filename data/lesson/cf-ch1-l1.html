@@ -1,0 +1,221 @@
+<h2 id="h-编译器在做什么前端--中端--后端与-llvm-生态">编译器在做什么：前端 / 中端 / 后端与 LLVM 生态<a class="anchor" href="#h-编译器在做什么前端--中端--后端与-llvm-生态" aria-label="本节链接">#</a></h2>
+<p>在写第一行编译器代码之前，我们需要一张<strong>地图</strong>。编译器是少数&quot;实现方式反过来决定语言设计&quot;的领域：为什么 C 里必须先声明后使用？为什么 Pascal 要求类型声明写在块的开头？答案不在语言理论里，而在<strong>当年的编译器只能单遍处理</strong>这个工程事实里。不理解这层，后面所有&quot;为什么要这样设计&quot;都会变成背结论。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-编译器是一条表示变换流水线">1. 编译器是一条&quot;表示变换&quot;流水线<a class="anchor" href="#h-1-编译器是一条表示变换流水线" aria-label="本节链接">#</a></h4>
+<p>编译器把<strong>源文本</strong>逐级变换成<strong>机器能执行的形态</strong>。关键在于：每一级变换都让<strong>语义更显式</strong>——从&quot;一串字符&quot;到&quot;谁引用了谁&quot;，再到&quot;要算哪些数、以什么顺序&quot;。</p>
+<pre><code>源码文本 → token 序列 → 语法树 → 带语义的树 → 中间表示 → 优化后的 IR → 目标代码
+语义：越来越显式                                        实现：越来越贴近机器</code></pre>
+<blockquote>
+<p>这个&quot;先上山（理解语义）、再下山（降到机器）&quot;的比喻来自 Robert Nystrom 的 <em>Crafting Interpreters</em>（第 2 章）：上山阶段我们逐步看清&quot;这段代码到底要做什么&quot;，下山阶段我们把它一步步降成 CPU 能执行的指令。</p>
+</blockquote>
+<h4 id="h-2-六个阶段的职责">2. 六个阶段的职责<a class="anchor" href="#h-2-六个阶段的职责" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>输入 → 输出</th>
+<th>要做的事</th>
+<th>会报的错</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>词法分析</strong>（scanning/lexing）</td>
+<td>字符流 → token 流</td>
+<td>切词、去掉空白与注释</td>
+<td>非法字符、未闭合字符串</td>
+</tr>
+<tr>
+<td><strong>语法分析</strong>（parsing）</td>
+<td>token 流 → 语法树（AST）</td>
+<td>按文法把扁平序列组织成嵌套结构</td>
+<td>语法错误（括号不匹配、缺分号）</td>
+</tr>
+<tr>
+<td><strong>语义分析</strong>（static analysis）</td>
+<td>AST → 带绑定/类型的 AST</td>
+<td>名字解析（作用域）、类型检查</td>
+<td>未定义变量、类型不匹配</td>
+</tr>
+<tr>
+<td><strong>中间表示</strong>（IR）</td>
+<td>AST → IR</td>
+<td>换成与源语言/目标机<strong>都不强绑定</strong>的形态</td>
+<td>——</td>
+</tr>
+<tr>
+<td><strong>优化</strong></td>
+<td>IR → 等价但更快的 IR</td>
+<td>常量折叠、死代码消除、内联…</td>
+<td>——</td>
+</tr>
+<tr>
+<td><strong>代码生成</strong></td>
+<td>IR → 汇编/机器码</td>
+<td>指令选择、寄存器分配、指令调度</td>
+<td>寄存器不足（溢出处理）</td>
+</tr>
+</tbody></table>
+<p>前三段合称<strong>前端</strong>（依赖源语言），最后一段是<strong>后端</strong>（依赖目标架构），夹在中间的 IR 与优化叫<strong>中端</strong>——这个词是后来补出来的，因为人们发现&quot;与两边都无关&quot;的优化（常量传播、死代码消除）完全可以共享。</p>
+<h4 id="h-3-为什么必须有中间表示">3. 为什么必须有中间表示<a class="anchor" href="#h-3-为什么必须有中间表示" aria-label="本节链接">#</a></h4>
+<p>假设要支持 <strong>M</strong> 种源语言、<strong>N</strong> 种目标架构。没有通用 IR 时，你要写 <strong>M × N</strong> 个完整编译器（Pascal→x86、C→ARM、……）。有了共享 IR，只需 <strong>M 个前端 + N 个后端</strong>：前端各自降到同一个 IR，后端各自从该 IR 出发。</p>
+<p>这正是 GCC 能支持 Modula-3 跑在 Motorola 68k 上的原因，也是 LLVM 成为现代工具链&quot;通用中端&quot;的原因——它在两端都提供了稳定的接口。</p>
+<p><figure><img class="md-img" src="content/courses/compiler-foundations/assets/chapter-1-figure-04.svg" alt="共享 IR 把 M×N 个编译器收敛成 M 个前端 + N 个后端" loading="lazy" decoding="async"><figcaption>共享 IR 把 M×N 个编译器收敛成 M 个前端 + N 个后端</figcaption></figure>
+</p>
+<h4 id="h-4-实现路线不止一条">4. 实现路线不止一条<a class="anchor" href="#h-4-实现路线不止一条" aria-label="本节链接">#</a></h4>
+<p>教科书常讲&quot;六阶段走完&quot;，真实实现充满捷径（以下都对应真实语言）：</p>
+<table>
+<thead>
+<tr>
+<th>路线</th>
+<th>做法</th>
+<th>代价 / 例子</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>单遍编译</strong></td>
+<td>解析时直接产出代码，不建 AST/IR</td>
+<td>语言被迫&quot;先声明后使用&quot;（C、Pascal 的语法限制就源于此）</td>
+</tr>
+<tr>
+<td><strong>树遍历解释器</strong></td>
+<td>解析成 AST 后直接遍历求值</td>
+<td>实现简单、慢；早期 Ruby(MRI)、教学语言常用</td>
+</tr>
+<tr>
+<td><strong>字节码 + 虚拟机</strong></td>
+<td>编译成虚拟指令，由 VM 执行</td>
+<td>可移植；CPython、JVM、早期 Ruby(YARV)</td>
+</tr>
+<tr>
+<td><strong>transpiler</strong>（源到源）</td>
+<td>生成另一种高级语言源码，交给它的工具链</td>
+<td>借力生态；TypeScript→JS、早期 C 作为目标语言</td>
+</tr>
+<tr>
+<td><strong>JIT</strong></td>
+<td>运行期编译成机器码，并按热点重优化</td>
+<td>最快但最复杂；HotSpot JVM、V8</td>
+</tr>
+</tbody></table>
+<p><strong>这条表最重要的启示</strong>：实现方式会<strong>反过来塑造语言</strong>。单遍编译不是&quot;偷懒&quot;，它直接解释了 C 的语法约束；这也提醒我们，看待一门语言的设计先问&quot;它当年的编译器是什么样&quot;。</p>
+<h4 id="h-5-编译器-vs-解释器是个假二分">5. &quot;编译器 vs 解释器&quot;是个假二分<a class="anchor" href="#h-5-编译器-vs-解释器是个假二分" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>编译</strong>是一种<em>实现技术</em>：把源码翻译成另一种（通常更底层的）形式；</li>
+<li><strong>解释器</strong>指&quot;拿源码直接执行&quot;的实现。</li>
+</ul>
+<p>二者并不互斥。CPython 是解释器，但它<strong>内部有一个编译器</strong>（把源码编译成字节码再交给 VM 执行）；Go 更典型：<code>go build</code> 时它是编译器，<code>go run</code> 时它是解释器，而它内部始终在编译。判断一个实现属于哪种，看<strong>用户是否直接看到中间产物</strong>，而不是看它内部有没有编译。</p>
+<h4 id="h-6-llvm-生态通用中端的现实长相">6. LLVM 生态：通用中端的现实长相<a class="anchor" href="#h-6-llvm-生态通用中端的现实长相" aria-label="本节链接">#</a></h4>
+<pre><code>clang（前端）→ LLVM IR（.ll 文本 / .bc 字节码）→ opt（优化 pass）→ llc（后端）→ .s → as/ld → 可执行
+                                                  └── lli 可直接解释执行 IR（便于验证）</code></pre>
+<ul>
+<li><strong>clang</strong>：C/C++/ObjC 前端，产出 LLVM IR；</li>
+<li><strong>LLVM IR</strong>：既像汇编又保留类型信息的中间语言，<strong>有文本形式便于阅读</strong>——这是它比&quot;只活在内存里&quot;的 IR 更适合学习的原因；</li>
+<li><strong>opt</strong>：跑优化 pass 管线，可逐个开关、可打印每一步之后的 IR（第 3 课要用它做&quot;调试 pass&quot;）；</li>
+<li><strong>llc</strong>：从 IR 生成目标汇编；</li>
+<li><strong>MLIR</strong>：LLVM 之上的多级 IR 框架，正是《深度学习编译器与算子生成》那一门的主角之一。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面这段 Python（无第三方依赖）用不到 60 行搭出&quot;编译器骨架&quot;：同一段源码，走完词法 → 语法 → IR 三个形态。它是本章后续课时与整门课的地基。</p>
+<pre data-lang="python"><code class="language-python"># ---- 例 1：一个最小编译器骨架（源码 → token → AST → 三地址码）----
+import re
+
+TOKEN = re.compile(r&#39;\s*(?:(\d+)|([a-zA-Z_]\w*)|([-+*/()=]))&#39;)
+
+def tokenize(src):
+    &quot;&quot;&quot;词法分析：字符流 → token 流（这里只认数字、标识符、运算符）&quot;&quot;&quot;
+    out, i = [], 0
+    while i &lt; len(src):
+        m = TOKEN.match(src, i)
+        if not m:
+            raise SyntaxError(f&#39;非法字符 {src[i]!r} at {i}&#39;)
+        i = m.end()
+        num, name, op = m.groups()
+        if num:  out.append((&#39;NUM&#39;, int(num)))
+        elif name: out.append((&#39;NAME&#39;, name))
+        elif op:   out.append((&#39;OP&#39;, op))
+    return out
+
+def parse(tokens):
+    &quot;&quot;&quot;语法分析：token 流 → AST（这里只处理赋值与二元运算，够用即可）&quot;&quot;&quot;
+    pos = 0
+    def peek():
+        return tokens[pos] if pos &lt; len(tokens) else (None, None)
+    def eat(kind, value=None):
+        nonlocal pos
+        k, v = peek()
+        if k != kind or (value is not None and v != value):
+            raise SyntaxError(f&#39;期望 {kind}{value or &quot;&quot;}，得到 {(k, v)}&#39;)
+        pos += 1
+        return v
+    def expr():
+        node = term()
+        while peek() == (&#39;OP&#39;, &#39;+&#39;) or peek() == (&#39;OP&#39;, &#39;-&#39;):
+            op = eat(&#39;OP&#39;); node = (&#39;bin&#39;, op, node, term())
+        return node
+    def term():
+        node = atom()
+        while peek() == (&#39;OP&#39;, &#39;*&#39;) or peek() == (&#39;OP&#39;, &#39;/&#39;):
+            op = eat(&#39;OP&#39;); node = (&#39;bin&#39;, op, node, atom())
+        return node
+    def atom():
+        k, v = peek()
+        if k == &#39;NUM&#39;:  eat(&#39;NUM&#39;);  return (&#39;num&#39;, v)
+        if k == &#39;NAME&#39;: eat(&#39;NAME&#39;); return (&#39;var&#39;, v)
+        if (k, v) == (&#39;OP&#39;, &#39;(&#39;):
+            eat(&#39;OP&#39;, &#39;(&#39;); node = expr(); eat(&#39;OP&#39;, &#39;)&#39;); return node
+        raise SyntaxError(f&#39;表达式起始处意外 token {(k, v)}&#39;)
+    name = eat(&#39;NAME&#39;); eat(&#39;OP&#39;, &#39;=&#39;)
+    return (&#39;assign&#39;, name, expr())
+
+def lower(node, out, tmp=[0]):
+    &quot;&quot;&quot;中间表示：AST → 三地址码（每条指令最多一个运算，结果存临时名）&quot;&quot;&quot;
+    if node[0] == &#39;num&#39;:
+        return (&#39;const&#39;, node[1])
+    if node[0] == &#39;var&#39;:
+        return (&#39;name&#39;, node[1])
+    _, op, l, r = node
+    a, b = lower(l, out), lower(r, out)
+    tmp[0] += 1
+    t = f&#39;t{tmp[0]}&#39;
+    out.append((t, op, a, b))
+    return (&#39;name&#39;, t)
+
+src = &#39;average = (min + max) / 2&#39;
+toks = tokenize(src)
+ast  = parse(toks)
+ir   = []
+print(&#39;token:&#39;, toks)
+print(&#39;AST  :&#39;, ast)
+lower(ast, ir)
+for ins in ir: print(&#39;IR   :&#39;, ins)</code></pre>
+<p>运行后你会看到同一段代码的三种形态：</p>
+<pre><code>token: [(&#39;NAME&#39;,&#39;average&#39;), (&#39;OP&#39;,&#39;=&#39;), (&#39;OP&#39;,&#39;(&#39;), (&#39;NAME&#39;,&#39;min&#39;), ...]
+AST  : (&#39;assign&#39;, &#39;average&#39;, (&#39;bin&#39;, &#39;/&#39;, (&#39;bin&#39;, &#39;+&#39;, (&#39;var&#39;,&#39;min&#39;), (&#39;var&#39;,&#39;max&#39;)), (&#39;num&#39;,2)))
+IR   : (&#39;t1&#39;, &#39;+&#39;, (&#39;name&#39;,&#39;min&#39;), (&#39;name&#39;,&#39;max&#39;))
+IR   : (&#39;t2&#39;, &#39;/&#39;,  (&#39;name&#39;,&#39;t1&#39;),  (&#39;const&#39;,2))</code></pre>
+<p><strong>注意 AST 与 IR 的差别</strong>：AST 是<strong>嵌套</strong>的（能看出语法结构），IR 是<strong>扁平指令序列 + 临时变量</strong>（每一行只做一件事）。这个&quot;从嵌套到扁平、把依赖关系显式化&quot;的动作，就是后面所有优化的前提。</p>
+<pre data-lang="python"><code class="language-python"># ---- 例 2（可选，需要本机有 clang）：同一条源码走一遍真实工具链 ----
+# 把下面源码存为 demo.c，然后：
+#   clang -S -emit-llvm demo.c -o demo.ll   # 前端 → LLVM IR（文本）
+#   clang -S demo.c -o demo.s              # 直接到汇编
+#   opt -passes=mem2reg -S demo.ll -o optimized.ll   # 跑一个优化 pass
+# demo.c:
+#   int demo(int min, int max) { return (min + max) / 2; }
+#
+# 没有 clang 也不影响本课：Python 版骨架（例 1）已经把三层形态演示完整，
+# 真实工具链的输出会在下一课与第 3 课对照讲解。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：给例 1 的 <code>tokenize</code> 增加对 <code>&lt;</code>、<code>&gt;</code> 的支持，并让 <code>parse</code> 能处理 <code>a = b &gt; c</code>（提示：给比较运算单独一层优先级）。</li>
+<li><strong>解释</strong>：为什么说&quot;单遍编译&quot;会导致语言要求&quot;先声明后使用&quot;？用 C 的函数前向声明举一个具体例子。</li>
+<li><strong>比较</strong>：CPython、Go、V8 三者分别在什么意义上&quot;是编译器&quot;、在什么意义上&quot;是解释器&quot;？做成一张表。</li>
+<li><strong>思考</strong>：如果没有共享 IR，支持 M 种语言、N 种目标需要多少编译器？有了 IR 之后呢？再想一层：MLIR 提出&quot;多级 IR&quot;，解决的是这个模型里的什么新问题？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Robert Nystrom, <em>Crafting Interpreters</em> 第 2 章「A Map of the Territory」（前端/中端/后端、IR、实现路线、编译 vs 解释）：<a href="https://craftinginterpreters.com/a-map-of-the-territory.html" target="_blank" rel="noopener noreferrer">https://craftinginterpreters.com/a-map-of-the-territory.html</a></li>
+<li>LLVM 官方 Kaleidoscope 教程（前端 → IR 的完整示例）：<a href="https://llvm.org/docs/tutorial/" target="_blank" rel="noopener noreferrer">https://llvm.org/docs/tutorial/</a></li>
+<li>LLVM 官方文档（IR 参考手册、opt/llc/lli 用法）：<a href="https://llvm.org/docs/" target="_blank" rel="noopener noreferrer">https://llvm.org/docs/</a></li>
+<li>Aho, Lam, Sethi, Ullman, <em>Compilers: Principles, Techniques, and Tools</em>（龙书）第 1 章：编译器的阶段划分</li>
+</ul>
+<p><a href="#/l/cf-ch1-l2">下一课：同一段程序的四层形态</a></p>

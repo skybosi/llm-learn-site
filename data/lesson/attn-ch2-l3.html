@@ -1,0 +1,88 @@
+<h2 id="h-多头注意力">多头注意力<a class="anchor" href="#h-多头注意力" aria-label="本节链接">#</a></h2>
+<p>上一课的注意力只有一个&quot;头&quot;：整条序列共用一套 QKV 投影，每个词只在一个&quot;关系视角&quot;下看别人。但语言里的关系是多样的——主谓关系、修饰关系、指代关系……一个视角往往顾此失彼。<strong>多头注意力（multi-head attention）</strong>的解法很直接：<strong>并行跑多个头，每个头用不同的投影参数，各自关注不同的关系，最后把结果拼起来</strong>。这一课我们把它从头实现一遍。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-一个头不够多来几个">1. 一个头不够，多来几个<a class="anchor" href="#h-1-一个头不够多来几个" aria-label="本节链接">#</a></h4>
+<p>单一注意力头会把所有信息压进一个&quot;平均&quot;的关系里。例如处理&quot;银行的河流&quot;时，同一个头很难同时既关注&quot;银行&quot;与&quot;河流&quot;的搭配，又关注&quot;河流&quot;与远处某个修饰语的关系——权重一旦被大关系占据，小关系就被稀释。</p>
+<p>多头注意力让 <code>h</code> 个头<strong>各干各的</strong>：每个头有自己独立的 <code>W_q、W_k、W_v</code> 投影，因此每个头学到的&quot;关系子空间&quot;不同。有的头可能专盯邻近词，有的头专盯句法上的远距离搭配，有的头专盯指代。最后把各个头的输出拼接，再经一个线性层融合，得到既丰富又统一的表示。</p>
+<h4 id="h-2-结构并行投影--各自注意--拼接--融合">2. 结构：并行投影 → 各自注意 → 拼接 → 融合<a class="anchor" href="#h-2-结构并行投影--各自注意--拼接--融合" aria-label="本节链接">#</a></h4>
+<p>多头的完整流程：</p>
+<ol>
+<li>把输入分别投影成 <code>h</code> 组 Q、K、V（每组维度 <code>d_head = d_model / h</code>）；</li>
+<li>每个头<strong>独立</strong>做一次缩放点积注意力，得到 <code>h</code> 个输出（每个 <code>d_head</code> 维）；</li>
+<li>把 <code>h</code> 个头的输出<strong>按特征维拼接</strong>，回到 <code>d_model</code> 维；</li>
+<li>再过最后一个可学习的线性层 <code>W_o</code> 融合各头信息。</li>
+</ol>
+<p>公式写作：</p>
+<pre><code>MultiHead(Q, K, V) = Concat(head_1, ..., head_h) W_o
+head_i = Attention(Q W_q^i, K W_k^i, V W_v^i)</code></pre>
+<h4 id="h-3-为什么切小而非加宽">3. 为什么&quot;切小&quot;而非&quot;加宽&quot;<a class="anchor" href="#h-3-为什么切小而非加宽" aria-label="本节链接">#</a></h4>
+<p>多头没有增加总参数量，而是<strong>把 <code>d_model</code> 拆成 <code>h</code> 份</strong>，每份一个头。这样做的好处是：与其让一个宽头学一个笼统的关系，不如让多个窄头<strong>并行探索不同的关系子空间</strong>。这正是论文所说的&quot;让模型在不同的表示子空间里联合关注来自不同位置的信息&quot;。</p>
+<p>代价是每个头的维度变小（<code>d_head = d_model / h</code>），单头的表达力下降；但多个头互补，整体更强。所以 <code>d_model</code> 通常要被 <code>h</code> 整除，这也成了实现时的第一行断言。</p>
+<h4 id="h-4-多头后的参数量与计算量">4. 多头后的参数量与计算量<a class="anchor" href="#h-4-多头后的参数量与计算量" aria-label="本节链接">#</a></h4>
+<p>多头注意力比单头多出的，只有最后的融合层 <code>W_o</code>（还有&quot;分头切分&quot;这个视角带来的组织开销）。总计算量仍与单头同阶，却换来了多视角的表达力——性价比极高。这也是为什么几乎所有后续大模型（BERT、GPT 等）都原封不动沿用多头结构。</p>
+<p><figure><img class="md-img" src="content/courses/attention-transformer/assets/chapter-2-figure-03.svg" alt="多头注意力：h 个头并行注意后拼接，再经 W_o 融合" loading="lazy" decoding="async"><figcaption>多头注意力：h 个头并行注意后拼接，再经 W_o 融合</figcaption></figure>
+</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面从零实现一个 <code>MultiHeadAttention</code>，用一次前向验证输出形状和&quot;每个头一张注意力图&quot;的结构。</p>
+<pre data-lang="python"><code class="language-python">import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+torch.manual_seed(0)
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, d_model, num_heads):
+        super().__init__()
+        assert d_model % num_heads == 0, &quot;d_model 必须能被头数整除&quot;
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_head = d_model // num_heads
+        # 三个投影：一次把 d_model 投影成 d_model，再在 forward 里切分成多头
+        self.Wq = nn.Linear(d_model, d_model, bias=False)
+        self.Wk = nn.Linear(d_model, d_model, bias=False)
+        self.Wv = nn.Linear(d_model, d_model, bias=False)
+        self.Wo = nn.Linear(d_model, d_model, bias=False)   # 融合各头
+
+    def forward(self, x):
+        B, T, _ = x.shape
+        # 投影后切成 h 个头，再转成 (B, h, T, d_head) 方便批量算注意力
+        Q = self.Wq(x).view(B, T, self.num_heads, self.d_head).transpose(1, 2)
+        K = self.Wk(x).view(B, T, self.num_heads, self.d_head).transpose(1, 2)
+        V = self.Wv(x).view(B, T, self.num_heads, self.d_head).transpose(1, 2)
+
+        scores = Q @ K.transpose(-2, -1) / (self.d_head ** 0.5)   # (B, h, T, T)
+        attn = F.softmax(scores, dim=-1)
+        out = attn @ V                                            # (B, h, T, d_head)
+
+        # 把多头拼回：先转回 (B, T, h, d_head)，再拼成 (B, T, d_model)
+        out = out.transpose(1, 2).contiguous().view(B, T, self.d_model)
+        return self.Wo(out), attn
+
+B, T, d_model = 2, 5, 12
+x = torch.randn(B, T, d_model)
+mha = MultiHeadAttention(d_model, num_heads=3)
+out, attn = mha(x)
+
+print(&quot;输出形状:&quot;, out.shape)        # (2, 5, 12)，与输入一致
+print(&quot;注意力矩阵形状:&quot;, attn.shape)  # (2, 3, 5, 5)：每个样本每个头一张注意力图
+print(&quot;每个头的维度:&quot;, mha.d_head)    # 12 // 3 = 4
+print(&quot;参数量:&quot;, sum(p.numel() for p in mha.parameters()))</code></pre>
+<p>运行后注意两点：</p>
+<ul>
+<li><code>out</code> 与输入 <code>x</code> 形状相同，说明多头注意力是一个&quot;<strong>保形</strong>&quot;的构件，可以像积木一样反复堆叠（这是下一章编码器的前提）；</li>
+<li><code>attn</code> 的形状是 <code>(B, h, T, T)</code>，即<strong>每个头各自产生一张注意力矩阵</strong>。把不同的头打印出来，常能看到它们关注着截然不同的位置——这就是&quot;多视角&quot;的直接证据。</li>
+</ul>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>把 <code>num_heads</code> 改成 1，观察输出形状与参数量；再改成 4，确认参数量几乎不变（只差在 <code>W_o</code> 前的组织方式），理解&quot;多头不靠堆参数取胜&quot;。</li>
+<li>打印同一输入下不同头的注意力矩阵，比较它们关注的差异，体会&quot;不同子空间关注不同关系&quot;。</li>
+<li>在 <code>__init__</code> 里去掉 <code>assert</code>，用一个不能被整除的组合（如 <code>d_model=10, num_heads=3</code>）跑一遍，观察 <code>view</code> 报什么错，从而理解为什么论文里 <code>d_model</code> 总是 <code>h</code> 的整数倍。</li>
+<li>思考：如果把&quot;拼接后过 <code>W_o</code>&quot;换成&quot;对 h 个头的输出直接求平均&quot;，会损失什么？<code>W_o</code> 在这里承担了什么样的角色？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Vaswani et al. · Attention Is All You Need：<a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1706.03762</a></li>
+<li>Jay Alammar · The Illustrated Transformer：<a href="https://jalammar.github.io/illustrated-transformer/" target="_blank" rel="noopener noreferrer">https://jalammar.github.io/illustrated-transformer/</a></li>
+<li>PyTorch 官方文档 · torch.nn.MultiheadAttention：<a href="https://pytorch.org/docs/stable/generated/torch.nn.MultiheadAttention.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/docs/stable/generated/torch.nn.MultiheadAttention.html</a></li>
+</ul>
+<p><a href="#/l/attn-ch3-l1">下一课：编码器解码器</a></p>

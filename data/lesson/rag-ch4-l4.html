@@ -1,0 +1,786 @@
+<h2 id="h-引用溯源让每条断言可核验">引用溯源：让每条断言可核验<a class="anchor" href="#h-引用溯源让每条断言可核验" aria-label="本节链接">#</a></h2>
+<h3 id="h-这一节要解决什么">这一节要解决什么<a class="anchor" href="#h-这一节要解决什么" aria-label="本节链接">#</a></h3>
+<p>前三节把&quot;查询该补什么信息、答案需要几步凑齐、证据怎么装配&quot;讲完了。到这里一个系统已经能给出<strong>正确答案</strong>。但正确答案还不够 —— 真实系统里必然会发生这三件事：</p>
+<pre><code>① 用户问&quot;你凭什么这么说&quot;      -&gt; 你必须能指到具体的块、版本、位置
+② 答案错了，要定位原因         -&gt; 你必须能分辨是召回错、排序错还是生成错
+③ 审计/合规要求可追溯          -&gt; 你必须能证明&quot;这个结论来自这份受控文档&quot;</code></pre>
+<p><strong>三件事都要求同一个东西：每条断言到证据的可核验链路。</strong> 而&quot;引用&quot;如果只做成语义上的装饰（答案末尾挂几个像样的块），它在这三件事上<strong>一个都做不到</strong> —— 反而更危险，因为它让答案<strong>看起来</strong>可信。</p>
+<p>这一节要回答四个问题：</p>
+<ol>
+<li><strong>溯源需要的最小元数据是什么？</strong> 为什么 <code>chunk_id</code> 必须是内容寻址的，缺了哪一项会导致链路断掉。</li>
+<li><strong>&quot;支持&quot;关系怎么判定？</strong> 为什么词面重叠不够 —— 本节会给出一个精确的失败例子：<strong>同义表达的真证据与同主题不同事实的错证据，词面重叠完全相同（都是 0.833）</strong>。</li>
+<li><strong>引用一致率怎么算，它为什么会骗你？</strong> 同一个模型、同一份答案，只因为检查阈值从 0.5 提到 0.9，这个指标就从 <strong>0.963 掉到 0.525</strong>。</li>
+<li><strong>核验成本怎么算？</strong> 引用粒度从文档级降到片段级，人工核验 600 条断言的成本从 <strong>700 分钟降到 60 分钟</strong> —— 这个量决定&quot;引用&quot;能不能真的被用起来。</li>
+</ol>
+<p>结论先放在这里：</p>
+<blockquote>
+<p><strong>引用不是生成阶段的收尾装饰，而是贯穿索引、检索、装配、生成的</strong>一条数据链路**。** 它的最小要求是：每条断言能追到一个<strong>内容寻址的块</strong>，加上足以重建上下文的元数据（文档、版本、偏移）。<strong>&quot;挂了引用&quot;与&quot;引用可核验&quot;之间的距离，主要不取决于模型，而取决于你的 chunk_id 与字段设计。</strong></p>
+</blockquote>
+<h3 id="h-一溯源需要的最小元数据">一、溯源需要的最小元数据<a class="anchor" href="#h-一溯源需要的最小元数据" aria-label="本节链接">#</a></h3>
+<h4 id="h-11-chunk_id-必须内容寻址">1.1 <code>chunk_id</code> 必须内容寻址<a class="anchor" href="#h-11-chunk_id-必须内容寻址" aria-label="本节链接">#</a></h4>
+<p><strong>内容寻址</strong>指 id 由内容（加上算法版本）哈希得到：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7063em;vertical-align:-0.0951em;"></span><span class="mord text"><span class="mord texttt">chunk_id</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.2em;vertical-align:-0.35em;"></span><span class="mord"><span class="mord mathrm">hash</span></span><span class="mord"><span class="delimsizing size1">(</span></span><span class="mord text"><span class="mord cjk_fallback">规范化文本</span></span><span class="mpunct">,</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord texttt">chunker_ver</span></span><span class="mpunct">,</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord texttt">embedder_ver</span></span><span class="mord"><span class="delimsizing size1">)</span></span></span></span></span></span></p>
+<p><strong>为什么不能用自增序号</strong>：索引重建后，同一段文本会拿到不同的序号，<strong>所有历史引用全部指向别的文本</strong>。而引用是<strong>长期资产</strong>（第 6 章第 4 节的 trace 要保留 90 天，审计要求更长），索引却是<strong>频繁重建</strong>的（第 2 章第 4 节：增删改与重建触发规则）。<strong>两者生命周期不匹配时，唯一稳定的锚点是内容本身。</strong></p>
+<p><strong>为什么必须带 <code>chunker_ver</code> / <code>embedder_ver</code></strong>：切分算法或嵌入模型一换，同一段原文可能被切成不同的块。带上版本号后，旧引用仍然可解释（&quot;这条引用来自 v2 切分器&quot;），而不是变成一个无法复现的哈希。</p>
+<h4 id="h-12-字段清单每一项都在回答一个具体问题">1.2 字段清单：每一项都在回答一个具体问题<a class="anchor" href="#h-12-字段清单每一项都在回答一个具体问题" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>回答的问题</th>
+<th>缺失的后果</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>chunk_id</code>（内容寻址）</td>
+<td>这条断言来自哪段文本？</td>
+<td>无法定位</td>
+</tr>
+<tr>
+<td><code>doc_id</code> + <code>doc_ver</code></td>
+<td>来自哪份文档的哪个版本？</td>
+<td>无法判断是否过期（第 2 章第 4 节）</td>
+</tr>
+<tr>
+<td><code>char_span</code>（起止偏移）</td>
+<td>在这个块的哪个位置？</td>
+<td>核验成本翻数倍（见第 4 部分）</td>
+</tr>
+<tr>
+<td><code>title_path</code>（标题路径）</td>
+<td>在文档的哪一节？</td>
+<td>用户无法建立上下文</td>
+</tr>
+<tr>
+<td><code>source</code> + <code>authority</code></td>
+<td>来源是谁？可信度几分？</td>
+<td>无法做冲突消解（第 3 节）</td>
+</tr>
+<tr>
+<td><code>retriever</code> + <code>score</code> + <code>rank</code></td>
+<td>它是哪一路、第几名召回的？</td>
+<td>无法归因（第 6 章第 4 节）</td>
+</tr>
+<tr>
+<td><code>ts</code>（时间戳）</td>
+<td>什么时候检索到的？</td>
+<td>无法做时间泄漏检测与重放</td>
+</tr>
+</tbody></table>
+<p><strong>这张表就是&quot;引用&quot;与&quot;证据链&quot;的分界。</strong> 只记 <code>chunk_id</code> 的引用能回答&quot;来自哪&quot;，但回答不了&quot;是否过期&quot;&quot;是否权威&quot;&quot;为什么被选中&quot;—— 而那三个问题恰恰是审计与归因要问的。</p>
+<h4 id="h-13-一个反直觉的设计只记-id-与哈希不记正文">1.3 一个反直觉的设计：只记 id 与哈希，不记正文<a class="anchor" href="#h-13-一个反直觉的设计只记-id-与哈希不记正文" aria-label="本节链接">#</a></h4>
+<p><strong>理由有三个，都是成本与风险的</strong>：</p>
+<ol>
+<li><strong>体积</strong>：trace 要长期保留。记正文意味着存储量随流量线性增长数倍，而正文可以从 <code>chunk_id</code> 反查（只要索引还在，且内容寻址保证了反查的正确性）；</li>
+<li><strong>权限</strong>：正文可能包含敏感内容。<strong>把正文复制到 trace 里，等于绕过了第 6 章第 3 节的 ACL</strong> —— 一份本应被权限过滤掉的内容，会通过日志泄露；</li>
+<li><strong>一致性</strong>：正文会随文档更新而变，而引用应该指向<strong>当时</strong>的那个版本。记哈希 + 版本号才能区分&quot;引用的是 v1 的文本&quot;与&quot;现在文档已经是 v3&quot;。</li>
+</ol>
+<p><strong>代价</strong>：反查需要索引长期可用（或一个只读归档）。这是一个真实的取舍：<strong>用&quot;索引必须保留历史版本&quot;换&quot;日志不存正文&quot;。</strong> 对大流量系统，这个交换几乎总是值得的。</p>
+<h3 id="h-二断言级归因从答案挂引用到每条断言挂引用">二、断言级归因：从&quot;答案挂引用&quot;到&quot;每条断言挂引用&quot;<a class="anchor" href="#h-二断言级归因从答案挂引用到每条断言挂引用" aria-label="本节链接">#</a></h3>
+<h4 id="h-21-三种引用粒度">2.1 三种引用粒度<a class="anchor" href="#h-21-三种引用粒度" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>粒度</th>
+<th>形式</th>
+<th>定位精度</th>
+<th>核验成本</th>
+<th>典型问题</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>文档级</td>
+<td>&quot;见《XX 手册》&quot;</td>
+<td>整篇</td>
+<td>最高</td>
+<td>用户要自己找</td>
+</tr>
+<tr>
+<td><strong>块级</strong></td>
+<td>&quot;见 §3.2 第 4 段（chunk_id）&quot;</td>
+<td>一个块</td>
+<td>中</td>
+<td>块可能很长，仍需扫读</td>
+</tr>
+<tr>
+<td><strong>片段级</strong></td>
+<td>&quot;见 §3.2 第 4 段 <code>[120,168)</code>&quot;</td>
+<td>一句话</td>
+<td>最低</td>
+<td>需要生成器输出 span</td>
+</tr>
+</tbody></table>
+<p><strong>关键一步是从&quot;答案级引用&quot;走到&quot;断言级引用&quot;</strong>：一条答案往往含多个断言，其中可能只有一部分被支持。<strong>如果引用挂在整条答案上，你就无法发现&quot;半支持的答案&quot;</strong> —— 而这类答案是最危险的（用户会连未被支持的部分一起接受）。</p>
+<h4 id="h-22-支持关系怎么判定词面重叠不够">2.2 &quot;支持&quot;关系怎么判定：词面重叠不够<a class="anchor" href="#h-22-支持关系怎么判定词面重叠不够" aria-label="本节链接">#</a></h4>
+<p>最省事的检查器是词面重叠：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathrm">sup</span></span><span class="mopen">(</span><span class="mord text"><span class="mord">claim</span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">c</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.363em;vertical-align:-0.936em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.427em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">∣</span><span class="mord text"><span class="mord">tokens</span></span><span class="mopen">(</span><span class="mord text"><span class="mord">claim</span></span><span class="mclose">)</span><span class="mord">∣</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">∣</span><span class="mord text"><span class="mord">tokens</span></span><span class="mopen">(</span><span class="mord text"><span class="mord">claim</span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">∩</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord text"><span class="mord">tokens</span></span><span class="mopen">(</span><span class="mord mathnormal">c</span><span class="mclose">)</span><span class="mord">∣</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.936em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≥</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span></span></span></span></span></p>
+<p>本节实测（600 条断言）把这四类候选块的词面重叠全部算了出来：</p>
+<table>
+<thead>
+<tr>
+<th>被引块类型</th>
+<th>真值支持</th>
+<th>重叠均值</th>
+<th>重叠最小</th>
+<th><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.5</span></span></span></span></th>
+<th><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.8</span></span></span></span></th>
+<th><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.95</span></span></span></span></th>
+</tr>
+</thead>
+<tbody><tr>
+<td>gold（取值词完全一致）</td>
+<td>是</td>
+<td>1.000</td>
+<td>1.000</td>
+<td>1.000</td>
+<td>1.000</td>
+<td>1.000</td>
+</tr>
+<tr>
+<td>gold（取值词同义表达）</td>
+<td><strong>是</strong></td>
+<td>0.833</td>
+<td>0.833</td>
+<td>1.000</td>
+<td>1.000</td>
+<td><strong>0.000</strong></td>
+</tr>
+<tr>
+<td>wrong_doc（同主题、错事实）</td>
+<td><strong>否</strong></td>
+<td>0.834</td>
+<td>0.833</td>
+<td>1.000</td>
+<td>1.000</td>
+<td>0.002</td>
+</tr>
+<tr>
+<td>decorative（无关块）</td>
+<td>否</td>
+<td>0.500</td>
+<td>0.500</td>
+<td>1.000</td>
+<td>0.000</td>
+<td>0.000</td>
+</tr>
+</tbody></table>
+<p><strong>这张表是本节最重要的证据，它说明三件事</strong>：</p>
+<ol>
+<li><strong><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.5</span></span></span></span> 时检查器形同虚设</strong>：连无关块（重叠 0.5）都被判为&quot;支持&quot;，一致率恒为 1.000。<strong>很多系统的&quot;引用一致率 0.95+&quot;就是这样来的。</strong></li>
+<li><strong><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.8</span></span></span></span> 时它无法分辨关键的两类</strong>：<code>gold(同义)</code> 与 <code>wrong_doc</code> 的重叠<strong>完全相同（都是 0.833）</strong>。<strong>任何词面阈值都不可能同时做到&quot;抓住错误引用&quot;与&quot;保住同义表达的真证据&quot;</strong> —— 因为这两件事在这个特征空间里是同一个点。</li>
+<li><strong><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.95</span></span></span></span> 时它用漏判换正确</strong>：拒绝所有同义表达的真证据（recall 掉 10.5 个百分点），同时把错误引用也拒了。</li>
+</ol>
+<p><strong>正确的做法是加一个结构化通道</strong>：把断言与证据都解析成 (实体, 属性, 取值) 三元组，<strong>逐字段比对</strong>。这样&quot;同义表达&quot;能被归一化后匹配上，而&quot;同主题不同取值&quot;会被明确判为不支持。<strong>代价是需要抽取器</strong>（第 4 章第 1 节的三类缺陷判别在这里又用了一次）—— 但它是唯一能把两类分开的方案。</p>
+<h4 id="h-23-三种引用失效">2.3 三种引用失效<a class="anchor" href="#h-23-三种引用失效" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>失效</th>
+<th>定义</th>
+<th>危害</th>
+<th>检出方式</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>装饰性引用</strong></td>
+<td>引用了，但内容不支持该断言</td>
+<td>制造虚假可信</td>
+<td>结构化支持判定（§2.2）</td>
+</tr>
+<tr>
+<td><strong>错误引用</strong></td>
+<td>引用了另一个文档/版本的相似内容</td>
+<td>溯源链路指向错的地方</td>
+<td><code>doc_id</code> / <code>doc_ver</code> 校验；结构化取值比对</td>
+</tr>
+<tr>
+<td><strong>过度引用</strong></td>
+<td>一条断言挂很多引用，其中只有一条支持</td>
+<td>掩盖低一致性；核验成本爆炸</td>
+<td>统计每条断言的引用条数 + 边际支持率（§3.3）</td>
+</tr>
+<tr>
+<td><strong>无引用断言</strong></td>
+<td>完全没有引用的断言</td>
+<td>无法核验</td>
+<td>计数（最便宜、最容易漏）</td>
+</tr>
+</tbody></table>
+<p><strong>&quot;无引用断言&quot;必须单独强调</strong>：它是最容易被忽略、也最容易自动检出的一项。<strong>工程上应该把它做成一个硬门禁</strong>（例如：无引用断言比例 &gt; 5% 就不允许上线），因为它几乎总意味着模型在凭参数记忆作答 —— 而这正是 RAG 要消除的行为。</p>
+<h3 id="h-三引用一致率怎么算以及它为什么会骗你">三、引用一致率：怎么算，以及它为什么会骗你<a class="anchor" href="#h-三引用一致率怎么算以及它为什么会骗你" aria-label="本节链接">#</a></h3>
+<h4 id="h-31-定义">3.1 定义<a class="anchor" href="#h-31-定义" aria-label="本节链接">#</a></h4>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord cjk_fallback">引用一致率</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.363em;vertical-align:-0.936em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.427em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">#</span><span class="mopen">{</span><span class="mord text"><span class="mord cjk_fallback">被引块</span></span><span class="mclose">}</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">#</span><span class="mopen">{</span><span class="mord text"><span class="mord cjk_fallback">被引块被判定为支持</span></span><span class="mclose">}</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.936em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></p>
+<p><strong>注意分母是&quot;被引块&quot;而不是&quot;断言&quot;</strong> —— 这个选择带来两个后果，都是坑：</p>
+<ul>
+<li>如果一条断言挂了 8 个块（过度引用），它在这条指标里的权重是单引用断言的 8 倍；</li>
+<li><strong>它不惩罚&quot;漏引&quot;</strong>：一条没有任何引用的断言完全不影响这个比值。</li>
+</ul>
+<p>所以完整的指标组至少要三个：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:3.6893em;vertical-align:-2.2623em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.6833em;"><span style="top:-1.6737em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">引对了没</span></span></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.6833em;"><span class="svg-align" style="top:-2.352em;"><span class="pstrut" style="height:3em;"></span><span class="stretchy" style="height:0.548em;min-width:1.6em;"><span class="brace-left" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMinYMin slice"><path d="M0 6l6-6h17c12.688 0 19.313.3 20 1 4 4 7.313 8.3 10 13
+ 35.313 51.3 80.813 93.8 136.5 127.5 55.688 33.7 117.188 55.8 184.5 66.5.688
+ 0 2 .3 4 1 18.688 2.7 76 4.3 172 5h399450v120H429l-6-1c-124.688-8-235-61.7
+-331-161C60.687 138.7 32.312 99.3 7 54L0 41V6z"/></svg></span><span class="brace-center" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMidYMin slice"><path d="M199572 214
+c100.7 8.3 195.3 44 280 108 55.3 42 101.7 93 139 153l9 14c2.7-4 5.7-8.7 9-14
+ 53.3-86.7 123.7-153 211-199 66.7-36 137.3-56.3 212-62h199568v120H200432c-178.3
+ 11.7-311.7 78.3-403 201-6 8-9.7 12-11 12-.7.7-6.7 1-18 1s-17.3-.3-18-1c-1.3 0
+-5-4-11-12-44.7-59.3-101.3-106.3-170-141s-145.3-54.3-229-60H0V214z"/></svg></span><span class="brace-right" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMaxYMin slice"><path d="M399994 0l6 6v35l-6 11c-56 104-135.3 181.3-238 232-57.3
+ 28.7-117 45-179 50H-300V214h399897c43.3-7 81-15 113-26 100.7-33 179.7-91 237
+-174 2.7-5 6-9 10-13 .7-1 7.3-1 20-1h17z"/></svg></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord text"><span class="mord cjk_fallback">一致率</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.648em;"><span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.3263em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:1em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.427em;"><span style="top:-1.1647em;"><span class="pstrut" style="height:3.427em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">引全了没</span></span></span></span></span><span style="top:-3.427em;"><span class="pstrut" style="height:3.427em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.427em;"><span class="svg-align" style="top:-1.843em;"><span class="pstrut" style="height:3.427em;"></span><span class="stretchy" style="height:0.548em;min-width:1.6em;"><span class="brace-left" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMinYMin slice"><path d="M0 6l6-6h17c12.688 0 19.313.3 20 1 4 4 7.313 8.3 10 13
+ 35.313 51.3 80.813 93.8 136.5 127.5 55.688 33.7 117.188 55.8 184.5 66.5.688
+ 0 2 .3 4 1 18.688 2.7 76 4.3 172 5h399450v120H429l-6-1c-124.688-8-235-61.7
+-331-161C60.687 138.7 32.312 99.3 7 54L0 41V6z"/></svg></span><span class="brace-center" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMidYMin slice"><path d="M199572 214
+c100.7 8.3 195.3 44 280 108 55.3 42 101.7 93 139 153l9 14c2.7-4 5.7-8.7 9-14
+ 53.3-86.7 123.7-153 211-199 66.7-36 137.3-56.3 212-62h199568v120H200432c-178.3
+ 11.7-311.7 78.3-403 201-6 8-9.7 12-11 12-.7.7-6.7 1-18 1s-17.3-.3-18-1c-1.3 0
+-5-4-11-12-44.7-59.3-101.3-106.3-170-141s-145.3-54.3-229-60H0V214z"/></svg></span><span class="brace-right" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMaxYMin slice"><path d="M399994 0l6 6v35l-6 11c-56 104-135.3 181.3-238 232-57.3
+ 28.7-117 45-179 50H-300V214h399897c43.3-7 81-15 113-26 100.7-33 179.7-91 237
+-174 2.7-5 6-9 10-13 .7-1 7.3-1 20-1h17z"/></svg></span></span></span><span style="top:-3.427em;"><span class="pstrut" style="height:3.427em;"></span><span class="mord"><span class="mord text"><span class="mord cjk_fallback">覆盖率</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.427em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">#</span><span class="mopen">{</span><span class="mord text"><span class="mord cjk_fallback">断言</span></span><span class="mclose">}</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">#</span><span class="mopen">{</span><span class="mord text"><span class="mord cjk_fallback">至少有一条支持引用的断言</span></span><span class="mclose">}</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.936em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.584em;"><span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:2.2623em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:1em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.6833em;"><span style="top:-1.6737em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">凭记忆作答的比例</span></span></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.6833em;"><span class="svg-align" style="top:-2.352em;"><span class="pstrut" style="height:3em;"></span><span class="stretchy" style="height:0.548em;min-width:1.6em;"><span class="brace-left" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMinYMin slice"><path d="M0 6l6-6h17c12.688 0 19.313.3 20 1 4 4 7.313 8.3 10 13
+ 35.313 51.3 80.813 93.8 136.5 127.5 55.688 33.7 117.188 55.8 184.5 66.5.688
+ 0 2 .3 4 1 18.688 2.7 76 4.3 172 5h399450v120H429l-6-1c-124.688-8-235-61.7
+-331-161C60.687 138.7 32.312 99.3 7 54L0 41V6z"/></svg></span><span class="brace-center" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMidYMin slice"><path d="M199572 214
+c100.7 8.3 195.3 44 280 108 55.3 42 101.7 93 139 153l9 14c2.7-4 5.7-8.7 9-14
+ 53.3-86.7 123.7-153 211-199 66.7-36 137.3-56.3 212-62h199568v120H200432c-178.3
+ 11.7-311.7 78.3-403 201-6 8-9.7 12-11 12-.7.7-6.7 1-18 1s-17.3-.3-18-1c-1.3 0
+-5-4-11-12-44.7-59.3-101.3-106.3-170-141s-145.3-54.3-229-60H0V214z"/></svg></span><span class="brace-right" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMaxYMin slice"><path d="M399994 0l6 6v35l-6 11c-56 104-135.3 181.3-238 232-57.3
+ 28.7-117 45-179 50H-300V214h399897c43.3-7 81-15 113-26 100.7-33 179.7-91 237
+-174 2.7-5 6-9 10-13 .7-1 7.3-1 20-1h17z"/></svg></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord text"><span class="mord cjk_fallback">无引用率</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.648em;"><span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.3263em;"><span></span></span></span></span></span></span></span></span></span></p>
+<h4 id="h-32-阈值决定指标同一个模型0963-还是-0525">3.2 阈值决定指标：同一个模型，0.963 还是 0.525<a class="anchor" href="#h-32-阈值决定指标同一个模型0963-还是-0525" aria-label="本节链接">#</a></h4>
+<p>本节实测的阈值扫描（混合四种失效模式，正类 = 断言真的被支持）：</p>
+<table>
+<thead>
+<tr>
+<th>阈值 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span></span></span></span></th>
+<th>precision</th>
+<th>recall</th>
+<th>F1</th>
+<th><strong>判为一致的占比</strong></th>
+</tr>
+</thead>
+<tbody><tr>
+<td>0.30</td>
+<td>0.609</td>
+<td>1.000</td>
+<td>0.757</td>
+<td>0.963</td>
+</tr>
+<tr>
+<td>0.50</td>
+<td>0.609</td>
+<td>1.000</td>
+<td>0.757</td>
+<td>0.963</td>
+</tr>
+<tr>
+<td>0.60</td>
+<td>0.704</td>
+<td>1.000</td>
+<td>0.826</td>
+<td>0.833</td>
+</tr>
+<tr>
+<td>0.70</td>
+<td>0.705</td>
+<td>1.000</td>
+<td>0.827</td>
+<td>0.832</td>
+</tr>
+<tr>
+<td>0.80</td>
+<td>0.705</td>
+<td>1.000</td>
+<td>0.827</td>
+<td>0.832</td>
+</tr>
+<tr>
+<td>0.90</td>
+<td><strong>1.000</strong></td>
+<td>0.895</td>
+<td><strong>0.945</strong></td>
+<td><strong>0.525</strong></td>
+</tr>
+<tr>
+<td>0.95</td>
+<td>1.000</td>
+<td>0.895</td>
+<td>0.945</td>
+<td>0.525</td>
+</tr>
+<tr>
+<td>1.00</td>
+<td>1.000</td>
+<td>0.895</td>
+<td>0.945</td>
+<td>0.525</td>
+</tr>
+</tbody></table>
+<p><strong>这张表要读出两个结论</strong>：</p>
+<ul>
+<li><strong>&quot;引用一致率&quot;这个数字在报告时必须连同检查器与阈值一起给出。</strong> 同一个系统在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.5</span></span></span></span> 下是 0.963，在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.9</span></span></span></span> 下是 0.525 —— <strong>差 0.44，而这与生成质量毫无关系</strong>。第 7 章第 2 节的指标树里把&quot;引用一致&quot;当作一个节点，就必须把检查器的定义一起冻结。</li>
+<li><strong>最优阈值是一个真实的取舍点</strong>（这里 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.9</span></span></span></span>，F1 0.945）：低阈值的代价是 precision 只有 0.609（近 40% 的&quot;一致&quot;是假的），高阈值则漏掉同义表达。<strong>&quot;选阈值&quot;这件事本身就是 §2.2 说的&quot;词面信息不够&quot;的直接后果</strong> —— 换上结构化校验后，这个取舍会大幅缓解。</li>
+</ul>
+<h4 id="h-33-过度引用一致率随引用条数线性下降">3.3 过度引用：一致率随引用条数线性下降<a class="anchor" href="#h-33-过度引用一致率随引用条数线性下降" aria-label="本节链接">#</a></h4>
+<p>设检索/生成找到黄金块的概率 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">find</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.70</span></span></span></span>，找不到时用相似块&quot;充数&quot;。每条断言挂 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 条引用：</p>
+<table>
+<thead>
+<tr>
+<th>引用条数 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span></th>
+<th>至少一条支持（覆盖）</th>
+<th>引用一致率</th>
+<th>相对单条基准</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1</td>
+<td>0.727</td>
+<td><strong>0.727</strong></td>
+<td>1.000</td>
+</tr>
+<tr>
+<td>2</td>
+<td>0.730</td>
+<td>0.365</td>
+<td>0.521</td>
+</tr>
+<tr>
+<td>3</td>
+<td>0.710</td>
+<td>0.237</td>
+<td>0.338</td>
+</tr>
+<tr>
+<td>5</td>
+<td>0.727</td>
+<td>0.145</td>
+<td>0.208</td>
+</tr>
+<tr>
+<td>8</td>
+<td>0.695</td>
+<td><strong>0.087</strong></td>
+<td>0.124</td>
+</tr>
+</tbody></table>
+<p><strong>读数</strong>：</p>
+<ul>
+<li><strong>覆盖率几乎不变（0.71~0.73）</strong>：因为&quot;找到黄金块&quot;的概率与后面挂几条无关。<strong>所以过度引用没有提升任何东西。</strong></li>
+<li><strong>一致率按 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1/</span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 掉</strong>：0.727 → 0.087（8 条时）。<strong>&quot;多挂几条更保险&quot;是一个纯粹的自我欺骗</strong> —— 它在指标上看起来&quot;覆盖更全&quot;（其实没变），代价是一致率崩掉、核验成本乘以 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span>。</li>
+<li><strong>这张表也解释了为什么&quot;强制每条断言必须有引用&quot;会失控</strong>：当模型找不到证据、而系统又硬性要求引用时，它只能挂相似块 —— <strong>恰好就是这里模拟的行为</strong>。正确做法是允许&quot;无引用 / 拒答&quot;，并用无引用率去监控它，而不是用强制引用把问题藏起来（第 5 章第 3 节的拒答阈值）。</li>
+</ul>
+<h4 id="h-34-核验成本让引用值得被核验">3.4 核验成本：让引用值得被核验<a class="anchor" href="#h-34-核验成本让引用值得被核验" aria-label="本节链接">#</a></h4>
+<p>引用的价值最终由&quot;人工核验的成本&quot;决定。成本可分解为：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.9694em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">verify</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.1597em;vertical-align:-1.4763em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.6833em;"><span style="top:-1.5237em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">找到那段话</span></span></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.6833em;"><span class="svg-align" style="top:-2.202em;"><span class="pstrut" style="height:3em;"></span><span class="stretchy" style="height:0.548em;min-width:1.6em;"><span class="brace-left" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMinYMin slice"><path d="M0 6l6-6h17c12.688 0 19.313.3 20 1 4 4 7.313 8.3 10 13
+ 35.313 51.3 80.813 93.8 136.5 127.5 55.688 33.7 117.188 55.8 184.5 66.5.688
+ 0 2 .3 4 1 18.688 2.7 76 4.3 172 5h399450v120H429l-6-1c-124.688-8-235-61.7
+-331-161C60.687 138.7 32.312 99.3 7 54L0 41V6z"/></svg></span><span class="brace-center" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMidYMin slice"><path d="M199572 214
+c100.7 8.3 195.3 44 280 108 55.3 42 101.7 93 139 153l9 14c2.7-4 5.7-8.7 9-14
+ 53.3-86.7 123.7-153 211-199 66.7-36 137.3-56.3 212-62h199568v120H200432c-178.3
+ 11.7-311.7 78.3-403 201-6 8-9.7 12-11 12-.7.7-6.7 1-18 1s-17.3-.3-18-1c-1.3 0
+-5-4-11-12-44.7-59.3-101.3-106.3-170-141s-145.3-54.3-229-60H0V214z"/></svg></span><span class="brace-right" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMaxYMin slice"><path d="M399994 0l6 6v35l-6 11c-56 104-135.3 181.3-238 232-57.3
+ 28.7-117 45-179 50H-300V214h399897c43.3-7 81-15 113-26 100.7-33 179.7-91 237
+-174 2.7-5 6-9 10-13 .7-1 7.3-1 20-1h17z"/></svg></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">locate</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.798em;"><span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.4763em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:2.2958em;vertical-align:-1.6124em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.6833em;"><span style="top:-1.3876em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">比对断言与原文</span></span></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.6833em;"><span class="svg-align" style="top:-2.0659em;"><span class="pstrut" style="height:3em;"></span><span class="stretchy" style="height:0.548em;min-width:1.6em;"><span class="brace-left" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMinYMin slice"><path d="M0 6l6-6h17c12.688 0 19.313.3 20 1 4 4 7.313 8.3 10 13
+ 35.313 51.3 80.813 93.8 136.5 127.5 55.688 33.7 117.188 55.8 184.5 66.5.688
+ 0 2 .3 4 1 18.688 2.7 76 4.3 172 5h399450v120H429l-6-1c-124.688-8-235-61.7
+-331-161C60.687 138.7 32.312 99.3 7 54L0 41V6z"/></svg></span><span class="brace-center" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMidYMin slice"><path d="M199572 214
+c100.7 8.3 195.3 44 280 108 55.3 42 101.7 93 139 153l9 14c2.7-4 5.7-8.7 9-14
+ 53.3-86.7 123.7-153 211-199 66.7-36 137.3-56.3 212-62h199568v120H200432c-178.3
+ 11.7-311.7 78.3-403 201-6 8-9.7 12-11 12-.7.7-6.7 1-18 1s-17.3-.3-18-1c-1.3 0
+-5-4-11-12-44.7-59.3-101.3-106.3-170-141s-145.3-54.3-229-60H0V214z"/></svg></span><span class="brace-right" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMaxYMin slice"><path d="M399994 0l6 6v35l-6 11c-56 104-135.3 181.3-238 232-57.3
+ 28.7-117 45-179 50H-300V214h399897c43.3-7 81-15 113-26 100.7-33 179.7-91 237
+-174 2.7-5 6-9 10-13 .7-1 7.3-1 20-1h17z"/></svg></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">compare</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.9341em;"><span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.6124em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:2.2958em;vertical-align:-1.6124em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.6833em;"><span style="top:-1.3876em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">判断是否支持</span></span></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.6833em;"><span class="svg-align" style="top:-2.0659em;"><span class="pstrut" style="height:3em;"></span><span class="stretchy" style="height:0.548em;min-width:1.6em;"><span class="brace-left" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMinYMin slice"><path d="M0 6l6-6h17c12.688 0 19.313.3 20 1 4 4 7.313 8.3 10 13
+ 35.313 51.3 80.813 93.8 136.5 127.5 55.688 33.7 117.188 55.8 184.5 66.5.688
+ 0 2 .3 4 1 18.688 2.7 76 4.3 172 5h399450v120H429l-6-1c-124.688-8-235-61.7
+-331-161C60.687 138.7 32.312 99.3 7 54L0 41V6z"/></svg></span><span class="brace-center" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMidYMin slice"><path d="M199572 214
+c100.7 8.3 195.3 44 280 108 55.3 42 101.7 93 139 153l9 14c2.7-4 5.7-8.7 9-14
+ 53.3-86.7 123.7-153 211-199 66.7-36 137.3-56.3 212-62h199568v120H200432c-178.3
+ 11.7-311.7 78.3-403 201-6 8-9.7 12-11 12-.7.7-6.7 1-18 1s-17.3-.3-18-1c-1.3 0
+-5-4-11-12-44.7-59.3-101.3-106.3-170-141s-145.3-54.3-229-60H0V214z"/></svg></span><span class="brace-right" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMaxYMin slice"><path d="M399994 0l6 6v35l-6 11c-56 104-135.3 181.3-238 232-57.3
+ 28.7-117 45-179 50H-300V214h399897c43.3-7 81-15 113-26 100.7-33 179.7-91 237
+-174 2.7-5 6-9 10-13 .7-1 7.3-1 20-1h17z"/></svg></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">judge</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.9341em;"><span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.6124em;"><span></span></span></span></span></span></span></span></span></span></p>
+<p><strong>为什么引用粒度直接决定 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">locate</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span></strong>：文档级引用要求核验者在整篇文档里搜索（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">locate</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 与文档长度成正比）；块级给了一个块（只需扫读）；片段级直接给出字符区间（几乎不需要搜索）。</p>
+<p>本节用的成本假设（600 条断言）：</p>
+<table>
+<thead>
+<tr>
+<th>引用粒度</th>
+<th>定位（秒）</th>
+<th>比对（秒）</th>
+<th>每条（秒）</th>
+<th>600 条合计（分钟）</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>文档级</td>
+<td>60</td>
+<td>10</td>
+<td>70</td>
+<td><strong>700</strong></td>
+</tr>
+<tr>
+<td>块级</td>
+<td>10</td>
+<td>8</td>
+<td>18</td>
+<td><strong>180</strong></td>
+</tr>
+<tr>
+<td>片段级</td>
+<td>2</td>
+<td>4</td>
+<td>6</td>
+<td><strong>60</strong></td>
+</tr>
+</tbody></table>
+<p><strong>⚠️ 表里的秒数是假设值，必须替换成你自己实测的</strong>（用秒表量 20 条就够）。但<strong>结构性的结论是稳健的</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">locate</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 的差距（60 : 10 : 2）远大于 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.9694em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">compare</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span></span>（10 : 8 : 4），<strong>所以&quot;把位置信息给足&quot;是降低核验成本的最有效手段</strong>。从文档级到片段级是 <strong>11.7 倍</strong>的差距 —— 这决定了你的引用&quot;能不能被真的抽查&quot;。</p>
+<p><strong>取舍的另一面</strong>：片段级引用要求生成器输出 span。这有两个代价：(a) 生成模型的输出变长（多出偏移字段），(b) 模型可能给出<strong>错误的 span</strong>（比错误的 chunk 更难被发现，因为它看起来更精确）。<strong>所以片段级必须配一个校验：span 必须落在被引块内、且 span 与断言的支持度达标</strong> —— 否则它会带来一种新的、更隐蔽的失效。</p>
+<p><figure><img class="md-img" src="content/courses/rag-systems/assets/chapter-4-figure-04.svg" alt="过度引用：一致率按 1/k 下降" loading="lazy" decoding="async"><figcaption>过度引用：一致率按 1/k 下降</figcaption></figure>
+</p>
+<h3 id="h-四边界与取舍">四、边界与取舍<a class="anchor" href="#h-四边界与取舍" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>引用修不了召回。</strong> 如果证据从未被检索到，就没有东西可引 —— <strong>此时&quot;无引用率&quot;上升是正确的信号</strong>，不要用强制引用把它压下去。判据：把&quot;无引用率&quot;与&quot;召回失败率&quot;分层对比；两者同向上升 → 问题在检索层。</li>
+<li><strong>引用会制造自动化偏误。</strong> 一段带引用的文本会被用户<strong>更少地质疑</strong>（即使引用是装饰性的）。<strong>所以引用一致率低但引用看起来规范，比没有引用更危险</strong> —— 这要求把一致率作为一个<strong>上线门禁</strong>而不是事后统计。</li>
+<li><strong>不是所有任务都该强制引用。</strong> 创意写作、摘要、翻译类任务里，&quot;每条断言必须有来源&quot;会逼迫模型挂装饰性引用（§3.3 的机制）。<strong>判据：如果任务的目标不是&quot;陈述可核验的事实&quot;，就不该套用引用门禁。</strong></li>
+<li><strong>结构化校验需要抽取器，而抽取器会失败。</strong> §2.2 的处方引入了一个新的失败点：三元组抽错会导致&quot;真证据被判为不支持&quot;。<strong>所以结构化校验的输出应当分三档</strong>（支持 / 不支持 / 无法判定），并把&quot;无法判定&quot;单独计数 —— 而不是硬塞进二分类。</li>
+<li><strong>引用是跨章节的接口。</strong> 它的字段设计直接决定第 6 章第 4 节能不能做反事实归因，决定第 7 章第 2 节的指标树能不能落地，也决定第 5 章第 3 节的&quot;证据利用率&quot;能不能被测量。<strong>字段少一个，后面某个实验就做不了</strong> —— 这是这一节必须写全清单的理由。</li>
+</ol>
+<h3 id="h-代码引用的三个可测问题">代码：引用的三个可测问题<a class="anchor" href="#h-代码引用的三个可测问题" aria-label="本节链接">#</a></h3>
+<p>⚠️ <strong>全部为合成&quot;断言-块&quot;对</strong>：它不模拟真实文本，只模拟&quot;被引块与断言的支持关系&quot;以及检查器能从词面看到的全部信息。</p>
+<pre data-lang="python"><code class="language-python">&quot;&quot;&quot;
+引用溯源与可核验性：引用失效、检查器的判别力、过度引用的代价、核验成本。
+全部为合成&quot;断言-块&quot;对 ⚠️，只依赖 numpy。
+  表一 四类被引块的词面重叠（检查器能用的全部信息）
+  表二 过度引用：引用条数 k 与&quot;引用一致率/覆盖&quot;的权衡
+  表三 引用粒度的核验成本（文档级 / 块级 / 片段级）
+  表四 检查阈值的敏感性（precision / recall / F1 扫描）
+&quot;&quot;&quot;
+import numpy as np
+
+V_TOPIC, T_PER, N_VAL = 40, 3, 120
+GEN = 6                      # 每条断言/每块都带的&quot;泛用词&quot;，模拟共享背景词
+P_GOLD_VALUE_EXACT = 0.9     # 黄金块里取值词与断言完全一致的概率（其余为同义表达）
+P_FIND = 0.70                # 检索/生成阶段真正找到黄金块的概率
+
+
+def make_claims(seed=1, n=600):
+    rng = np.random.default_rng(seed)
+    claims = []
+    for _ in range(n):
+        topic = int(rng.integers(0, V_TOPIC))
+        tset = rng.choice(T_PER, 2, replace=False)
+        ttok = [topic * 100 + int(i) for i in tset]          # 主题词
+        val = int(rng.integers(0, N_VAL))                     # 取值词（事实的核心）
+        gen = [10_000 + int(i) for i in rng.choice(GEN, 3, replace=False)]
+        claims.append({&quot;topic&quot;: topic, &quot;ttok&quot;: ttok, &quot;val&quot;: val, &quot;gen&quot;: gen})
+    return claims
+
+
+def make_pool(claims, seed=2):
+    &quot;&quot;&quot;为每条断言造三个候选块：黄金 / 同主题不同事实（危险）/ 无关。&quot;&quot;&quot;
+    rng = np.random.default_rng(seed)
+    pool = []
+    for c in claims:
+        exact = rng.random() &lt; P_GOLD_VALUE_EXACT
+        gold_val = c[&quot;val&quot;] if exact else c[&quot;val&quot;] + 1000      # 同义表达：词面不同
+        gold = {&quot;kind&quot;: &quot;gold&quot;, &quot;doc&quot;: rng.integers(0, 10_000),
+                &quot;tokens&quot;: c[&quot;ttok&quot;] + [gold_val] + c[&quot;gen&quot;]}
+        other_val = c[&quot;val&quot;] + 1 if c[&quot;val&quot;] + 1 != c[&quot;val&quot;] else c[&quot;val&quot;] + 2
+        wrong = {&quot;kind&quot;: &quot;wrong_doc&quot;, &quot;doc&quot;: rng.integers(0, 10_000),
+                 &quot;tokens&quot;: c[&quot;ttok&quot;] + [other_val] + c[&quot;gen&quot;]}  # 同主题、错事实
+        deco = {&quot;kind&quot;: &quot;decorative&quot;, &quot;doc&quot;: rng.integers(0, 10_000),
+                &quot;tokens&quot;: [(c[&quot;topic&quot;] + 1) % V_TOPIC * 100 + 1,
+                           (c[&quot;topic&quot;] + 1) % V_TOPIC * 100 + 2]
+                          + [c[&quot;val&quot;] + 50] + c[&quot;gen&quot;]}
+        pool.append({&quot;gold&quot;: gold, &quot;wrong_doc&quot;: wrong, &quot;decorative&quot;: deco})
+    return pool
+
+
+def overlap(claim, chunk):
+    c = set(claim[&quot;ttok&quot;]) | {claim[&quot;val&quot;]} | set(claim[&quot;gen&quot;])
+    return len(c &amp; set(chunk[&quot;tokens&quot;])) / len(c)
+
+
+def make_citations(claims, pool, rng, mode):
+    &quot;&quot;&quot;mode: correct / wrong_doc / decorative / missing，返回 (被引块, 真值是否支持)。&quot;&quot;&quot;
+    out = []
+    for c, p in zip(claims, pool):
+        if mode == &quot;correct&quot;:
+            # 只有&quot;找到了&quot;才引黄金块；没找到时退回装饰性引用
+            if rng.random() &lt; P_FIND:
+                out.append((p[&quot;gold&quot;], True))
+            else:
+                out.append((p[&quot;decorative&quot;], False))
+        elif mode == &quot;wrong_doc&quot;:
+            out.append((p[&quot;wrong_doc&quot;], False))
+        elif mode == &quot;decorative&quot;:
+            out.append((p[&quot;decorative&quot;], False))
+        else:
+            out.append((None, False))
+    return out
+
+
+def table_modes(claims, pool):
+    &quot;&quot;&quot;按&quot;被引块类型&quot;统计词面重叠 —— 这是词面检查器的全部信息。&quot;&quot;&quot;
+    kinds = {&quot;gold_exact&quot;: ([], True), &quot;gold_synonym&quot;: ([], True),
+             &quot;wrong_doc&quot;: ([], False), &quot;decorative&quot;: ([], False)}
+    for c, p in zip(claims, pool):
+        kinds[&quot;gold_exact&quot; if c[&quot;val&quot;] == p[&quot;gold&quot;][&quot;tokens&quot;][len(c[&quot;ttok&quot;])]
+              else &quot;gold_synonym&quot;][0].append(overlap(c, p[&quot;gold&quot;]))
+        kinds[&quot;wrong_doc&quot;][0].append(overlap(c, p[&quot;wrong_doc&quot;]))
+        kinds[&quot;decorative&quot;][0].append(overlap(c, p[&quot;decorative&quot;]))
+    print(&quot;=&quot; * 88)
+    print(f&quot;表一：四类被引块的词面重叠（{len(claims)} 条断言）——检查器能用的全部信息&quot;)
+    print(&quot;=&quot; * 88)
+    print(f&quot;{&#39;被引块类型&#39;:&lt;16}{&#39;真值支持&#39;:&gt;9}{&#39;重叠均值&#39;:&gt;10}{&#39;重叠最小&#39;:&gt;10}&quot;
+          f&quot;{&#39;tau=0.5&#39;:&gt;10}{&#39;tau=0.8&#39;:&gt;10}{&#39;tau=0.95&#39;:&gt;11}&quot;)
+    for k, (ov, truth) in kinds.items():
+        ov = np.array(ov)
+        cells = []
+        for tau in (0.5, 0.8, 0.95):
+            hit = float((ov &gt;= tau).mean())
+            cells.append(f&quot;{hit:.3f}&quot;)
+        print(f&quot;{k:&lt;16}{(&#39;是&#39; if truth else &#39;否&#39;):&gt;9}{ov.mean():&gt;10.3f}&quot;
+              f&quot;{ov.min():&gt;10.3f}&quot; + &quot;&quot;.join(f&quot;{c:&gt;10}&quot; for c in cells))
+    print()
+    print(&quot;读法：tau=0.8 时 gold_synonym 与 wrong_doc 的重叠完全相同（都是 0.833），&quot;)
+    print(&quot;      任何词面阈值都无法同时做到「抓住错误引用」与「保住同义表达的真证据」——&quot;)
+    print(&quot;      这就是必须做取值/实体级结构化校验、而不能只靠词面重叠的理由。&quot;)
+
+
+def table_overcitation(claims, pool):
+    print()
+    print(&quot;=&quot; * 88)
+    print(&quot;表二：过度引用（每条断言挂 k 条引用；检索找到黄金块的概率 &quot;
+          f&quot;{P_FIND:.2f}）&quot;)
+    print(&quot;=&quot; * 88)
+    print(f&quot;{&#39;引用条数 k&#39;:&gt;11}{&#39;至少一条支持(覆盖)&#39;:&gt;20}{&#39;引用一致率&#39;:&gt;12}&quot;
+          f&quot;{&#39;一致率/单条基准&#39;:&gt;18}&quot;)
+    for k in (1, 2, 3, 5, 8):
+        rng = np.random.default_rng(200 + k)
+        covered, cons, tot = 0, 0, 0
+        for c, p in zip(claims, pool):
+            found = rng.random() &lt; P_FIND
+            cites = [p[&quot;gold&quot;]] if found else []
+            while len(cites) &lt; k:                 # 找不到就&quot;挂装饰性引用&quot;充数
+                cites.append(p[&quot;wrong_doc&quot;] if rng.random() &lt; 0.5 else p[&quot;decorative&quot;])
+            cites = cites[:k]
+            nsup = sum(1 for ch in cites if ch[&quot;kind&quot;] == &quot;gold&quot;)
+            covered += int(nsup &gt; 0)
+            cons += nsup
+            tot += k
+        print(f&quot;{k:&gt;11d}{covered / len(claims):&gt;20.3f}{cons / tot:&gt;12.3f}&quot;
+              f&quot;{(cons / tot) / (P_FIND / 1):&gt;18.3f}&quot;)
+
+
+def table_cost():
+    print()
+    print(&quot;=&quot; * 88)
+    print(&quot;表三：引用粒度的核验成本（600 条断言；假设值需替换为你自己的实测）&quot;)
+    print(&quot;=&quot; * 88)
+    print(f&quot;{&#39;引用粒度&#39;:&lt;14}{&#39;定位(秒)&#39;:&gt;10}{&#39;比对(秒)&#39;:&gt;10}{&#39;每条(秒)&#39;:&gt;10}&quot;
+          f&quot;{&#39;600 条合计(分钟)&#39;:&gt;18}&quot;)
+    rows = ((&quot;文档级&quot;, 60, 10), (&quot;块级&quot;, 10, 8), (&quot;片段级&quot;, 2, 4))
+    for name, loc, cmp_ in rows:
+        per = loc + cmp_
+        print(f&quot;{name:&lt;14}{loc:&gt;10d}{cmp_:&gt;10d}{per:&gt;10d}&quot;
+              f&quot;{per * 600 / 60:&gt;18.0f}&quot;)
+
+
+def table_threshold(claims, pool):
+    print()
+    print(&quot;=&quot; * 88)
+    print(&quot;表四：检查阈值扫描（正类 = 断言真的被支持；混合了四种失效模式）&quot;)
+    print(&quot;=&quot; * 88)
+    rng = np.random.default_rng(300)
+    mix = []
+    for c, p in zip(claims, pool):
+        r = rng.random()
+        if r &lt; 0.55:
+            mix.append((p[&quot;gold&quot;], True))
+        elif r &lt; 0.80:
+            mix.append((p[&quot;wrong_doc&quot;], False))
+        elif r &lt; 0.95:
+            mix.append((p[&quot;decorative&quot;], False))
+        else:
+            mix.append((None, False))
+    print(f&quot;{&#39;阈值 tau&#39;:&gt;9}{&#39;precision&#39;:&gt;11}{&#39;recall&#39;:&gt;9}{&#39;F1&#39;:&gt;8}&quot;
+          f&quot;{&#39;判为一致的占比&#39;:&gt;16}&quot;)
+    best = None
+    for tau in (0.3, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 1.0):
+        tp = fp = fn = 0
+        for c, (ch, truth) in zip(claims, mix):
+            pred = False if ch is None else (overlap(c, ch) &gt;= tau)
+            tp += truth and pred
+            fn += truth and not pred
+            fp += (not truth) and pred
+        prec = tp / (tp + fp) if tp + fp else float(&quot;nan&quot;)
+        rec = tp / (tp + fn) if tp + fn else float(&quot;nan&quot;)
+        f1 = 2 * prec * rec / (prec + rec) if prec and rec else 0.0
+        if best is None or f1 &gt; best[0]:
+            best = (f1, tau, prec, rec)
+        print(f&quot;{tau:&gt;9.2f}{prec:&gt;11.3f}{rec:&gt;9.3f}{f1:&gt;8.3f}&quot;
+              f&quot;{(tp + fp) / len(claims):&gt;16.3f}&quot;)
+    print(f&quot;\n最优阈值 tau={best[1]:.2f}：precision {best[2]:.3f} / recall &quot;
+          f&quot;{best[3]:.3f} / F1 {best[0]:.3f}&quot;)
+    print(&quot;注意：错误引用里的 wrong_doc 与黄金块的词面重叠只差一个取值词，&quot;
+          &quot;\n所以词面检查器在低阈值下无法区分 —— 必须靠取值/实体级别的结构化校验。&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    claims = make_claims()
+    pool = make_pool(claims)
+    table_modes(claims, pool)
+    table_overcitation(claims, pool)
+    table_cost()
+    table_threshold(claims, pool)</code></pre>
+<p><strong>实测输出</strong>：</p>
+<p><strong>表一 —— 四类被引块的词面重叠</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>被引块类型</th>
+<th>真值支持</th>
+<th>重叠均值</th>
+<th>重叠最小</th>
+<th><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.5</span></span></span></span></th>
+<th><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.8</span></span></span></span></th>
+<th><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.95</span></span></span></span></th>
+</tr>
+</thead>
+<tbody><tr>
+<td>gold（取值一致）</td>
+<td>是</td>
+<td>1.000</td>
+<td>1.000</td>
+<td>1.000</td>
+<td>1.000</td>
+<td>1.000</td>
+</tr>
+<tr>
+<td>gold（取值同义）</td>
+<td>是</td>
+<td>0.833</td>
+<td>0.833</td>
+<td>1.000</td>
+<td>1.000</td>
+<td><strong>0.000</strong></td>
+</tr>
+<tr>
+<td>wrong_doc</td>
+<td>否</td>
+<td>0.834</td>
+<td>0.833</td>
+<td>1.000</td>
+<td>1.000</td>
+<td>0.002</td>
+</tr>
+<tr>
+<td>decorative</td>
+<td>否</td>
+<td>0.500</td>
+<td>0.500</td>
+<td>1.000</td>
+<td>0.000</td>
+<td>0.000</td>
+</tr>
+</tbody></table>
+<p><strong>表二 —— 过度引用</strong>：覆盖率恒在 0.695~0.730，而引用一致率从 0.727（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span>）掉到 <strong>0.087</strong>（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">8</span></span></span></span>）。</p>
+<p><strong>表三 —— 核验成本（600 条断言）</strong>：文档级 <strong>700 分钟</strong> / 块级 <strong>180 分钟</strong> / 片段级 <strong>60 分钟</strong>（⚠️ 秒数为假设值，需换成你自己的实测）。</p>
+<p><strong>表四 —— 阈值扫描</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>阈值 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span></span></span></span></th>
+<th>precision</th>
+<th>recall</th>
+<th>F1</th>
+<th>判为一致的占比</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>0.30</td>
+<td>0.609</td>
+<td>1.000</td>
+<td>0.757</td>
+<td>0.963</td>
+</tr>
+<tr>
+<td>0.50</td>
+<td>0.609</td>
+<td>1.000</td>
+<td>0.757</td>
+<td>0.963</td>
+</tr>
+<tr>
+<td>0.60</td>
+<td>0.704</td>
+<td>1.000</td>
+<td>0.826</td>
+<td>0.833</td>
+</tr>
+<tr>
+<td>0.70</td>
+<td>0.705</td>
+<td>1.000</td>
+<td>0.827</td>
+<td>0.832</td>
+</tr>
+<tr>
+<td>0.80</td>
+<td>0.705</td>
+<td>1.000</td>
+<td>0.827</td>
+<td>0.832</td>
+</tr>
+<tr>
+<td><strong>0.90</strong></td>
+<td><strong>1.000</strong></td>
+<td>0.895</td>
+<td><strong>0.945</strong></td>
+<td><strong>0.525</strong></td>
+</tr>
+<tr>
+<td>0.95</td>
+<td>1.000</td>
+<td>0.895</td>
+<td>0.945</td>
+<td>0.525</td>
+</tr>
+<tr>
+<td>1.00</td>
+<td>1.000</td>
+<td>0.895</td>
+<td>0.945</td>
+<td>0.525</td>
+</tr>
+</tbody></table>
+<p>最优阈值 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.90</span></span></span></span>：precision 1.000 / recall 0.895 / F1 0.945。<strong>同一份答案的&quot;引用一致率&quot;，在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.5</span></span></span></span> 下是 0.963、在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.9</span></span></span></span> 下是 0.525 —— 报告这个指标时必须把检查器与阈值一起冻结。</strong></p>
+<h3 id="h-练习">练习<a class="anchor" href="#h-练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><p><strong>查出你的&quot;假一致&quot;比例。</strong> 取 100 条线上答案，对每条断言，用一个较低的词面阈值（例如 0.5）与一个较高的阈值（例如 0.9）分别判一次一致。<strong>要求给出两个一致率以及差异最大的 5 个例子</strong>，并判断这些例子属于装饰性引用还是同义表达漏判。<strong>回答：你的系统报告的&quot;引用一致率&quot;实际落在哪个阈值上？</strong></p>
+</li>
+<li><p><strong>实现一个结构化支持判定器。</strong> 把断言与证据都解析成 (实体, 属性, 取值) 三元组（可用正则 + 一个强模型的少量调用），逐字段比对，输出三档：支持 / 不支持 / 无法判定。<strong>要求报告三档的比例</strong>，并说明&quot;无法判定&quot;如何处理（不能硬塞进二分类）。</p>
+</li>
+<li><p><strong>测你的核验成本。</strong> 用秒表实测你自己核验 20 条引用所需的时间，分别按文档级（只看文档名）、块级（给块）、片段级（给字符区间）三种条件各测一轮。<strong>要求给出三种条件下的每条秒数、600 条的合计，以及 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">locate</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">:</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.9694em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">compare</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span></span> 的实测比值</strong> —— 并与 §3.4 的假设值（6:1）比较。</p>
+</li>
+<li><p><strong>做一次&quot;强制引用&quot;的对照实验。</strong> 把生成端的引用要求从&quot;允许无引用&quot;改成&quot;每条断言必须至少一条引用&quot;，在同一个评测集上测：无引用率、引用一致率、覆盖率、答案正确率。<strong>要求解释一致率的变化是否符合表二的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1/</span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 规律</strong>，并给出&quot;该不该强制引用&quot;的结论。</p>
+</li>
+<li><p><strong>设计 chunk_id 与引用字段的完整 schema。</strong> 写出你的系统的字段定义（名称、类型、是否必填、保留期），并逐项说明：<strong>它对应 §1.2 里哪个问题</strong>。然后回答：如果明天要换嵌入模型，你的历史引用会怎样？（提示：<code>embedder_ver</code> 的作用。）</p>
+</li>
+<li><p><strong>构造一次&quot;引用掩盖了召回失败&quot;的案例。</strong> 用代码把 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">find</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 从 0.7 降到 0.3，观察无引用率与一致率的变化；然后加上&quot;强制引用&quot;的补丁（找不到就挂相似块），再看一遍。<strong>要求给出四个数字（两个阶段 × 两个指标），并说明为什么&quot;一致率上升&quot;在这里是一个坏消息。</strong></p>
+</li>
+<li><p><strong>给引用加一个跨版本校验。</strong> 假设同一 <code>doc_id</code> 有 v1、v2 两个版本，<code>chunk_id</code> 是内容寻址的。设计一个校验：当引用的块来自 v1 而当前活跃版本是 v2 时，如何标记这条引用？<strong>要求给出判定规则、输出字段，以及它与第 6 章第 1 节&quot;段式索引与回滚&quot;的接口。</strong></p>
+</li>
+</ol>
+<h3 id="h-小结">小结<a class="anchor" href="#h-小结" aria-label="本节链接">#</a></h3>
+<ul>
+<li><strong>引用是贯穿索引 → 检索 → 装配 → 生成的一条数据链路，不是收尾装饰。</strong> 最小元数据清单里每一项都在回答一个具体问题：<code>chunk_id</code>（内容寻址）回答&quot;来自哪段文本&quot;，<code>doc_ver</code> 回答&quot;是否过期&quot;，<code>char_span</code> 回答&quot;在哪个位置&quot;，<code>source/authority</code> 回答&quot;是否权威&quot;，<code>retriever/score/rank</code> 回答&quot;为什么被选中&quot;。<strong>少一个字段，后面某个归因实验就做不了。</strong></li>
+<li><strong><code>chunk_id</code> 必须内容寻址</strong>（<code>hash(规范化文本, chunker_ver, embedder_ver)</code>）：引用的生命周期（长期）与索引的生命周期（频繁重建）不匹配，唯一稳定的锚点是内容。<strong>只记 id 与哈希、不记正文</strong>，理由是体积、权限（避免绕过 ACL 泄露）与版本一致性三条 —— 代价是索引必须能反查历史版本。</li>
+<li><strong>词面重叠不足以判定支持关系</strong>，这是一个精确的失败而非调参问题：本节实测 <code>gold(同义表达)</code> 与 <code>wrong_doc(同主题错事实)</code> 的重叠<strong>完全相同（都是 0.833）</strong>。<strong>所以任何词面阈值都无法同时做到抓错与保真</strong>；正确处方是加一条 (实体, 属性, 取值) 的结构化比对通道，并输出&quot;支持 / 不支持 / 无法判定&quot;三档。</li>
+<li><strong>&quot;引用一致率&quot;是一个需要连同定义一起冻结的指标</strong>：同一份答案，检查阈值 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.5</span></span></span></span> 时是 <strong>0.963</strong>，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.9</span></span></span></span> 时是 <strong>0.525</strong>。分母是&quot;被引块&quot;而不是&quot;断言&quot;，所以它<strong>偏好少引用、不惩罚漏引</strong> —— 必须配覆盖率与无引用率一起看。</li>
+<li><strong>过度引用不提升任何东西，只摧毁一致率</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 从 1 到 8 时覆盖率恒在 0.695~0.730，而一致率从 0.727 掉到 <strong>0.087</strong>（约 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1/</span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span>）。<strong>&quot;每条断言强制必须有引用&quot;正是制造这种行为的原因</strong> —— 找不到证据时挂相似块。正确做法是允许无引用/拒答，并把<strong>无引用率</strong>做成硬门禁。</li>
+<li><strong>核验成本主要由引用粒度决定</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">locate</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">:</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.9694em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">compare</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span></span> 的实测差距（本节假设 60:10 / 10:8 / 2:4）使 600 条断言的核验时间从文档级的 <strong>700 分钟</strong>降到片段级的 <strong>60 分钟</strong>（11.7 倍）。<strong>片段级必须配 span 校验</strong>（落在块内 + 支持度达标），否则会引入一种更隐蔽的新失效。</li>
+<li><strong>边界</strong>：引用修不了召回（无引用率与召回失败率应同向监控）；引用会制造自动化偏误（低一致率 + 规范外观比没有引用更危险）；创意/摘要类任务不该强制引用；结构化校验的抽取器本身会失败，所以要有&quot;无法判定&quot;这一档。</li>
+<li><strong>一句话</strong>：<strong>把&quot;引用&quot;当成一次可复现的证据查询：给定一条断言，能追到内容寻址的块、确定的版本、精确的区间，并且这个&quot;支持&quot;判断有明确的三档结果与冻结的判定规则 —— 做到这些，第 6 章的线上归因与第 7 章的指标树才有落脚点。</strong></li>
+</ul>
+<blockquote>
+<p>下一节：前四章一直在<strong>内部</strong>优化一条流水线：切分、索引、重排、融合、查询理解、证据装配、引用溯源。到这里，一次问答在质量维度上已经讲透了。但有一个更根本的问题一直没被正面回答 —— <strong>既然模型的窗口已经能到 128k 甚至 1M token，为什么不干脆把整份知识库塞进去？</strong> 检索这一整套是不是正在变成历史遗产？<strong>第 5 章第 1 节</strong>（长上下文不是 RAG 的替代品）不做立场表态，只做一件事：把&quot;塞进去&quot;拆成可以算的量（KV 显存 / prefill 算力 / token 费用），把&quot;答得对&quot;拆成可以测的量（位置折扣 / 干扰竞争 / 多事实聚合），然后给出一个可执行的判据。</p>
+</blockquote>

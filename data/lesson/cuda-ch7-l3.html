@@ -1,0 +1,238 @@
+<h2 id="h-cutlass--cublas什么时候该用库而不是手写">CUTLASS / cuBLAS：什么时候该用库而不是手写<a class="anchor" href="#h-cutlass--cublas什么时候该用库而不是手写" aria-label="本节链接">#</a></h2>
+<p>前两课把&quot;能写&quot;补上了：手写 CUDA、Triton 都能出正确且不慢的算子。但工程上第一件该问的不是&quot;怎么写&quot;，而是&quot;<strong>为什么觉得库不够用</strong>&quot;。这一课拆开 CUTLASS 与 cuBLAS 的分层结构，给出四条能当场核对的选型判据。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-cutlass把-gemm-做成可组合的分层模板">1. CUTLASS：把 GEMM 做成&quot;可组合的分层模板&quot;<a class="anchor" href="#h-1-cutlass把-gemm-做成可组合的分层模板" aria-label="本节链接">#</a></h4>
+<p>CUTLASS 的核心是一段<strong>分层阻塞的三重循环</strong>，每层对应 CUDA 执行模型的一层并发、存储层次的一层容量：</p>
+<pre data-lang="text"><code class="language-text">for cta_n / cta_m:                       ← threadblock 级并发（CTA tile 落 shared memory）
+  for cta_k:                             ← mainloop：一次迭代=一个 stage（软件流水的单位）
+    for warp_n / warp_m:                 ← warp 级并发（从 shared 取到寄存器 fragment）
+      for warp_k:                        ← 在 CtaTileK 上完全展开（一个 k group）
+        for mma_k / mma_n / mma_m:       ← Tensor Core 指令（mma.sync）
+          mma_instruction(d, a, b, c)</code></pre>
+<p>三层 tile 各有明确职责：<strong>threadblock tile</strong> 决定从 global memory 搬多少（太大反而浪费在边界上，太小则 DRAM 带宽变瓶颈）；<strong>warp tile</strong> 决定 shared memory 的复用与 bank conflict；<strong>thread tile</strong> 决定寄存器内的复用。你手写时要自己拍的三组数字，在这里是 <code>ThreadblockShape</code> / <code>WarpShape</code> / <code>InstructionShape</code> 三个模板参数。</p>
+<p>它的&quot;工程增量&quot;和你在第 4、5、6 章逐条打过照面：</p>
+<ul>
+<li><strong>epilogue 独立成阶段</strong>：MMA 的输出布局是为了算得快挑的，不适合直接写回 global memory；epilogue 让线程先通过 shared memory 交换数据，再合并写回——<strong>这也是融合激活/bias 的合法位置</strong>。</li>
+<li><strong>软件流水线</strong>：threadblock tile 双缓冲 + warp fragment 双缓冲，把访存与计算重叠（第 4 课双缓冲的库化）。</li>
+<li><strong>threadblock rasterization</strong>：决定 CTA 与输出的映射顺序以提升 L2 复用（第 2 课在 Triton 里叫 <code>GROUP_SIZE_M</code>）。</li>
+<li><strong>split-K / sliced-K</strong>：M、N 小、K 大时用 K 维并行补足并行度——代价是<strong>多一个归约 kernel 与一块 workspace</strong>，下一节会算给你看。</li>
+<li>从 Hopper 起 CUTLASS 3.x 引入 <strong>warp specialization</strong>（producer/consumer warp group）与 <strong>tile scheduler</strong>，把第 5 课的 warp specialization 与第 4 课的 TMA 组合成库内默认路径。</li>
+</ul>
+<h4 id="h-2-cublas--cublaslt厂商调好的那一条路">2. cuBLAS / cuBLASLt：厂商调好的那一条路<a class="anchor" href="#h-2-cublas--cublaslt厂商调好的那一条路" aria-label="本节链接">#</a></h4>
+<p>cuBLAS 是闭源但高度调优的 GEMM 实现，供应了列主序的经典 API；<strong>cuBLASLt</strong> 是它的轻量层：算法由启发式（heuristic）选择、支持 epilogue 融合、<strong>需要显式管理工作区</strong>，并且可以让你在若干候选算法里挑。使用它的三个必答题是：<strong>布局</strong>（cuBLAS 传统上是 column-major，与 PyTorch 的 row-major 约定不一致，需要转置或换 API）、<strong>workspace</strong>（大小请求与切分策略）、<strong>算法</strong>（默认启发式可能不是你形状上的最优）。</p>
+<p>什么时候库会不如你？大致三类：<strong>形状极端</strong>（M 很小、K 很浅、batch 不规则）、<strong>融合超出它的 epilogue 菜单</strong>、<strong>需要非标准布局/精度组合</strong>。这三类恰好就是下一节决策函数的输入。</p>
+<h4 id="h-3-四条判据先分类再决策">3. 四条判据：先分类，再决策<a class="anchor" href="#h-3-四条判据先分类再决策" aria-label="本节链接">#</a></h4>
+<ol>
+<li><strong>形状</strong>：输出块数够不够铺满 SM？tile 补齐浪费多少？——这决定&quot;库的 tile 是不是过大&quot;。</li>
+<li><strong>融合</strong>：要融的算子是否在库的 epilogue 菜单里？不在就自己写（或 Triton）。</li>
+<li><strong>数据类型</strong>：fp16/bf16 库最全；fp8、int4 等低精度路径要看清支持矩阵。</li>
+<li><strong>布局/调度</strong>：需要自定义 tiling、persistent scheduler、非标准 stride 时，CUTLASS 才是对的层。</li>
+</ol>
+<p><figure><img class="md-img" src="content/courses/gpu-cuda-kernels/assets/chapter-7-figure-02.svg" alt="库与手写的选择判据：形状、融合、数据类型、布局" loading="lazy" decoding="async"><figcaption>库与手写的选择判据：形状、融合、数据类型、布局</figcaption></figure>
+</p>
+<h4 id="h-4-三笔必须算清的账">4. 三笔必须算清的账<a class="anchor" href="#h-4-三笔必须算清的账" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>tile 利用率</strong>：M=1、N=4096、K=4096 用 128×128 的 tile，<strong>99.2% 的乘加落在补零 lane 上</strong>——无效计算放大到 128 倍（有效算术强度从 128 掉到 0.5 FLOP/B）。</li>
+<li><strong>够不够铺满</strong>：把输出块数与 SM 数比。132 个 SM 时 4096×4096 有 1024 块（8 波，最后一波只剩 100 块），而 M=1 只有 32 块——整卡跑一排就没了。</li>
+<li><strong>融合的经济学</strong>：单独一条 elementwise kernel 要读一遍 C、写一遍 C。以 4096×11008×4096 为例，融合把总流量从 376 MiB 降到 204 MiB（省下 172 MiB，约 54%），而且这部分收益与算力无关，纯粹是带宽。</li>
+</ul>
+<h4 id="h-5-常见坑">5. 常见坑<a class="anchor" href="#h-5-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>拿 cuBLAS 的 TFLOPS 去比自己的小形状</strong>：库的启发式在标准大形状上接近峰值，小形状上可能选到不合适的 tile。</li>
+<li><strong>忽略 split-K 的 workspace</strong>：它为并行度付的是&quot;显存 + 一个归约 kernel&quot;。</li>
+<li><strong>在 cuBLASLt 上忘记 workspace 与布局约束</strong>：结果是静默走回退路径，看起来&quot;库很慢&quot;。</li>
+<li><strong>用 CUTLASS 2.x 的教程去写 3.x 的代码</strong>：3.x 的 collective/builder 与 2.x 的 <code>DefaultGemm</code> 不是同一套抽象。</li>
+<li><strong>手写只为了&quot;可控&quot;</strong>：目标形状在库的舒适区、也不需要额外融合时，手写通常只在维护成本上亏。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面的纯 Python 版本把四条判据实现成一个决策函数，并把三笔账（tile 浪费、铺满度、split-K workspace、融合收益）算成数字。不需要 GPU。</p>
+<pre data-lang="python"><code class="language-python"># ===== ch7-l3：什么时候该用库（cuBLAS/CUTLASS），什么时候该手写（纯标准库，无 GPU）=====
+import math
+
+# ---------- 1. 形状分类：tile 利用率才是第一道筛子 ----------
+def classify(M, N, K, TM=128, TN=128, TK=64):
+    bm, bn = math.ceil(M/TM), math.ceil(N/TN)
+    tiles = bm * bn
+    waste = 1 - (M*N) / (bm*TM * bn*TN)        # tile 补齐带来的无效计算占比
+    k_steps = math.ceil(K/TK)
+    if M*N &lt;= TM*TN:            kind = &quot;小方阵（单 tile 装得下）&quot;
+    elif M &lt;= TM:               kind = &quot;瘦长（解码期 / 小 batch）&quot;
+    elif K &lt;= TK:               kind = &quot;K 很浅（近似 outer product）&quot;
+    else:                       kind = &quot;规整大方阵&quot;
+    return tiles, k_steps, waste, kind
+
+print(&quot;[1] tile = 128x128x64 面对不同形状：输出块数、K 段数、补齐浪费&quot;)
+print(f&quot;{&#39;M x N x K&#39;:&gt;20} {&#39;输出块&#39;:&gt;7} {&#39;K 段&#39;:&gt;5} {&#39;补齐浪费&#39;:&gt;9}  类别&quot;)
+for M, N, K in [(4096,4096,4096), (4096,11008,4096), (1,4096,4096), (16,4096,4096),
+                (4096,4096,32), (128,128,128)]:
+    t, ks, w, kind = classify(M, N, K)
+    print(f&quot;{f&#39;{M}x{N}x{K}&#39;:&gt;20} {t:&gt;7} {ks:&gt;5} {w:&gt;8.1%}  {kind}&quot;)
+
+# ---------- 2. 算术强度全账（含写回 C）+ 补零放大 → 有效算术强度 ----------
+def intensity(M, N, K, TM, TN, elem=2, acc=4):
+    &quot;&quot;&quot;按第 4 章账本重数一遍，这次把写回 C 也算进去（roofline 的诚实口径）&quot;&quot;&quot;
+    bm, bn = math.ceil(M/TM), math.ceil(N/TN)
+    moved = bm*bn * K * (TM+TN) * elem + M*N*acc      # A/B 条带 + 写回 C
+    flops = 2.0*M*N*K
+    pad   = (bm*TM*bn*TN) / (M*N)                      # tile 内的无效 lane 也在做乘加
+    return flops/moved, flops*pad/moved
+print(f&quot;\n[2] 含写回 C 的算术强度；括号里是『tile 内补零 lane 也参与计算』后的有效值&quot;)
+print(f&quot;{&#39;shape&#39;:&gt;18}&quot; + &quot;&quot;.join(f&quot;{f&#39;{tm}x{tn}&#39;:&gt;20}&quot; for tm, tn in [(64,64),(128,128),(256,256)]))
+for M, N, K in [(4096,4096,4096), (4096,11008,4096), (1,4096,4096), (16,4096,4096), (128,128,128)]:
+    cells = []
+    for tm, tn in [(64,64),(128,128),(256,256)]:
+        ai, eff = intensity(M, N, K, tm, tn)
+        cells.append(f&quot;{ai:&gt;8.1f}({eff:&gt;8.1f})&quot;)
+    print(f&quot;{f&#39;{M}x{N}x{K}&#39;:&gt;18}&quot; + &quot;&quot;.join(cells))
+
+# ---------- 3. 够不够铺满：grid 深度与余数波 ----------
+def waves(M, N, TM, TN, sm=132):
+    tiles = math.ceil(M/TM) * math.ceil(N/TN)
+    full = tiles // sm
+    return tiles, full, tiles % sm, tiles/sm
+print(f&quot;\n[3] 以 132 个 SM 为例：需要多少个波次才铺满（余数波就是『最后一批 SM 闲着』）&quot;)
+print(f&quot;{&#39;shape&#39;:&gt;18} {&#39;块数&#39;:&gt;7} {&#39;整波&#39;:&gt;5} {&#39;余数块&#39;:&gt;7} {&#39;波数(含余)&#39;:&gt;10}&quot;)
+for M, N, K in [(64,64,4096), (128,512,4096), (1,4096,4096), (16,4096,4096), (4096,4096,4096), (8192,8192,8192)]:
+    t, full, rem, w = waves(M, N, 128, 128)
+    print(f&quot;{f&#39;{M}x{N}&#39;:&gt;18} {t:&gt;7} {full:&gt;5} {rem:&gt;7} {math.ceil(w):&gt;10}&quot;)
+
+# ---------- 4. split-K：多出来的并行度要付 workspace ----------
+def splitk(M, N, K, parts, TM=128, TN=128, elem=4):
+    tiles = math.ceil(M/TM) * math.ceil(N/TN)
+    grid = tiles * parts                       # partitionedK GEMM：每段 K 各出一批 block
+    ws = tiles * parts * TM * TN * elem        # 部分和（fp32）落显存
+    return grid, ws, ws*2                      # 归约 kernel 读+写
+print(f&quot;\n[4] split-K：用 K 维并行度换 workspace（fp32 部分和）与一个额外的归约 kernel&quot;)
+print(f&quot;{&#39;shape&#39;:&gt;18} {&#39;parts&#39;:&gt;6} {&#39;grid&#39;:&gt;8} {&#39;workspace&#39;:&gt;11} {&#39;归约多搬&#39;:&gt;10}&quot;)
+for M, N, K in [(1024,1024,4096), (4096,4096,4096)]:
+    for parts in (1, 4, 16):
+        g, ws, red = splitk(M, N, K, parts)
+        print(f&quot;{f&#39;{M}x{N}x{K}&#39;:&gt;18} {parts:&gt;6} {g:&gt;8} {ws/2**20:&gt;9.1f}MiB {red/2**20:&gt;8.1f}MiB&quot;)
+
+# ---------- 5. 融合的经济学：省下的正好是一次中间张量的读 + 写 ----------
+def traffic(M, N, K, elem=2, fusable=True):
+    gemm = (M*K + K*N)*elem + M*N*elem         # 主线：读 A/B，写 C
+    extra = 2*M*N*elem if fusable else 0       # 独立 elementwise kernel：读 C + 写 C
+    return gemm, gemm + extra
+print(f&quot;\n[5] 把激活/GELU/bias 融进 epilogue：省下一次 C 的读 + 写（纯带宽收益）&quot;)
+print(f&quot;{&#39;shape&#39;:&gt;18} {&#39;不融合&#39;:&gt;11} {&#39;融合后&#39;:&gt;10} {&#39;省下&#39;:&gt;10} {&#39;相对收益&#39;:&gt;9}&quot;)
+for M, N, K in [(4096,11008,4096), (8192,8192,8192)]:
+    g, gf = traffic(M, N, K)
+    print(f&quot;{f&#39;{M}x{N}x{K}&#39;:&gt;18} {gf/2**20:&gt;9.1f}MiB {g/2**20:&gt;8.1f}MiB {(gf-g)/2**20:&gt;8.1f}MiB &quot;
+          f&quot;{g/gf:&gt;8.1%}&quot;)
+
+# ---------- 6. 决策函数：把上面几条判据折成一个可核对的推荐 ----------
+def recommend(M, N, K, batch=1, fuse=&quot;none&quot;, dtype=&quot;fp16&quot;, need_layout_control=False,
+              TM=128, TN=128, sm=132):
+    tiles, _, _, kind = classify(M, N, K, TM, TN)
+    if need_layout_control:
+        return &quot;CUTLASS/CuTe DSL（要自定义 tile 与调度）&quot;
+    if batch &gt; 1 and fuse != &quot;none&quot;:
+        return &quot;CUTLASS grouped GEMM 或 Triton（融合 epilogue）&quot;
+    if batch &gt; 1:
+        return &quot;cuBLAS strided-batched / torch.bmm&quot;
+    if tiles &lt; sm or M &lt;= TM:
+        return &quot;手写（或 Triton）：库的 tile 太大，grid 铺不满&quot;
+    if fuse != &quot;none&quot;:
+        return &quot;cuBLASLt epilogue 融合，或手写 Triton 融合 kernel&quot;
+    if dtype in (&quot;fp8&quot;, &quot;int4&quot;):
+        return &quot;cuBLASLt / CUTLASS（低精度路径更全）&quot;
+    return &quot;直接调 cuBLAS&quot;
+print(f&quot;\n[6] 决策函数在几个真实形状上跑一遍&quot;)
+cases = [((4096,4096,4096), {}),
+         ((1,4096,4096), {}),
+         ((16,4096,4096), {}),
+         ((16,11008,4096), dict(batch=16, fuse=&quot;silu&quot;)),
+         ((8192,8192,8192), dict(fuse=&quot;bias+gelu&quot;)),
+         ((4096,4096,4096), dict(dtype=&quot;fp8&quot;)),
+         ((4096,4096,4096), dict(need_layout_control=True))]
+for (M, N, K), kw in cases:
+    print(f&quot;    {f&#39;{M}x{N}x{K}&#39;:&gt;18} {str(kw):&lt;36} → {recommend(M,N,K,**kw)}&quot;)</code></pre>
+<p>在 <code>python3.10</code> 下实际运行结果：</p>
+<pre data-lang="text"><code class="language-text">[1] tile = 128x128x64 面对不同形状：输出块数、K 段数、补齐浪费
+           M x N x K     输出块   K 段      补齐浪费  类别
+      4096x4096x4096    1024    64     0.0%  规整大方阵
+     4096x11008x4096    2752    64     0.0%  规整大方阵
+         1x4096x4096      32    64    99.2%  小方阵（单 tile 装得下）
+        16x4096x4096      32    64    87.5%  瘦长（解码期 / 小 batch）
+        4096x4096x32    1024     1     0.0%  K 很浅（近似 outer product）
+         128x128x128       1     2     0.0%  小方阵（单 tile 装得下）
+
+[2] 含写回 C 的算术强度；括号里是『tile 内补零 lane 也参与计算』后的有效值
+             shape               64x64             128x128             256x256
+    4096x4096x4096    31.5(    31.5)    62.1(    62.1)   120.5(   120.5)
+   4096x11008x4096    31.5(    31.5)    62.1(    62.1)   120.5(   120.5)
+       1x4096x4096     0.5(    32.0)     0.5(    64.0)     0.5(   128.0)
+      16x4096x4096     8.0(    31.9)     8.0(    63.8)     8.0(   127.5)
+       128x128x128    21.3(    21.3)    32.0(    32.0)    21.3(    85.3)
+
+[3] 以 132 个 SM 为例：需要多少个波次才铺满（余数波就是『最后一批 SM 闲着』）
+             shape      块数    整波     余数块     波数(含余)
+             64x64       1     0       1          1
+           128x512       4     0       4          1
+            1x4096      32     0      32          1
+           16x4096      32     0      32          1
+         4096x4096    1024     7     100          8
+         8192x8192    4096    31       4         32
+
+[4] split-K：用 K 维并行度换 workspace（fp32 部分和）与一个额外的归约 kernel
+             shape  parts     grid   workspace       归约多搬
+    1024x1024x4096      1       64       4.0MiB      8.0MiB
+    1024x1024x4096      4      256      16.0MiB     32.0MiB
+    1024x1024x4096     16     1024      64.0MiB    128.0MiB
+    4096x4096x4096      1     1024      64.0MiB    128.0MiB
+    4096x4096x4096      4     4096     256.0MiB    512.0MiB
+    4096x4096x4096     16    16384    1024.0MiB   2048.0MiB
+
+[5] 把激活/GELU/bias 融进 epilogue：省下一次 C 的读 + 写（纯带宽收益）
+             shape         不融合        融合后         省下      相对收益
+   4096x11008x4096     376.0MiB    204.0MiB    172.0MiB    54.3%
+    8192x8192x8192     640.0MiB    384.0MiB    256.0MiB    60.0%
+
+[6] 决策函数在几个真实形状上跑一遍
+        4096x4096x4096 {}                                   → 直接调 cuBLAS
+           1x4096x4096 {}                                   → 手写（或 Triton）：库的 tile 太大，grid 铺不满
+          16x4096x4096 {}                                   → 手写（或 Triton）：库的 tile 太大，grid 铺不满
+         16x11008x4096 {&#39;batch&#39;: 16, &#39;fuse&#39;: &#39;silu&#39;}        → CUTLASS grouped GEMM 或 Triton（融合 epilogue）
+        8192x8192x8192 {&#39;fuse&#39;: &#39;bias+gelu&#39;}                → cuBLASLt epilogue 融合，或手写 Triton 融合 kernel
+        4096x4096x4096 {&#39;dtype&#39;: &#39;fp8&#39;}                     → cuBLASLt / CUTLASS（低精度路径更全）
+        4096x4096x4096 {&#39;need_layout_control&#39;: True}        → CUTLASS/CuTe DSL（要自定义 tile 与调度）</code></pre>
+<p>三处结论可以直接拿去用：</p>
+<ul>
+<li><strong>第 2 段是选型的分水岭</strong>：4096×4096×4096 在 128×128 tile 下算术强度 62.1 FLOP/B（含写回 C 的诚实口径），足够越过一般数据中心 GPU 的 roofline 拐点；而 M=1 时只有 0.5 FLOP/B，<strong>补零 lane 把有效值放大了 128 倍这件事，说明这里的瓶颈根本不是矩阵乘</strong>——这是一个 GEMV/访存问题，该换公式而不是换 tile。</li>
+<li><strong>第 3 段量的是&quot;铺不铺得满&quot;</strong>：M=1 时 32 块在 132 个 SM 上连一波都填不满；4096×4096 是 7 整波 + 100 块的余数波（约 8 波）。余数波的存在解释了为什么&quot;同一形状换个 shape 就慢一截&quot;。</li>
+<li><strong>第 4 段是 split-K 的真价钱</strong>：1024×1024×4096 从 1 段开到 4 段，grid 从 64 涨到 256（终于铺满），但 workspace 从 4 MiB 涨到 16 MiB、归约 kernel 还要多搬 32 MiB。<strong>只有当&quot;铺满&quot;带来的收益大于这笔搬运时，split-K 才成立</strong>——而这笔账用上面几行就能算出来，不必先上卡。</li>
+</ul>
+<p><strong>可选，需自备或云上按需</strong>：有了 GPU 之后，把&quot;库 vs 手写&quot;的对照做完整：</p>
+<pre data-lang="bash"><code class="language-bash"># 1) 先确认你的形状落在库的舒适区还是边缘（ncu 只看 GEMM 自身，不看框架开销）
+ncu --metrics sm__throughput.avg.pct_of_peak_sustained_elapsed,\
+dram__bytes_read.sum,dram__bytes_write.sum,sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed \
+    ./my_gemm 4096 4096 4096
+#    判读：sm__throughput 与 dram 都远未打满 → 先怀疑 tile/occupancy，而不是&quot;库不行&quot;
+# 2) CUTLASS 官方的 profiler 能在同一形状上枚举多种 tile 与 kernel 设计：
+#    ./cutlass_profiler --operation=Gemm --m=4096 --n=4096 --k=4096 --A=f16:row --B=f16:row
+#    （构建方式见 CUTLASS quickstart；输出里能直接看到不同 tile 的 GFLOP/s）
+# 3) cuBLASLt 的 workspace 与算法选择：见 cuBLAS 文档的 cuBLASLt 章节
+# 4) PyTorch 侧切换后端（不同版本 API 名可能不同，以你装到的版本为准）：
+#      import torch
+#      torch.backends.cuda.preferred_blas_library(&quot;cublaslt&quot;)   # 或 &quot;cublas&quot;
+#      print(torch.backends.cuda.preferred_blas_library())
+#      # 参考文档：https://pytorch.org/docs/stable/backends.html
+#    没有 GPU 时用上面的 [2][3] 两段先把&quot;该不该换实现&quot;判掉：
+#    算术强度没过拐点、或 grid 铺不满，换库也救不回来。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：给 <code>recommend</code> 加一条判据——<code>K</code> 相对 <code>M</code>、<code>N</code> 极小（如 K ≤ 32）时推荐&quot;把 K 维放进寄存器做外积，而不是走 GEMM 框架&quot;。用第 6 章的 naive→tiling 账本说明理由，并把 4096×4096×32 的算术强度算出来。</li>
+<li><strong>解释</strong>：为什么 epilogue 要单独成阶段、而不是把 MMA 的输出直接写回？结合&quot;MMA 的输出映射是按计算挑的、不适合合并写回&quot;这一点，说明如果没有 epilogue，你的融合算子在正确性/带宽上会撞到什么。</li>
+<li><strong>对比/验证</strong>：用第 2 段与第 3 段的输出，在 4096×4096×4096 与 1×4096×4096 两个形状上分别算出&quot;若换用 Triton 手写，应该把 BLOCK 取多大才既不浪费 tile 又能铺满 132 个 SM&quot;，并说明两个形状的答案为什么差一个量级。</li>
+<li><strong>思考</strong>：假设你的算子形状完全在 cuBLAS 舒适区、也不需要额外融合，但团队坚持手写。请用本课的三笔账（tile 浪费、铺满度、融合收益）写出一份&quot;不值得手写&quot;的量化论证；再反过来给出一个&quot;值得手写&quot;的真实场景。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>NVIDIA CUTLASS, <em>Efficient GEMM in CUDA</em>（分层阻塞三重循环、threadblock/warp/thread 三级 tile、epilogue、软件流水双缓冲、threadblock rasterization、split-K/sliced-K、Hopper warp specialization）：<a href="https://docs.nvidia.com/cutlass/latest/media/docs/cpp/efficient_gemm.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cutlass/latest/media/docs/cpp/efficient_gemm.html</a></li>
+<li>NVIDIA CUTLASS, <em>CUTLASS 3.x Design</em>（collective/builder 抽象与 3.x 的 kernel 设计分层）：<a href="https://docs.nvidia.com/cutlass/latest/media/docs/cpp/cutlass_3x_design.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cutlass/latest/media/docs/cpp/cutlass_3x_design.html</a></li>
+<li>NVIDIA CUTLASS, <em>Quickstart</em>（构建与 <code>cutlass_profiler</code> 的用法，本课&quot;可选&quot;段引用）：<a href="https://docs.nvidia.com/cutlass/latest/media/docs/cpp/quickstart.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cutlass/latest/media/docs/cpp/quickstart.html</a></li>
+<li>NVIDIA, <em>cuBLAS 文档</em>（cuBLASLt 的算法选择、epilogue 融合、workspace 与布局约束）：<a href="https://docs.nvidia.com/cuda/cublas/index.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/cublas/index.html</a></li>
+<li>NVIDIA, <em>Hopper Tuning Guide</em>（tile/occupancy 与流水深度在 Hopper 上的官方调参口径）：<a href="https://docs.nvidia.com/cuda/hopper-tuning-guide/index.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/hopper-tuning-guide/index.html</a></li>
+</ul>
+<p><a href="../chapter-8/index.md">下一章：性能工程闭环与项目</a></p>

@@ -1,0 +1,518 @@
+<h2 id="h-离线索引流水线增量更新版本与回滚">离线索引流水线：增量更新、版本与回滚<a class="anchor" href="#h-离线索引流水线增量更新版本与回滚" aria-label="本节链接">#</a></h2>
+<h3 id="h-这一节要解决什么">这一节要解决什么<a class="anchor" href="#h-这一节要解决什么" aria-label="本节链接">#</a></h3>
+<p>前面五章都在回答&quot;给定一份索引，怎么把一次问答做到最好&quot;。但从这一节开始，问题变成：</p>
+<blockquote>
+<p>这份索引<strong>本身会变</strong> —— 文档新增、修改、删除，切分策略要调，嵌入模型要升级。每一次变化都要在<strong>不打断线上服务</strong>的前提下生效，并且<strong>出错能退回去</strong>。</p>
+</blockquote>
+<p>这件事在倒排索引里是日常（倒排表本来就是增量可写的），在向量索引里却很难，原因有三层：</p>
+<ol>
+<li><strong>结构性</strong>：HNSW 类图索引的删除会破坏连通性，增量插入会让&quot;小世界&quot;性质缓慢退化（第 2 章第 4 节已经算过代价）；</li>
+<li><strong>一致性</strong>：嵌入模型的版本一变，<strong>所有向量都必须重算</strong> —— 新旧向量在同一空间里不可比；</li>
+<li><strong>可运维性</strong>：线上正在被查询的索引不能被原地改坏，必须有版本、有指针、有回滚。</li>
+</ol>
+<p>本节要回答四个问题：</p>
+<ol>
+<li>有哪几类变更？各自的代价如何量化？哪些能增量、哪些必须全量？</li>
+<li>为什么&quot;段式不可变索引&quot;（LSM 风格）是这一层的正确抽象？墓碑与压实的代价怎么算？</li>
+<li>什么让一次重建是<strong>可复现</strong>的？chunk id 为什么必须内容寻址？</li>
+<li>发布与回滚怎么做？&quot;什么时候该全量重建&quot;能不能给一个可执行的阈值？</li>
+</ol>
+<blockquote>
+<p><strong>结论先放在这里</strong>：索引不是&quot;一个文件&quot;，而是<strong>一组不可变的段 + 一个原子切换的 manifest 指针</strong>。所有更新都是&quot;写新段 + 打墓碑&quot;，删除不是删除而是墓碑，查询时过滤；一致性靠<strong>指针切换</strong>而不是原地修改；回滚就是<strong>把指针切回去</strong>。而&quot;该不该全量重建&quot;有一条可算的阈值：当每日变更率超过单位成本之比 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">full</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord">/</span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3175em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">inc</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 时，全量更便宜（⚠️ 示例：理论阈值 0.72，含压实开销后实测交叉点 0.4）。</p>
+</blockquote>
+<h3 id="h-一变更的类型与代价">一、变更的类型与代价<a class="anchor" href="#h-一变更的类型与代价" aria-label="本节链接">#</a></h3>
+<h4 id="h-11-五类变更">1.1 五类变更<a class="anchor" href="#h-11-五类变更" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>变更类型</th>
+<th>例子</th>
+<th>能否增量</th>
+<th>代价构成</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>新增文档</td>
+<td>新上传一篇 PDF</td>
+<td><strong>能</strong></td>
+<td>解析 + 切分 + 嵌入 + 写入新段</td>
+</tr>
+<tr>
+<td>修改文档</td>
+<td>某篇被编辑</td>
+<td><strong>能</strong>（墓碑旧版 + 新段）</td>
+<td>同上 + 墓碑</td>
+</tr>
+<tr>
+<td>删除文档</td>
+<td>权限撤销 / 过期</td>
+<td><strong>能</strong>（墓碑）</td>
+<td>几乎为零，但留下空间放大</td>
+</tr>
+<tr>
+<td>重嵌入</td>
+<td>换 embedding 模型</td>
+<td><strong>不能</strong>（全量）</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span></span></span></span> 次嵌入 + 全量重建</td>
+</tr>
+<tr>
+<td>切分策略变更</td>
+<td>chunk 大小/重叠调整</td>
+<td><strong>不能</strong>（全量）</td>
+<td>重新切分 + 重嵌入 + 重建</td>
+</tr>
+</tbody></table>
+<p>这里有一条容易忽略的规则：</p>
+<blockquote>
+<p><strong>chunk id 必须包含&quot;决定它的所有版本号&quot;。</strong> 切分策略变了 → 同一段文字会切出不同的 span → chunk 边界全变；嵌入模型变了 → 同一 chunk 的向量在新空间里不可比。<strong>这两类变更都不能&quot;部分更新&quot;</strong>，必须整体重建，否则索引里会同时存在两个不可比的空间。</p>
+</blockquote>
+<h4 id="h-12-更新代价为什么不能按变更比例线性估">1.2 更新代价为什么不能按&quot;变更比例&quot;线性估<a class="anchor" href="#h-12-更新代价为什么不能按变更比例线性估" aria-label="本节链接">#</a></h4>
+<p>直觉是&quot;改了 1% 的文档，就只花 1% 的重建代价&quot;。这个直觉在<strong>每单位成本相同</strong>时成立，但真实系统里增量更新的单位成本<strong>更高</strong>，原因有三：</p>
+<ol>
+<li><strong>批处理效率低</strong>：全量重建可以大批量顺序写、批量嵌入；增量更新是零散的小写入，GPU 利用率低、I/O 是小随机写。</li>
+<li><strong>查询放大</strong>：每次增量写入产生一个新段，查询要扫更多段（见 §2.3）。</li>
+<li><strong>压实开销</strong>：段多了必须合并，合并本身要重写存活数据。</li>
+</ol>
+<p>把这三项放进模型：设每次全量重建的单位成本 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">full</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>、增量的单位成本 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3175em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">inc</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>，且 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6891em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3175em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">inc</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&gt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">full</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>（因为批处理优势），则<strong>每日变更比例</strong> <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0379em;">δ</span></span></span></span> 下的成本比较是：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:2.3924em;vertical-align:-1.698em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.6944em;"><span style="top:-1.477em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">增量</span><span class="mord mtight">/</span><span class="mord cjk_fallback mtight">天</span></span></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.6944em;"><span class="svg-align" style="top:-2.202em;"><span class="pstrut" style="height:3em;"></span><span class="stretchy" style="height:0.548em;min-width:1.6em;"><span class="brace-left" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMinYMin slice"><path d="M0 6l6-6h17c12.688 0 19.313.3 20 1 4 4 7.313 8.3 10 13
+ 35.313 51.3 80.813 93.8 136.5 127.5 55.688 33.7 117.188 55.8 184.5 66.5.688
+ 0 2 .3 4 1 18.688 2.7 76 4.3 172 5h399450v120H429l-6-1c-124.688-8-235-61.7
+-331-161C60.687 138.7 32.312 99.3 7 54L0 41V6z"/></svg></span><span class="brace-center" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMidYMin slice"><path d="M199572 214
+c100.7 8.3 195.3 44 280 108 55.3 42 101.7 93 139 153l9 14c2.7-4 5.7-8.7 9-14
+ 53.3-86.7 123.7-153 211-199 66.7-36 137.3-56.3 212-62h199568v120H200432c-178.3
+ 11.7-311.7 78.3-403 201-6 8-9.7 12-11 12-.7.7-6.7 1-18 1s-17.3-.3-18-1c-1.3 0
+-5-4-11-12-44.7-59.3-101.3-106.3-170-141s-145.3-54.3-229-60H0V214z"/></svg></span><span class="brace-right" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMaxYMin slice"><path d="M399994 0l6 6v35l-6 11c-56 104-135.3 181.3-238 232-57.3
+ 28.7-117 45-179 50H-300V214h399897c43.3-7 81-15 113-26 100.7-33 179.7-91 237
+-174 2.7-5 6-9 10-13 .7-1 7.3-1 20-1h17z"/></svg></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3175em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">inc</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord mathnormal" style="margin-right:0.0379em;">δ</span><span class="mord mathnormal" style="margin-right:0.109em;">N</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.798em;"><span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.698em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:1em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">vs</span></span><span class="mspace" style="margin-right:1em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.6833em;"><span style="top:-1.477em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">全量</span><span class="mord mtight">/</span><span class="mord cjk_fallback mtight">天</span></span></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.6833em;"><span class="svg-align" style="top:-2.202em;"><span class="pstrut" style="height:3em;"></span><span class="stretchy" style="height:0.548em;min-width:1.6em;"><span class="brace-left" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMinYMin slice"><path d="M0 6l6-6h17c12.688 0 19.313.3 20 1 4 4 7.313 8.3 10 13
+ 35.313 51.3 80.813 93.8 136.5 127.5 55.688 33.7 117.188 55.8 184.5 66.5.688
+ 0 2 .3 4 1 18.688 2.7 76 4.3 172 5h399450v120H429l-6-1c-124.688-8-235-61.7
+-331-161C60.687 138.7 32.312 99.3 7 54L0 41V6z"/></svg></span><span class="brace-center" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMidYMin slice"><path d="M199572 214
+c100.7 8.3 195.3 44 280 108 55.3 42 101.7 93 139 153l9 14c2.7-4 5.7-8.7 9-14
+ 53.3-86.7 123.7-153 211-199 66.7-36 137.3-56.3 212-62h199568v120H200432c-178.3
+ 11.7-311.7 78.3-403 201-6 8-9.7 12-11 12-.7.7-6.7 1-18 1s-17.3-.3-18-1c-1.3 0
+-5-4-11-12-44.7-59.3-101.3-106.3-170-141s-145.3-54.3-229-60H0V214z"/></svg></span><span class="brace-right" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMaxYMin slice"><path d="M399994 0l6 6v35l-6 11c-56 104-135.3 181.3-238 232-57.3
+ 28.7-117 45-179 50H-300V214h399897c43.3-7 81-15 113-26 100.7-33 179.7-91 237
+-174 2.7-5 6-9 10-13 .7-1 7.3-1 20-1h17z"/></svg></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">full</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.798em;"><span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.698em;"><span></span></span></span></span></span></span></span></span></span></p>
+<p>解得<strong>阈值</strong>：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7387em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0379em;">δ</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.7387em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.9436em;vertical-align:-0.836em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.1076em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3175em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">inc</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">full</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.836em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7387em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0379em;">δ</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.7387em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.9436em;vertical-align:-0.836em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.1076em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3175em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">inc</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">full</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.836em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></p>
+<ul>
+<li><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7335em;vertical-align:-0.0391em;"></span><span class="mord mathnormal" style="margin-right:0.0379em;">δ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&lt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0379em;">δ</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6887em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span></span></span></span></span></span></span></span>：增量便宜，做增量；</li>
+<li><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7335em;vertical-align:-0.0391em;"></span><span class="mord mathnormal" style="margin-right:0.0379em;">δ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&gt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0379em;">δ</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6887em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span></span></span></span></span></span></span></span>：<strong>全量重建更便宜</strong> —— 这反直觉但正确：变更太多时，&quot;零散的逐篇更新&quot;比&quot;一次整齐的全量&quot;更贵。</li>
+</ul>
+<p>⚠️ 示例（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3175em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">inc</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1.0</span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">full</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.72</span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1200</span></span></span></span>、30 天、含压实）：理论 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0379em;">δ</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6887em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.72</span></span></span></span>，但<strong>含压实开销后实测交叉点在 0.4</strong> —— 因为压实把增量路径的额外成本又抬高了一截。<strong>这说明阈值必须实测，不能只算理论比值。</strong></p>
+<h3 id="h-二段式不可变索引">二、段式不可变索引<a class="anchor" href="#h-二段式不可变索引" aria-label="本节链接">#</a></h3>
+<h4 id="h-21-结构">2.1 结构<a class="anchor" href="#h-21-结构" aria-label="本节链接">#</a></h4>
+<p>把索引组织成一组<strong>不可变的段（segment）</strong>，与 LSM-Tree 的 memtable/sstable 思路同构：</p>
+<pre><code>写入:  新文档/更新 -&gt; 生成新段（append-only）
+删除:  在旧段上打 tombstone（不改数据）
+查询:  并行搜所有活跃段 -&gt; 过滤 tombstone -&gt; 归并 top-k
+压实:  段数/墓碑超限 -&gt; 合并为一个只含存活 chunk 的新段
+发布:  manifest 指针原子切换 -&gt; 新段集合生效</code></pre>
+<p><strong>为什么不可变是对的抽象</strong>：</p>
+<ul>
+<li><strong>并发安全</strong>：读操作永远看到一致的段集合（只需保证指针读取与段列表一致）；写操作只追加，不需要锁；</li>
+<li><strong>回滚免费</strong>：旧段只要没被删除就还在，&quot;回滚&quot;只是把指针指回去；</li>
+<li><strong>增量与全量统一</strong>：全量重建 = 写一个大段；增量 = 写一个小段。<strong>同一条代码路径。</strong></li>
+</ul>
+<h4 id="h-22-墓碑的代价召回损失与空间放大">2.2 墓碑的代价：召回损失与空间放大<a class="anchor" href="#h-22-墓碑的代价召回损失与空间放大" aria-label="本节链接">#</a></h4>
+<p>墓碑（tombstone）不是免费的。设某段的墓碑比例为 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span></span></span></span>，要返回 top-<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 条<strong>存活</strong>结果，从该段至少要取回：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0315em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">raw</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.1408em;vertical-align:-0.7693em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3714em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.7693em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></p>
+<p>因为墓碑也占名额。若段内过滤是在&quot;取出 top-<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 之后&quot;做的，实际召回会下降；正确做法是<strong>先过滤再排名</strong>（或取 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mord">/</span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mclose">)</span></span></span></span> 再过滤）。</p>
+<p>空间放大定义为：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord text"><span class="mord">amp</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.0574em;vertical-align:-0.686em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3714em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord text"><span class="mord cjk_fallback">存活</span><span class="mord"> chunk </span><span class="mord cjk_fallback">数</span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord text"><span class="mord cjk_fallback">存储的</span><span class="mord"> chunk </span><span class="mord cjk_fallback">总数</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.0908em;vertical-align:-0.7693em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3214em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.7693em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></p>
+<p>⚠️ 示例：更新 10 篇后 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.143</span></span></span></span>（放大 1.17），删除 5 篇后 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.214</span></span></span></span>（放大 1.27）。<strong>删除只增空间不减空间，直到压实。</strong></p>
+<h4 id="h-23-压实触发条件与收益">2.3 压实：触发条件与收益<a class="anchor" href="#h-23-压实触发条件与收益" aria-label="本节链接">#</a></h4>
+<p>压实把一个或多个段合并为一个只含存活数据的新段。触发条件（任一满足）：</p>
+<table>
+<thead>
+<tr>
+<th>触发条件</th>
+<th>阈值（示例）</th>
+<th>理由</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>段数超限</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5782em;vertical-align:-0.0391em;"></span><span class="mrel">&gt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">8</span></span></span></span></td>
+<td>查询代价 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4831em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal">a</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">b</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span></span></span></span>，段数直接乘在每查询开销上</td>
+</tr>
+<tr>
+<td>墓碑比例超限</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5782em;vertical-align:-0.0391em;"></span><span class="mrel">&gt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">20%</span></span></span></span></td>
+<td>召回损失与空间放大同时上升</td>
+</tr>
+<tr>
+<td>定期（低峰）</td>
+<td>每天/每周</td>
+<td>合并碎片、回收空间</td>
+</tr>
+<tr>
+<td>索引版本变更</td>
+<td>重建时</td>
+<td>顺便统一版本</td>
+</tr>
+</tbody></table>
+<p><strong>查询代价的段数依赖</strong>可以量化为每查询</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0361em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">query</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal">a</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">b</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span></span></span></span></span></p>
+<p>在 ANN 里 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">a</span></span></span></span> 是单段的图下降与候选展开，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">b</span></span></span></span> 是每段的固定开销（打开、初始化、归并）。⚠️ 示例模型 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">a</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord">20</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">b</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">3</span></span></span></span>（任意单位）：</p>
+<table>
+<thead>
+<tr>
+<th>段数 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span></span></span></span></th>
+<th>1</th>
+<th>2</th>
+<th>4</th>
+<th>8</th>
+<th>16</th>
+<th>32</th>
+<th>64</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>单查询代价</td>
+<td>23</td>
+<td>26</td>
+<td>32</td>
+<td>44</td>
+<td>68</td>
+<td>116</td>
+<td>212</td>
+</tr>
+<tr>
+<td>相对单段</td>
+<td>1.00</td>
+<td>1.13</td>
+<td>1.39</td>
+<td>1.91</td>
+<td>2.96</td>
+<td>5.04</td>
+<td>9.22</td>
+</tr>
+</tbody></table>
+<p><strong>所以&quot;段数上限&quot;不是审美要求，而是延迟预算要求</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8193em;vertical-align:-0.136em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≤</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">8</span></span></span></span> 把查询代价限制在单段的 1.91 倍以内。</p>
+<h4 id="h-24-边界">2.4 边界<a class="anchor" href="#h-24-边界" aria-label="本节链接">#</a></h4>
+<ul>
+<li>段式结构的代价是<strong>读放大</strong>（每次查询要扫多个段）与<strong>空间放大</strong>（墓碑）。二者的平衡点由 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0576em;">S</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0576em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mop mtight"><span class="mtight">m</span><span class="mtight">a</span><span class="mtight">x</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 与 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.1132em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mop mtight"><span class="mtight">m</span><span class="mtight">a</span><span class="mtight">x</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 决定。</li>
+<li>墓碑必须在<strong>所有</strong>查询路径上生效（包括缓存、评测、导出），否则会出现&quot;删了还能查到&quot;的隐蔽 bug —— 这是第 3 节权限泄漏的一条路径。</li>
+<li>压实需要额外存储（新旧段并存一段时间），峰值空间是稳态的约 2 倍。</li>
+</ul>
+<p><figure><img class="md-img" src="content/courses/rag-systems/assets/chapter-6-figure-01.svg" alt="段数决定每次查询的展开代价" loading="lazy" decoding="async"><figcaption>段数决定每次查询的展开代价</figcaption></figure>
+</p>
+<h3 id="h-三内容寻址manifest-与可复现性">三、内容寻址、manifest 与可复现性<a class="anchor" href="#h-三内容寻址manifest-与可复现性" aria-label="本节链接">#</a></h3>
+<h4 id="h-31-chunk-id-必须内容寻址">3.1 chunk id 必须内容寻址<a class="anchor" href="#h-31-chunk-id-必须内容寻址" aria-label="本节链接">#</a></h4>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0044em;vertical-align:-0.31em;"></span><span class="mord text"><span class="mord">chunk_id</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.2em;vertical-align:-0.35em;"></span><span class="mord text"><span class="mord">hash</span></span><span class="mord"><span class="delimsizing size1">(</span></span><span class="mord text"><span class="mord">doc_id</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∥</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.06em;vertical-align:-0.31em;"></span><span class="mord text"><span class="mord">doc_version</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∥</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord">span</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∥</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.06em;vertical-align:-0.31em;"></span><span class="mord text"><span class="mord">chunker_ver</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∥</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.2em;vertical-align:-0.35em;"></span><span class="mord text"><span class="mord">embedder_ver</span></span><span class="mord"><span class="delimsizing size1">)</span></span></span></span></span></span></p>
+<p>这个定义带来三个直接性质：</p>
+<ol>
+<li><strong>幂等</strong>：相同的输入必然产生相同的 id。重跑一次流水线不会产生&quot;新&quot;chunk，因此不会重复写入、不会让缓存失效。</li>
+<li><strong>可追踪</strong>：从引用（citation）里的 chunk_id 能反推出文档、版本、位置与两个算法版本 —— 这是第 4 节审计与第 6.4 节可观测性的基础。</li>
+<li><strong>变更可见</strong>：换 embedder 会让 id 全变（⚠️ 示例：<code>6af1c5701d85d550</code> → <code>e4d9be395419f1bc</code>），因此<strong>所有依赖 id 的东西自动失效</strong> —— 缓存、引用、评测集里的黄金证据标注。<strong>这是好事</strong>：它把&quot;版本不一致&quot;从一个隐蔽 bug 变成一次显式的全量失效。</li>
+</ol>
+<p>反例：如果 chunk_id 用自增序号或随机 uuid，那么&quot;重跑一次流水线&quot;就会让所有引用失效、让缓存全部 miss、让评测集对不上。<strong>这是最常见也最贵的可复现性事故。</strong></p>
+<h4 id="h-32-manifest版本的载体">3.2 manifest：版本的载体<a class="anchor" href="#h-32-manifest版本的载体" aria-label="本节链接">#</a></h4>
+<p>manifest 是&quot;当前生效的索引状态&quot;的完整描述：</p>
+<pre data-lang="json"><code class="language-json">{
+  &quot;manifest_id&quot;: &quot;...&quot;,
+  &quot;segments&quot;: [{&quot;sid&quot;: 12, &quot;chunks&quot;: 216, &quot;bytes&quot;: 0}],
+  &quot;embedder&quot;: &quot;emb-v2&quot;,
+  &quot;chunker&quot;: &quot;chk-v1&quot;,
+  &quot;doc_hashes&quot;: {&quot;doc0&quot;: &quot;sha1:...&quot;, &quot;...&quot;: &quot;...&quot;},
+  &quot;counts&quot;: {&quot;docs&quot;: 55, &quot;chunks&quot;: 216, &quot;tomb&quot;: 0.0},
+  &quot;created_at&quot;: &quot;...&quot;
+}</code></pre>
+<p>要点：</p>
+<ul>
+<li>manifest <strong>不包含向量本体</strong>，它只是一个指针集合 + 版本信息，因此很小、可以快速读取与切换；</li>
+<li><code>doc_hashes</code> 是增量的依据：只有 hash 变化的文档才需要重新处理（<strong>内容寻址的第二层应用</strong>）；</li>
+<li><code>counts</code> 与 <code>tomb</code> 是压实触发器与告警的输入。</li>
+</ul>
+<h4 id="h-33-幂等与可复现">3.3 幂等与可复现<a class="anchor" href="#h-33-幂等与可复现" aria-label="本节链接">#</a></h4>
+<p><strong>判据</strong>：给定同一份文档集合与同一组算法版本，重跑流水线应当得到<strong>逐字节相同</strong>的 manifest（除了时间戳）。实现要点：</p>
+<ul>
+<li>段内 chunk 的排序稳定（按 chunk_id 排序，而不是按插入顺序）；</li>
+<li>浮点嵌入的确定性（同一硬件、同一 kernel、同一精度下可复现；跨硬件可能不可复现，需记录）；</li>
+<li>不把&quot;当前时间&quot;&quot;随机 id&quot;&quot;进程号&quot;写进影响 id 的字段。</li>
+</ul>
+<h3 id="h-四发布回滚与重建触发">四、发布、回滚与重建触发<a class="anchor" href="#h-四发布回滚与重建触发" aria-label="本节链接">#</a></h3>
+<h4 id="h-41-蓝绿与指针切换">4.1 蓝绿与指针切换<a class="anchor" href="#h-41-蓝绿与指针切换" aria-label="本节链接">#</a></h4>
+<pre data-lang="text"><code class="language-text">         ┌──────────┐   atomically swap   ┌──────────┐
+线上查询 ─┤ manifest ├────────────────────┤ 新 manifest │
+         └────┬─────┘                     └────┬─────┘
+              │                                │
+        旧段集合（保留）                   新段集合（已就绪）</code></pre>
+<p><strong>切换必须是原子的</strong>：查询要么看到旧 manifest，要么看到新 manifest，不能看到&quot;一半新一半旧&quot;。实践中用&quot;读别名 → 解析到 manifest_id → 用该 id 的段列表查询&quot;实现。</p>
+<p><strong>双写/影子期</strong>：新索引就绪后，可先让一小部分流量（或离线评测）走新索引，对比指标后才全量切换。</p>
+<h4 id="h-42-一致性窗口">4.2 一致性窗口<a class="anchor" href="#h-42-一致性窗口" aria-label="本节链接">#</a></h4>
+<p>在&quot;新段已写入但 manifest 尚未切换&quot;的窗口里：</p>
+<ul>
+<li>新写入的文档<strong>查不到</strong>（因为指针还是旧的）—— 这是一致性窗口；</li>
+<li>处理方式：要么接受&quot;延迟可见&quot;（明确 SLA，例如&quot;文档上传后 5 分钟内可检索&quot;），要么在写路径上&quot;双读&quot;（查询时同时读新旧段并去重），代价是复杂度与延迟。</li>
+</ul>
+<p><strong>必须显式定义这个窗口</strong>，否则&quot;刚上传的文档搜不到&quot;会被当成 bug 反复排查。</p>
+<h4 id="h-43-回滚rto-与-rpo">4.3 回滚：RTO 与 RPO<a class="anchor" href="#h-43-回滚rto-与-rpo" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>概念</th>
+<th>定义</th>
+<th>段式索引下的值</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>RTO</strong>（恢复时间目标）</td>
+<td>从发现故障到恢复服务的时长</td>
+<td>≈ 指针切换时间（秒级），前提是旧段保留</td>
+</tr>
+<tr>
+<td><strong>RPO</strong>（恢复点目标）</td>
+<td>允许丢失多少更新</td>
+<td>= 旧 manifest 之后的所有更新</td>
+</tr>
+</tbody></table>
+<p><strong>代价</strong>：旧段必须保留 → 存储翻倍（或按保留代数计算）。<strong>这是&quot;回滚能力&quot;的明码标价。</strong></p>
+<h4 id="h-44-重建触发规则可执行">4.4 重建触发规则（可执行）<a class="anchor" href="#h-44-重建触发规则可执行" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>触发条件</th>
+<th>动作</th>
+<th>预期耗时</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>embedder / chunker 版本变更</td>
+<td><strong>全量重建</strong></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">O</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mclose">)</span></span></span></span> 嵌入 + 写入</td>
+</tr>
+<tr>
+<td>每日变更率 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7335em;vertical-align:-0.0391em;"></span><span class="mord mathnormal" style="margin-right:0.0379em;">δ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&gt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0379em;">δ</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6887em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span></span></span></span></span></span></span></span>（实测 0.4 量级）</td>
+<td><strong>全量重建</strong></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">O</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mclose">)</span></span></span></span></td>
+</tr>
+<tr>
+<td>段数 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7224em;vertical-align:-0.0391em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&gt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0576em;">S</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0576em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mop mtight"><span class="mtight">m</span><span class="mtight">a</span><span class="mtight">x</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>（示例 8）</td>
+<td>压实</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">O</span><span class="mopen">(</span><span class="mord text"><span class="mord cjk_fallback">存活</span><span class="mord"> chunk</span></span><span class="mclose">)</span></span></span></span></td>
+</tr>
+<tr>
+<td>墓碑比例 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5782em;vertical-align:-0.0391em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&gt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.1132em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mop mtight"><span class="mtight">m</span><span class="mtight">a</span><span class="mtight">x</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>（示例 0.2）</td>
+<td>压实</td>
+<td>同上</td>
+</tr>
+<tr>
+<td>线上召回监控跌破基线（例如 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.0833em;"></span><span class="mord">−</span><span class="mord">3%</span></span></span></span>）</td>
+<td>先回滚，再排查后重建</td>
+<td>切换秒级</td>
+</tr>
+<tr>
+<td>距上次全量重建超过 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span></span></span></span> 天</td>
+<td>全量重建（防漂移累积）</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">O</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mclose">)</span></span></span></span></td>
+</tr>
+</tbody></table>
+<p><strong>最后一行容易被忽略</strong>：即使所有增量都正确，长期的&quot;切分边界漂移 + 小世界退化&quot;也会让索引质量缓慢下降。<strong>定期全量重建是一种&quot;重置漂移&quot;的手段，不是浪费。</strong></p>
+<h3 id="h-代码">代码<a class="anchor" href="#h-代码" aria-label="本节链接">#</a></h3>
+<p>一个最小但完整的段式索引：内容寻址 id、墓碑、压实、全量重嵌入、manifest、回滚断言，以及&quot;增量 vs 全量&quot;的成本扫描。</p>
+<pre data-lang="python"><code class="language-python"># -*- coding: utf-8 -*-
+&quot;&quot;&quot;⚠️ 合成数据：段式不可变索引 —— 增量更新 / 墓碑 / 压实 / manifest / 回滚 + 重建成本交叉。
+   嵌入用 hashing-trick 代理（不是真实双塔），只为让索引机制可见。&quot;&quot;&quot;
+import hashlib, numpy as np
+
+DIM = 32
+def _h(s):
+    &quot;&quot;&quot;稳定整数哈希：不用内置 hash()（按进程加盐，会破坏可复现性）。&quot;&quot;&quot;
+    return int(hashlib.md5(s.encode()).hexdigest()[:8], 16)
+
+def embed(text, embedder_ver, seed=0):
+    r = np.random.default_rng(_h(f&quot;{seed}|{embedder_ver}&quot;) % (2**32))
+    P = r.normal(0, 1, (256, DIM)); v = np.zeros(DIM)
+    for w in text.lower().split(): v += P[_h(w) % 256]
+    n = np.linalg.norm(v); return v / n if n else v
+
+def chunk_id(doc_id, ver, span, chunker_ver, embedder_ver):
+    raw = f&quot;{doc_id}|{ver}|{span}|{chunker_ver}|{embedder_ver}&quot;
+    return hashlib.sha1(raw.encode()).hexdigest()[:16]
+
+class Segment:
+    &quot;&quot;&quot;不可变段：写入后不再修改（LSM 风格）。&quot;&quot;&quot;
+    _seq = 0
+    def __init__(self):
+        Segment._seq += 1; self.sid = Segment._seq; self.items, self.tomb = {}, set()
+    def put(self, cid, vec, meta): self.items[cid] = (vec, *meta)
+    def kill(self, cid):
+        if cid in self.items: self.tomb.add(cid)
+    def live(self): return {c: v for c, v in self.items.items() if c not in self.tomb}
+
+class IndexManager:
+    def __init__(self):
+        self.embedder_ver, self.chunker_ver = &quot;emb-v1&quot;, &quot;chk-v1&quot;
+        self.segments, self.doc_chunks, self.doc_text = [], {}, {}
+    def _write_doc(self, doc_id, ver, text):
+        s = Segment(); self.segments.append(s); cids = []; words = text.split()
+        for i in range(0, max(1, len(words)), 6):          # 定长窗口切分
+            span = (i, min(i + 6, len(words)))
+            cid = chunk_id(doc_id, ver, span, self.chunker_ver, self.embedder_ver)
+            txt = &quot; &quot;.join(words[span[0]:span[1]])
+            s.put(cid, embed(txt, self.embedder_ver), (doc_id, ver, span, txt))
+            cids.append(cid)
+        self.doc_chunks.setdefault(doc_id, {})[ver] = cids
+        self.doc_text[doc_id] = text
+    def upsert(self, doc_id, text, ver=None):
+        old = self.doc_chunks.get(doc_id, {})
+        new_ver = ver if ver is not None else (max(old) + 1 if old else 1)
+        for v, cids in old.items():                        # 旧版本全部打墓碑
+            for s in self.segments:
+                for c in cids: s.kill(c)
+        self._write_doc(doc_id, new_ver, text)
+    def delete(self, doc_id):
+        for v, cids in self.doc_chunks.get(doc_id, {}).items():
+            for s in self.segments:
+                for c in cids: s.kill(c)
+        self.doc_chunks.pop(doc_id, None); self.doc_text.pop(doc_id, None)
+    def compact(self):
+        s = Segment()
+        for seg in self.segments[:-1]:
+            for c, v in seg.live().items(): s.items.setdefault(c, v)
+        self.segments = [s]
+    def reembed_all(self, new_ver):
+        &quot;&quot;&quot;换 embedder：必须全量重嵌入（chunk_id 含 embedder_ver，也会全变）。&quot;&quot;&quot;
+        docs = dict(self.doc_text); vers = {d: max(self.doc_chunks[d]) for d in docs}
+        self.embedder_ver = new_ver; self.segments, self.doc_chunks = [], {}
+        for d, t in docs.items(): self._write_doc(d, vers[d], t)
+    def search(self, q, k=10):
+        qv = embed(q, self.embedder_ver); hits = []
+        for seg in self.segments:
+            for c, v in seg.live().items():
+                hits.append((float(np.dot(qv, v[0])), c, v[4]))
+        hits.sort(reverse=True); return hits[:k]
+    def stats(self):
+        live = sum(len(s.live()) for s in self.segments)
+        total = sum(len(s.items) for s in self.segments)
+        return dict(segments=len(self.segments), live=live, total=total,
+                    tomb=round((total - live) / total, 3) if total else 0,
+                    disk_amp=round(total / live, 2) if live else 0)
+
+rng = np.random.default_rng(0); VOCAB = [f&quot;w{i}&quot; for i in range(120)]
+def rand_text(n=24): return &quot; &quot;.join(rng.choice(VOCAB, n))
+
+idx = IndexManager()
+for d in range(60): idx.upsert(f&quot;doc{d}&quot;, rand_text())
+print(&quot;== 时间线（段式索引）==&quot;)
+print(f&quot;插入 60 篇           : {idx.stats()}&quot;)
+for d in range(10): idx.upsert(f&quot;doc{d}&quot;, rand_text())
+print(f&quot;更新 10 篇           : {idx.stats()}&quot;)
+for d in range(5): idx.delete(f&quot;doc{d}&quot;)
+print(f&quot;删除 5 篇            : {idx.stats()}&quot;)
+idx.compact(); print(f&quot;压实后               : {idx.stats()}&quot;)
+snap_old = idx.search(&quot; &quot;.join(VOCAB[:6]), k=10)
+
+snapshot = [(s.sid, dict(s.items), set(s.tomb)) for s in idx.segments]   # 发布前存快照
+idx.reembed_all(&quot;emb-v2&quot;)                                               # 换 embedder（全量重嵌）
+snap_new = idx.search(&quot; &quot;.join(VOCAB[:6]), k=10)
+print(f&quot;换 embedder 全量重嵌  : {idx.stats()}&quot;)
+print(f&quot;新版本 top1 = {snap_new[0][2][:26]}...&quot;)
+print(f&quot;旧版本 top1 = {snap_old[0][2][:26]}...&quot;)
+idx.segments = []
+for sid, items, tomb in snapshot:                    # 回滚 = 指针切回旧段快照
+    s = Segment(); s.sid = sid; s.items = dict(items); s.tomb = set(tomb); idx.segments.append(s)
+idx.embedder_ver = &quot;emb-v1&quot;
+print(f&quot;回滚断言（与旧结果逐条相等）: {idx.search(&#39; &#39;.join(VOCAB[:6]), k=10) == snap_old}&quot;)
+print(&quot;chunk_id 随 embedder 版本变化: &quot;,
+      chunk_id(&quot;doc0&quot;, 1, (0, 6), &quot;chk-v1&quot;, &quot;emb-v1&quot;), &quot;-&gt;&quot;,
+      chunk_id(&quot;doc0&quot;, 1, (0, 6), &quot;chk-v1&quot;, &quot;emb-v2&quot;), &quot;（id 变了，缓存/引用随之失效）&quot;)
+
+print(&quot;\n== (a) 重建成本：增量 vs 全量（每日变更率 delta）==&quot;)
+N, D, C_INC, C_FULL, C_COMPACT, SMAX = 1200, 30, 1.0, 0.72, 0.35, 8
+print(&quot;  说明：增量按篇处理、批处理效率低 -&gt; 单位成本 1.0；全量可批量化 -&gt; 0.72&quot;)
+print(f&quot;{&#39;delta&#39;:&gt;7} {&#39;增量总成本&#39;:&gt;12} {&#39;全量总成本&#39;:&gt;12} {&#39;更优&#39;:&gt;6} {&#39;平均段数&#39;:&gt;9}&quot;)
+cross = None
+for delta in (0.01, 0.05, 0.1, 0.2, 0.4, 0.6, 0.72, 0.8, 1.0):
+    inc, nseg, seg_hist = 0.0, 1, []
+    for _ in range(D):
+        inc += C_INC * delta * N
+        nseg += max(1, int(delta * N / 6))            # 简化：新增段数随变更量增长
+        if nseg &gt; SMAX: inc += C_COMPACT * N; nseg = 1
+        seg_hist.append(nseg)
+    full = D * C_FULL * N
+    who = &quot;增量&quot; if inc &lt; full else &quot;全量&quot;
+    if cross is None and inc &gt;= full: cross = delta
+    print(f&quot;{delta:&gt;7.2f} {inc:&gt;12.0f} {full:&gt;12.0f} {who:&gt;6} {np.mean(seg_hist):&gt;9.1f}&quot;)
+print(f&quot;理论阈值 delta* = c_full / c_inc = {C_FULL/C_INC:.2f}；含压实后实测交叉点 ≈ {cross}&quot;)
+
+print(&quot;\n== (b) 查询放大：段数 -&gt; 单查询代价（示例模型 20 + 3*nseg）==&quot;)
+print(f&quot;{&#39;段数&#39;:&gt;6} {&#39;单查询代价&#39;:&gt;11} {&#39;相对单段&#39;:&gt;9} {&#39;P95(ms)&#39;:&gt;9}&quot;)
+for nseg in (1, 2, 4, 8, 16, 32, 64):
+    c = 20 + 3 * nseg
+    print(f&quot;{nseg:&gt;6} {c:&gt;11} {c/23:&gt;9.2f} {c/23*40:&gt;9.1f}&quot;)
+print(&quot;压实阈值 SMAX=8 -&gt; 查询代价被限制在 &lt;=44/23 = 1.91 倍单段水平&quot;)</code></pre>
+<pre data-lang="text"><code class="language-text">== 时间线（段式索引）==
+插入 60 篇           : {&#39;segments&#39;: 60, &#39;live&#39;: 240, &#39;total&#39;: 240, &#39;tomb&#39;: 0.0, &#39;disk_amp&#39;: 1.0}
+更新 10 篇           : {&#39;segments&#39;: 70, &#39;live&#39;: 240, &#39;total&#39;: 280, &#39;tomb&#39;: 0.143, &#39;disk_amp&#39;: 1.17}
+删除 5 篇            : {&#39;segments&#39;: 70, &#39;live&#39;: 220, &#39;total&#39;: 280, &#39;tomb&#39;: 0.214, &#39;disk_amp&#39;: 1.27}
+压实后               : {&#39;segments&#39;: 1, &#39;live&#39;: 216, &#39;total&#39;: 216, &#39;tomb&#39;: 0.0, &#39;disk_amp&#39;: 1.0}
+换 embedder 全量重嵌  : {&#39;segments&#39;: 55, &#39;live&#39;: 220, &#39;total&#39;: 220, &#39;tomb&#39;: 0.0, &#39;disk_amp&#39;: 1.0}
+新版本 top1 = w4 w68 w53 w0 w65 w92...
+旧版本 top1 = w4 w1 w99 w44 w108 w40...
+回滚断言（与旧结果逐条相等）: True
+chunk_id 随 embedder 版本变化:  6af1c5701d85d550 -&gt; e4d9be395419f1bc （id 变了，缓存/引用随之失效）
+
+== (a) 重建成本：增量 vs 全量（每日变更率 delta）==
+  说明：增量按篇处理、批处理效率低 -&gt; 单位成本 1.0；全量可批量化 -&gt; 0.72
+  delta        增量总成本        全量总成本    更优      平均段数
+   0.01         3300        25920     增量       4.0
+   0.05        14400        25920     增量       1.0
+   0.10        16200        25920     增量       1.0
+   0.20        19800        25920     增量       1.0
+   0.40        27000        25920     全量       1.0
+   0.60        34200        25920     全量       1.0
+   0.72        38520        25920     全量       1.0
+   0.80        41400        25920     全量       1.0
+   1.00        48600        25920     全量       1.0
+理论阈值 delta* = c_full / c_inc = 0.72；含压实后实测交叉点 ≈ 0.4
+
+== (b) 查询放大：段数 -&gt; 单查询代价（示例模型 20 + 3*nseg）==
+    段数       单查询代价      相对单段   P95(ms)
+     1          23      1.00      40.0
+     2          26      1.13      45.2
+     4          32      1.39      55.7
+     8          44      1.91      76.5
+    16          68      2.96     118.3
+    32         116      5.04     201.7
+    64         212      9.22     368.7
+压实阈值 SMAX=8 -&gt; 查询代价被限制在 &lt;=44/23 = 1.91 倍单段水平</code></pre>
+<p><strong>关键设计决策</strong>：把删除实现成<strong>墓碑</strong>而不是物理删除，是这份代码里最重要的选择。物理删除会带来三个连锁问题：(1) 段变成可变对象，破坏并发安全；(2) 回滚不再可能（数据已经没了）；(3) 图索引的连通性被破坏。改用墓碑后，&quot;删除&quot;退化成一次集合写入，<strong>代价被推迟到压实</strong> —— 这就是 LSM 的核心思想：<strong>把随机写变成顺序写，把一致性交给不可变性。</strong> 代价是查询时必须过滤（读放大）与空间放大，两者都有明确的可调阈值。</p>
+<h3 id="h-练习">练习<a class="anchor" href="#h-练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><p><strong>墓碑召回损失的精确推导</strong>。设在某段内墓碑比例 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span></span></span></span>、段内 chunk 按相关度排序无关（随机），要返回 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 条存活结果。证明：若只取 top-<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 再过滤，期望存活数约为 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mclose">)</span></span></span></span>；并推导&quot;取 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mord">/</span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mclose">)</span></span></span></span> 再过滤&quot;使存活数达到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 的概率。用模拟验证两个公式。</p>
+</li>
+<li><p><strong>压实策略比较</strong>。实现三种压实触发：(a) 段数超限即全合并；(b) 分层压实（小段合并成大段，模仿 leveled compaction）；(c) 定时压实。在&quot;每天 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0379em;">δ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.05</span></span></span></span> 变更、持续 90 天&quot;的仿真里比较三种策略的总写入量、平均段数、P95 查询代价。给出你的推荐及理由。</p>
+</li>
+<li><p><strong>证明幂等性并构造反例</strong>。证明 §3.1 的 chunk_id 定义下&quot;重跑流水线&quot;是幂等的；然后构造一个<strong>不幂等</strong>的 id 方案（例如含时间戳或自增序号），并说明它会造成哪三类事故（提示：缓存、引用、评测集黄金证据）。</p>
+</li>
+<li><p><strong>回滚的存储代价</strong>。设每天全量重建一次、保留 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">g</span></span></span></span> 代 manifest 供回滚。推导存储放大随 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">g</span></span></span></span> 的表达式；给定存储预算 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0502em;">B</span></span></span></span> 与单份索引大小 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span></span></span></span>，求最大 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0359em;">g</span></span></span></span>。再回答：如果改为&quot;只保留 1 代 + 每日增量备份&quot;，RTO/RPO 各变成多少？</p>
+</li>
+<li><p><strong>一致性窗口的 SLA 设计</strong>。设文档上传到可检索的延迟目标为 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span></span></span></span>。比较两种实现：(a) 定时批量切换 manifest（每 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span></span></span></span> 切换一次）；(b) 每次写入立即切换。分别计算切换次数（每天）、平均可见延迟、以及切换失败的爆炸半径。给出在什么规模下选 (a)、什么规模下选 (b)。</p>
+</li>
+<li><p><strong><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0379em;">δ</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6887em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span></span></span></span></span></span></span></span> 的敏感性</strong>。用代码里的成本模型，扫描 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3175em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">inc</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord">/</span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">full</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">{</span><span class="mord">1.1</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">1.4</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">2.0</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">3.0</span><span class="mclose">}</span></span></span></span> 与 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0576em;">S</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0576em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mop mtight"><span class="mtight">m</span><span class="mtight">a</span><span class="mtight">x</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">{</span><span class="mord">2</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">8</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">32</span><span class="mclose">}</span></span></span></span>，输出各自的实测交叉点 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0379em;">δ</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6887em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span></span></span></span></span></span></span></span>。回答：压实阈值 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0576em;">S</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0576em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mop mtight"><span class="mtight">m</span><span class="mtight">a</span><span class="mtight">x</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 越大，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0379em;">δ</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6887em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span></span></span></span></span></span></span></span> 往哪个方向移动？为什么？</p>
+</li>
+<li><p><strong>段数上限与延迟预算的联立</strong>。给定 P95 延迟预算 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span></span></span></span>、单段查询耗时 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">a</span></span></span></span>、每段开销 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">b</span></span></span></span>、以及&quot;段数超限时需要压实（一次压实约耗时 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">c</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>）&quot;。推导最大段数 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0576em;">S</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0576em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mop mtight"><span class="mtight">m</span><span class="mtight">a</span><span class="mtight">x</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 并说明它如何与&quot;每日变更率&quot;共同决定压实频率。</p>
+</li>
+<li><p><strong>给一个真实系统设计索引发布流程</strong>。写出从&quot;文档上传&quot;到&quot;线上可检索&quot;的完整状态机（含：解析失败、切分失败、嵌入超时、manifest 切换失败、回滚触发），标注每个状态的可观测信号与超时阈值。这份状态机就是第 4 节要讲的可观测性的一部分。</p>
+</li>
+</ol>
+<h3 id="h-小结">小结<a class="anchor" href="#h-小结" aria-label="本节链接">#</a></h3>
+<ul>
+<li><strong>五类变更，两类必须全量</strong>：新增/修改/删除可增量；<strong>换 embedder、换切分策略必须全量</strong>，因为 chunk 边界与向量空间都变了。</li>
+<li><strong>段式不可变索引是这一层的正确抽象</strong>：写新段 + 打墓碑 + 指针切换 + 压实。它同时给出并发安全、回滚能力、以及&quot;增量与全量同一条代码路径&quot;。</li>
+<li><strong>墓碑有代价且可算</strong>：要返回 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 条存活结果需取回约 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mord">/</span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mclose">)</span></span></span></span>；空间放大 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.3669em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1/</span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mclose">)</span></span></span></span>。⚠️ 示例：更新 10 篇后 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.143</span></span></span></span>、删除 5 篇后 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.214</span></span></span></span>（放大 1.27），<strong>删除只增空间不减空间</strong>。</li>
+<li><strong>查询代价随段数线性增长</strong>（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal">a</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">b</span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span></span></span></span>）：⚠️ 示例 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span></span></span></span> 从 1 到 8 使单查询代价从 23 涨到 44（1.91 倍），到 64 则 9.22 倍。<strong><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0576em;">S</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0576em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mop mtight"><span class="mtight">m</span><span class="mtight">a</span><span class="mtight">x</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 是延迟预算决定的，不是审美。</strong></li>
+<li><strong>全量重建的阈值可算</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0379em;">δ</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6887em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">full</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord">/</span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3175em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">inc</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>；⚠️ 示例理论值 0.72，<strong>含压实后实测 0.4</strong>。超过它，全量更便宜 —— 因为增量的单位成本更高（批处理效率低 + 查询放大 + 压实）。</li>
+<li><strong>chunk id 必须内容寻址</strong>，且含 <code>chunker_ver</code> 与 <code>embedder_ver</code>。它同时给出幂等、可追踪、以及&quot;版本变更时自动全量失效&quot;。⚠️ 示例 id 从 <code>6af1c5701d85d550</code> 变成 <code>e4d9be395419f1bc</code>。</li>
+<li><strong>manifest 是版本的载体</strong>：段列表 + 算法版本 + 文档哈希 + 计数。<strong>指针切换必须原子</strong>；回滚 = 指针切回，RTO 秒级、RPO = 旧 manifest 之后的更新。</li>
+<li><strong>一致性窗口要显式定义</strong>（&quot;文档上传后 N 分钟可检索&quot;），否则&quot;刚上传搜不到&quot;会被当成 bug 反复排查。</li>
+<li><strong>重建触发规则</strong>：版本变更 → 全量；<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7335em;vertical-align:-0.0391em;"></span><span class="mord mathnormal" style="margin-right:0.0379em;">δ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&gt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0379em;">δ</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6887em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∗</span></span></span></span></span></span></span></span></span></span></span></span> → 全量；段数/墓碑超限 → 压实；召回跌破基线 → 先回滚；超过 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span></span></span></span> 天 → 定期全量重置漂移。</li>
+<li><strong>一句话</strong>：<strong>索引不是一个文件，而是&quot;一组不可变段 + 一个可原子切换的指针&quot;。把更新变成追加、把删除变成墓碑、把发布变成换指针、把回滚变成换回来 —— 索引运维就从&quot;危险的原地修改&quot;变成了&quot;可预测的状态机&quot;。</strong></li>
+</ul>
+<blockquote>
+<p>下一节：索引会更新了。但线上查询的高频重复、以及&quot;同一个问题换个说法&quot;，还在白烧算力。下一节讲缓存与批处理 —— 以及语义缓存为什么是 RAG 里最危险的一层缓存。</p>
+</blockquote>

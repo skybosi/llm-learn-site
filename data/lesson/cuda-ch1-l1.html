@@ -1,0 +1,213 @@
+<h2 id="h-从会用框架到能改瓶颈三层能力模型">从&quot;会用框架&quot;到&quot;能改瓶颈&quot;：三层能力模型<a class="anchor" href="#h-从会用框架到能改瓶颈三层能力模型" aria-label="本节链接">#</a></h2>
+<p>同一段 PyTorch 训练代码，有人只知道&quot;换个卡会快一点&quot;，有人能指着 <code>ncu</code> 的报告说&quot;这个 kernel 只跑到峰值带宽的 38%，因为访存没有合并&quot;。差别<strong>不在 API 熟练度</strong>：后者能把程序结构换算成<strong>机器代价</strong>。这一课给这门课划地图，并回答为什么第一件事是学会算账而不是学会写 kernel。</p>
+<p><figure><img class="md-img" src="content/courses/gpu-cuda-kernels/assets/chapter-1-figure-01.svg" alt="从基线到回归：一次完整的性能闭环" loading="lazy" decoding="async"><figcaption>从基线到回归：一次完整的性能闭环</figcaption></figure>
+</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-三层能力调用诊断改写">1. 三层能力：调用、诊断、改写<a class="anchor" href="#h-1-三层能力调用诊断改写" aria-label="本节链接">#</a></h4>
+<p>把&quot;GPU 编程能力&quot;拆开，三层各自有明确的<strong>判据</strong>（不是&quot;知道得更多&quot;）：</p>
+<table>
+<thead>
+<tr>
+<th>层</th>
+<th>能力</th>
+<th>典型行为</th>
+<th>判据（答不上来就说明还没到这一层）</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>L1 调用</td>
+<td>用框架/库把活干完</td>
+<td><code>torch.matmul</code>、<code>F.scaled_dot_product_attention</code>、<code>cuBLAS</code></td>
+<td>结果对不对、在哪块设备上</td>
+</tr>
+<tr>
+<td>L2 诊断</td>
+<td>说清&quot;慢在哪、为什么慢&quot;</td>
+<td>用 profiler 定位、读 roofline、算算术强度</td>
+<td>这个 kernel 是<strong>带宽瓶颈</strong>还是<strong>算力瓶颈</strong>？依据是什么？</td>
+</tr>
+<tr>
+<td>L3 改写</td>
+<td>亲手改变代价结构</td>
+<td>写 kernel、改 tiling、换精度、换库、改数据布局</td>
+<td>优化后瓶颈转移到了哪里？还剩多少空间？</td>
+</tr>
+</tbody></table>
+<p>L1 到 L2 的门槛是<strong>测量</strong>：没有 profile 就没有诊断，只有猜测。L2 到 L3 的门槛是<strong>代价账本</strong>：不知道该目标的上限，就无法判断&quot;还剩多少空间&quot;，也无法判断&quot;这次优化值不值得做&quot;（第三课）。本课与第 3 课负责 L2，第 2 章到第 8 章把 L3 落到具体手段上。</p>
+<p><figure><img class="md-img" src="content/courses/gpu-cuda-kernels/assets/chapter-1-figure-03.svg" alt="三层能力与两道门槛：L1 到 L2 靠测量，L2 到 L3 靠代价账本" loading="lazy" decoding="async"><figcaption>三层能力与两道门槛：L1 到 L2 靠测量，L2 到 L3 靠代价账本</figcaption></figure>
+</p>
+<h4 id="h-2-唯一需要的账本算力带宽与算术强度">2. 唯一需要的账本：算力、带宽与算术强度<a class="anchor" href="#h-2-唯一需要的账本算力带宽与算术强度" aria-label="本节链接">#</a></h4>
+<p>一个 kernel 的性能上限，由<strong>两个峰值</strong>与<strong>一个比值</strong>决定：<strong>峰值算力</strong> <code>P</code>（FLOP/s，一次乘或一次加记 1 FLOP、乘加记 2）、<strong>峰值带宽</strong> <code>B</code>（byte/s，单位时间能从 HBM 搬进/搬出多少字节）、<strong>算术强度</strong>（arithmetic intensity，AI）<code>AI = 浮点运算次数 / 访存字节数</code>（FLOP/byte）。</p>
+<p><strong>roofline 模型</strong>把两者合成一句判据：把该目标的 <code>P / B</code> 记为<strong>转折点</strong> <code>R</code>，则 <code>AI &lt; R</code> → <strong>memory-bound</strong>（带宽瓶颈，算力翻倍也没用，性能 ≈ <code>B × AI</code>）；<code>AI &gt; R</code> → <strong>compute-bound</strong>（算力瓶颈，带宽翻倍也没用，性能 ≈ <code>P</code>）。直觉就是<strong>每搬 1 字节能做多少运算</strong>。</p>
+<h4 id="h-3-用它给算子分类relu-与-gemm-是两个极端">3. 用它给算子分类：ReLU 与 GEMM 是两个极端<a class="anchor" href="#h-3-用它给算子分类relu-与-gemm-是两个极端" aria-label="本节链接">#</a></h4>
+<p>以 float32（每元素 4 字节）计，把访存量按读写数组个数相加：</p>
+<table>
+<thead>
+<tr>
+<th>算子</th>
+<th>FLOP</th>
+<th>字节</th>
+<th>AI ≈</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>ReLU（逐元素）</td>
+<td><code>2N</code></td>
+<td><code>2 × 4N</code>（读 + 写）</td>
+<td><strong>0.25</strong></td>
+</tr>
+<tr>
+<td><code>c = a + b</code>（逐元素）</td>
+<td><code>N</code></td>
+<td><code>3 × 4N</code></td>
+<td><strong>0.08</strong></td>
+</tr>
+<tr>
+<td>Softmax（<code>max</code>/<code>exp</code>/<code>sum</code>/<code>div</code>，含 2 读 1 写）</td>
+<td><code>≈5N</code></td>
+<td><code>3 × 4N</code></td>
+<td><strong>≈0.4</strong></td>
+</tr>
+<tr>
+<td>LayerNorm（<code>5N</code>，2 读 1 写）</td>
+<td><code>≈5N</code></td>
+<td><code>2 × 4N</code></td>
+<td><strong>≈0.6</strong></td>
+</tr>
+<tr>
+<td>GEMM（<code>n×n @ n×n</code>，<code>2n³</code>）</td>
+<td><code>2n³</code></td>
+<td><code>3 × 4n²</code></td>
+<td><strong>≈<code>n/6</code></strong>，<code>n=4096</code> 时 ≈ <strong>683</strong></td>
+</tr>
+</tbody></table>
+<p>结论一眼可辨：<strong>逐元素与归一化类算子全在 AI &lt; 1 的一侧</strong>，而 GEMM 高出三个数量级。所以&quot;ReLU 慢&quot;和&quot;GEMM 慢&quot;是<strong>两个完全不同的问题</strong>：前者只该关心&quot;能不能少搬字节、搬得更整齐&quot;，后者才轮到关心 tiling 与数据复用（第 4 章）。这个分类在写代码之前就能推出。</p>
+<h4 id="h-4-三层能力的判据从知道到算得出">4. 三层能力的判据：从&quot;知道&quot;到&quot;算得出&quot;<a class="anchor" href="#h-4-三层能力的判据从知道到算得出" aria-label="本节链接">#</a></h4>
+<p>L2 的标志是能<strong>把代码结构换算成一个量级判断</strong>：</p>
+<ol>
+<li>这个算子属于上表哪一行？AI 与转折点谁大？</li>
+<li>用实测带宽反推时间下界：<code>t ≥ 字节数 / B</code>。实测时间若已接近下界，说明它到顶了。</li>
+<li>收益上限：若某 kernel 占端到端 12%，把它做到无穷快，端到端也只快 13%（第三课）。</li>
+</ol>
+<p>L3 的标志是<strong>决策顺序</strong>：先算账 → 再选手段（合并访存 / tiling / 换精度 / 换库）→ 再验证（回归 + 正确性）。反过来先写&quot;高性能 kernel&quot;，通常是在优化不存在的瓶颈。</p>
+<h4 id="h-5-常见坑">5. 常见坑<a class="anchor" href="#h-5-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>没有 profile 就下结论</strong>：&quot;感觉是访存瓶颈&quot;和实测&quot;DRAM 带宽用满&quot;是两回事。</li>
+<li><strong>对着结果而不是对着 <code>AI</code> 优化</strong>：同一个 ReLU 改 tiling 没用；同一个 GEMM 改循环顺序可能快数倍。</li>
+<li><strong>忘记搬字节包含读写两头</strong>：in-place ReLU 是&quot;读 N + 写 N&quot;，只按 N 算会把带宽估高一倍。</li>
+<li><strong>忘了转折点随精度与架构变</strong>：换低精度（TF32/FP16）时 <code>P</code> 上升、<code>B</code> 基本不变，<code>R</code> 变大，归属可能翻转。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面这段<strong>纯标准库</strong>代码不依赖 GPU 与 numpy：它按上面的公式算出五个典型算子的算术强度与访存字节数，再用 <code>array</code> 实测本机的可达内存带宽，最后把算子逐个判成 memory-bound / compute-bound。<strong>这套&quot;算账—分类&quot;的动作在 GPU 上完全同构</strong>，只是把实测带宽换成显存带宽。</p>
+<pre data-lang="python"><code class="language-python"># ---- 算术强度与 roofline 分类：纯 Python，无第三方依赖 ----
+import sys, time
+from array import array
+
+GB = 1e9
+
+def ai(flops, bytes_moved):
+    &quot;&quot;&quot;算术强度：每搬 1 字节能做多少次浮点运算&quot;&quot;&quot;
+    return flops / bytes_moved
+
+print(&#39;== 1. 五个典型算子的算术强度（单精度 float32，每元素 4 字节）==&#39;)
+print(&#39;   规则：每读/写一个元素记 4 字节；一次乘加记 2 FLOP&#39;)
+rows = [
+    (&#39;ReLU (N=2^20)&#39;,            2 * 2**20,       2 * 4 * 2**20),
+    (&#39;向量加 c=a+b (N=2^20)&#39;,     1 * 2**20,       3 * 4 * 2**20),
+    (&#39;Softmax (N=2^20)&#39;,         5 * 2**20,       3 * 4 * 2**20),
+    (&#39;LayerNorm (B=4096,F=4096)&#39;, 5 * 4096 * 4096, 2 * 4 * 4096 * 4096),
+    (&#39;GEMM (n=4096, 2n^3)&#39;,      2 * 4096**3,     3 * 4 * 4096**2),
+]
+print(f&quot;{&#39;算子&#39;:&lt;28}{&#39;FLOP&#39;:&gt;13}{&#39;字节&#39;:&gt;13}{&#39;AI (FLOP/byte)&#39;:&gt;17}&quot;)
+for name, f, b in rows:
+    print(f&#39;{name:&lt;28}{f/1e6:&gt;11.1f}M{b/1e6:&gt;11.1f}MB{ai(f, b):&gt;17.2f}&#39;)
+
+print()
+print(&#39;== 2. 本机实测可达带宽（标准库 array，块拷贝，5 次取最小）==&#39;)
+N, CH = 8 * 2**20, 2**16           # N 个 double 元素；CH 为拷贝块大小
+src, dst = array(&#39;d&#39;, bytes(8 * N)), array(&#39;d&#39;, bytes(8 * N))
+def copy_once():
+    for i in range(0, N, CH):
+        dst[i:i + CH] = src[i:i + CH]
+for _ in range(2):
+    copy_once()                     # 预热：让页表与缓存进入稳定状态
+ts = []
+for _ in range(5):
+    t0 = time.perf_counter(); copy_once(); t1 = time.perf_counter()
+    ts.append(t1 - t0)
+bw_gbs = 2 * N * 8 / min(ts) / GB   # 一块数据读 + 写，共 2 份流量
+print(f&#39;  Python {sys.version.split()[0]}；元素数 N={N}；块大小 CH={CH}&#39;)
+print(f&#39;  单次耗时（5 次取最小）= {min(ts)*1e3:.2f} ms  →  可达带宽 ≈ {bw_gbs:.2f} GB/s&#39;)
+print(f&#39;  均值 {sum(ts)/len(ts)*1e3:.2f} ms，最小/均值 = {min(ts)/(sum(ts)/len(ts)):.2f}（越大说明抖动越多）&#39;)
+
+print()
+print(&#39;== 3. roofline 分类：转折点 R = 峰值算力 / 峰值带宽 ==&#39;)
+for peak_tflops, bw_tbs in ((30.0, 2.0), (60.0, 3.0)):
+    ridge = peak_tflops / bw_tbs     # 单位 FLOP/byte；数值仅为量级示意，以官方规格为准
+    print(f&#39;  -- 假设峰值 {peak_tflops} TFLOPS + {bw_tbs} TB/s → 转折点 R = {ridge:.1f} FLOP/byte&#39;)
+    for name, f, b in rows:
+        kind = &#39;memory-bound&#39; if ai(f, b) &lt; ridge else &#39;compute-bound&#39;
+        print(f&#39;     {name:&lt;28}{ai(f, b):&gt;8.2f}  →  {kind}&#39;)</code></pre>
+<p>真实运行输出（本机无 GPU，第 1、3 部分不依赖硬件；第 2 部分的带宽数字<strong>每次运行都会变</strong>，下面这一份是其中一次）：</p>
+<pre><code>== 1. 五个典型算子的算术强度（单精度 float32，每元素 4 字节）==
+   规则：每读/写一个元素记 4 字节；一次乘加记 2 FLOP
+算子                                   FLOP           字节   AI (FLOP/byte)
+ReLU (N=2^20)                       2.1M        8.4MB             0.25
+向量加 c=a+b (N=2^20)                  1.0M       12.6MB             0.08
+Softmax (N=2^20)                    5.2M       12.6MB             0.42
+LayerNorm (B=4096,F=4096)          83.9M      134.2MB             0.62
+GEMM (n=4096, 2n^3)            137439.0M      201.3MB           682.67
+
+== 2. 本机实测可达带宽（标准库 array，块拷贝，5 次取最小）==
+  Python 3.10.16；元素数 N=8388608；块大小 CH=65536
+  单次耗时（5 次取最小）= 3.75 ms  →  可达带宽 ≈ 35.74 GB/s
+  均值 3.84 ms，最小/均值 = 0.98（越大说明抖动越多）
+== 3. roofline 分类：转折点 R = 峰值算力 / 峰值带宽 ==
+  -- 假设峰值 30.0 TFLOPS + 2.0 TB/s → 转折点 R = 15.0 FLOP/byte
+     ReLU (N=2^20)                   0.25  →  memory-bound
+     向量加 c=a+b (N=2^20)            0.08  →  memory-bound
+     Softmax (N=2^20)                0.42  →  memory-bound
+     LayerNorm (B=4096,F=4096)       0.62  →  memory-bound
+     GEMM (n=4096, 2n^3)           682.67  →  compute-bound
+  -- 假设峰值 60.0 TFLOPS + 3.0 TB/s → 转折点 R = 20.0 FLOP/byte
+     ReLU (N=2^20)                   0.25  →  memory-bound
+     向量加 c=a+b (N=2^20)            0.08  →  memory-bound
+     Softmax (N=2^20)                0.42  →  memory-bound
+     LayerNorm (B=4096,F=4096)       0.62  →  memory-bound
+     GEMM (n=4096, 2n^3)           682.67  →  compute-bound</code></pre>
+<p>第 2 节是可复现的<strong>量级，不是常量</strong>：同一台机器连测多遍，最小耗时在 3.1<del>4.5 ms、换算带宽在 <strong>30</del>43 GB/s</strong> 之间摆动（&quot;最小/均值&quot;本身也在 0.74~0.98 之间跳）。这预告了第三课的核心问题——测量有噪声地板。两点必须自己核对：</p>
+<ol>
+<li>第 2 节的带宽是本机 <strong>CPU 内存</strong>可达带宽，不是任何 GPU 的显存带宽——它只演示&quot;如何把字节数换成时间下界&quot;。把 <code>bw_gbs</code> 代进 <code>t ≥ 字节数 / B</code>，就是该算子在同带宽器件上的下界。</li>
+<li>第 3 节的 <code>30 TFLOPS + 2 TB/s</code> 是<strong>假设值</strong>，真实值以器件官方规格为准；转折点是两个数的比值，量级对则分类结论稳。</li>
+</ol>
+<pre data-lang="python"><code class="language-python"># ---- 可选（需自备 GPU 或云上按需）：把同一套账本搬到真实器件上 ----
+# 需要 PyTorch 的 CUDA 构建；没有 GPU 时跳过，不影响本课结论。
+import torch, time
+
+x = torch.randn(1 &lt;&lt; 26, device=&#39;cuda&#39;)          # 约 268 MB 的 float32
+for _ in range(3):
+    y = torch.relu(x)                             # 预热：排除 context 与分配开销
+torch.cuda.synchronize()
+t0 = time.perf_counter()
+for _ in range(20):
+    y = torch.relu(x)
+torch.cuda.synchronize()                          # 计时必须把异步 kernel 等到真正做完
+dt = (time.perf_counter() - t0) / 20
+bytes_moved = 2 * x.numel() * 4                  # 读 + 写，各 4 字节/元素
+print(f&#39;ReLU 实测 {dt*1e6:.1f} µs → 有效带宽 {bytes_moved/dt/1e9:.1f} GB/s&#39;)
+print(f&#39;时间下界 = 字节数 / 器件峰值带宽；实测越接近下界，越说明已经到顶&#39;)
+# 器件峰值可用 nvidia-smi 自己读：nvidia-smi -q -d CLOCK</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：给上面 §1 的 <code>rows</code> 表补三个算子——<code>GELU</code>（逐元素，含 <code>erf</code>）、<code>RMSNorm</code>、<code>Attention scores</code>（<code>QKᵀ</code>，<code>2n³</code> 或实测形状下的实际 FLOP 数），算出它们的 AI，并判断各自属于哪一类。</li>
+<li><strong>解释</strong>：为什么逐元素算子的 AI 与 N 无关，而 GEMM 的 AI 随 n 线性增长？据此说明&quot;大矩阵乘比小矩阵乘更容易跑满算力&quot;的原因。</li>
+<li><strong>对比/验证</strong>：把 §2 的块大小 <code>CH</code> 依次改成 <code>2**10</code>、<code>2**16</code>、<code>2**22</code> 重测带宽，解释为什么太小和太大都会掉；再解释&quot;最小/均值&quot;这个比值在指导什么。</li>
+<li><strong>思考</strong>：若把 GEMM 从 float32 换成更低精度（TF32/FP16），<code>P</code> 会上升、<code>B</code> 基本不变，<code>R</code> 会怎么变？GEMM 的&quot;compute-bound&quot;结论会不会被推翻？什么算子会因此从 compute-bound 变成 memory-bound？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>NVIDIA, <em>CUDA C++ Programming Guide</em>（&quot;Programming Model&quot; 与附录 &quot;Compute Capabilities&quot;：执行模型与各架构能力）：<a href="https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html</a></li>
+<li>NVIDIA, <em>CUDA C++ Best Practices Guide</em>（&quot;Assessing Your Application&quot;：性能评估流程与本课的账本思路同源）：<a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/contents.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/contents.html</a></li>
+<li>NVIDIA, <em>CUDA GPU Compute Capability</em>（各架构 compute capability 对照，用于确定编译目标）：<a href="https://developer.nvidia.com/cuda-gpus" target="_blank" rel="noopener noreferrer">https://developer.nvidia.com/cuda-gpus</a></li>
+</ul>
+<p><a href="#/l/cuda-ch1-l2">下一课：环境与工具链——驱动/Toolkit/容器版本对齐、ncu 与 nsys</a></p>

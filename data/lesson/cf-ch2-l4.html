@@ -1,0 +1,219 @@
+<h2 id="h-错误恢复让编译器能继续而不是崩掉">错误恢复：让编译器能继续而不是崩掉<a class="anchor" href="#h-错误恢复让编译器能继续而不是崩掉" aria-label="本节链接">#</a></h2>
+<p>前几课的解析器遇到第一个语法错误就抛异常退出。这在学习代码里没问题，在真实编译器里却不可接受：一个 5000 行的文件里漏了一个分号，你希望编译器报出<strong>这一个</strong>错误，改完就完事；更糟的是错误连锁——手一抖删掉一个括号，解析器报出一串莫须有的错误，真正的错因被埋掉。错误恢复（error recovery）就是让解析器出错后<strong>回到一个已知安全的位置继续扫描</strong>。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-编译器对错误的三个义务">1. 编译器对错误的三个义务<a class="anchor" href="#h-1-编译器对错误的三个义务" aria-label="本节链接">#</a></h4>
+<p>龙书把错误处理的目标总结成三条，顺序不能颠倒：<strong>报告要准确</strong>（定位出错位置，不报&quot;其实没错&quot;的错误）、<strong>要能恢复</strong>（继续检查后面代码，报出尽可能多的<strong>独立</strong>错误）、<strong>不能崩</strong>（任何输入，哪怕是二进制垃圾，都不能让它崩溃或死循环）。第三条是工程底线：解析器处理的是<strong>不可信输入</strong>，必须假设它被故意写坏。第二条决定体验——只报第一个错误的编译器等价于让用户&quot;改一个、编译一次&quot;。</p>
+<h4 id="h-2-恐慌模式最便宜也最常用的恢复策略">2. 恐慌模式：最便宜也最常用的恢复策略<a class="anchor" href="#h-2-恐慌模式最便宜也最常用的恢复策略" aria-label="本节链接">#</a></h4>
+<p><strong>恐慌模式</strong>（panic mode）的思想是：出错了别硬撑，把 token 一路丢掉，直到遇见<strong>同步点</strong>（synchronization point）——一个几乎肯定标志&quot;新语句开始&quot;的位置。语句级同步点有两类：语句终结符（<code>;</code>、<code>}</code>）与语句起始关键字（<code>var</code>、<code>print</code>、<code>if</code>……）。代价是<strong>该语句剩下的部分不再被检查</strong>（内部错误可能漏报），收益是其后的语句全部照常解析。工业实现几乎都把它当第一道防线。</p>
+<h4 id="h-3-恢复之后ast-必须是合法的坏树">3. 恢复之后，AST 必须是&quot;合法的坏树&quot;<a class="anchor" href="#h-3-恢复之后ast-必须是合法的坏树" aria-label="本节链接">#</a></h4>
+<p>恢复点有一个容易被忽略的约束：<strong>调用者拿到的返回值必须是它能安全处理的</strong>。<code>factor()</code> 报&quot;表达式起始处非法&quot;时如果直接抛出去，<code>expr()</code>／<code>stmt()</code> 栈上的中间变量都是半成品。做法是返回一个 <code>(&#39;error&#39;,)</code> <strong>错误节点</strong>当作&quot;这里有个表达式但内容不可信&quot;，让树结构保持完整，交给语义分析跳过；而在括号、参数列表这类有明确边界的结构里，就地同步到 <code>)</code> 比全局 panic 更精准——它不会跳过外层语句的其余部分。</p>
+<h4 id="h-4-三种恢复策略的取舍">4. 三种恢复策略的取舍<a class="anchor" href="#h-4-三种恢复策略的取舍" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>策略</th>
+<th>做法</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>panic mode</strong></td>
+<td>丢 token 到同步点</td>
+<td>简单、不卡死；可能漏报被丢区域内的错误</td>
+</tr>
+<tr>
+<td><strong>短语级恢复</strong></td>
+<td>在出错处插入/删除一个 token 后重试（如自动补 <code>;</code>）</td>
+<td>能报更多真错；需要判断&quot;插谁&quot;，可能引出假错</td>
+</tr>
+<tr>
+<td><strong>错误产生式</strong></td>
+<td>文法里直接写 <code>stmt → error &quot;;&quot;</code> 这样的规则</td>
+<td>与递归下降结合自然（ANTLR 风格）；文法变脏</td>
+</tr>
+</tbody></table>
+<h4 id="h-5-防止错误级联给恢复加约束">5. 防止错误级联：给恢复加约束<a class="anchor" href="#h-5-防止错误级联给恢复加约束" aria-label="本节链接">#</a></h4>
+<p>恐慌模式最容易失控的地方是<strong>无限循环</strong>：如果恢复时一个 token 都不消费、而当前 token 又永远无法启动任何语句，<code>while not EOF</code> 就会原地打转。两条防线缺一不可：<strong>强制前进</strong>（主循环记录每轮开始位置，解析后位置没变就强制丢弃一个 token）与<strong>同一行不重复报</strong>（恢复前后仍在同一行时直接丢 token）——后者正好压掉&quot;删一个括号引发一串错误&quot;里的绝大多数。</p>
+<p><figure><img class="md-img" src="content/courses/compiler-foundations/assets/chapter-2-figure-04.svg" alt="恐慌模式：出错后丢 token 到同步点，再继续解析后面的语句" loading="lazy" decoding="async"><figcaption>恐慌模式：出错后丢 token 到同步点，再继续解析后面的语句</figcaption></figure>
+</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面这个解析器在第 3 课的基础上加了三样东西：<code>Report</code> 收集错误、<code>synchronize()</code> 做语句级 panic 恢复、<code>program()</code> 里的强制前进兜底。它对三份坏源码都能跑完并给出结果。</p>
+<pre data-lang="python"><code class="language-python"># ---- 例 1：带错误恢复的解析器——一次报出多个错误且不崩 ----
+class ParseError(Exception):
+    pass
+
+class Report:
+    def __init__(self): self.errors = []
+    def error(self, tok, msg):
+        self.errors.append((tok[2], f&#39;第 {tok[2]} 行：{msg}（遇到 {tok[1]!r}）&#39;))
+
+STARTERS = {&#39;var&#39;, &#39;print&#39;, &#39;if&#39;, &#39;while&#39;}
+
+class Parser:
+    def __init__(self, tokens, report):
+        self.toks, self.report, self.pos = tokens, report, 0
+        self.last_error_line = -1
+
+    def peek(self, k=0):
+        i = min(self.pos + k, len(self.toks) - 1)
+        return self.toks[i]
+    def check(self, kind, value=None):
+        k, v, _ = self.peek()
+        return k == kind and (value is None or v == value)
+    def advance(self):
+        tok = self.peek()
+        if not self.check(&#39;EOF&#39;): self.pos += 1
+        return tok
+    def match(self, kind, value=None):
+        if self.check(kind, value): return self.advance()
+        return None
+    def expect(self, kind, value=None, what=&#39;&#39;):
+        tok = self.match(kind, value)
+        if tok is None:
+            raise ParseError(f&#39;期望 {what or (value or kind)}&#39;)
+        return tok
+
+    # --- 恐慌模式：丢掉 token，直到下一个语句边界 ---
+    def synchronize(self):
+        line = self.peek()[2]
+        if line == self.last_error_line:      # 同一行的级联错误：丢掉一个 token 就够
+            self.advance(); return
+        self.last_error_line = line
+        while True:
+            k, v, _ = self.peek()
+            if k == &#39;EOF&#39;: return
+            if k == &#39;OP&#39; and v == &#39;;&#39;: self.advance(); return
+            if k == &#39;NAME&#39; and v in STARTERS: return    # 下一个语句的开头
+            self.advance()
+
+    def program(self):
+        stmts = 0
+        while not self.check(&#39;EOF&#39;):
+            before = self.pos
+            stmts += self.statement()
+            if self.pos == before:            # 兜底：本轮一个 token 都没消费 → 强制前进
+                self.advance()
+        return stmts
+
+    def statement(self):
+        before = self.pos
+        try:
+            if self.match(&#39;NAME&#39;, &#39;var&#39;):
+                self.expect(&#39;NAME&#39;, what=&#39;变量名&#39;)
+                self.expect(&#39;OP&#39;, &#39;=&#39;, what=&#39;=&#39;)
+                self.expression()
+                self.expect(&#39;OP&#39;, &#39;;&#39;, what=&#39;;&#39;)
+            elif self.match(&#39;NAME&#39;, &#39;print&#39;):
+                self.expression()
+                self.expect(&#39;OP&#39;, &#39;;&#39;, what=&#39;;&#39;)
+            else:
+                self.expect(&#39;NAME&#39;, what=&#39;变量名&#39;)
+                self.expect(&#39;OP&#39;, &#39;=&#39;, what=&#39;=&#39;)
+                self.expression()
+                self.expect(&#39;OP&#39;, &#39;;&#39;, what=&#39;;&#39;)
+            return 1
+        except ParseError as e:
+            self.report.error(self.peek(), str(e))
+            self.synchronize()
+            return 1 if self.pos &gt; before else 0     # 没推进就不算一个语句
+
+    # expr → term ((&quot;+&quot;|&quot;-&quot;) term)* ；term → factor ((&quot;*&quot;|&quot;/&quot;) factor)*
+    def expression(self):
+        node = self.term()
+        while self.check(&#39;OP&#39;, &#39;+&#39;) or self.check(&#39;OP&#39;, &#39;-&#39;):
+            op = self.advance()[1]; node = (&#39;bin&#39;, op, node, self.term())
+        return node
+
+    def term(self):
+        node = self.factor()
+        while self.check(&#39;OP&#39;, &#39;*&#39;) or self.check(&#39;OP&#39;, &#39;/&#39;):
+            op = self.advance()[1]; node = (&#39;bin&#39;, op, node, self.factor())
+        return node
+
+    def parenthesized(self):
+        &quot;&quot;&quot;括号恢复：只在括号这层同步，外层调用者的位置不受影响。&quot;&quot;&quot;
+        self.expect(&#39;OP&#39;, &#39;(&#39;, what=&#39;(&#39;)
+        try:
+            node = self.expression()
+        except ParseError as e:
+            self.report.error(self.peek(), str(e))
+            while not self.check(&#39;OP&#39;, &#39;)&#39;) and not self.check(&#39;EOF&#39;):
+                self.advance()
+            node = (&#39;error&#39;,)                        # 返回&quot;坏树&quot;，让上层继续
+        self.expect(&#39;OP&#39;, &#39;)&#39;, what=&#39;)&#39;)
+        return node
+
+    def factor(self):
+        if self.check(&#39;NUMBER&#39;):
+            return (&#39;num&#39;, self.advance()[1])
+        if self.check(&#39;NAME&#39;):
+            return (&#39;var&#39;, self.advance()[1])
+        if self.check(&#39;OP&#39;, &#39;(&#39;):
+            return self.parenthesized()
+        raise ParseError(&#39;表达式起始处&#39;)
+
+# 扫描器与第 1 课一致：token = (类型, 字面值, 行号)
+def scan(src):
+    import re
+    TOKEN_RE = re.compile(r&#39;[A-Za-z_]\w*|\d+(?:\.\d+)?|[-+*/(){}=;]&#39;)
+    tokens, i, line = [], 0, 1
+    while i &lt; len(src):
+        c = src[i]
+        if c == &#39;\n&#39;: line += 1; i += 1; continue
+        if c in &#39; \t\r&#39;: i += 1; continue
+        if src[i:i + 2] == &#39;//&#39;:
+            i = src.find(&#39;\n&#39;, i); i = len(src) if i &lt; 0 else i; continue
+        m = TOKEN_RE.match(src, i)
+        if not m: raise SyntaxError(f&#39;第 {line} 行：非法字符 {c!r}&#39;)
+        text = m.group(); i = m.end()
+        if text.isidentifier():   tokens.append((&#39;NAME&#39;, text, line))
+        elif text[0].isdigit():   tokens.append((&#39;NUMBER&#39;, float(text), line))
+        else:                     tokens.append((&#39;OP&#39;, text, line))
+    tokens.append((&#39;EOF&#39;, &#39;EOF&#39;, line))
+    return tokens
+
+SOURCES = {
+    &#39;缺分号（第二行）&#39;: &#39;var a = 1\nvar b = a + 2\nprint a;\n&#39;,
+    &#39;括号未闭合&#39;:       &#39;print (a + 2;\nprint a;\n&#39;,
+    &#39;一行多个错误&#39;:     &#39;var x = ;\nvar y = 3\nz = 4;\n&#39;,
+}
+for name, src in SOURCES.items():
+    report = Report()
+    parser = Parser(scan(src), report)
+    n = parser.program()
+    print(f&#39;【{name}】解析完成 {n} 个语句，报出 {len(report.errors)} 个错误&#39;)
+    for ln, msg in report.errors:
+        print(&#39;   &#39;, msg)</code></pre>
+<p>运行输出（<strong>没有异常逃出来</strong>，三份输入都跑完了）：</p>
+<pre><code>【缺分号（第二行）】解析完成 3 个语句，报出 2 个错误
+    第 2 行：期望 ;（遇到 &#39;var&#39;）
+    第 3 行：期望 ;（遇到 &#39;print&#39;）
+【括号未闭合】解析完成 2 个语句，报出 1 个错误
+    第 1 行：期望 )（遇到 &#39;;&#39;）
+【一行多个错误】解析完成 2 个语句，报出 2 个错误
+    第 1 行：表达式起始处（遇到 &#39;;&#39;）
+    第 3 行：期望 ;（遇到 &#39;z&#39;）</code></pre>
+<p>诚实地读这份输出，两个现象值得注意：</p>
+<ul>
+<li><strong>&quot;缺分号&quot;那份报了两条</strong>：第二行的 <code>var b = ...</code> 缺 <code>;</code>，恢复时把 <code>var b</code> 当成了赋值语句的 <code>NAME &quot;=&quot; ...</code>，于是第三行开头又撞上一次。这说明恢复是<strong>尽力而为</strong>，不是&quot;语义无损&quot;；但它没有连锁成十几条，也没丢下第三行不查——这才是恢复的意义。</li>
+<li><strong>&quot;一行多个错误&quot;原本有三处问题，只报了两条</strong>：<code>var x = ;</code> 触发表达式错误，又因 <code>;</code> 是语句终结符被恢复逻辑吞掉，第三处被&quot;同一行不重复报&quot;压掉。这是<strong>准确率与覆盖率的取舍</strong>：真实编译器同样在这条曲线上做选择，只是把&quot;报错预算&quot;（<code>-ferror-limit=N</code>）交给用户调。</li>
+</ul>
+<pre data-lang="bash"><code class="language-bash"># ---- 例 2（可选，需要本机有 clang）：观察真实编译器的恢复行为 ----
+#   故意写坏五行代码后：clang -fsyntax-only bad.c        # 数一数它一次报了几条
+#   clang -ferror-limit=N -fsyntax-only bad.c            # 限制报错条数：N 条之后停止再报
+# 没有 clang 不影响本课：例 1 的 Report/synchronize 与真实编译器是同一套机制。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：给 <code>synchronize()</code> 加一层&quot;恢复成功计数&quot;，若连续 5 次恢复都没能解析出任何一个合法语句，就打印&quot;后续内容已放弃检查&quot;并跳到 EOF。这对应真实编译器的&quot;错得太离谱就停止&quot;策略。</li>
+<li><strong>解释</strong>：为什么恢复后必须返回 <code>(&#39;error&#39;,)</code> 这样的<strong>节点</strong>，而不是返回 <code>None</code> 让上层自行判断？从 <code>evaluate</code>／语义分析的历史代码角度回答。</li>
+<li><strong>对比</strong>：把 <code>synchronize()</code> 里的&quot;同一行不重复报&quot;那两行删掉，重跑三份坏源码，比较报错条数。再删掉 <code>program()</code> 里的强制前进兜底，构造一份会让它原地打转的输入（提示：<code>var</code> 后面全是 <code>)</code>）。</li>
+<li><strong>思考</strong>：错误恢复的质量该用什么指标衡量？试着定义&quot;真错召回率&quot;与&quot;假错率&quot;，并说明为什么一个什么都不恢复的解析器（只报第一个错）在这两个指标上看起来&quot;假错率很低&quot;却依然不可接受。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Aho, Lam, Sethi, Ullman, <em>Compilers: Principles, Techniques, and Tools</em>（龙书）第 4.1.3 节「Error Recovery in Parsing」：panic mode、短语级恢复、错误产生式</li>
+<li>Robert Nystrom, <em>Crafting Interpreters</em> 第 6 章（递归下降里错误与同步的实际写法）：<a href="https://craftinginterpreters.com/parsing-expressions.html" target="_blank" rel="noopener noreferrer">https://craftinginterpreters.com/parsing-expressions.html</a></li>
+<li>LLVM 官方 Kaleidoscope 教程第 2 章「Parser」（错误提示与 token 位置信息）：<a href="https://llvm.org/docs/tutorial/MyFirstLanguageFrontend/LangImpl02.html" target="_blank" rel="noopener noreferrer">https://llvm.org/docs/tutorial/MyFirstLanguageFrontend/LangImpl02.html</a></li>
+<li>LLVM/Clang 诊断文档（<code>-ferror-limit</code>、诊断分级，真实编译器的报错预算）：<a href="https://clang.llvm.org/docs/UsersManual.html" target="_blank" rel="noopener noreferrer">https://clang.llvm.org/docs/UsersManual.html</a></li>
+</ul>
+<p><a href="#/l/cf-ch3-l1">下一课：符号表与作用域链</a></p>

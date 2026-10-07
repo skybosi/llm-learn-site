@@ -1,0 +1,116 @@
+<h2 id="h-计算密集-vs-访存密集">计算密集 vs 访存密集<a class="anchor" href="#h-计算密集-vs-访存密集" aria-label="本节链接">#</a></h2>
+<p>上一课引入了算术强度，这一课把它用到实处：把形形色色的算子分成两大类——<strong>计算密集（compute-bound）</strong> 和 <strong>访存密集（memory-bound）</strong>。分类不是贴标签，而是决定&quot;该往哪个方向优化&quot;。方向错了，力气全白费。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-两类算子的定义">1. 两类算子的定义<a class="anchor" href="#h-1-两类算子的定义" aria-label="本节链接">#</a></h4>
+<p>用算术强度 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord">AI</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord">FLOPs</span></span><span class="mord">/</span><span class="mord text"><span class="mord cjk_fallback">字节数</span></span></span></span></span> 作标尺：</p>
+<ul>
+<li><strong>计算密集</strong>：强度高，算得多、搬得少。瓶颈在算力，机器在&quot;满负荷做运算&quot;。典型：大矩阵乘、卷积。</li>
+<li><strong>访存密集</strong>：强度低，搬得多、算得少。瓶颈在带宽，机器在&quot;干等数据到货&quot;。典型：逐元素激活、归一化、矩阵乘向量。</li>
+</ul>
+<h4 id="h-2-一个直觉搬运是开销计算是产出">2. 一个直觉：搬运是&quot;开销&quot;，计算是&quot;产出&quot;<a class="anchor" href="#h-2-一个直觉搬运是开销计算是产出" aria-label="本节链接">#</a></h4>
+<p>把每次访存都当成一次开销：如果搬 1 字节能做几百次运算（大 GEMM），开销就被摊薄了，产出受算力限制；如果搬 1 字节只能做 0.2 次运算（逐元素加法），那绝大部分时间都花在搬数据上，算力再多也闲着。<strong>这就是两类算子的本质区别。</strong></p>
+<h4 id="h-3-常见算子的强度速查">3. 常见算子的强度速查<a class="anchor" href="#h-3-常见算子的强度速查" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>算子</th>
+<th>强度（量级）</th>
+<th>类型</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>大矩阵乘 GEMM</td>
+<td>几十～几百 FLOP/byte</td>
+<td>计算密集</td>
+</tr>
+<tr>
+<td>卷积（大 kernel、大通道）</td>
+<td>较高</td>
+<td>计算密集</td>
+</tr>
+<tr>
+<td>逐元素激活/加法</td>
+<td>~0.2</td>
+<td>访存密集</td>
+</tr>
+<tr>
+<td>LayerNorm / RMSNorm</td>
+<td>很低</td>
+<td>访存密集</td>
+</tr>
+<tr>
+<td>Softmax / 注意力分数</td>
+<td>很低</td>
+<td>访存密集</td>
+</tr>
+<tr>
+<td>矩阵 × 向量（瘦长矩阵）</td>
+<td>~1</td>
+<td>访存密集</td>
+</tr>
+</tbody></table>
+<p>特别注意最后一行：<strong>矩阵乘不一定是计算密集的</strong>。当矩阵&quot;瘦长&quot;到接近向量时，强度骤降到 1 附近——而 LLM 推理 decode 阶段每生成一个 token，本质上就是一堆&quot;矩阵 × 向量&quot;。</p>
+<h4 id="h-4-分类决定优化方向">4. 分类决定优化方向<a class="anchor" href="#h-4-分类决定优化方向" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>计算密集</strong>算子：优化方向是<strong>榨干算力</strong>——用 Tensor Core、对齐维度、提高算术强度、让分块更高效；</li>
+<li><strong>访存密集</strong>算子：优化方向是<strong>减少搬运</strong>——算子融合（把多个逐元素 op 合成一个 kernel，中间结果不落显存）、低精度量化（字节数减半）、增大 batch（一次读权重服务更多 token）。</li>
+</ul>
+<p>如果方向搞反——比如给一个访存密集的 layernorm 疯狂优化计算——收益几乎为零，因为它根本不卡在计算上。</p>
+<h4 id="h-5-判断工具和机器的-ridge-比">5. 判断工具：和机器的 ridge 比<a class="anchor" href="#h-5-判断工具和机器的-ridge-比" aria-label="本节链接">#</a></h4>
+<p>一个算子是&quot;计算密集&quot;还是&quot;访存密集&quot;，还要看它跑在<strong>哪台机器</strong>上。判据就是上一课的 ridge：</p>
+<ul>
+<li>算子强度 &gt; 机器 ridge → 计算密集（机器算力是瓶颈）；</li>
+<li>算子强度 &lt; 机器 ridge → 访存密集（机器带宽是瓶颈）。</li>
+</ul>
+<p>H100 的 ridge ≈ 295，所以强度 500 的 GEMM 是计算密集，强度 1 的矩阵乘向量是访存密集。同一个算子，换到 ridge 更高的机器上，结论可能反转。</p>
+<p><figure><img class="md-img" src="content/courses/inference-hardware/assets/chapter-4-figure-01.svg" alt="计算密集与访存密集两类算子的对比示意" loading="lazy" decoding="async"><figcaption>计算密集与访存密集两类算子的对比示意</figcaption></figure>
+</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>给几个算子算强度，并和 H100 的 ridge 比较，输出&quot;密集类型&quot;判断。</p>
+<pre data-lang="python"><code class="language-python"># ---- 例 1：机器 ridge 与算子强度 ----
+H100_RIDGE = 989.0 * 1e12 / (3.35 * 1e12)   # ≈ 295 FLOP/byte
+
+def classify(flops, bytes_moved, name, ridge=H100_RIDGE):
+    ai = flops / bytes_moved
+    kind = &quot;计算密集&quot; if ai &gt; ridge else &quot;访存密集&quot;
+    print(f&quot;{name}: 强度={ai:8.1f} FLOP/byte -&gt; {kind}&quot;)
+    return ai
+
+# ---- 例 2：逐个判断 ----
+# 大 GEMM 4096^3（FP16，近似搬 3 个矩阵）
+n = 4096
+classify(2*n**3, 3*n*n*2, &quot;大 GEMM(4096^3)&quot;)
+
+# 逐元素 ReLU：读 1、写 1，每个元素 1 次运算
+classify(1, 2*2, &quot;逐元素 ReLU(FP16)&quot;)
+
+# LayerNorm：读 1 写 1，每个元素约 3 次运算（减均值、除标准差、乘 gamma）
+classify(3, 2*2, &quot;LayerNorm(FP16)&quot;)
+
+# 矩阵乘向量：m=1, k=n=4096（decode 的一个投影）
+classify(2*1*4096*4096, (1*4096 + 4096*4096)*2, &quot;矩阵×向量(1×4096×4096)&quot;)
+
+# ---- 例 3：优化方向检查 ----
+def optimize_advice(kind):
+    if kind == &quot;计算密集&quot;:
+        return &quot;榨干算力：Tensor Core / 对齐维度 / 提高强度&quot;
+    return &quot;减少搬运：算子融合 / 低精度量化 / 增大 batch&quot;
+
+for ai in [500.0, 0.25]:
+    kind = &quot;计算密集&quot; if ai &gt; H100_RIDGE else &quot;访存密集&quot;
+    print(f&quot;强度 {ai} 的算子 -&gt; 建议：{optimize_advice(kind)}&quot;)</code></pre>
+<p><strong>要点</strong>：同一个 <code>classify</code> 函数，把不同算子的强度算出来一对比，立刻看出大 GEMM（几百）和逐元素/归一化（0.x）的天壤之别。例 3 是&quot;分类&quot;的最终目的——<strong>不同瓶颈，优化动作完全不同</strong>。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>判断</strong>：softmax 需要读入一段向量、求出最大值与和、再做逐元素指数与除法。估算它的算术强度（读 1 写 1，每元素约 4 次运算），判断它在 H100 上属于哪一类。</li>
+<li><strong>计算</strong>：注意力分数矩阵 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0358em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">Q</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">K</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8413em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.1389em;">T</span></span></span></span></span></span></span></span></span></span></span> 是一个 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span></span></span></span> 的矩阵乘（N 为序列长度）。当 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2048</span></span></span></span> 时它偏哪一类？当 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">128</span></span></span></span> 时呢？（提示：用 GEMM 强度 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mrel">∝</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span></span></span></span> 的结论。）</li>
+<li><strong>验证</strong>：把 H100 换成 A100（ridge ≈ 156），例 2 里的哪些判断会改变？</li>
+<li><strong>思考</strong>：为什么&quot;算子融合&quot;能加速访存密集算子？它减少的到底是什么？（提示：中间结果不落显存，省的是什么？）</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Samuel Williams 等，Roofline: An Insightful Visual Performance Model：<a href="https://crd.lbl.gov/assets/Uploads/roofline-intro.pdf" target="_blank" rel="noopener noreferrer">https://crd.lbl.gov/assets/Uploads/roofline-intro.pdf</a></li>
+<li>NVIDIA 开发者博客：Matrix Multiplication Background User&#39;s Guide（计算/访存分析）：<a href="https://docs.nvidia.com/deeplearning/performance/dl-performance-matrix-multiplication/" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/deeplearning/performance/dl-performance-matrix-multiplication/</a></li>
+<li>PyTorch 性能调优指南（算子融合与内存带宽）：<a href="https://pytorch.org/tutorials/recipes/recipes/tuning_guide.html" target="_blank" rel="noopener noreferrer">https://pytorch.org/tutorials/recipes/recipes/tuning_guide.html</a></li>
+</ul>
+<p><a href="#/l/hw-ch4-l2">下一课：Roofline 曲线</a></p>

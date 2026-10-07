@@ -1,0 +1,100 @@
+<h2 id="h-pcie-带宽">PCIe 带宽<a class="anchor" href="#h-pcie-带宽" aria-label="本节链接">#</a></h2>
+<p>GPU 内部算得再快，数据进出也要走一条&quot;公路&quot;——<strong>PCIe（Peripheral Component Interconnect Express）</strong>。它连接 CPU 与 GPU，也常常是多卡之间兜底的通信通道。学完本课，你应当能说清 PCIe 各代带宽是多少、它和显存带宽差多少个数量级，以及什么场景下它会成为性能瓶颈。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-pcie-是什么">1. PCIe 是什么<a class="anchor" href="#h-1-pcie-是什么" aria-label="本节链接">#</a></h4>
+<p>PCIe 是 CPU 与外设（GPU、网卡、NVMe 盘）之间的高速串行总线。带宽由两件事决定：<strong>代数（Gen）</strong>决定每条通道（lane）的速度，<strong>通道数（×1、×4、×8、×16）</strong>决定并了多少条通道。GPU 通常用 <strong>×16</strong>。</p>
+<h4 id="h-2-各代带宽">2. 各代带宽<a class="anchor" href="#h-2-各代带宽" aria-label="本节链接">#</a></h4>
+<p>PCIe 用 GT/s（每秒十亿次传输）标速率，实际数据要扣掉 128b/130b 的编码开销。每 lane 单向带宽大致是：</p>
+<table>
+<thead>
+<tr>
+<th>代数</th>
+<th>每 lane 速率</th>
+<th>每 lane 单向带宽</th>
+<th>×16 单向带宽</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>PCIe 3.0</td>
+<td>8 GT/s</td>
+<td>≈ 0.985 GB/s</td>
+<td>≈ 15.75 GB/s</td>
+</tr>
+<tr>
+<td>PCIe 4.0</td>
+<td>16 GT/s</td>
+<td>≈ 1.97 GB/s</td>
+<td>≈ 31.5 GB/s</td>
+</tr>
+<tr>
+<td>PCIe 5.0</td>
+<td>32 GT/s</td>
+<td>≈ 3.94 GB/s</td>
+<td>≈ 63 GB/s</td>
+</tr>
+</tbody></table>
+<p>注意这是<strong>单向</strong>带宽；标注&quot;双向&quot;时通常再翻一倍。</p>
+<h4 id="h-3-和显存带宽的巨大差距">3. 和显存带宽的巨大差距<a class="anchor" href="#h-3-和显存带宽的巨大差距" aria-label="本节链接">#</a></h4>
+<p>对比一下就明白了：H100 的 HBM3 显存带宽高达 <strong>约 3.35 TB/s</strong>，而最快的 PCIe 5.0 ×16 只有 <strong>约 63 GB/s</strong>——差了两个数量级。这意味着<strong>数据一旦要跨过 PCIe 这条窄路，速度立刻被拖慢 50 倍以上</strong>。这就是为什么推理引擎拼命让权重和数据留在显存里、避免反复通过 PCIe 搬运。</p>
+<p><figure><img class="md-img" src="content/courses/inference-hardware/assets/chapter-6-figure-01.svg" alt="PCIe 带宽对比图：左侧画 CPU 与 GPU 之间一条细窄的&quot;车道&quot;标 PCIe（Gen3/4/5 ×16），右侧画 GPU 与显存之间一条粗大的&quot;管道&quot;标 HBM（约 3.35 TB/s）；两条通道粗细形成强烈反差，旁边各标注带宽数字，底部一行字&quot;带宽差两个数量级，PCIe 是搬运瓶颈&quot;" loading="lazy" decoding="async"><figcaption>PCIe 带宽对比图：左侧画 CPU 与 GPU 之间一条细窄的&quot;车道&quot;标 PCIe（Gen3/4/5 ×16），右侧画 GPU 与显存之间一条粗大的&quot;管道&quot;标 HBM（约 3.35 TB/s）；两条通道粗细形成强烈反差，旁边各标注带宽数字，底部一行字&quot;带宽差两个数量级，PCIe 是搬运瓶颈&quot;</figcaption></figure>
+</p>
+<h4 id="h-4-什么场景会撞上-pcie-瓶颈">4. 什么场景会撞上 PCIe 瓶颈<a class="anchor" href="#h-4-什么场景会撞上-pcie-瓶颈" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>权重/数据从主机搬上 GPU</strong>：首次加载模型、每次从 CPU 内存搬运输入输出；</li>
+<li><strong>显存装不下时的&quot;权重卸载（offload）&quot;</strong>：把部分权重放 CPU 内存，用时经 PCIe 取，速度被 PCIe 卡死；</li>
+<li><strong>无 NVLink 的多卡通信</strong>：两卡之间靠 CPU 中转或 PCIe 直连，带宽同样受限。</li>
+</ul>
+<p>传输时间可以用一个简单公式估算：<strong>时间 = 数据量 ÷ 带宽</strong>。</p>
+<h3 id="h-二可运行示例">二、可运行示例<a class="anchor" href="#h-二可运行示例" aria-label="本节链接">#</a></h3>
+<p>用纯 Python 算一算&quot;过 PCIe 搬数据要多久&quot;，再和显存带宽对比，直观感受数量级差距。</p>
+<pre data-lang="python"><code class="language-python"># -*- coding: utf-8 -*-
+# 传输时间 = 数据量 ÷ 带宽
+
+def transfer_time_seconds(data_bytes, bandwidth_bytes_per_sec):
+    return data_bytes / bandwidth_bytes_per_sec
+
+# 各代 PCIe x16 单向带宽（GB/s -&gt; B/s）
+PCIe_BW = {
+    &quot;PCIe 3.0 x16&quot;: 15.75e9,
+    &quot;PCIe 4.0 x16&quot;: 31.5e9,
+    &quot;PCIe 5.0 x16&quot;: 63.0e9,
+}
+HBM_BW = 3.35e12   # H100 HBM3 约 3.35 TB/s
+
+# 场景一：把 7B 模型的 FP16 权重（约 14 GB）从 CPU 搬进 GPU
+weight_bytes = 6.74e9 * 2   # 参数量 × 2 字节
+print(&quot;搬运 7B FP16 权重（约 %.1f GB）所需时间：&quot; % (weight_bytes / 1e9))
+for name, bw in PCIe_BW.items():
+    t = transfer_time_seconds(weight_bytes, bw)
+    print(f&quot;  {name:&lt;16} {t*1000:&gt;7.1f} 毫秒&quot;)
+
+# 场景二：同一份数据，显存内部（HBM）读取要多久
+t_hbm = transfer_time_seconds(weight_bytes, HBM_BW)
+print(f&quot;  显存 HBM（对照） {t_hbm*1e6:&gt;7.1f} 微秒&quot;)
+print(f&quot;\n  PCIe 5.0 比 HBM 慢了约 {PCIe_BW[&#39;PCIe 5.0 x16&#39;]/HBM_BW:.0f} 倍 → 差 {HBM_BW/PCIe_BW[&#39;PCIe 5.0 x16&#39;]:.0f} 倍带宽&quot;)
+
+# 场景三：权重卸载——如果每次前向都要经 PCIe 重读权重，吞吐会被卡成多少？
+#   解码一个 token 要读一遍全部权重；吞吐 ≈ 带宽 ÷ 每 token 需搬运字节数
+print(&quot;\n权重卸载时（经 PCIe 重读权重）的理论解码吞吐：&quot;)
+for name, bw in PCIe_BW.items():
+    tokens_per_sec = bw / weight_bytes   # 每 token 读 14 GB 权重
+    print(f&quot;  {name:&lt;16} 约 {tokens_per_sec:&gt;6.2f} token/s&quot;)
+
+tokens_hbm = HBM_BW / weight_bytes
+print(f&quot;  显存 HBM（对照） 约 {tokens_hbm:&gt;6.1f} token/s&quot;)</code></pre>
+<p>运行后你会看到：经 PCIe 5.0 搬 14 GB 权重约要 0.2 秒，而 HBM 内部读只需几十微秒；如果做权重卸载，每生成一个 token 都要重读一遍权重，吞吐会从显存内的上百 token/s 暴跌到每秒几个——这就是&quot;别让数据频繁过 PCIe&quot;的原因。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>手算</strong>：PCIe 4.0 ×16 单向带宽约 31.5 GB/s，搬 100 GB 数据要几秒？</li>
+<li><strong>换车道</strong>：把通道数从 ×16 改成 ×8（带宽减半），重算 14 GB 权重的搬运时间，说明为什么 GPU 插槽要插满 ×16。</li>
+<li><strong>双向</strong>：PCIe 带宽&quot;双向&quot;通常约是单向的两倍。若全双工搬运，上面场景一的时间会变成多少？为什么实际往往达不到理论双向值？</li>
+<li><strong>卸载吞吐</strong>：把模型换成 70B（FP16 约 138 GB），重算权重卸载下的解码吞吐，对比 7B，体会&quot;模型越大，PCIe 卸载越不可行&quot;。</li>
+<li><strong>思考</strong>：为什么推理引擎要把 KV cache 和权重都常驻显存、而不是按需从 CPU 内存取？如果必须&quot;省显存&quot;而做卸载，你会优先卸载权重还是 KV cache？理由是什么？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>PCI-SIG（PCIe 规范组织，各代速率标准）：<a href="https://pcisig.com/" target="_blank" rel="noopener noreferrer">https://pcisig.com/</a></li>
+<li>NVIDIA H100 Tensor Core GPU（HBM3 显存带宽规格）：<a href="https://www.nvidia.com/en-us/data-center/h100/" target="_blank" rel="noopener noreferrer">https://www.nvidia.com/en-us/data-center/h100/</a></li>
+<li>NVIDIA NVLink &amp; NVSwitch（与 PCIe 的带宽对比背景）：<a href="https://www.nvidia.com/en-us/data-center/nvlink/" target="_blank" rel="noopener noreferrer">https://www.nvidia.com/en-us/data-center/nvlink/</a></li>
+</ul>
+<p><a href="#/l/hw-ch6-l2">下一课：NVLink/NVSwitch</a></p>

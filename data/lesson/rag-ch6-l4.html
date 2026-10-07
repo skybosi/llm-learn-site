@@ -1,0 +1,571 @@
+<h2 id="h-可观测性与线上定位把每次问答的证据链留下来">可观测性与线上定位：把每次问答的证据链留下来<a class="anchor" href="#h-可观测性与线上定位把每次问答的证据链留下来" aria-label="本节链接">#</a></h2>
+<h3 id="h-这一节要解决什么">这一节要解决什么<a class="anchor" href="#h-这一节要解决什么" aria-label="本节链接">#</a></h3>
+<p>前面三节把&quot;长期运行&quot;的四个工程问题解决了一半：索引会更新（6.1）、缓存能省钱且不越权（6.2）、权限不漏（6.3）。剩下最后一个，也是最影响迭代速度的一个：</p>
+<blockquote>
+<p>线上用户说&quot;它答错了&quot;。你打开日志，只看到一句 query 和一句 answer。接下来怎么办？</p>
+</blockquote>
+<p>传统服务的排障靠异常栈：出错就有栈，栈指向行号。<strong>RAG 没有栈</strong>。它的失败形态是：</p>
+<ul>
+<li><strong>非确定性</strong>：同一问题两次回答可能不同；</li>
+<li><strong>部分失败</strong>：答案通顺、引用齐全、格式正确，但内容是错的 —— 没有任何&quot;异常&quot;；</li>
+<li><strong>链路长</strong>：召回、排序、装配、生成，任何一段出错都表现为同一个症状；</li>
+<li><strong>信号滞后且稀疏</strong>：用户不点踩不代表答对；点踩了也往往不说原因。</li>
+</ul>
+<p>所以这一节的核心产物不是&quot;日志格式&quot;，而是<strong>一次问答的证据链（evidence chain）</strong>：把&quot;这次回答是基于哪些候选、哪几段证据、哪个版本的索引和模板&quot;完整记录下来，使得任何一次失败都可以<strong>离线重放（replay）并用反事实实验定位到具体某一段</strong>。</p>
+<p>要回答四个问题：</p>
+<ol>
+<li>证据链必须记哪些字段？哪些字段<strong>绝不能</strong>记？</li>
+<li>全量记太贵，采样怎么采才不丢关键案例？日志体积怎么估？</li>
+<li>怎么把&quot;答错了&quot;定位到&quot;召回 / 排序 / 生成&quot;？需要哪几个反事实实验？</li>
+<li>线上该监控什么、怎么告警才不疲劳？最常见的根因是哪三个？</li>
+</ol>
+<blockquote>
+<p><strong>结论先放在这里</strong>：把每次问答记录成一条 <strong>Trace</strong>（候选 + 入选上下文 + 版本 + 输出 + 引用 + 延迟分段），并对失败样本跑<strong>五个反事实实验</strong>（空上下文 / oracle 注入 / 放大 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> / 重排 / 反事实交换），可以把&quot;答错了&quot;自动归因到四类之一。⚠️ 实测：在四类各 10 条的合成集上，归因准确率 <strong>0.950</strong>；两条 <code>rank_fail</code> 被误判为 <code>recall_fail</code> —— 而这恰恰是&quot;真值本身带噪声&quot;的表现，值得保留在结果里而不是藏起来。</p>
+</blockquote>
+<h3 id="h-一为什么-rag-的排障比普通服务难">一、为什么 RAG 的排障比普通服务难<a class="anchor" href="#h-一为什么-rag-的排障比普通服务难" aria-label="本节链接">#</a></h3>
+<table>
+<thead>
+<tr>
+<th>普通服务</th>
+<th>RAG 系统</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>出错有异常栈</td>
+<td>失败是&quot;答了但错&quot;，没有异常</td>
+</tr>
+<tr>
+<td>请求是确定性的</td>
+<td>采样、索引版本、缓存都会改变输出</td>
+</tr>
+<tr>
+<td>指标单一（延迟、错误率）</td>
+<td>质量指标不可直接观测，只能靠评测或人工</td>
+</tr>
+<tr>
+<td>失败可复现（同输入同输出）</td>
+<td>复现需要完整上下文 + 版本 + 采样参数</td>
+</tr>
+</tbody></table>
+<p><strong>结论</strong>：RAG 的可观测性目标不是&quot;记录发生了什么&quot;，而是<strong>记录足够的信息以便事后重建那一次问答</strong>。判据很直接：</p>
+<blockquote>
+<p>给定一条 trace，能否在离线环境里<strong>逐字节重建</strong>当时的上下文、候选、版本，并跑反事实实验？能，则这条 trace 合格；不能，则它只是一条日志。</p>
+</blockquote>
+<h3 id="h-二证据链的字段设计">二、证据链的字段设计<a class="anchor" href="#h-二证据链的字段设计" aria-label="本节链接">#</a></h3>
+<h4 id="h-21-必备字段">2.1 必备字段<a class="anchor" href="#h-21-必备字段" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>类型</th>
+<th>含 PII？</th>
+<th>保留期（示例）</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>trace_id</code></td>
+<td>str</td>
+<td>否</td>
+<td>90 天</td>
+<td>关联与检索</td>
+</tr>
+<tr>
+<td><code>tenant</code></td>
+<td>str</td>
+<td>否（id）</td>
+<td>90 天</td>
+<td>权限审计、分租户指标</td>
+</tr>
+<tr>
+<td><code>query_hash</code></td>
+<td>str（加盐）</td>
+<td>否（不可逆）</td>
+<td>90 天</td>
+<td>去重、聚类、缓存分析</td>
+</tr>
+<tr>
+<td><code>query_redacted</code></td>
+<td>str</td>
+<td><strong>可能</strong></td>
+<td>7 天</td>
+<td>人工排查（需脱敏）</td>
+</tr>
+<tr>
+<td><code>rewritten_query</code></td>
+<td>str</td>
+<td>可能</td>
+<td>7 天</td>
+<td>归因查询改写（ch4）</td>
+</tr>
+<tr>
+<td><code>candidates[]</code></td>
+<td>list</td>
+<td>否（仅 id + 分数 + 名次）</td>
+<td>90 天</td>
+<td>判断召回/排序</td>
+</tr>
+<tr>
+<td><code>context[]</code></td>
+<td>list of chunk_id</td>
+<td>否</td>
+<td>90 天</td>
+<td>判断装配与位置</td>
+</tr>
+<tr>
+<td><code>context_hashes[]</code></td>
+<td>list of hash</td>
+<td>否</td>
+<td>90 天</td>
+<td>校验上下文未被篡改</td>
+</tr>
+<tr>
+<td><code>prompt_template_ver</code></td>
+<td>str</td>
+<td>否</td>
+<td>90 天</td>
+<td>版本对比</td>
+</tr>
+<tr>
+<td><code>model_ver</code></td>
+<td>str</td>
+<td>否</td>
+<td>90 天</td>
+<td>版本对比</td>
+</tr>
+<tr>
+<td><code>index_manifest_id</code></td>
+<td>str</td>
+<td>否</td>
+<td>90 天</td>
+<td>索引版本（6.1）</td>
+</tr>
+<tr>
+<td><code>acl_fingerprint</code></td>
+<td>str</td>
+<td>否</td>
+<td>90 天</td>
+<td>权限快照</td>
+</tr>
+<tr>
+<td><code>output</code></td>
+<td>str</td>
+<td><strong>是</strong></td>
+<td>7 天或哈希</td>
+<td>质量分析</td>
+</tr>
+<tr>
+<td><code>citations[]</code></td>
+<td>list of chunk_id</td>
+<td>否</td>
+<td>90 天</td>
+<td>引用一致率</td>
+</tr>
+<tr>
+<td><code>latency_ms{}</code></td>
+<td>dict</td>
+<td>否</td>
+<td>90 天</td>
+<td>分段延迟（ch5-l4）</td>
+</tr>
+<tr>
+<td><code>cost</code></td>
+<td>float</td>
+<td>否</td>
+<td>90 天</td>
+<td>成本归因</td>
+</tr>
+<tr>
+<td><code>feedback</code></td>
+<td>enum/None</td>
+<td>可能</td>
+<td>180 天</td>
+<td>标签回流的种子</td>
+</tr>
+</tbody></table>
+<h4 id="h-22-为什么记-chunk_id-与哈希而不是正文">2.2 为什么记 chunk_id 与哈希而不是正文<a class="anchor" href="#h-22-为什么记-chunk_id-与哈希而不是正文" aria-label="本节链接">#</a></h4>
+<p>三个理由，缺一不可：</p>
+<ol>
+<li><strong>可复现</strong>：有了 <code>chunk_id</code> 与 <code>index_manifest_id</code>，就能从<strong>当时的索引版本</strong>取回原文。若只存正文，你其实是在存一份快照，无法判断&quot;当时正确的那段现在是否还在索引里&quot;。</li>
+<li><strong>隐私与合规</strong>：正文里可能含个人信息；<code>chunk_id</code> 是引用，不是内容。<strong>内容留在有权限控制的文档存储里，日志只留指针。</strong></li>
+<li><strong>体积</strong>：一条候选记录的 id + 分数约几十字节，而正文可能几百 token。</li>
+</ol>
+<p><strong>注意一个容易踩的坑</strong>：<code>query_redacted</code> 与 <code>output</code> 是最容易含 PII 的两个字段。要么不存，要么存<strong>加盐哈希</strong>（不可逆、但可用于去重与聚簇），要么只存 7 天并单独加密。</p>
+<h4 id="h-23-版本字段为什么必须在内">2.3 版本字段为什么必须在内<a class="anchor" href="#h-23-版本字段为什么必须在内" aria-label="本节链接">#</a></h4>
+<p>RAG 的失败有一大类来自<strong>版本不一致</strong>：</p>
+<ul>
+<li>索引已经更新，但缓存还返回旧答案（6.1 + 6.2）；</li>
+<li>prompt 模板改了，模型行为变了；</li>
+<li>模型本身升级了。</li>
+</ul>
+<p><strong>没有版本字段的 trace，无法区分&quot;算法变差了&quot;和&quot;版本换了&quot;。</strong> 这也是最常见的排障弯路：花两天调检索参数，最后发现是模板版本回滚了。</p>
+<h3 id="h-三采样体积与隐私">三、采样、体积与隐私<a class="anchor" href="#h-三采样体积与隐私" aria-label="本节链接">#</a></h3>
+<h4 id="h-31-分层采样">3.1 分层采样<a class="anchor" href="#h-31-分层采样" aria-label="本节链接">#</a></h4>
+<p>全量记录 trace 的成本不能忽略。<strong>分层采样</strong>（而不是随机采样）是关键：</p>
+<table>
+<thead>
+<tr>
+<th>层</th>
+<th>采样率</th>
+<th>理由</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>用户点踩 / 报错</td>
+<td><strong>100%</strong></td>
+<td>这是最有价值的样本</td>
+</tr>
+<tr>
+<td>低分 / 空结果 / 拒答</td>
+<td><strong>100%</strong></td>
+<td>失败集中区</td>
+</tr>
+<tr>
+<td>新租户 / 新语料（前 7 天）</td>
+<td><strong>100%</strong></td>
+<td>冷启动问题</td>
+</tr>
+<tr>
+<td>慢查询（P95 以上）</td>
+<td>100%</td>
+<td>延迟归因</td>
+</tr>
+<tr>
+<td>canary / 探针查询</td>
+<td><strong>100%</strong></td>
+<td>权限与健康检查</td>
+</tr>
+<tr>
+<td>正常查询</td>
+<td>1%~5%</td>
+<td>统计基线</td>
+</tr>
+</tbody></table>
+<p><strong>判据</strong>：随机采样会<strong>系统性丢失罕见事件</strong>（而罕见事件恰好是故障）。所以采样必须以&quot;是否异常&quot;为条件，而不是&quot;是否被抽中&quot;。</p>
+<h4 id="h-32-体积估算">3.2 体积估算<a class="anchor" href="#h-32-体积估算" aria-label="本节链接">#</a></h4>
+<p>设每条 trace 平均 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">c</span></span></span></span> 个候选、每个候选约 40 字节、上下文与输出共 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0502em;">B</span></span></span></span> 字节，则单条约：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">40</span><span class="mord mathnormal">c</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0502em;">B</span></span></span></span></span></p>
+<p><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">c</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">50</span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0502em;">B</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">2</span><span class="mord text"><span class="mord">KB</span></span></span></span></span> 时 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">4</span><span class="mord text"><span class="mord">KB</span></span></span></span></span>。若 QPS 为 20、全量记录：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord">4</span><span class="mord text"><span class="mord">KB</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">20</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">86400</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">6.9</span><span class="mspace"> </span><span class="mord text"><span class="mord">GB/</span><span class="mord cjk_fallback">天</span></span></span></span></span></span></p>
+<p><strong>这就是必须采样的量化理由</strong>（1% 采样 → 69MB/天，完全可控）。同时这说明：<strong>降低候选数 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">c</span></span></span></span>（例如 trace 里只记 top-20 而不是全部候选）比降低采样率更划算</strong> —— 因为候选列表是体积的主要来源。</p>
+<h4 id="h-33-隐私边界">3.3 隐私边界<a class="anchor" href="#h-33-隐私边界" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>加盐哈希</strong>：<code>hash(salt || query)</code> 不可逆，但同一 query 在同一个盐下可去重。盐必须与日志分开存储、可轮换（轮换后旧哈希只用于历史关联）。</li>
+<li><strong>保留期分层</strong>：指针类字段 90 天，内容类字段 7 天（或哈希）。</li>
+<li><strong>删除请求（GDPR 类）</strong>：因为日志只有哈希与 id，删除文档时同时删除其 chunk_id 相关记录即可；不需要在全文日志里做模糊匹配。</li>
+<li><strong>审计日志只记 <code>(who, when, query_hash, doc_ids)</code></strong>（6.3 §4）：保证&quot;谁在何时访问了哪些文档&quot;可审计，同时不复制内容。</li>
+</ul>
+<h3 id="h-四反事实归因把答错了定位到一段">四、反事实归因：把&quot;答错了&quot;定位到一段<a class="anchor" href="#h-四反事实归因把答错了定位到一段" aria-label="本节链接">#</a></h3>
+<h4 id="h-41-五个实验">4.1 五个实验<a class="anchor" href="#h-41-五个实验" aria-label="本节链接">#</a></h4>
+<p>给定一条失败的 trace 与一个可重放的系统，依次跑：</p>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>实验</th>
+<th>操作</th>
+<th>结论方向</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>①</td>
+<td><strong>空上下文</strong></td>
+<td>去掉所有证据，只给问题</td>
+<td>若仍答对 ⇒ 参数记忆已够，检索不是必需（可能「无需修」）</td>
+</tr>
+<tr>
+<td>②</td>
+<td><strong>oracle 注入</strong></td>
+<td>把黄金证据强制放在上下文首位</td>
+<td>若修好 ⇒ 问题在<strong>检索/排序</strong>；若仍错 ⇒ 问题在<strong>生成</strong></td>
+</tr>
+<tr>
+<td>③</td>
+<td><strong>放大 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span></strong></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">→</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord">5</span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 重跑</td>
+<td>若修好 ⇒ 召回瓶颈（黄金证据没进候选池）</td>
+</tr>
+<tr>
+<td>④</td>
+<td><strong>重排</strong></td>
+<td>把黄金证据移到首位（仅当它在候选内）</td>
+<td>若修好 ⇒ 排序/位置瓶颈</td>
+</tr>
+<tr>
+<td>⑤</td>
+<td><strong>反事实交换</strong></td>
+<td>改黄金证据中的关键值</td>
+<td>输出是否跟随 ⇒ 是否真在用证据（ch5-l3）</td>
+</tr>
+</tbody></table>
+<h4 id="h-42-判定逻辑">4.2 判定逻辑<a class="anchor" href="#h-42-判定逻辑" aria-label="本节链接">#</a></h4>
+<pre data-lang="text"><code class="language-text">if 基线正确:                      -&gt; none
+elif not oracle_ok:               -&gt; gen_fail     （给了正确证据也不用）
+elif 黄金证据不在候选:             -&gt; recall_fail  （检索没找回来）
+elif 放大k修好 且 重排没修好:       -&gt; recall_fail  （候选池不足）
+elif 重排修好:                     -&gt; rank_fail    （找回来了但没排进上下文）
+else:                             -&gt; rank_fail    （兜底：装配/位置问题）</code></pre>
+<p><strong>这套逻辑有一个重要性质：结论完全由可观测的反事实结果推出，不依赖任何人的判断。</strong> 这正是它比&quot;人工看看日志&quot;强的根本原因。</p>
+<h4 id="h-43-实测准确率与误判分析">4.3 实测准确率与误判分析<a class="anchor" href="#h-43-实测准确率与误判分析" aria-label="本节链接">#</a></h4>
+<p>⚠️ 合成集：四类失败各 10 条，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">10</span></span></span></span>、上下文预算 4 条。</p>
+<pre><code>true/pred             none  recall_fail    rank_fail     gen_fail    sum
+none                    10            0            0            0     10
+recall_fail              0           10            0            0     10
+rank_fail                0            2            8            0     10
+gen_fail                 0            0            0           10     10
+归因准确率 = 0.950</code></pre>
+<p><strong>两条 <code>rank_fail</code> 被误判为 <code>recall_fail</code></strong>，原因是：这两条的黄金证据在<strong>放大 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 后仍不在候选池里</strong>（噪声把小 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 与大 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 的排序都压过了它），于是判定逻辑走了 <code>not 黄金证据在候选</code> 这一支。</p>
+<p><strong>这个误判不该被隐藏，它揭示了两个真实约束</strong>：</p>
+<ol>
+<li>归因质量受<strong>候选池规模</strong>限制：如果 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 太小，你无法区分&quot;没召回&quot;与&quot;召回了但排在后面&quot;；</li>
+<li><strong>真值本身可能带噪声</strong>：预设的标签是&quot;rank_fail&quot;，但从可观测行为看它就是召回失败 —— <strong>在真实系统里，&quot;真值&quot;往往是人工判断，本身就有误差</strong>。所以混淆矩阵里的非对角元不全是算法错。</li>
+</ol>
+<h4 id="h-44-边界">4.4 边界<a class="anchor" href="#h-44-边界" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>反事实实验需要可重放的系统</strong>：如果生成是外部 API 且不可复现（温度、版本漂移），归因结果带噪声。缓解：固定随机种子、记录并复用当时的版本。</li>
+<li><strong>oracle 注入测的是&quot;生成能力上界&quot;</strong>：它证明&quot;给对证据能答对&quot;，但不证明&quot;排序没问题&quot;。</li>
+<li><strong>归因不是免费的</strong>：每失败一次要跑约 5 次推理。所以只对<strong>采样出的失败样本</strong>做归因，并把结论聚合（&quot;本周失败中召回占 62%&quot;）。</li>
+<li><strong>归因结论会随 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span>、预算、模型变化</strong>：它描述的是<strong>当时配置下</strong>的瓶颈分布，不是系统的永久属性。</li>
+</ul>
+<p><figure><img class="md-img" src="content/courses/rag-systems/assets/chapter-6-figure-04.svg" alt="反事实归因的混淆矩阵" loading="lazy" decoding="async"><figcaption>反事实归因的混淆矩阵</figcaption></figure>
+</p>
+<h3 id="h-五线上信号与告警">五、线上信号与告警<a class="anchor" href="#h-五线上信号与告警" aria-label="本节链接">#</a></h3>
+<h4 id="h-51-三类信号">5.1 三类信号<a class="anchor" href="#h-51-三类信号" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>类别</th>
+<th>指标</th>
+<th>为什么需要</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>健康</strong></td>
+<td>空结果率、拒答率、引用率、P95 延迟、错误率</td>
+<td>用户能直接感知</td>
+</tr>
+<tr>
+<td><strong>质量代理</strong></td>
+<td>召回命中率（黄金证据在 top-k 的比例）、引用一致率、点踩率</td>
+<td>无标注时的质量近似</td>
+</tr>
+<tr>
+<td><strong>版本与一致性</strong></td>
+<td>索引 manifest 漂移、模板/模型版本分布、缓存命中率</td>
+<td>版本类故障（最容易漏）</td>
+</tr>
+</tbody></table>
+<h4 id="h-52-金丝雀探针synthetic-probes">5.2 金丝雀探针（synthetic probes）<a class="anchor" href="#h-52-金丝雀探针synthetic-probes" aria-label="本节链接">#</a></h4>
+<p>用一批<strong>固定答案的合成问题</strong>定时打线上（例如每分钟 1 条）：</p>
+<ul>
+<li>它们有确定的黄金证据与期望答案，因此<strong>可以不依赖用户反馈</strong>检测质量下降；</li>
+<li>覆盖三类：单跳事实、多跳、应拒答；</li>
+<li>与 canary 权限探针（6.3）合并成&quot;端到端体检&quot;。</li>
+</ul>
+<p><strong>判据</strong>：探针失败率 &gt; 0 即告警（因为探针是确定的，失败一定是系统问题）。</p>
+<h4 id="h-53-用变化点检测代替固定阈值">5.3 用变化点检测代替固定阈值<a class="anchor" href="#h-53-用变化点检测代替固定阈值" aria-label="本节链接">#</a></h4>
+<p>质量指标天然有波动（流量结构、语料变化），固定阈值会产生大量误报。工程上常用：</p>
+<ul>
+<li><strong>EWMA</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">m</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7333em;vertical-align:-0.15em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mord"><span class="mord mathnormal">x</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mclose">)</span><span class="mord"><span class="mord mathnormal">m</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">t</span><span class="mbin mtight">−</span><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2083em;"><span></span></span></span></span></span></span></span></span></span>，对均值漂移敏感；</li>
+<li><strong>3σ 控制限</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">∣</span><span class="mord"><span class="mord mathnormal">x</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal">m</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord">∣</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&gt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7944em;vertical-align:-0.15em;"></span><span class="mord">3</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0359em;">σ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 才告警；</li>
+<li><strong>CUSUM</strong>：累积偏移 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mop">max</span><span class="mopen">(</span><span class="mord">0</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0576em;">S</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.0576em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">t</span><span class="mbin mtight">−</span><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2083em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">x</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">m</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mclose">)</span></span></span></span>，对<strong>缓慢持续</strong>的恶化最敏感。</li>
+</ul>
+<p><strong>告警设计原则</strong>：① 每个告警必须有对应的处置动作；② 阈值用&quot;变化&quot;而不是&quot;绝对值&quot;；③ 探针类（确定性）用零容忍，统计类（噪声大）用变化点检测。</p>
+<h4 id="h-54-最常见的三个根因">5.4 最常见的三个根因<a class="anchor" href="#h-54-最常见的三个根因" aria-label="本节链接">#</a></h4>
+<p>按 §2.3 与 §5.1 的字段设计，线上失败最常见的三个根因是：</p>
+<table>
+<thead>
+<tr>
+<th>排名</th>
+<th>根因</th>
+<th>判据信号</th>
+<th>处置</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1</td>
+<td><strong>索引未更新/未切换</strong></td>
+<td>manifest 漂移、<code>created_at</code> 过旧、新文档查不到</td>
+<td>检查发布流水线（6.1）</td>
+</tr>
+<tr>
+<td>2</td>
+<td><strong>ACL 字段缺失/继承错</strong></td>
+<td>不可见率异常上升或下降、canary 失败</td>
+<td>跑 ACL 对抗测试（6.3）</td>
+</tr>
+<tr>
+<td>3</td>
+<td><strong>模板/模型版本不一致</strong></td>
+<td>版本分布出现双峰、缓存键版本混杂</td>
+<td>统一版本、清缓存</td>
+</tr>
+</tbody></table>
+<p><strong>这三个根因有一个共同点：它们都不是&quot;算法问题&quot;，而是&quot;运维问题&quot;。</strong> 所以可观测性的第一价值不是帮你调参，而是<strong>让你不必调参就能排除这三类</strong>。</p>
+<h3 id="h-代码">代码<a class="anchor" href="#h-代码" aria-label="本节链接">#</a></h3>
+<pre data-lang="python"><code class="language-python"># -*- coding: utf-8 -*-
+&quot;&quot;&quot;⚠️ 合成数据：证据链 Trace + 反事实重放归因 + 混淆矩阵。
+   检索/生成为可复现的确定性 stub，只为让归因逻辑可见。&quot;&quot;&quot;
+import json, numpy as np
+from dataclasses import dataclass, field, asdict
+
+@dataclass
+class Trace:
+    trace_id: str; tenant: str; query: str; k: int; ctx_budget: int
+    candidates: list = field(default_factory=list)   # [{doc,score,rank,in_ctx}]
+    context: list = field(default_factory=list)      # [doc,...] 顺序即位置
+    output: str = &quot;&quot;; citation: str = &quot;&quot;
+    latency_ms: dict = field(default_factory=dict); cost: float = 0.0
+    def to_jsonl(self): return json.dumps(asdict(self), ensure_ascii=False)
+
+# ---------- 模拟系统 ----------
+def pos_pen(i, n, kappa=1.3):        # 中部惩罚 -&gt; 注意力 U 形
+    d = i / max(1, n - 1)
+    return kappa * (1 - abs(2 * d - 1))
+
+def retrieve(q, k, rng):
+    hits = []
+    for d in range(q[&quot;n_doc&quot;]):
+        base = q[&quot;gold_base&quot;] if d == q[&quot;gold&quot;] else (
+            q[&quot;dist_base&quot;] if d in q[&quot;distract&quot;] else -1.0)
+        hits.append((base + rng.normal(0, 0.35), d))
+    hits.sort(reverse=True)
+    return [{&quot;doc&quot;: d, &quot;score&quot;: round(s, 4), &quot;rank&quot;: i + 1}
+            for i, (s, d) in enumerate(hits[:k])]
+
+def generate(q, ctx):
+    &quot;&quot;&quot;ctx 是 (doc, score) 列表，顺序即位置。返回 (答案, 引用)。&quot;&quot;&quot;
+    if q[&quot;type&quot;] == &quot;none&quot;:
+        return q[&quot;prior&quot;], &quot;&quot;                       # 参数记忆已足够，检索与否都对
+    if q[&quot;type&quot;] == &quot;gen_fail&quot;:
+        return q[&quot;wrong_ans&quot;], &quot;doc?&quot;               # 先验压过证据：读到也不用
+    if not ctx:
+        return &quot;UNKNOWN&quot;, &quot;&quot;
+    logits = [s - pos_pen(i, len(ctx)) for i, (d, s) in enumerate(ctx)]
+    d = ctx[int(np.argmax(logits))][0]
+    return (q[&quot;gold_ans&quot;] if d == q[&quot;gold&quot;] else q[&quot;wrong_ans&quot;]), f&quot;doc{d}&quot;
+
+def run(q, k, ctx_budget, rng, ctx_override=None):
+    cands = retrieve(q, k, rng)
+    ctx = (ctx_override if ctx_override is not None
+           else [(c[&quot;doc&quot;], c[&quot;score&quot;]) for c in cands[:ctx_budget]])
+    ans, cite = generate(q, ctx)
+    return Trace(trace_id=f&quot;t{q[&#39;qid&#39;]}&quot;, tenant=q[&quot;tenant&quot;], query=q[&quot;query&quot;], k=k,
+                 ctx_budget=ctx_budget,
+                 candidates=[{**c, &quot;in_ctx&quot;: c[&quot;doc&quot;] in [d for d, _ in ctx]} for c in cands],
+                 context=[d for d, _ in ctx], output=ans, citation=cite,
+                 latency_ms={&quot;retrieve&quot;: 9.0, &quot;rerank&quot;: 0.0, &quot;prefill&quot;: 120.0, &quot;decode&quot;: 900.0},
+                 cost=0.0007)
+
+# ---------- 反事实归因 ----------
+def attribute(q, k, ctx_budget, rng, base_trace=None):
+    tr = base_trace or run(q, k, ctx_budget, np.random.default_rng(q[&quot;qid&quot;] + 1000))
+    ok = (tr.output == q[&quot;gold_ans&quot;])
+    gold_in_topk = any(c[&quot;doc&quot;] == q[&quot;gold&quot;] for c in tr.candidates)
+    others = [(c[&quot;doc&quot;], c[&quot;score&quot;]) for c in tr.candidates if c[&quot;doc&quot;] != q[&quot;gold&quot;]]
+    # ① oracle 注入：黄金证据强制放首位
+    o_ans, _ = generate(q, [(q[&quot;gold&quot;], 99.0)] + others[:max(0, ctx_budget - 1)])
+    oracle_ok = (o_ans == q[&quot;gold_ans&quot;])
+    # ② 空上下文
+    no_ret_ok = (generate(q, [])[0] == q[&quot;gold_ans&quot;])
+    # ③ 放大 k
+    big_ok = (run(q, k * 5, ctx_budget, np.random.default_rng(q[&quot;qid&quot;] + 2000)).output
+              == q[&quot;gold_ans&quot;])
+    # ④ 重排：黄金证据放首位（仅当已在候选内）
+    reorder_ok = False
+    if gold_in_topk:
+        sc = next(c[&quot;score&quot;] for c in tr.candidates if c[&quot;doc&quot;] == q[&quot;gold&quot;])
+        reorder_ok = (generate(q, [(q[&quot;gold&quot;], sc)] + others[:max(0, ctx_budget - 1)])[0]
+                      == q[&quot;gold_ans&quot;])
+    # ⑤ 反事实交换
+    q2 = dict(q); q2[&quot;gold_ans&quot;] = q[&quot;gold_ans&quot;] + &quot;-SWAPPED&quot;
+    follows = (generate(q2, [(q[&quot;gold&quot;], 99.0)] + others[:max(0, ctx_budget - 1)])[0]
+               == q2[&quot;gold_ans&quot;])
+    ev = dict(oracle=oracle_ok, no_ret=no_ret_ok, big=big_ok, reorder=reorder_ok, follow=follows)
+    if ok:                       return &quot;none&quot;, ev
+    if not oracle_ok:            return &quot;gen_fail&quot;, ev
+    if not gold_in_topk:         return &quot;recall_fail&quot;, ev
+    if big_ok and not reorder_ok: return &quot;recall_fail&quot;, ev
+    if reorder_ok:               return &quot;rank_fail&quot;, ev
+    return &quot;rank_fail&quot;, ev
+
+# ---------- 构造 40 条查询（四类各 10 条）----------
+rng = np.random.default_rng(3)
+Q = []
+for i in range(40):
+    t = [&quot;recall_fail&quot;, &quot;rank_fail&quot;, &quot;gen_fail&quot;, &quot;none&quot;][i % 4]
+    gold_base, dist_base, n_dist = 2.0, 0.9, 6
+    if t == &quot;recall_fail&quot;: gold_base, dist_base, n_dist = 0.2, 1.6, 20    # 被挤出 top-k
+    if t == &quot;rank_fail&quot;:   gold_base, dist_base, n_dist = 1.00, 1.02, 12  # 在 top-k，排在预算外
+    Q.append(dict(qid=i, tenant=f&quot;t{i%3}&quot;, query=f&quot;问题{i}&quot;, type=t, n_doc=120, gold=i % 50,
+                  gold_base=gold_base, dist_base=dist_base,
+                  distract=set(range(50, 50 + n_dist)),
+                  gold_ans=f&quot;A{i}&quot;, wrong_ans=f&quot;W{i}&quot;, prior=f&quot;A{i}&quot;))
+K, CTX = 10, 4
+KINDS = [&quot;none&quot;, &quot;recall_fail&quot;, &quot;rank_fail&quot;, &quot;gen_fail&quot;]
+conf = {a: {b: 0 for b in KINDS} for a in KINDS}
+for q in Q:
+    pred, ev = attribute(q, K, CTX, rng)
+    conf[q[&quot;type&quot;]][pred] += 1
+
+print(&quot;== ⚠️ 合成数据：反事实归因的混淆矩阵（行=预设真值，列=归因结果）==&quot;)
+print(f&quot;{&#39;true/pred&#39;:&lt;13} &quot; + &quot; &quot;.join(f&quot;{k:&gt;12}&quot; for k in KINDS) + f&quot; {&#39;sum&#39;:&gt;6}&quot;)
+for a in KINDS:
+    print(f&quot;{a:&lt;13} &quot; + &quot; &quot;.join(f&quot;{conf[a][b]:&gt;12}&quot; for b in KINDS) +
+          f&quot; {sum(conf[a].values()):&gt;6}&quot;)
+print(f&quot;归因准确率 = {sum(conf[a][a] for a in KINDS)/len(Q):.3f}&quot;)
+
+print(&quot;\n== 一条 trace 的证据链（JSONL 单行）==&quot;)
+tr = run(Q[0], K, CTX, np.random.default_rng(1))
+line = tr.to_jsonl()
+print(line[:300] + (&quot;...&quot; if len(line) &gt; 300 else &quot;&quot;))
+print(f&quot;\n字段数={len(asdict(tr))}  含 query 原文={(&#39;query&#39; in asdict(tr))}&quot;)
+print(&quot;工程上 query/output 应存加盐哈希或短保留期，正文留在有权限控制的存储里。&quot;)</code></pre>
+<pre data-lang="text"><code class="language-text">== ⚠️ 合成数据：反事实归因的混淆矩阵（行=预设真值，列=归因结果）==
+true/pred             none  recall_fail    rank_fail     gen_fail    sum
+none                    10            0            0            0     10
+recall_fail              0           10            0            0     10
+rank_fail                0            2            8            0     10
+gen_fail                 0            0            0           10     10
+归因准确率 = 0.950
+
+== 一条 trace 的证据链（JSONL 单行）==
+{&quot;trace_id&quot;: &quot;t0&quot;, &quot;tenant&quot;: &quot;t0&quot;, &quot;query&quot;: &quot;问题0&quot;, &quot;k&quot;: 10, &quot;ctx_budget&quot;: 4, &quot;candidates&quot;: [{&quot;doc&quot;: 56, &quot;score&quot;: 1.9201, &quot;rank&quot;: 1, &quot;in_ctx&quot;: true}, {&quot;doc&quot;: 54, &quot;score&quot;: 1.9077, &quot;rank&quot;: 2, &quot;in_ctx&quot;: true}, {&quot;doc&quot;: 67, &quot;score&quot;: 1.8658, &quot;rank&quot;: 3, &quot;in_ctx&quot;: true}, {&quot;doc&quot;: 52, &quot;score&quot;: 1.8561, &quot;rank&quot;: ...
+
+字段数=11  含 query 原文=True
+工程上 query/output 应存加盐哈希或短保留期，正文留在有权限控制的存储里。</code></pre>
+<p><strong>关键设计决策</strong>：归因函数的返回<strong>只依赖反事实实验的布尔结果</strong>（<code>oracle_ok</code>、<code>gold_in_topk</code>、<code>big_ok</code>、<code>reorder_ok</code>），没有任何&quot;人工看一眼&quot;的环节。这是这份代码最重要的选择：<strong>排障结论必须能被别人用同样的 trace 复算出来</strong>，否则&quot;归因&quot;就退化成个人经验。代码里那两个误判也没有被&quot;修掉&quot;——它们来自候选池规模与真值噪声，把它们保留下来才能暴露归因方法的真实边界。</p>
+<h3 id="h-练习">练习<a class="anchor" href="#h-练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><p><strong>补全 trace 字段并估算体积</strong>。为你的系统写出完整字段表（含类型、是否 PII、保留期），并计算：QPS=30、候选 100、每条上下文 8 段、输出 400 token 时的日志体积/天。然后给出两种把体积压到 1/10 的方案（提示：候选只存 top-20 + 分数分桶；输出存哈希）并比较各自丢失了什么能力。</p>
+</li>
+<li><p><strong>构造 5 条&quot;看起来正确但错&quot;的失败</strong>。设计 5 条 trace，使其输出通顺、引用齐全，但答案错误或引用不支持。然后说明你的归因流程能否识别它们（提示：需要第 5 个实验&quot;反事实交换&quot;与引用一致率检查）。</p>
+</li>
+<li><p><strong>归因的代价核算</strong>。每次归因跑 5 次推理。设失败率 3%、QPS=30、对所有失败做归因、每次推理成本 0.002 元。计算每天归因成本；再改为&quot;对 20% 失败样本归因&quot;重算。给出&quot;归因覆盖率 vs 成本&quot;的推荐工作点及理由。</p>
+</li>
+<li><p><strong>采样偏差实验</strong>。构造一个场景：5% 的查询是&quot;新租户的首次查询&quot;，且它们的失败率是正常的 10 倍。分别用 (a) 1% 随机采样、(b) 分层采样（新租户 100%），估计总体失败率。比较两种估计的偏差与方差，说明为什么随机采样会系统性低估故障。</p>
+</li>
+<li><p><strong>告警设计</strong>。为 <code>空结果率</code> 设计一个告警：给出 EWMA 与 CUSUM 的具体参数（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">h</span></span></span></span>），并用模拟数据（正常波动 + 一次持续 2 小时的 3 倍恶化）比较两种方法的检测延迟与误报率。给出你推荐的方案。</p>
+</li>
+<li><p><strong>canary 探针与质量探针合并</strong>。设计一套 30 条的探针集：10 条单跳、10 条多跳、5 条应拒答、5 条跨租户 canary。写出每条探针的字段（问题、期望答案、黄金证据、期望行为），并说明如何用它在 1 分钟内判断&quot;索引/权限/生成&quot;三部分是否健康。</p>
+</li>
+<li><p><strong>版本漂移的自动检测</strong>。设计一个任务：每天统计 trace 中 <code>index_manifest_id</code>、<code>prompt_template_ver</code>、<code>model_ver</code> 的分布，断言&quot;线上版本集合 ⊆ 发布清单&quot;。说明这个断言能捕获哪三类故障，并给出实现要点（提示：缓存键里的版本也会出现在 trace 里）。</p>
+</li>
+<li><p><strong>反事实交换的归因增强</strong>。把第 5 个实验的 <code>follow</code>（是否跟随证据）加入判定逻辑，构造一个新的失败类型&quot;引用装饰&quot;（输出引用了证据但内容实际来自参数记忆）。给出判定条件与实测方法（提示：<code>follow == False</code> 且 <code>oracle_ok == True</code>）。</p>
+</li>
+</ol>
+<h3 id="h-小结">小结<a class="anchor" href="#h-小结" aria-label="本节链接">#</a></h3>
+<ul>
+<li><strong>RAG 没有异常栈</strong>：失败是&quot;答了但错&quot;，且非确定、链路长、信号滞后。可观测性的目标是<strong>能重建那一次问答</strong>，不是&quot;记一条日志&quot;。</li>
+<li><strong>证据链必备字段</strong>：<code>trace_id / tenant / query_hash / rewritten_query / candidates(含分数与名次) / context / context_hashes / prompt_template_ver / model_ver / index_manifest_id / acl_fingerprint / output / citations / latency_ms / cost / feedback</code>。</li>
+<li><strong>只记 chunk_id 与哈希，不记正文</strong>：三个理由 —— 可复现（依赖当时索引版本）、隐私合规、体积。⚠️ 字段数 11、单条含候选列表的 JSONL 示例见代码输出。</li>
+<li><strong>采样必须分层</strong>：点踩/低分/空结果/新租户/慢查询/canary 100%，正常 1%~5%。<strong>随机采样会系统性丢失罕见故障。</strong> 体积：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">40</span><span class="mord mathnormal">c</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0502em;">B</span></span></span></span>，QPS=20 全量约 6.9GB/天 —— 这就是要采样的量化理由。</li>
+<li><strong>五个反事实实验</strong>：空上下文、<strong>oracle 注入</strong>、放大 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span>、重排、反事实交换。判定逻辑完全由布尔结果推出，<strong>可被他人用同一条 trace 复算</strong>。</li>
+<li><strong>实测归因准确率 0.950</strong>（四类各 10 条）。两条 <code>rank_fail</code> 被误判为 <code>recall_fail</code>，原因是候选池太小 + 真值噪声 —— <strong>非对角元不全是算法错，它暴露的是方法边界</strong>（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 太小时无法区分&quot;没召回&quot;与&quot;排在后面&quot;）。</li>
+<li><strong>常见根因排序</strong>：① 索引未更新/未切换；② ACL 字段缺失或继承错；③ 模板/模型版本不一致。<strong>三者都是运维问题，可观测性的第一价值是让你不必调参就能排除它们。</strong></li>
+<li><strong>告警用变化点检测</strong>（EWMA / 3σ / CUSUM）而不是固定阈值；<strong>确定性探针（canary、金丝雀问答）零容忍</strong>，统计指标用变化点。</li>
+<li><strong>一句话</strong>：<strong>把每次问答记成一条可重放的证据链，失败就能用反事实实验自动定位到召回/排序/生成；而在那之前，先用版本字段排除掉三类最常见的运维故障。</strong></li>
+</ul>
+<blockquote>
+<p>下一节：单次问答的机制、成本与长期运营都讲完了。最后一章把这些拼成一个能上线的系统：先从 SLO 反推架构，再用评测驱动迭代，然后给出完整案例，最后是&quot;什么场景不该用 RAG&quot;的边界与失效清单。</p>
+</blockquote>

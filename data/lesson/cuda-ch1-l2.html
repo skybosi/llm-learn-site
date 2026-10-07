@@ -1,0 +1,261 @@
+<h2 id="h-环境与工具链驱动toolkit容器版本对齐ncu-与-nsys">环境与工具链：驱动/Toolkit/容器版本对齐、ncu 与 nsys<a class="anchor" href="#h-环境与工具链驱动toolkit容器版本对齐ncu-与-nsys" aria-label="本节链接">#</a></h2>
+<p>代码在本机编译通过、在配好卡的机器上却报 <code>cudaErrorNoKernelImageForDevice</code>；同一份镜像在 A 集群能跑、在 B 集群启动即失败。这类问题有确定的因果链（驱动 ↔ Toolkit ↔ 编译目标 ↔ 运行期），知道四个量各由谁决定就能快速定位。这一课讲清这条链，并把 <code>ncu</code> / <code>nsys</code> 放回它们该在的位置。</p>
+<p><figure><img class="md-img" src="content/courses/gpu-cuda-kernels/assets/chapter-1-figure-02.svg" alt="版本对齐：四个量决定一次 kernel 能否跑起来" loading="lazy" decoding="async"><figcaption>版本对齐：四个量决定一次 kernel 能否跑起来</figcaption></figure>
+</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-cuda-软件栈的五个角色">1. CUDA 软件栈的五个角色<a class="anchor" href="#h-1-cuda-软件栈的五个角色" aria-label="本节链接">#</a></h4>
+<p>按&quot;谁决定谁&quot;排（上层依赖下层，但<strong>版本各自独立</strong>）：</p>
+<table>
+<thead>
+<tr>
+<th>角色</th>
+<th>由谁决定</th>
+<th>看什么命令</th>
+<th>关键特征</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>GPU 器件</td>
+<td>你买/租的硬件</td>
+<td><code>nvidia-smi -L</code></td>
+<td>有固定的 <strong>compute capability</strong></td>
+</tr>
+<tr>
+<td>驱动（driver）</td>
+<td>宿主机/云镜像的管理员</td>
+<td><code>nvidia-smi</code></td>
+<td>提供对<strong>最高 CUDA 版本</strong>的支持，向上兼容</td>
+</tr>
+<tr>
+<td>Toolkit（编译工具链）</td>
+<td>你的开发环境</td>
+<td><code>nvcc --version</code></td>
+<td>决定 <code>libcudart</code>、编译出的 PTX/SASS</td>
+</tr>
+<tr>
+<td>运行时（runtime）</td>
+<td>你的进程实际加载的库</td>
+<td><code>torch.version.cuda</code></td>
+<td>决定进程要走哪条兼容路径</td>
+</tr>
+<tr>
+<td>容器镜像</td>
+<td>你写的 Dockerfile</td>
+<td><code>docker run ... nvcc --version</code></td>
+<td>镜像<strong>不含驱动</strong>，靠 <code>--gpus</code> 把宿主驱动注入</td>
+</tr>
+</tbody></table>
+<p>一句话分界：<strong>驱动在宿主机（或由容器运行时注入），Toolkit 与库在镜像/环境里</strong>——所以&quot;换镜像里的 Toolkit&quot;和&quot;升级宿主驱动&quot;是两件必须分别搞定的事。</p>
+<h4 id="h-2-三个版本号必须对齐以及它们各自对齐什么">2. 三个版本号必须对齐，以及它们各自对齐什么<a class="anchor" href="#h-2-三个版本号必须对齐以及它们各自对齐什么" aria-label="本节链接">#</a></h4>
+<p><code>nvidia-smi</code> 顶部那行 <code>CUDA Version:</code> <strong>不是&quot;本机装了哪个 CUDA&quot;</strong>，而是<strong>这个驱动能支持的最高 CUDA 运行时版本</strong>。它与 <code>nvcc --version</code> 报的 Toolkit 版本<strong>经常不同</strong>，而不同本身完全正常。</p>
+<p>对齐规则（来源：NVIDIA <em>CUDA Compatibility</em> 文档的 Minor Version Compatibility 表）：</p>
+<table>
+<thead>
+<tr>
+<th>关系</th>
+<th>结果</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>Toolkit 版本 &gt; 驱动支持的最高 CUDA</code></td>
+<td><strong>必然失败</strong>：初始化阶段报 <code>cudaErrorInsufficientDriver</code>（CUDA 3），设备 Query 直接 <code>Result = FAIL</code></td>
+</tr>
+<tr>
+<td><code>Toolkit 与驱动同一主版本</code>（如都是 12.x）</td>
+<td>走<strong>小版本兼容</strong>（CUDA 11 起默认）：功能集受限；用 PTX 路径时可能报 <code>cudaErrorCallRequiresNewerDriver</code>；<strong>必须显式传 <code>-arch=sm_xx</code></strong></td>
+</tr>
+<tr>
+<td><code>Toolkit 版本 &lt; 驱动支持的最高 CUDA</code></td>
+<td>通常没问题：驱动的向后兼容覆盖旧 Toolkit</td>
+</tr>
+</tbody></table>
+<p>表格里&quot;驱动支持的最高 CUDA 主版本&quot;对应官方表 1 的最低驱动：CUDA 11.x 需 ≥ 450、12.x 需 ≥ 525、13.x 需 ≥ 580（Linux；完整表以官方 Release Notes 为准）。<strong>小版本兼容的条件是&quot;同主版本 + 达到最低驱动&quot;</strong>，不是&quot;随便哪个驱动都行&quot;。</p>
+<h4 id="h-3-怎么读输出三个命令各看什么">3. 怎么读输出：三个命令各看什么<a class="anchor" href="#h-3-怎么读输出三个命令各看什么" aria-label="本节链接">#</a></h4>
+<pre data-lang="bash"><code class="language-bash">nvidia-smi                       # 驱动版本 + 驱动支持的最高 CUDA + 进程/显存占用
+nvcc --version                   # 编译期 Toolkit 版本（决定 libcudart、PTX ISA）
+nvidia-smi -L                    # 器件列表；配 --query-gpu 可拿到 compute_cap
+nvidia-smi --query-gpu=name,compute_cap,driver_version,memory.total --format=csv</code></pre>
+<p>无 GPU 环境下这些命令不存在是<strong>正常的</strong>：本课全部判定逻辑都能用注入文本演练（见 §二），这正是&quot;无 GPU 也能学完&quot;的路径。</p>
+<h4 id="h-4-compute-capability--sm_xx--sassptx二进制兼容链">4. compute capability → sm_XX → SASS/PTX：二进制兼容链<a class="anchor" href="#h-4-compute-capability--sm_xx--sassptx二进制兼容链" aria-label="本节链接">#</a></h4>
+<p>驱动的兼容性只解决&quot;库能不能加载&quot;；<strong>kernel 能不能跑</strong>由另一条链决定：</p>
+<ol>
+<li>器件有固定的 <code>compute capability</code>（形如 <code>9.0</code>，即 <code>sm_90</code>）。</li>
+<li><code>nvcc</code> 把它编译成对应的 <strong>SASS</strong>（实际机器码）。若编译目标里<strong>没有</strong>当前器件的 <code>sm_XX</code>，运行时报 <code>cudaErrorNoKernelImageForDevice</code>。</li>
+<li>若同时嵌入了 <strong>PTX</strong>（中间码），驱动可在<strong>首次运行时</strong> JIT 成该器件的 SASS——这是&quot;一个二进制跑多种架构&quot;的备选路径，代价是首次执行变慢。</li>
+<li>只嵌 SASS 的二进制<strong>不会</strong>在更新架构上自动可用；只嵌 PTX 则完全依赖 JIT。</li>
+</ol>
+<p>编译目标要显式给全，例如 <code>-gencode arch=compute_90,code=sm_90 -gencode arch=compute_80,code=sm_80</code>。最常见的错误不是算错，而是<strong>默认架构</strong>：<code>nvcc</code> 缺省只编一个通用目标，未必覆盖你的卡。</p>
+<h4 id="h-5-ncu-与-nsys分工不同">5. ncu 与 nsys：分工不同<a class="anchor" href="#h-5-ncu-与-nsys分工不同" aria-label="本节链接">#</a></h4>
+<p>两个工具常被混着叫&quot;性能分析&quot;，但回答的是不同问题：</p>
+<table>
+<thead>
+<tr>
+<th>工具</th>
+<th>回答的问题</th>
+<th>粒度</th>
+<th>典型用法</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>nsys</strong>（Nsight Systems）</td>
+<td><strong>时间线</strong>：整个训练/推理步里，时间花在哪些 kernel、拷贝、同步、CPU 侧调用上</td>
+<td>系统级，一次看全</td>
+<td><code>nsys profile -o out ./app</code>，先找&quot;哪个 kernel 最贵&quot;</td>
+</tr>
+<tr>
+<td><strong>ncu</strong>（Nsight Compute）</td>
+<td><strong>单个 kernel 内部</strong>：带宽/算力用了多少、是否 memory-bound、访存是否合并</td>
+<td>kernel 级，很贵</td>
+<td><code>ncu --set full -k &lt;kernel_name&gt; ./app</code>，判断&quot;它为什么慢&quot;</td>
+</tr>
+</tbody></table>
+<p>正确顺序是<strong>先 nsys 定位、再 ncu 深挖</strong>：直接对全部 kernel 跑 <code>ncu --set full</code> 会让程序慢几个数量级，也产不出可读结论。</p>
+<h4 id="h-6-常见坑">6. 常见坑<a class="anchor" href="#h-6-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>把 <code>nvidia-smi</code> 的 <code>CUDA Version:</code> 当成&quot;已安装的 CUDA&quot;</strong>：它是驱动上限，用它去对 <code>nvcc</code> 会得出错误结论。</li>
+<li><strong>把驱动版本当成 CUDA 版本</strong>：驱动版本形如 <code>580.65.06</code>，与 <code>13.0</code> 是两个坐标系。</li>
+<li><strong>升级了 Toolkit 却没动驱动</strong>：容器里 <code>nvcc 13.x</code> + 宿主驱动只支持到 12.x，就是&quot;必然失败&quot;。</li>
+<li><strong>只编一个架构</strong>：在 A100 上开发、跑到 H100 上报 <code>cudaErrorNoKernelImageForDevice</code>。</li>
+<li><strong>忽略&quot;小版本兼容&quot;的功能缺口</strong>：能跑不等于特性齐全，<code>cudaErrorCallRequiresNewerDriver</code> 常出现在用到新 API 时。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面这段<strong>纯标准库</strong>代码是本课的&quot;环境对齐自检&quot;：优先读真实的 <code>nvidia-smi</code> / <code>nvcc</code> 输出，<strong>无 GPU 时自动回落到注入文本</strong>，让三个判定分支（通过 / 警告 / 失败）都能被真实演练。样本值取自 NVIDIA 文档，用于演示逻辑，<strong>不是</strong>对任何具体机器的断言。</p>
+<pre data-lang="python"><code class="language-python"># ---- 环境对齐自检：解析 nvidia-smi / nvcc 输出，判定「驱动 ↔ Toolkit ↔ 目标架构」----
+import argparse, re, shutil, subprocess
+
+# 小版本兼容的最低驱动（来源：NVIDIA CUDA Compatibility 文档 Table 1，Linux）
+MIN_DRIVER = {11: 450, 12: 525, 13: 580}
+
+def run(cmd):
+    &quot;&quot;&quot;优先跑真实命令；本机没有该工具时返回 None（纯 CPU 学习环境下照样能跑）&quot;&quot;&quot;
+    if shutil.which(cmd[0]) is None:
+        return None
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        return None
+
+def parse(smi_text, nvcc_text):
+    v = {&#39;driver&#39;: None, &#39;driver_major&#39;: None, &#39;driver_max_cuda&#39;: None,
+         &#39;toolkit&#39;: None, &#39;devices&#39;: []}
+    if (m := re.search(r&#39;Driver Version:\s*([0-9.]+)&#39;, smi_text)):
+        v[&#39;driver&#39;], v[&#39;driver_major&#39;] = m.group(1), int(m.group(1).split(&#39;.&#39;)[0])
+    if (m := re.search(r&#39;CUDA Version:\s*([0-9.]+)&#39;, smi_text)):
+        v[&#39;driver_max_cuda&#39;] = tuple(int(x) for x in m.group(1).split(&#39;.&#39;))
+    if (m := re.search(r&#39;release\s+([0-9.]+)&#39;, nvcc_text)):
+        v[&#39;toolkit&#39;] = tuple(int(x) for x in m.group(1).split(&#39;.&#39;))
+    for line in smi_text.splitlines():
+        if (m := re.match(r&#39;^([^,]+),\s*([0-9]+\.[0-9]+),\s*(\d+)\s*MiB&#39;, line.strip())):
+            v[&#39;devices&#39;].append((m.group(1).strip(), m.group(2), int(m.group(3))))
+    return v
+
+def fmt(t): return &#39;.&#39;.join(map(str, t)) if t else &#39;-&#39;
+
+def verdicts(v):
+    &quot;&quot;&quot;返回 (级别, 说明) 列表；级别 ∈ 通过 / 警告 / 失败 / 检查&quot;&quot;&quot;
+    if not v[&#39;driver&#39;]:
+        return [(&#39;跳过&#39;, &#39;本机没有 nvidia-smi（纯 CPU 环境），用注入的示例文本演练判定逻辑&#39;)]
+    out = []
+    tk, mx = v[&#39;toolkit&#39;], v[&#39;driver_max_cuda&#39;]
+    if tk and mx:
+        if tk &gt; mx:
+            out.append((&#39;失败&#39;, f&#39;Toolkit {fmt(tk)} 高于驱动上限 {fmt(mx)}：&#39;
+                                f&#39;初始化即报 cudaErrorInsufficientDriver&#39;))
+        elif tk[0] == mx[0]:
+            need = MIN_DRIVER.get(tk[0])
+            if need and v[&#39;driver_major&#39;] &lt; need:
+                out.append((&#39;失败&#39;, f&#39;CUDA {tk[0]}.x 要求驱动 &gt;= {need}，当前 {v[&quot;driver_major&quot;]}&#39;))
+            else:
+                out.append((&#39;警告&#39;, f&#39;Toolkit 与驱动同为 {tk[0]}.x：走小版本兼容，功能集受限；&#39;
+                                    f&#39;PTX 路径可能报 cudaErrorCallRequiresNewerDriver，&#39;
+                                    f&#39;且必须显式 -arch=sm_xx&#39;))
+        else:
+            out.append((&#39;通过&#39;, f&#39;Toolkit {fmt(tk)} 低于驱动上限 {fmt(mx)}：向后兼容&#39;))
+    for name, cap, mem in v[&#39;devices&#39;]:
+        gencode = f&#39;arch=compute_{cap.replace(&quot;.&quot;, &quot;&quot;)},code=sm_{cap.replace(&quot;.&quot;, &quot;&quot;)}&#39;
+        out.append((&#39;检查&#39;, f&#39;{name}（capability {cap}，显存 {mem} MiB ≈ {mem/1024:.1f} GiB）&#39;
+                            f&#39;→ 编译目标必须含 -gencode {gencode}&#39;))
+    return out
+
+SCENARIOS = [
+    (&#39;场景 A：驱动上限高于 Toolkit（正常）&#39;, &quot;&quot;&quot;NVIDIA-SMI 580.65.06    Driver Version: 580.65.06    CUDA Version: 13.0
+Tesla T4, 7.5, 15360 MiB&quot;&quot;&quot;, &quot;&quot;&quot;Cuda compilation tools, release 12.8, V12.8.61&quot;&quot;&quot;),
+    (&#39;场景 B：与驱动同主版本（只能小版本兼容）&#39;, &quot;&quot;&quot;NVIDIA-SMI 570.86.10    Driver Version: 570.86.10    CUDA Version: 12.8
+NVIDIA H100 PCIe, 9.0, 81559 MiB&quot;&quot;&quot;, &quot;&quot;&quot;Cuda compilation tools, release 12.8, V12.8.61&quot;&quot;&quot;),
+    (&#39;场景 C：Toolkit 高于驱动上限（必然失败）&#39;, &quot;&quot;&quot;NVIDIA-SMI 550.54.14    Driver Version: 550.54.14    CUDA Version: 12.4
+Tesla T4, 7.5, 15360 MiB&quot;&quot;&quot;, &quot;&quot;&quot;Cuda compilation tools, release 13.0, V13.0.48&quot;&quot;&quot;),
+]
+
+def main():
+    ap = argparse.ArgumentParser(description=&#39;CUDA 环境对齐自检&#39;)
+    ap.add_argument(&#39;--smi-file&#39;, help=&#39;nvidia-smi 输出文本；缺省则现场执行&#39;)
+    ap.add_argument(&#39;--nvcc-file&#39;, help=&#39;nvcc --version 输出文本；缺省则现场执行&#39;)
+    args = ap.parse_args()
+    smi = open(args.smi_file).read() if args.smi_file else (run([&#39;nvidia-smi&#39;]) or &#39;&#39;)
+    nvcc = open(args.nvcc_file).read() if args.nvcc_file else (run([&#39;nvcc&#39;, &#39;--version&#39;]) or &#39;&#39;)
+    print(&#39;== 真实环境（本机）==&#39;)
+    if not smi:
+        print(&#39;  未检测到 nvidia-smi：本机是无 GPU 学习环境，不影响下面的判定逻辑&#39;)
+    for lvl, msg in verdicts(parse(smi, nvcc)):
+        print(f&#39;  [{lvl}] {msg}&#39;)
+    print()
+    print(&#39;== 三种典型输入下的判定结果 ==&#39;)
+    for tag, s, n in SCENARIOS:
+        print(f&#39;--- {tag} ---&#39;)
+        for lvl, msg in verdicts(parse(s, n)):
+            print(f&#39;  [{lvl}] {msg}&#39;)
+        print()
+
+main()</code></pre>
+<p>真实运行输出（本机是无 GPU 环境，因此第一部分走&quot;跳过&quot;分支；这也正是本课要演示的降级路径）：</p>
+<pre><code>== 真实环境（本机）==
+  未检测到 nvidia-smi：本机是无 GPU 学习环境，不影响下面的判定逻辑
+  [跳过] 本机没有 nvidia-smi（纯 CPU 环境），用注入的示例文本演练判定逻辑
+
+== 三种典型输入下的判定结果 ==
+--- 场景 A：驱动上限高于 Toolkit（正常） ---
+  [通过] Toolkit 12.8 低于驱动上限 13.0：向后兼容
+  [检查] Tesla T4（capability 7.5，显存 15360 MiB ≈ 15.0 GiB）→ 编译目标必须含 -gencode arch=compute_75,code=sm_75
+
+--- 场景 B：与驱动同主版本（只能小版本兼容） ---
+  [警告] Toolkit 与驱动同为 12.x：走小版本兼容，功能集受限；PTX 路径可能报 cudaErrorCallRequiresNewerDriver，且必须显式 -arch=sm_xx
+  [检查] NVIDIA H100 PCIe（capability 9.0，显存 81559 MiB ≈ 79.6 GiB）→ 编译目标必须含 -gencode arch=compute_90,code=sm_90
+
+--- 场景 C：Toolkit 高于驱动上限（必然失败） ---
+  [失败] Toolkit 13.0 高于驱动上限 12.4：初始化即报 cudaErrorInsufficientDriver
+  [检查] Tesla T4（capability 7.5，显存 15360 MiB ≈ 15.0 GiB）→ 编译目标必须含 -gencode arch=compute_75,code=sm_75</code></pre>
+<p>在<strong>有 GPU 的机器</strong>上，把真实输出喂进去即可得到同一套判定——不需要改一行代码：</p>
+<pre data-lang="bash"><code class="language-bash"># ---- 有 GPU 时：把真实输出存成文件再喂给自检脚本（可选，需自备或云上按需）----
+nvidia-smi &gt; smi.txt
+nvcc --version &gt; nvcc.txt
+python3 env_check.py --smi-file smi.txt --nvcc-file nvcc.txt</code></pre>
+<p>最后一步是<strong>验证工具链真的能出正确结果</strong>。这不依赖 CUDA 硬件知识，只依赖&quot;对照&quot;的习惯：把同一个算子在 CPU 与 GPU 上各算一遍，比较数值（第三课会把容差写成判据）。</p>
+<pre data-lang="python"><code class="language-python"># ---- 可选（需自备 GPU 或云上按需租用）：确认工具链端到端可用 ----
+# 关键点：第一次运行可能触发 PTX 即时编译（JIT），所以要先预热、再计时/比对。
+import torch
+
+assert torch.cuda.is_available(), &#39;没有可用 GPU：本节跳过，前两段纯 Python 代码已完成本课全部验证&#39;
+print(&#39;构建期 CUDA 版本 torch.version.cuda =&#39;, torch.version.cuda)   # 运行时版本
+print(&#39;器件能力 =&#39;, torch.cuda.get_device_capability(), &#39;名称 =&#39;, torch.cuda.get_device_name())
+
+a = torch.randn(512, 512)
+ref = a @ a.T                                     # CPU 参考实现
+for _ in range(3):
+    out = (a.cuda() @ a.cuda().T).cpu()           # 预热：让 JIT/缓存就绪
+torch.testing.assert_close(out, ref, rtol=1e-3, atol=1e-3)
+print(&#39;CPU 与 GPU 结果一致（fp32 容差 rtol=atol=1e-3）&#39;)</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：给 <code>verdicts()</code> 增加判定——Toolkit 与驱动主版本相同时，额外打印文档要求的最小驱动，并说明它属于&quot;小版本兼容&quot;而非&quot;任意驱动可用&quot;。</li>
+<li><strong>解释</strong>：为什么升级 Toolkit 后 <code>nvidia-smi</code> 的 <code>CUDA Version:</code> <strong>不会变</strong>？它由谁决定？</li>
+<li><strong>对比/验证</strong>：分别只编 SASS（<code>code=sm_XX</code>）与只编 PTX（<code>code=compute_XX</code>）各一份，比较同一器件上的<strong>首次</strong>运行耗时；并说明 <code>cudaErrorNoKernelImageForDevice</code> 与 <code>cudaErrorInsufficientDriver</code> 分属链路的哪一环。</li>
+<li><strong>思考</strong>：容器镜像装了 Toolkit 13.x，宿主驱动只支持到 12.x。除&quot;升级驱动&quot;外还有哪些出路？代价如何？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>NVIDIA, <em>CUDA Compatibility</em>（&quot;Minor Version Compatibility&quot; 表 1：CUDA 11/12/13 的最低驱动版本与上限；本课表格的唯一依据）：<a href="https://docs.nvidia.com/deploy/cuda-compatibility/minor-version-compatibility.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/deploy/cuda-compatibility/minor-version-compatibility.html</a></li>
+<li>NVIDIA, <em>CUDA C++ Programming Guide</em>（§&quot;Programming Model&quot; 与附录 &quot;Compute Capabilities&quot;：compute capability → <code>sm_XX</code>、SASS/PTX 与 JIT 的规则）：<a href="https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html</a></li>
+<li>NVIDIA, <em>Nsight Compute Documentation</em>（<code>ncu</code> 的 metric 体系与 <code>--set</code>/<code>-k</code> 用法；kernel 级深挖）：<a href="https://docs.nvidia.com/nsight-compute/" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/nsight-compute/</a></li>
+<li>NVIDIA, <em>Nsight Systems User Guide</em>（<code>nsys profile</code> 的时间线与系统级定位；先用它再用 <code>ncu</code>）：<a href="https://docs.nvidia.com/nsight-systems/" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/nsight-systems/</a></li>
+</ul>
+<p><a href="#/l/cuda-ch1-l3">下一课：性能工程方法论——基线 → profile → 优化 → 回归；何时不值得优化</a></p>

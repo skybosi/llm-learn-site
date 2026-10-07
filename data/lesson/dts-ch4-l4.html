@@ -1,0 +1,231 @@
+<h2 id="h-故障排查带宽不达标hang--timeout-的定位路径">故障排查：带宽不达标、hang / timeout 的定位路径<a class="anchor" href="#h-故障排查带宽不达标hang--timeout-的定位路径" aria-label="本节链接">#</a></h2>
+<p>多卡训练的事故只有两类：<strong>慢<strong>（带宽不达标、扩展性差）和</strong>停</strong>（hang、超时后自动中止）。两类事故的共同陷阱是：一上手就改环境变量或加超时。本课给一条从&quot;硬件上限&quot;到&quot;应用层顺序&quot;的自上而下排查路径，并先把每种现象会等多久、该看哪几行日志算清楚。</p>
+<p><figure><img class="md-img" src="content/courses/distributed-training-systems/assets/chapter-4-figure-02.svg" alt="慢与停两类故障的分层定位路径" loading="lazy" decoding="async"><figcaption>慢与停两类故障的分层定位路径</figcaption></figure>
+</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-三类现象第一动作不同">1. 三类现象，第一动作不同<a class="anchor" href="#h-1-三类现象第一动作不同" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>现象</th>
+<th>第一动作</th>
+<th>别做</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>慢：busbw 只有链路峰值的零头</td>
+<td>先量硬件上限（<code>nvidia-smi topo -m</code>、<code>nvbandwidth</code>、<code>ib_write_bw</code>）</td>
+<td>直接抄调参配方</td>
+</tr>
+<tr>
+<td>停：初始化阶段就挂住</td>
+<td><code>NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,BOOTSTRAP,NET</code></td>
+<td>先加大超时</td>
+</tr>
+<tr>
+<td>错：报错后进程退出</td>
+<td>读 <code>NCCL WARN</code> 原文 + 版本/插件不匹配告警</td>
+<td>用 mismatch 类开关跳过</td>
+</tr>
+</tbody></table>
+<h4 id="h-2-慢先证明硬件能给多少再怀疑-nccl">2. 慢：先证明硬件能给多少，再怀疑 NCCL<a class="anchor" href="#h-2-慢先证明硬件能给多少再怀疑-nccl" aria-label="本节链接">#</a></h4>
+<p>官方给的顺序很具体：节点内先看 <code>nvidia-smi topo -m</code>，再用 <code>nvidia-smi topo -p2p n</code>（NVLink）或 <code>-p2p p</code>（PCIe）确认逐对 P2P 是否 <code>OK</code>；然后用 <code>nvbandwidth</code>（或 <code>nvloom</code>）量 GPU↔GPU 实际带宽。跨节点用 <code>ib_write_bw</code> 量带宽、<code>ib_write_lat</code> 量延迟——官方特别指出<strong>带宽好而尾延迟差</strong>的情况要用延迟测试抓；<code>rdma statistic</code> 里 <code>rnr_nak_retry_err</code>、<code>packet_seq_err</code>、<code>local_ack_timeout_err</code> 增长说明在丢包重传，<code>ibstat</code>/<code>ibstatus</code> 看端口是否 <code>Active</code>、速率有无降档，<code>perfquery</code> 看 <code>SymbolErrorCounter</code> 类错误计数。</p>
+<p><strong>如果硬件测试达标而 NCCL 不达标，问题在配置这一层</strong>，此时才轮到第 3 课的变量。判定用账本：取两个大消息实测点反解 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0528em;">β</span></span></span></span>，与拓扑给出的链路等级比；取小消息点反解 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span>，与算法/协议选择比。</p>
+<h4 id="h-3-停先分清初始化挂起与运行中挂起">3. 停：先分清&quot;初始化挂起&quot;与&quot;运行中挂起&quot;<a class="anchor" href="#h-3-停先分清初始化挂起与运行中挂起" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>初始化挂起</strong>：官方推荐的诊断是 <code>NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,BOOTSTRAP,NET</code>，看三件事：bootstrap 连接是否建立、选中的网络接口对不对（自动选择可能挑到&quot;UP 但跨节点不通&quot;的接口，此时需要显式 <code>NCCL_SOCKET_IFNAME</code>）、版本/插件是否一致。TCP 端口范围可用内核参数收窄，便于放行防火墙。</li>
+<li><strong>运行中挂起</strong>：最常见的原因是各 rank <strong>collective 顺序/参数不一致</strong>。官方明确：集合操作必须每个 rank 都用同样的 count 与 datatype 调用，否则是 undefined behavior，表现为 hang、崩溃或数据损坏。PyTorch 侧另有几个专用开关：<code>TORCH_NCCL_DESYNC_DEBUG</code>（找不同步的元凶 rank）、<code>TORCH_NCCL_ASYNC_ERROR_HANDLING</code>（默认 3：不 abort 通信子直接销毁进程）、以及 flight recorder——<code>TORCH_NCCL_TRACE_BUFFER_SIZE</code>（必须 &gt; 0）配合 <code>TORCH_NCCL_DUMP_ON_TIMEOUT</code>、<code>TORCH_NCCL_DEBUG_INFO_TEMP_FILE</code> 在超时时导出各 rank 的最后若干次集合操作。</li>
+</ul>
+<h4 id="h-4-每种停默认会等多久">4. 每种&quot;停&quot;默认会等多久<a class="anchor" href="#h-4-每种停默认会等多久" aria-label="本节链接">#</a></h4>
+<p>默认值不是随便定的，它给大集群留了余量，所以&quot;卡了很久&quot;往往只是还在正常等待：</p>
+<table>
+<thead>
+<tr>
+<th>层级</th>
+<th>默认口径</th>
+<th>出错前的等待量级</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>socket 建连重试</td>
+<td><code>NCCL_SOCKET_RETRY_CNT=34</code>、<code>NCCL_SOCKET_RETRY_SLEEP_MSEC=100</code></td>
+<td>约 <strong>60 s</strong>（官方给的总时间公式 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mord">/2</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">s</span><span class="mord mathnormal" style="margin-right:0.0197em;">l</span><span class="mord mathnormal">ee</span><span class="mord mathnormal">p</span></span></span></span>）</td>
+</tr>
+<tr>
+<td>InfiniBand</td>
+<td><code>NCCL_IB_TIMEOUT=20</code>、<code>NCCL_IB_RETRY_CNT=7</code></td>
+<td>单次超时 4.295 s × 7 ≈ <strong>30 s</strong></td>
+</tr>
+<tr>
+<td>PyTorch 进程组</td>
+<td><code>init_process_group(timeout=...)</code></td>
+<td><strong>NCCL 默认 10 分钟</strong>（其他后端 30 分钟，以所装版本文档为准）</td>
+</tr>
+</tbody></table>
+<p>对照一下：一次正常的 576 MiB AllReduce（按 25 GB/s 算）只要约 24 ms——IB 的默认预算就是它的 1200 倍以上。<strong>所以&quot;hang 了三分钟&quot;完全可能仍在等一个正常的超时</strong>，先量预算再改超时。</p>
+<h4 id="h-5-被忽略的环境权限类原因">5. 被忽略的环境/权限类原因<a class="anchor" href="#h-5-被忽略的环境权限类原因" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>PCIe P2P 被 IOMMU 拦住</strong>：官方明确指出，Linux 裸机上 CUDA/驱动栈不支持开启 IOMMU 的 PCIe P2P；症状不像 NCCL 报错，而像应用或框架的 bug。检查 <code>cat /proc/cmdline</code> 与 <code>dmesg | grep -i iommu</code>，<code>Default domain type: Translated</code> 值得警惕。</li>
+<li><strong>PCI ACS</strong> 同样会让 P2P 退化，表现为&quot;拓扑看起来 OK、带宽就是上不去&quot;。</li>
+<li><strong>GDRDMA 没生效</strong>：GPU 直连网卡需要 <code>nvidia-peermem</code> 模块，节点重启后要确认已加载（<code>modprobe nvidia-peermem</code> / <code>lsmod</code>）。</li>
+<li><strong>多进程争用同一张 GPU</strong>：PyTorch 文档明确，NCCL 后端下每个进程必须独占它使用的每张 GPU，否则可能死锁或触发 NCCL invalid usage。</li>
+<li><strong>网卡/端口不匹配</strong>：<code>NCCL_IB_HCA</code> 漏配会让部分通信绕远路，表现出来仍是&quot;慢&quot;，不是&quot;停&quot;。</li>
+</ul>
+<h4 id="h-6-定位顺序按代价从低到高">6. 定位顺序（按代价从低到高）<a class="anchor" href="#h-6-定位顺序按代价从低到高" aria-label="本节链接">#</a></h4>
+<ol>
+<li>读日志：<code>NCCL WARN</code> 原文、<code>GRAPH</code> 的环/树、<code>TUNING</code> 的算法/协议/通道；</li>
+<li>量硬件：<code>nvbandwidth</code> / <code>ib_write_bw</code> / <code>ib_write_lat</code>；</li>
+<li>反解 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0528em;">β</span></span></span></span>，与链路等级比对；</li>
+<li>查环境：接口、HCA、IOMMU/ACS、CPU 亲和、进程数 × 卡数；</li>
+<li>最后才查应用：collective 顺序、count/dtype、<code>no_sync()</code> 用法、分支导致的 rank 不同步。</li>
+</ol>
+<h4 id="h-7-常见坑">7. 常见坑<a class="anchor" href="#h-7-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li>用 <code>NCCL_P2P_DISABLE=1</code> 之类开关&quot;试出来能跑&quot;就留在生产脚本里，掩盖真实原因。</li>
+<li>用 <code>NCCL_IGNORE_NET_MISMATCH</code> / <code>NCCL_IGNORE_COLLNET_MISMATCH</code> 跳过配置错误告警。</li>
+<li>不加 <code>NCCL_DEBUG_FILE</code> 就在 8 卡 × 多节点上开 <code>NCCL_DEBUG=INFO</code>：日志互相覆盖，官方建议用 <code>%h.%p</code> 分文件。</li>
+<li>只看平均带宽不看尾延迟：<code>ib_write_lat</code> 的高尾延迟才是&quot;间歇性变慢&quot;的线索。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>第一段解析一份 NCCL 调试日志（形状取自官方示例输出）并分类；第二段把超时预算算成一张表；第三段把两个实测点拆成 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0528em;">β</span></span></span></span> 再给结论。三段都不需要 GPU。</p>
+<pre data-lang="python"><code class="language-python"># ===== 示例 1：先解析 NCCL 日志分类，再决定查什么（形状取自官方示例输出） =====
+import re, collections
+
+LOG = &quot;&quot;&quot;node-01:1895811:1895822 [0] NCCL INFO Tree 0 : -1 -&gt; 0 -&gt; 1/-1/-1
+node-01:1895811:1895822 [0] NCCL INFO Ring 00 : 1 -&gt; 0 -&gt; 1
+node-01:631398:631398 [0] NCCL INFO Channel 00/0 : 0[0] -&gt; 1[1] via P2P/CUMEM
+node-01:631398:631398 [0] NCCL INFO Channel 01/0 : 1[1] -&gt; 0[0] via SHM/direct/direct
+node-01:1897709:1897731 [0] NCCL INFO Channel 00/0 : 0[0] -&gt; 1[1] [send] via NET/Socket/0
+node-01:631871:631871 [0] NCCL INFO AllReduce: 33554432 Bytes -&gt; Algo RING proto SIMPLE channel{Lo..Hi}={0..31}
+node-01:631871:631871 [0] NCCL INFO AllReduce: 1048576 Bytes -&gt; Algo TREE proto SIMPLE channel{Lo..Hi}={0..15}
+node-01:1896826:1896838 [0] NCCL INFO NCCL_SOCKET_IFNAME set by environment to eth0
+node-01:1897709:1897731 [0] NCCL WARN NET/Socket : Could not find any interface for 10.0.0.0/24
+node-01:1897709:1897731 [0] NCCL WARN A job is running with different NCCL version
+&quot;&quot;&quot;
+
+def triage(log):
+    stats = collections.Counter()
+    rings, tunings, warns, envs = [], [], [], []
+    for line in log.strip().splitlines():
+        if m := re.search(r&quot;via (\S+)&quot;, line):
+            stats[m.group(1)] += 1
+        if m := re.search(r&quot;Ring (\d+) : (.+)&quot;, line):
+            rings.append((m.group(1), m.group(2).strip()))
+        if m := re.search(r&quot;(\w+): (\d+) Bytes -&gt; Algo (\w+) proto (\w+)&quot;, line):
+            tunings.append((int(m.group(2)), m.group(3), m.group(4)))
+        if &quot;NCCL WARN&quot; in line:
+            warns.append(line.split(&quot;NCCL WARN&quot;, 1)[1].strip())
+        if m := re.search(r&quot;(NCCL_\w+) set by environment to (\S+)&quot;, line):
+            envs.append((m.group(1), m.group(2)))
+    return stats, rings, tunings, warns, envs
+
+stats, rings, tunings, warns, envs = triage(LOG)
+print(&quot;示例 1：NCCL 日志分类&quot;)
+print(&quot;  传输路径统计：&quot;, dict(stats))
+print(&quot;  环：&quot;, rings)
+print(&quot;  算法/协议选择：&quot;)
+for size, algo, proto in sorted(tunings):
+    print(f&quot;    {size:&gt;9} Bytes -&gt; {algo:&lt;5} {proto}&quot;)
+print(&quot;  生效的环境变量：&quot;, envs)
+print(&quot;  警告 %d 条：&quot; % len(warns))
+for w in warns:
+    print(&quot;    -&quot;, w)
+
+# ===== 示例 2：超时/重试预算表（数值全部取自官方文档口径） =====
+def socket_budget(retry, sleep_ms):
+    return (retry + 1) * retry / 2 * sleep_ms / 1000.0          # 官方公式 (N+1)*N/2*sleep
+
+print(&quot;\n示例 2：超时预算（默认值 -&gt; 出错前要等多久）&quot;)
+print(f&quot;  socket：NCCL_SOCKET_RETRY_CNT=34, SLEEP=100ms -&gt; {socket_budget(34, 100):.1f} s（官方约 60 s）&quot;)
+for t in (18, 20, 23):
+    print(f&quot;  IB：NCCL_IB_TIMEOUT={t}, RETRY=7 -&gt; {4.096e-6*2**t*7:6.2f} s/次重试总额 &quot;
+          f&quot;（单次超时 {4.096e-6*2**t*1000:6.1f} ms）&quot;)
+print(&quot;  PyTorch ProcessGroupNCCL 默认超时：10 分钟（其他后端 30 分钟，以所装版本文档为准）&quot;)
+normal_ms = 576 * 2**20 / 25e9 * 1e3
+print(f&quot;  对照：一次正常的 576 MiB AllReduce（25 GB/s）约 {normal_ms:.0f} ms；&quot;
+      f&quot;IB 默认预算 = 它的 {30.06*1000/normal_ms:.0f}x，socket 预算 = 它的 {59.5*1000/normal_ms:.0f}x&quot;)
+
+# ===== 示例 3：带宽不达标时，用两个实测点把差距拆到 α 与 β =====
+def fit(sizes, times):
+    (s1, t1), (s2, t2) = list(zip(sizes, times))
+    beta = (s2 - s1) / ((t2 - t1) * 1e-6) / 1e9
+    return t1 - s1 / (beta * 1e9) * 1e6, beta
+
+def verdict(alpha, beta, expected_bw, expected_alpha=60.0):
+    out = []
+    if beta &lt; 0.5 * expected_bw:
+        out.append(f&quot;β 只有链路峰值的 {beta/expected_bw:.0%}：查拓扑/rail/协议（GRAPH、TUNING 日志）&quot;)
+    if alpha &gt; 3 * expected_alpha:
+        out.append(f&quot;α 偏大（{alpha:.0f}us）：小消息或算法选择问题（树 vs 环、协议）&quot;)
+    return out or [&quot;α、β 与预期同量级：瓶颈更可能在重叠或排队，不在 NCCL 参数&quot;]
+
+print(&quot;\n示例 3：把实测点拆成 α、β 再下结论（期望 β≈250 GB/s，期望 α≈60us）&quot;)
+cases = {
+    &quot;健康&quot;:  ([8 &lt;&lt; 20, 256 &lt;&lt; 20], [60 + s / (250e9) * 1e6 for s in (8 &lt;&lt; 20, 256 &lt;&lt; 20)]),
+    &quot;带宽腰斩&quot;: ([8 &lt;&lt; 20, 256 &lt;&lt; 20], [60 + s / (100e9) * 1e6 for s in (8 &lt;&lt; 20, 256 &lt;&lt; 20)]),
+    &quot;延迟偏大&quot;: ([8 &lt;&lt; 20, 256 &lt;&lt; 20], [300 + s / (250e9) * 1e6 for s in (8 &lt;&lt; 20, 256 &lt;&lt; 20)]),
+}
+for name, (sizes, times) in cases.items():
+    a, b = fit(sizes, times)
+    print(f&quot;  {name:&lt;8} α={a:7.2f}us β={b:6.2f}GB/s -&gt; {&#39;；&#39;.join(verdict(a, b, 250.0))}&quot;)</code></pre>
+<p>在 Python 3.14.5 + numpy 2.5.3 环境下实际运行结果：</p>
+<pre data-lang="text"><code class="language-text">示例 1：NCCL 日志分类
+  传输路径统计： {&#39;P2P/CUMEM&#39;: 1, &#39;SHM/direct/direct&#39;: 1, &#39;NET/Socket/0&#39;: 1}
+  环： [(&#39;00&#39;, &#39;1 -&gt; 0 -&gt; 1&#39;)]
+  算法/协议选择：
+      1048576 Bytes -&gt; TREE  SIMPLE
+     33554432 Bytes -&gt; RING  SIMPLE
+  生效的环境变量： [(&#39;NCCL_SOCKET_IFNAME&#39;, &#39;eth0&#39;)]
+  警告 2 条：
+    - NET/Socket : Could not find any interface for 10.0.0.0/24
+    - A job is running with different NCCL version
+
+示例 2：超时预算（默认值 -&gt; 出错前要等多久）
+  socket：NCCL_SOCKET_RETRY_CNT=34, SLEEP=100ms -&gt; 59.5 s（官方约 60 s）
+  IB：NCCL_IB_TIMEOUT=18, RETRY=7 -&gt;   7.52 s/次重试总额 （单次超时 1073.7 ms）
+  IB：NCCL_IB_TIMEOUT=20, RETRY=7 -&gt;  30.06 s/次重试总额 （单次超时 4295.0 ms）
+  IB：NCCL_IB_TIMEOUT=23, RETRY=7 -&gt; 240.52 s/次重试总额 （单次超时 34359.7 ms）
+  PyTorch ProcessGroupNCCL 默认超时：10 分钟（其他后端 30 分钟，以所装版本文档为准）
+  对照：一次正常的 576 MiB AllReduce（25 GB/s）约 24 ms；IB 默认预算 = 它的 1244x，socket 预算 = 它的 2463x
+
+示例 3：把实测点拆成 α、β 再下结论（期望 β≈250 GB/s，期望 α≈60us）
+  健康       α=  60.00us β=250.00GB/s -&gt; α、β 与预期同量级：瓶颈更可能在重叠或排队，不在 NCCL 参数
+  带宽腰斩     α=  60.00us β=100.00GB/s -&gt; β 只有链路峰值的 40%：查拓扑/rail/协议（GRAPH、TUNING 日志）
+  延迟偏大     α= 300.00us β=250.00GB/s -&gt; α 偏大（300us）：小消息或算法选择问题（树 vs 环、协议）</code></pre>
+<p>判读：示例 1 的&quot;警告 2 条&quot;就是排查入口——接口找不到（<code>NCCL_SOCKET_IFNAME</code> 与网络段不匹配）和版本不一致，都是能直接定位的问题；示例 2 把&quot;等多久&quot;变成可核对的数，避免把正常等待当 hang；示例 3 给出&quot;到底该查拓扑还是查算法&quot;的分诊结论。</p>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选：需要 1~2 张 GPU。下面是复现上面三段的步骤 ----
+# 1) 完整日志：每个进程单独一个文件（官方推荐写法）
+NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=ALL NCCL_DEBUG_FILE=/tmp/nccl_%h_%p.log \
+  torchrun --nproc_per_node=2 train_ddp.py
+# 2) 初始化挂起时只看三个子系统
+NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,BOOTSTRAP,NET \
+  torchrun --nproc_per_node=2 train_ddp.py
+# 3) 硬件上限：逐对 P2P 与实测带宽
+nvidia-smi topo -p2p n          # NVLink 逐对是否 OK；PCIe 用 -p2p p
+git clone https://github.com/NVIDIA/nvbandwidth &amp;&amp; cd nvbandwidth &amp;&amp; cmake . &amp;&amp; make
+./nvbandwidth -t device_to_device_memcpy_read_ce   # 单机 GPU↔GPU 实测上限
+# 跨机（可选，云上按需开两台）：官方推荐用 perftest 套件测带宽与延迟
+ib_write_bw -d mlx5_0 -a &lt;server&gt;        # 服务端先跑；客户端同参数加主机名
+ib_write_lat -d mlx5_0 &lt;server&gt;          # 尾延迟排查
+rdma statistic                            # 看 rnr_nak_retry_err 等计数是否在涨
+# 4) 运行中 hang：打开 flight recorder 与 desync 调试
+TORCH_NCCL_TRACE_BUFFER_SIZE=1048576 TORCH_NCCL_DUMP_ON_TIMEOUT=1 \
+TORCH_NCCL_DESYNC_DEBUG=1 TORCH_NCCL_DEBUG_INFO_TEMP_FILE=/tmp/nccl_dump_ \
+  torchrun --nproc_per_node=2 train_ddp.py</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：给示例 1 的 <code>triage</code> 加上&quot;按 rank 分组&quot;的能力（日志行里有 <code>[0]</code> 这样的 rank 字段），输出每个 rank 的算法/协议选择；说明什么情况下不同 rank 的选择不一致、以及为什么那属于配置错误。</li>
+<li><strong>解释</strong>：为什么官方给 socket 重试的总时间公式是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mord">/2</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">s</span><span class="mord mathnormal" style="margin-right:0.0197em;">l</span><span class="mord mathnormal">ee</span><span class="mord mathnormal">p</span></span></span></span> 而不是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">s</span><span class="mord mathnormal" style="margin-right:0.0197em;">l</span><span class="mord mathnormal">ee</span><span class="mord mathnormal">p</span></span></span></span>？把 <code>NCCL_SOCKET_RETRY_CNT=34</code> 代进去验证约 60 s。</li>
+<li><strong>对比/验证</strong>：把示例 2 的 <code>NCCL_IB_TIMEOUT</code> 从 20 改成 24 再算一遍，并解释&quot;总预算 8 分钟&quot;与&quot;PyTorch 默认超时 10 分钟&quot;谁会先触发。</li>
+<li><strong>思考</strong>：一个 8 卡任务每 200 步随机卡住一次，重启后正常。给出你的排查顺序，并说明 <code>TORCH_NCCL_DESYNC_DEBUG</code>、<code>rdma statistic</code>、<code>ib_write_lat</code> 三者分别能排除什么假设。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>NVIDIA, <em>NCCL User Guide</em> —「Logging」（<code>NCCL_DEBUG</code> 四个级别、<code>NCCL_DEBUG_SUBSYS</code> 默认 <code>INIT,BOOTSTRAP,ENV</code> 与全部子系统名、<code>NCCL_DEBUG_FILE</code> 的 <code>%h.%p</code> 分文件写法，以及&quot;初始化挂起用 INIT,BOOTSTRAP,NET&quot;&quot;性能问题用 TUNING&quot;的官方排查建议）：<a href="https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/troubleshooting/logging.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/troubleshooting/logging.html</a></li>
+<li>NVIDIA, <em>NCCL User Guide</em> —「Performance and tuning」（<code>nvbandwidth</code>/<code>nvloom</code> 量 GPU↔GPU 带宽、<code>nvidia-smi topo -m</code> 与 <code>topo -p2p n</code> 的用法、CPU/NUMA 亲和与 <code>NCCL_IGNORE_CPU_AFFINITY</code>）：<a href="https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/troubleshooting/performance_and_tuning.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/troubleshooting/performance_and_tuning.html</a></li>
+<li>NVIDIA, <em>NCCL User Guide</em> —「Networking Troubleshooting」（<code>ibstat</code>/<code>ibstatus</code> 看端口状态与降档、<code>ib_write_bw</code>/<code>ib_write_lat</code> 带宽与延迟测试、<code>rdma statistic</code> 的重传类计数、<code>perfquery</code> 的错误计数、IP 接口与端口范围）：<a href="https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/troubleshooting/networking_troubleshooting.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/troubleshooting/networking_troubleshooting.html</a></li>
+<li>NVIDIA, <em>NCCL User Guide</em> —「GPU troubleshooting」（P2P 访问检查、Linux 裸机 IOMMU 开启时 PCIe P2P 不受支持、PCI ACS、GPU Direct RDMA 需要 <code>nvidia-peermem</code>，以及用 <code>NCCL_P2P_DISABLE</code> 做对照实验的思路）：<a href="https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/troubleshooting/gpu_troubleshooting.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/troubleshooting/gpu_troubleshooting.html</a></li>
+<li>PyTorch, <em>PyTorch ProcessGroupNCCL Environment Variables</em>（<code>TORCH_NCCL_ASYNC_ERROR_HANDLING</code> 默认 3、<code>TORCH_NCCL_DESYNC_DEBUG</code>、<code>TORCH_NCCL_TRACE_BUFFER_SIZE</code>、<code>TORCH_NCCL_DUMP_ON_TIMEOUT</code>、<code>TORCH_NCCL_DEBUG_INFO_TEMP_FILE</code> 等运行中 hang 的诊断开关）：<a href="https://docs.pytorch.org/docs/stable/torch_nccl_environment_variables.html" target="_blank" rel="noopener noreferrer">https://docs.pytorch.org/docs/stable/torch_nccl_environment_variables.html</a></li>
+<li>PyTorch, <em><code>torch.distributed</code></em> 的 <code>init_process_group</code>（<code>timeout</code> 默认&quot;NCCL 10 分钟、其他后端 30 分钟&quot;的口径，以及 NCCL 后端下&quot;每个进程必须独占所用 GPU，否则可能死锁或 NCCL invalid usage&quot;）：<a href="https://docs.pytorch.org/docs/stable/distributed.html" target="_blank" rel="noopener noreferrer">https://docs.pytorch.org/docs/stable/distributed.html</a></li>
+</ul>
+<p><a href="#/l/dts-ch5-l1">下一章：并行策略原理</a></p>

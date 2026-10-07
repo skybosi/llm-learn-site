@@ -1,0 +1,119 @@
+<h2 id="h-svd-与-als">SVD 与 ALS<a class="anchor" href="#h-svd-与-als" aria-label="本节链接">#</a></h2>
+<p>上一课我们得到了矩阵分解的优化目标，并用 SGD 求解。但 SGD 有一个痛点：<strong>它串行地逐样本更新，隐因子维度一多就慢</strong>。这一课讲两个&quot;名头很大&quot;的解法——<strong>SVD</strong>（这里的 SVD 特指推荐领域的 FunkSVD/正则化 SVD）与 <strong>ALS（交替最小二乘）</strong>：前者讲清&quot;为什么不能直接用线性代数的 SVD&quot;，后者给出一种<strong>把非凸问题拆成一串凸子问题</strong>的漂亮解法，也是 Implicit 库处理隐式反馈的主力。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-线性代数的-svd理论与现实的鸿沟">1. 线性代数的 SVD：理论与现实的鸿沟<a class="anchor" href="#h-1-线性代数的-svd理论与现实的鸿沟" aria-label="本节链接">#</a></h4>
+<p>线性代数里的 SVD 是精确分解 <code>R = U Σ Vᵀ</code>，且 <code>U</code>、<code>V</code> 正交。截断 SVD 取前 <code>k</code> 个奇异值，得到 Frobenius 范数下的最佳低秩近似。但把它直接搬来做推荐会撞上三堵墙：</p>
+<ol>
+<li><strong>缺失值</strong>：SVD 要求矩阵完整，评分矩阵却大面积缺失；用 0 或均值填充会把&quot;没评分&quot;错当成&quot;打了 0 分&quot;。</li>
+<li><strong>无正则化</strong>：原始 SVD 最小化的是对全矩阵的重构误差，没有防过拟合的惩罚项，稀疏场景下极易过拟合。</li>
+<li><strong>正交约束</strong>：<code>U</code>、<code>V</code> 必须正交，这纯粹是线性代数的性质，对推荐任务毫无必要，反而限制了模型的表达自由。</li>
+</ol>
+<p>所以推荐领域说的 &quot;SVD&quot;，通常指 <strong>Simon Funk 在 Netflix Prize 里提出的 FunkSVD</strong>——它<strong>放弃了正交约束</strong>，把目标改成&quot;观测值上的平方损失 + L2 正则化&quot;，用 SGD 求解。这就是上一课我们手写的那套东西；它在工程上被广泛称为&quot;正则化 SVD&quot;或&quot;隐语义模型&quot;。</p>
+<h4 id="h-2-funksvd-与-sgd-的代价">2. FunkSVD 与 SGD 的代价<a class="anchor" href="#h-2-funksvd-与-sgd-的代价" aria-label="本节链接">#</a></h4>
+<p>SGD 求 FunkSVD 的更新规则上一课已经推导：</p>
+<pre><code>p_u ← p_u + η ( e_ui · q_i − λ p_u )
+q_i ← q_i + η ( e_ui · p_u − λ q_i )</code></pre>
+<p>它实现简单、内存友好（每次只处理一个样本），缺点是：<strong>每轮要串行扫过所有观测</strong>，难以并行；且学习率 <code>η</code> 要细心调，大了震荡、小了慢。</p>
+<h4 id="h-3-als把非凸问题切成凸问题">3. ALS：把非凸问题切成凸问题<a class="anchor" href="#h-3-als把非凸问题切成凸问题" aria-label="本节链接">#</a></h4>
+<p>回顾优化目标：</p>
+<pre><code>J(P, Q) = Σ_{(u,i) ∈ Ω} (R[u,i] − p_uᵀ q_i)² + λ ( Σ_u ‖p_u‖² + Σ_i ‖q_i‖² )</code></pre>
+<p><code>J</code> 对 <code>(P, Q)</code> 整体是<strong>非凸</strong>的（因为 <code>p_uᵀ q_i</code> 是两个变量相乘）。但 ALS 注意到一个关键事实：<strong>固定 <code>Q</code>，<code>J</code> 对 <code>P</code> 是凸的（二次函数）；固定 <code>P</code>，<code>J</code> 对 <code>Q</code> 也是凸的</strong>。于是可以用<strong>交替（Alternating）</strong>策略：</p>
+<ol>
+<li>固定 <code>Q</code>，对每个用户 <code>u</code> 独立地最小化关于 <code>p_u</code> 的二次目标，得到闭式解；</li>
+<li>固定 <code>P</code>，对每个物品 <code>i</code> 独立地最小化关于 <code>q_i</code> 的二次目标，得到闭式解；</li>
+<li>反复交替，直到收敛。</li>
+</ol>
+<p><strong>&quot;最小二乘（Least Squares）&quot;</strong> 正是指这两步的闭式解——每步都是一个带 L2 正则化的最小二乘问题，可用<strong>正规方程</strong>解出：</p>
+<pre><code>p_u = ( Q_uᵀ Q_u + λ I )⁻¹ Q_uᵀ r_u
+q_i = ( P_iᵀ P_i + λ I )⁻¹ P_iᵀ r_i</code></pre>
+<p>其中 <code>Q_u</code> 是用户 <code>u</code> 评过分的那些物品的隐向量堆成的矩阵，<code>r_u</code> 是对应的真实评分列向量（<code>P_i</code>、<code>r_i</code> 同理）。</p>
+<p>ALS 的优势非常突出：</p>
+<ul>
+<li><strong>每步都是凸问题</strong>，收敛稳定，不依赖学习率；</li>
+<li><strong>高度可并行</strong>：固定 <code>Q</code> 求所有 <code>p_u</code> 时，不同用户之间互不依赖，可以并行（Spark MLlib 正是靠这点做分布式 ALS）；</li>
+<li><strong>易于扩展</strong>：隐式反馈的置信度加权、时间衰减等，都能自然塞进这个二次目标。</li>
+</ul>
+<h4 id="h-4-隐式反馈的-alsimplicit-库的核心">4. 隐式反馈的 ALS（Implicit 库的核心）<a class="anchor" href="#h-4-隐式反馈的-alsimplicit-库的核心" aria-label="本节链接">#</a></h4>
+<p>隐式反馈里，<code>R[u,i]</code> 不是评分而是&quot;偏好置信度&quot;。Implicit 库采用的形式是：把&quot;是否有交互&quot;记为偏好 <code>p_ui ∈ {0, 1}</code>，再给每个交互一个<strong>置信度</strong> <code>c_ui = 1 + α·r_ui</code>（交互次数越多越可信），目标变成：</p>
+<pre><code>J = Σ_{(u,i)} c_ui ( p_ui − p_uᵀ q_i )² + λ ( Σ_u ‖p_u‖² + Σ_i ‖q_i‖² )</code></pre>
+<p>注意这里<strong>连&quot;未交互&quot;的 0 也参与拟合</strong>（只是置信度低），因为隐式反馈里&quot;0&quot;代表&quot;尚未观察到&quot;，而非&quot;不喜欢&quot;。于是 ALS 的闭式解里，<code>Q_uᵀ Q_u</code> 项要换成带权重的 <code>Qᵀ C_u Q</code>。这个形式让 ALS 能高效处理上亿规模的隐式行为数据，是 Implicit 库的理论基石。</p>
+<p><figure><img class="md-img" src="content/courses/recommendation-systems/assets/chapter-3-figure-02.svg" alt="SVD 与 ALS 对比示意：左图画完整矩阵 R 分解为 U Σ Vᵀ（三个矩阵，标注&quot;要求完整矩阵、U/V 正交&quot;）；右图画交替优化的循环——上方框&quot;固定 Q，解 P（正规方程）&quot;，下方框&quot;固定 P，解 Q（正规方程）&quot;，两个框之间用双向箭头连成循环，标注&quot;交替最小二乘 ALS：每步凸问题，可并行&quot;" loading="lazy" decoding="async"><figcaption>SVD 与 ALS 对比示意：左图画完整矩阵 R 分解为 U Σ Vᵀ（三个矩阵，标注&quot;要求完整矩阵、U/V 正交&quot;）；右图画交替优化的循环——上方框&quot;固定 Q，解 P（正规方程）&quot;，下方框&quot;固定 P，解 Q（正规方程）&quot;，两个框之间用双向箭头连成循环，标注&quot;交替最小二乘 ALS：每步凸问题，可并行&quot;</figcaption></figure>
+</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>用 NumPy 手写 ALS：每轮先固定 <code>Q</code> 解出所有用户的 <code>P</code>，再固定 <code>P</code> 解出所有物品的 <code>Q</code>。</p>
+<pre data-lang="python"><code class="language-python">import numpy as np
+
+R = np.array([
+    [5, 3, 0, 1],
+    [4, 0, 0, 1],
+    [1, 1, 0, 5],
+    [0, 0, 0, 4],
+    [0, 1, 5, 4],
+], dtype=float)
+
+n_users, n_items = R.shape
+k = 3
+lam = 0.1
+iters = 20
+
+rng = np.random.default_rng(0)
+P = rng.normal(0, 0.1, (n_users, k))
+Q = rng.normal(0, 0.1, (n_items, k))
+
+def solve_users(R, Q, lam):
+    &quot;&quot;&quot;固定 Q，对每个用户独立解 p_u（正规方程）。&quot;&quot;&quot;
+    k = Q.shape[1]
+    P = np.zeros((n_users, k))
+    eye = np.eye(k)
+    for u in range(n_users):
+        idx = np.where(R[u] &gt; 0)[0]          # 该用户评过分的物品编号
+        if idx.size == 0:
+            continue                          # 没有评分，保持零向量
+        Q_u = Q[idx]                          # 对应物品的隐向量矩阵
+        r_u = R[u, idx]                       # 真实评分
+        # 正规方程: (Q_uᵀQ_u + λI) p_u = Q_uᵀ r_u
+        P[u] = np.linalg.solve(Q_u.T @ Q_u + lam * eye, Q_u.T @ r_u)
+    return P
+
+def solve_items(R, P, lam):
+    &quot;&quot;&quot;固定 P，对每个物品独立解 q_i（正规方程）。&quot;&quot;&quot;
+    k = P.shape[1]
+    Q = np.zeros((n_items, k))
+    eye = np.eye(k)
+    for i in range(n_items):
+        idx = np.where(R[:, i] &gt; 0)[0]        # 评过该物品的用户编号
+        if idx.size == 0:
+            continue
+        P_i = P[idx]
+        r_i = R[idx, i]
+        Q[i] = np.linalg.solve(P_i.T @ P_i + lam * eye, P_i.T @ r_i)
+    return Q
+
+for it in range(iters):
+    P = solve_users(R, Q, lam)   # 第一步：固定 Q，解 P
+    Q = solve_items(R, P, lam)   # 第二步：固定 P，解 Q
+
+R_hat = P @ Q.T
+print(&quot;ALS 补全后的评分矩阵 R̂：\n&quot;, np.round(R_hat, 2))</code></pre>
+<p>观察要点：ALS <strong>不需要学习率</strong>，每步都是精确解，20 轮左右就能稳定收敛。把 <code>iters</code> 加大、<code>lam</code> 调小，会发现解趋向&quot;更贴训练值&quot;；增大 <code>lam</code> 则隐向量被压小、更保守——与 SGD 版同一权衡，但收敛行为更可控。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>把 <code>lam</code> 设为 0，观察 ALS 是否还能稳定求解；当某个用户只评了 1 个物品时，<code>(Q_uᵀ Q_u + λI)</code> 的可逆性会怎样？说明正则化项 <code>λI</code> 除了防过拟合，还承担了&quot;保证可逆&quot;的作用。</li>
+<li>手写推导 <code>p_u</code> 的正规方程：从 <code>min_{p_u} Σ_{i∈Ω_u} (r_ui − p_uᵀq_i)² + λ‖p_u‖²</code> 出发，对 <code>p_u</code> 求梯度并令其为 0，验证 <code>(Q_uᵀQ_u + λI)p_u = Q_uᵀ r_u</code>。</li>
+<li>改造代码实现<strong>隐式反馈 ALS</strong>：把 <code>R</code> 换成 0/1 交互矩阵 + 置信度 <code>c_ui = 1 + α·R_ui</code>，目标项变为 <code>c_ui (p_ui − p_uᵀq_i)²</code>，写出新的正规方程（提示：<code>Q_uᵀ Q_u</code> 要换成 <code>Qᵀ C_u Q</code>，<code>C_u</code> 是用户 <code>u</code> 的置信度对角阵）。</li>
+<li>对比：用同一矩阵分别跑上一课的 SGD 和本课的 ALS，记录两者收敛所需的&quot;扫描轮数&quot;，谈谈&quot;梯度下降要调学习率&quot;与&quot;ALS 闭式解&quot;在工程上的优劣。</li>
+</ol>
+<h3 id="h-为什么这样做理论推导">为什么这样做？——理论推导<a class="anchor" href="#h-为什么这样做理论推导" aria-label="本节链接">#</a></h3>
+<h4 id="h-为什么固定一边就把非凸变成了凸">为什么&quot;固定一边&quot;就把非凸变成了凸<a class="anchor" href="#h-为什么固定一边就把非凸变成了凸" aria-label="本节链接">#</a></h4>
+<p><code>J</code> 里唯一的非线性来自 <code>p_uᵀ q_i</code>（两个变量相乘）。固定 <code>Q</code> 后，<code>p_uᵀ q_i</code> 变成&quot;关于 <code>p_u</code> 的<strong>线性</strong>函数&quot;，于是 <code>(r − p_uᵀ q_i)²</code> 是关于 <code>p_u</code> 的<strong>二次函数</strong>，加上 <code>λ‖p_u‖²</code> 仍是二次函数——二次函数的 Hessian 是 <code>2(Q_uᵀQ_u + λI)</code>，<strong>半正定</strong>，故是凸的。凸函数求极值只需&quot;令梯度为 0&quot;，这正是正规方程能直接给出闭式解的原因。</p>
+<h4 id="h-为什么-als-能收敛">为什么 ALS 能收敛<a class="anchor" href="#h-为什么-als-能收敛" aria-label="本节链接">#</a></h4>
+<p>ALS 每一步都<strong>不增</strong>目标函数值（每步在凸子问题里取到最优），且 <code>J ≥ 0</code> 有下界，于是目标值单调递减且有下界 → 必收敛（到某个驻点）。注意它不保证收敛到<strong>全局最优</strong>（原问题非凸），但实践中结果稳定且够好——这是&quot;坐标下降（Coordinate Descent）&quot;这一大类优化算法的通用保证：<strong>把难的非凸问题拆成逐坐标/逐块的凸子问题轮流优化</strong>。</p>
+<p><strong>母原理连接：</strong> ALS 是<strong>坐标下降</strong>的实例，而坐标下降的核心思想——&quot;抓住一个变量不动、优化另一个&quot;——与机器学习里 EM 算法、k-means 的交替分配/更新，是同一套&quot;交替优化&quot;母题。SGD 是&quot;沿随机梯度一步步下山&quot;，ALS 是&quot;交替地在每个方向上一步到位&quot;，二者分别代表了优化里的<strong>一阶随机方法</strong>与<strong>块坐标方法</strong>两大流派。</p>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>维基百科 · 推荐系统之矩阵分解（含 ALS）：<a href="https://en.wikipedia.org/wiki/Matrix_factorization_(recommender_systems)" target="_blank" rel="noopener noreferrer">https://en.wikipedia.org/wiki/Matrix_factorization_(recommender_systems)</a></li>
+<li>Implicit 库文档（隐式反馈 ALS 的实现）：<a href="https://benfred.github.io/implicit/" target="_blank" rel="noopener noreferrer">https://benfred.github.io/implicit/</a></li>
+<li>Implicit 库源码仓库：<a href="https://github.com/benfred/implicit" target="_blank" rel="noopener noreferrer">https://github.com/benfred/implicit</a></li>
+<li>Netflix Prize 维基条目（FunkSVD 的出处）：<a href="https://en.wikipedia.org/wiki/Netflix_Prize" target="_blank" rel="noopener noreferrer">https://en.wikipedia.org/wiki/Netflix_Prize</a></li>
+</ul>
+<p><a href="#/l/rec-ch3-l3">下一课：隐语义模型</a></p>

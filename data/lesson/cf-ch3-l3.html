@@ -1,0 +1,253 @@
+<h2 id="h-隐式转换绑定与语义动作的落点">隐式转换、绑定与语义动作的落点<a class="anchor" href="#h-隐式转换绑定与语义动作的落点" aria-label="本节链接">#</a></h2>
+<p>上一课我们让 <code>f / x</code>（float 除以 int）直接报错，真实语言不会这么强硬：它会在中间<strong>悄悄补一次转换</strong>。这次&quot;悄悄&quot;很危险——<code>1 / 2 + 0.5</code> 里转换补在除法之前还是之后，结果是 1.0 还是 0.5，而两份代码都通得过类型检查。本课把隐式转换写成显式规则，并回答本章最后一问：语义动作<strong>放在树的哪个位置</strong>，决定编译器生成什么程序。</p>
+<p><figure><img class="md-img" src="content/courses/compiler-foundations/assets/chapter-3-figure-02.svg" alt="语义分析的三段流水：绑定、类型检查与转换、发射三地址码" loading="lazy" decoding="async"><figcaption>语义分析的三段流水：绑定、类型检查与转换、发射三地址码</figcaption></figure>
+</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-强制转换与隐式转换">1. 强制转换与隐式转换<a class="anchor" href="#h-1-强制转换与隐式转换" aria-label="本节链接">#</a></h4>
+<p>龙书 §6.5.2 把这个选择摆得很清楚：<strong>严格</strong>类型系统不做任何自动转换，只提供程序员调用的转换函数，这叫<strong>类型转换</strong>（cast），程序要么类型相容、要么报错；<strong>宽松</strong>做法允许语言规定某些转换由编译器自动补上，这叫<strong>隐式转换 / 强制转换</strong>（type coercion）。</p>
+<p>转换按方向分两类：<strong>加宽</strong>（widening，如 <code>int → float</code>）值域变大、通常安全；<strong>收窄</strong>（narrowing，如 <code>float → int</code>）会丢信息，多数语言要求显式写出。龙书用偏序集描述：类型之间存在 widening 关系，一对类型取<strong>最小上界</strong>（LUB，least upper bound），二元算术就是三段式——</p>
+<pre><code>1. 结果类型 t = LUB(左类型, 右类型)
+2. 把每个操作数 widen 到 t   ← 要么生成一条转换指令，要么是 no-op
+3. 在 t 上做运算</code></pre>
+<p>必须强调第二步：<strong>隐式转换在编译器内部绝不&quot;隐式&quot;</strong>——它必须变成一条真实指令，否则后端不知道该插什么机器码。</p>
+<h4 id="h-2-转换规则表允许哪些禁止哪些">2. 转换规则表：允许哪些、禁止哪些<a class="anchor" href="#h-2-转换规则表允许哪些禁止哪些" aria-label="本节链接">#</a></h4>
+<p>规则表要写全，否则&quot;能转就转&quot;会让类型系统失去意义：</p>
+<table>
+<thead>
+<tr>
+<th>源 → 目标</th>
+<th>类别</th>
+<th>常见处理</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>int → float</code></td>
+<td>widening</td>
+<td>隐式允许，浮点可精确表示时无损</td>
+</tr>
+<tr>
+<td><code>float → int</code></td>
+<td>narrowing</td>
+<td>通常要求显式；若隐式，须规定截断或舍入</td>
+</tr>
+<tr>
+<td>小整数 → 大整数</td>
+<td>widening</td>
+<td>隐式允许</td>
+</tr>
+<tr>
+<td>大整数 → 小整数</td>
+<td>narrowing</td>
+<td>截断，多要求显式</td>
+</tr>
+<tr>
+<td>有符号 ↔ 无符号</td>
+<td>重新解释</td>
+<td><strong>最危险的一类</strong>，见下</td>
+</tr>
+</tbody></table>
+<p>有符号/无符号混用是经典事故源。C 的 usual arithmetic conversions 在 <code>int</code> 与 <code>unsigned int</code> 混合时把 <code>int</code> 转成 <code>unsigned</code>，于是 <code>-1 &lt; 0u</code> 为<strong>假</strong>：<code>-1</code> 先变成 4294967295。例 1 末尾复现了这个结论。</p>
+<h4 id="h-3-隐式转换在-ir-里长什么样">3. 隐式转换在 IR 里长什么样<a class="anchor" href="#h-3-隐式转换在-ir-里长什么样" aria-label="本节链接">#</a></h4>
+<p>LLVM 把每种转换都做成一等指令（LangRef）：<code>sitofp</code>（有符号整数 → 浮点）、<code>uitofp</code>（无符号整数 → 浮点）、<code>fptosi</code> / <code>fptoui</code>（浮点 → 整数）、<code>fpext</code> / <code>fptrunc</code>（浮点加宽 / 收窄）、<code>sext</code> / <code>zext</code> / <code>trunc</code>（整数扩展 / 截断）、<code>bitcast</code>（同尺寸重解释）。LLVM IR 是强类型的：<code>add</code> 的两个操作数必须类型相同、且等于结果类型，所以加宽必须写成一条指令，没有&quot;自动升级&quot;这回事。</p>
+<p>Kaleidoscope 教程第 3 章有个现场例子：<code>fcmp</code> 结果类型固定是 <code>i1</code>，而教程里所有值都是 <code>double</code>，于是必须补一条 <code>uitofp</code>；若误用 <code>sitofp</code>，<code>&lt;</code> 会返回 0.0 和 <strong>-1.0</strong> 而不是 0.0 和 1.0。<strong>转换指令选错，值就错了。</strong></p>
+<h4 id="h-4-两种绑定别混名字绑定与存储绑定">4. 两种&quot;绑定&quot;别混：名字绑定与存储绑定<a class="anchor" href="#h-4-两种绑定别混名字绑定与存储绑定" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>绑定</th>
+<th>何时确定</th>
+<th>谁负责</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>名字 → 声明</td>
+<td><strong>编译期</strong>（第 1 课的作用域链）</td>
+<td>符号表 / 解析器</td>
+</tr>
+<tr>
+<td>变量 → 存储位置</td>
+<td><strong>运行期</strong>（活动记录 / 栈帧）</td>
+<td>后端 + 运行时</td>
+</tr>
+</tbody></table>
+<p>局部变量住在活动记录（activation record）里，编译期只能确定它<strong>相对于帧指针的偏移</strong>，帧基址要到调用时才定。所以符号表里存 <code>storage</code> + <code>offset</code>，而&quot;这个名字是哪个声明&quot;必须在此之前钉死。</p>
+<h4 id="h-5-语义动作的落点s-属性-vs-l-属性">5. 语义动作的落点：S 属性 vs L 属性<a class="anchor" href="#h-5-语义动作的落点s-属性-vs-l-属性" aria-label="本节链接">#</a></h4>
+<p>龙书 §5.1/§5.2 给每个产生式配语义规则（SDD）：<strong>综合属性</strong>（synthesized）从子节点流向父节点，<strong>继承属性</strong>（inherited）从父节点（或左兄弟）流向子节点。§5.4 的语法制导翻译方案（SDT）把动作嵌在产生式右部的某个位置，<strong>位置决定动作何时执行</strong>。</p>
+<p>本课最反直觉的结论是：动作的落点会改变程序含义。对 <code>1 / 2 + 0.5</code>：</p>
+<ul>
+<li><strong>S 属性（自底向上综合）</strong>：<code>1 / 2</code> 的类型由两个子节点决定 → 整数除法得 <code>0</code>；父节点 <code>+</code> 再按 LUB 把它加宽成 <code>0.0</code> → <strong>0.5</strong>。这正是 C 的行为。</li>
+<li><strong>L 属性（上下文下传）</strong>：把&quot;我要 float&quot;当继承属性往下传 → <code>1 / 2</code> 变成 <code>1.0 / 2.0</code> → <strong>1.0</strong>。</li>
+</ul>
+<p>两条路都不报错、都能跑，却生成不同的程序。所以&quot;类型规则是自底向上还是自顶向下&quot;不是实现自由度，而是规范必须写死的事。工程后果也直接：消除左递归会改变动作的自然落点，必须重排动作或改用继承属性（§5.4.4、§5.5）。</p>
+<h4 id="h-6-常见坑">6. 常见坑<a class="anchor" href="#h-6-常见坑" aria-label="本节链接">#</a></h4>
+<ol>
+<li><strong>转换插入的时机错了</strong>：转换必须在类型检查<strong>之后</strong>、常量折叠<strong>之前</strong>写进 IR，并成为可见的一条指令；顺序一乱，折叠就在错的类型上算。</li>
+<li><strong>静默收窄</strong>：<code>float → int</code> 若允许隐式，须规定截断（向零）还是舍入，并明确&quot;超出目标范围&quot;这类边界的语义（LLVM 对应 <code>fptosi</code>，边界行为以 LangRef 为准）。</li>
+<li><strong>转换路径不唯一</strong>：<code>int → float → double</code> 与 <code>int → long → double</code> 精度可能不同；规范应给出唯一路径（通常就是&quot;直接转成 LUB&quot;）。</li>
+<li><strong>把 no-op 当没发生过</strong>：LUB 相等时 widen 什么都不做，但类型标注仍要写进 IR 节点，否则下游 pass 拿不到类型。</li>
+</ol>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>例 1 把两条策略都实现出来：<code>Gen.bottom_up</code> 是 S 属性，<code>Gen.expected</code> 是 L 属性；两者都把隐式转换落地成一条 <code>cast</code> 指令，再由同一个解释器执行。</p>
+<pre data-lang="python"><code class="language-python"># ---- 隐式转换插在哪：自底向上综合 vs 上下文下传（语义动作的落点）----
+INT, FLOAT = &#39;int&#39;, &#39;float&#39;
+
+def lub(t1, t2):
+    &quot;&quot;&quot;最小上界（龙书 §6.5.2 的 LUB）：int 与 float 的上界是 float&quot;&quot;&quot;
+    if t1 == t2:
+        return t1
+    if {t1, t2} == {INT, FLOAT}:
+        return FLOAT
+    raise TypeError(f&#39;{t1} 与 {t2} 在类型格上没有上界&#39;)
+
+def natural_type(node):
+    &quot;&quot;&quot;节点的&quot;自然类型&quot;：不看上下文，只由自己和子节点决定&quot;&quot;&quot;
+    if node[0] in (&#39;num&#39;, &#39;var&#39;):
+        return node[2]
+    _, _, l, r = node
+    return lub(natural_type(l), natural_type(r))
+
+def c_int_div(x, y):
+    &quot;&quot;&quot;C 的整数除法：向零截断&quot;&quot;&quot;
+    q = abs(x) // abs(y)
+    return q if (x &lt; 0) == (y &lt; 0) else -q
+
+class Gen:
+    &quot;&quot;&quot;把带类型的 AST 降成三地址码；隐式转换落地成一条显式 cast 指令&quot;&quot;&quot;
+    def __init__(self):
+        self.code, self.n = [], 0
+
+    def tmp(self):
+        self.n += 1
+        return f&#39;t{self.n}&#39;
+
+    def emit(self, *ins):
+        self.code.append(ins)
+        return ins[1]
+
+    def widen(self, a, ta, want):
+        if ta == want:
+            return a                     # 类型已经一致：隐式转换退化成&quot;什么都不做&quot;
+        d = self.tmp()
+        self.emit(&#39;cast&#39;, d, a, ta, want)
+        return d
+
+    def bottom_up(self, node):
+        &quot;&quot;&quot;策略 A：S 属性 —— 子节点类型决定父节点，上下文不回传（C 的做法）&quot;&quot;&quot;
+        if node[0] == &#39;num&#39;:
+            return self.emit(&#39;const&#39;, self.tmp(), node[1], node[2]), node[2]
+        if node[0] == &#39;var&#39;:
+            return self.emit(&#39;var&#39;, self.tmp(), node[1], node[2]), node[2]
+        _, op, l, r = node
+        a, ta = self.bottom_up(l)
+        b, tb = self.bottom_up(r)
+        t = lub(ta, tb)
+        a, b = self.widen(a, ta, t), self.widen(b, tb, t)
+        return self.emit(&#39;bin&#39;, self.tmp(), op, a, b, t), t
+
+    def expected(self, node, want):
+        &quot;&quot;&quot;策略 B：L 属性 —— 把上文期望的类型向下传（继承属性）&quot;&quot;&quot;
+        if node[0] == &#39;num&#39;:
+            return self.emit(&#39;const&#39;, self.tmp(), node[1], want), want
+        if node[0] == &#39;var&#39;:
+            d = self.emit(&#39;var&#39;, self.tmp(), node[1], node[2])
+            return self.widen(d, node[2], want), want
+        _, op, l, r = node
+        t = lub(natural_type(node), want)          # 本节点最终按这个类型算
+        a, _ = self.expected(l, t)
+        b, _ = self.expected(r, t)
+        return self.emit(&#39;bin&#39;, self.tmp(), op, a, b, t), t
+
+def render(ins):
+    k = ins[0]
+    if k == &#39;const&#39;:
+        return f&#39;{ins[1]} = const {ins[2]}:{ins[3]}&#39;
+    if k == &#39;var&#39;:
+        return f&#39;{ins[1]} = load {ins[2]}:{ins[3]}&#39;
+    if k == &#39;cast&#39;:
+        llvm = &#39;sitofp i32 -&gt; double&#39; if ins[4] == FLOAT else &#39;fptosi double -&gt; i32&#39;
+        return f&#39;{ins[1]} = cast {ins[2]} ({ins[3]} -&gt; {ins[4]})   # LLVM: {llvm}&#39;
+    if k == &#39;bin&#39;:
+        return f&#39;{ins[1]} = {ins[3]} {ins[2]} {ins[4]}   ({ins[5]})&#39;
+    return f&#39;{ins[1]} = {ins[2]}   ({ins[3]})&#39;
+
+def run(code, env=None):
+    &quot;&quot;&quot;执行三地址码；整数除法按 C 的语义（向零截断）&quot;&quot;&quot;
+    env = dict(env or {})
+    for ins in code:
+        k = ins[0]
+        if k == &#39;const&#39;:
+            env[ins[1]] = ins[2]
+        elif k == &#39;var&#39;:
+            env[ins[1]] = env[ins[2]]
+        elif k == &#39;cast&#39;:
+            _, d, a, _, want = ins
+            env[d] = float(env[a]) if want == FLOAT else int(env[a])
+        elif k == &#39;bin&#39;:
+            _, d, op, a, b, t = ins
+            x, y = env[a], env[b]
+            if op == &#39;+&#39;:
+                v = x + y
+            elif op == &#39;-&#39;:
+                v = x - y
+            elif op == &#39;*&#39;:
+                v = x * y
+            else:
+                v = c_int_div(x, y) if t == INT else x / y
+            env[d] = v
+        elif k == &#39;store&#39;:
+            env[ins[1]] = env[ins[2]]
+    return env
+
+# 源码：r: float = 1 / 2 + 0.5
+EXPR = (&#39;bin&#39;, &#39;+&#39;, (&#39;bin&#39;, &#39;/&#39;, (&#39;num&#39;, 1, INT), (&#39;num&#39;, 2, INT)), (&#39;num&#39;, 0.5, FLOAT))
+TARGET = FLOAT
+
+for label, mode in ((&#39;A 自底向上（S 属性）&#39;, &#39;A&#39;), (&#39;B 上下文下传（L 属性）&#39;, &#39;B&#39;)):
+    g = Gen()
+    d, t = g.bottom_up(EXPR) if mode == &#39;A&#39; else g.expected(EXPR, TARGET)
+    d = g.widen(d, t, TARGET)                # 最终落到声明类型 float
+    g.emit(&#39;store&#39;, &#39;r&#39;, d, TARGET)
+    print(f&#39;== 策略 {label} ==&#39;)
+    for ins in g.code:
+        print(&#39;   &#39;, render(ins))
+    print(f&#39;    r = {run(g.code)[&quot;r&quot;]}\n&#39;)
+
+# ---- 附：C 的 usual arithmetic conversions 里最著名的一个坑 ----
+u32 = lambda v: v % 2**32                    # 模拟 32 位无符号数
+print(&#39;-1 &lt; 0u 在 C 里为:&#39;, u32(-1) &lt; 0)     # False：-1 先被转成 4294967295</code></pre>
+<pre><code>== 策略 A 自底向上（S 属性） ==
+    t1 = const 1:int
+    t2 = const 2:int
+    t3 = t1 / t2   (int)
+    t4 = const 0.5:float
+    t5 = cast t3 (int -&gt; float)   # LLVM: sitofp i32 -&gt; double
+    t6 = t5 + t4   (float)
+    r = t6   (float)
+    r = 0.5
+
+== 策略 B 上下文下传（L 属性） ==
+    t1 = const 1:float
+    t2 = const 2:float
+    t3 = t1 / t2   (float)
+    t4 = const 0.5:float
+    t5 = t3 + t4   (float)
+    r = t5   (float)
+    r = 1.0
+
+-1 &lt; 0u 在 C 里为: False</code></pre>
+<p>两段 IR 的差别只有一处：策略 A 在 <code>int</code> 除法<strong>之后</strong>插了一条 <code>cast</code>（对应 LLVM 的 <code>sitofp</code>），策略 B 干脆让除法一开始就在 float 上做。<strong>转换的位置变了，算术的含义就变了</strong>——这正是 §5.4&quot;动作的位置决定动作何时执行&quot;的代价。C 的行为是策略 A，所以 <code>1 / 2 + 0.5</code> 在 C 里是 0.5；若在别的语言里看到 1.0，那门语言的类型规则多半是自顶向下的。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：给 <code>Gen</code> 加 narrowing：<code>want == INT</code> 而实际是 <code>FLOAT</code> 时生成 <code>fptosi</code> 风格指令，并让 <code>run</code> 按&quot;向零截断&quot;执行；用 <code>r: int = 3.7</code> 验证。</li>
+<li><strong>解释</strong>：为什么 LLVM IR 里&quot;没有隐式转换&quot;？若 <code>add</code> 能自动升级操作数，出错信息、常量的可表示范围、优化 pass 的合法性判断各会遇到什么麻烦？</li>
+<li><strong>对比/验证</strong>：把 <code>EXPR</code> 换成 <code>1 / 2 * 1.0 + 0.5</code>，先推导两条策略的结果再实测，指出哪一步的落点差异起了作用。</li>
+<li><strong>思考</strong>：龙书 §5.4.4 说消除左递归时动作必须重排。若不重排，本课这个例子会得到策略 A、策略 B，还是第三种结果？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Aho, Lam, Sethi, Ullman, <em>Compilers: Principles, Techniques, and Tools</em>（龙书，2nd ed.）§6.5.2「Type Conversions」（cast 与 coercion、widening、LUB）；§5.1、§5.2、§5.4（含 §5.4.4 左递归消除）、§5.5</li>
+<li>LLVM 官方 IR 参考手册（<code>sitofp</code> / <code>uitofp</code> / <code>fptosi</code> / <code>fpext</code> / <code>fptrunc</code> / <code>sext</code> / <code>zext</code> / <code>trunc</code> 的语义与类型约束）：<a href="https://llvm.org/docs/LangRef.html" target="_blank" rel="noopener noreferrer">https://llvm.org/docs/LangRef.html</a></li>
+<li>LLVM 官方 Kaleidoscope 教程第 3 章（用 <code>uitofp</code> 把 <code>fcmp</code> 的 <code>i1</code> 转成 <code>double</code>；<code>add</code> 操作数类型必须一致）：<a href="https://llvm.org/docs/tutorial/MyFirstLanguageFrontend/LangImpl03.html" target="_blank" rel="noopener noreferrer">https://llvm.org/docs/tutorial/MyFirstLanguageFrontend/LangImpl03.html</a></li>
+<li>Aho et al., 龙书第 7 章「Run-Time Environments」：活动记录与局部变量的运行期地址</li>
+</ul>
+<p><a href="#/learn/../chapter-4/lesson-01">下一章：中间表示</a></p>

@@ -1,0 +1,119 @@
+<h2 id="h-文生图实战">文生图实战<a class="anchor" href="#h-文生图实战" aria-label="本节链接">#</a></h2>
+<p>上一课我们把项目规划好了，环境也通过了 smoke test。本课时正式开跑：<strong>用 Stable Diffusion 完成一次有质量的文生图</strong>。我们会把第三章学的扩散理论（潜空间、去噪、条件引导、分类器无关引导 CFG）逐一落到代码参数上，让你看清&quot;理论&quot;和&quot;按钮&quot;之间的对应关系。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-文生图全流程回顾一句话版本">1. 文生图全流程回顾（一句话版本）<a class="anchor" href="#h-1-文生图全流程回顾一句话版本" aria-label="本节链接">#</a></h4>
+<p>Stable Diffusion 做文生图，内部是四条链路的接力：</p>
+<ol>
+<li><strong>文本编码</strong>：prompt 经 CLIP 文本编码器变成条件向量（第四章的对齐成果在这里直接派上用场）。</li>
+<li><strong>正向采样</strong>：从随机噪声 z_T 开始，逐步去噪，得到潜空间里的&quot;干净图像&quot; z_0。每一步，UNet 都预测噪声，而<strong>文本条件通过交叉注意力注入</strong>，引导去噪方向。</li>
+<li><strong>CFG 引导</strong>：<code>guidance_scale</code> 控制&quot;无条件去噪&quot;与&quot;有条件去噪&quot;的加权差，值越大越贴合 prompt、但越容易过饱和。</li>
+<li><strong>解码</strong>：潜变量 z_0 交给 VAE 解码器，还原成像素图。</li>
+</ol>
+<p><figure><img class="md-img" src="content/courses/multimodal-diffusion/assets/chapter-6-figure-02.svg" alt="文生图全流程：文本编码 → 潜空间去噪(CFG) → VAE 解码" loading="lazy" decoding="async"><figcaption>文生图全流程：文本编码 → 潜空间去噪(CFG) → VAE 解码</figcaption></figure>
+</p>
+<h4 id="h-2-关键参数与它们的理论位置">2. 关键参数与它们的&quot;理论位置&quot;<a class="anchor" href="#h-2-关键参数与它们的理论位置" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>num_inference_steps（去噪步数）</strong>：对应扩散的离散化步数。默认调度器一般 50 步；25~30 步往往已接近收敛，再多则收益递减、耗时线性增加。</li>
+<li><strong>guidance_scale（CFG 强度）</strong>：默认 7.5。太低 → 图不贴合文字；太高 → 颜色过艳、细节过锐、出现伪影。这是最值得反复调的一个旋钮。</li>
+<li><strong>generator + seed（随机种子）</strong>：噪声 z_T 的来源。<strong>固定 seed 可完全复现同一张图</strong>，这是调试和 A/B 对比的前提。</li>
+<li><strong>negative_prompt（负向提示）</strong>：告诉模型&quot;不要什么&quot;，例如 <code>&quot;low quality, blurry, deformed&quot;</code>，能有效压掉常见瑕疵。</li>
+<li><strong>height / width</strong>：输出分辨率，须是 8 的倍数（与 VAE 的 8 倍下采样对齐）。</li>
+</ul>
+<p><figure><img class="md-img" src="content/courses/multimodal-diffusion/assets/chapter-6-figure-03.svg" alt="参数与扩散流程的对应关系" loading="lazy" decoding="async"><figcaption>参数与扩散流程的对应关系</figcaption></figure>
+</p>
+<h4 id="h-3-显存不足时的三板斧">3. 显存不足时的三板斧<a class="anchor" href="#h-3-显存不足时的三板斧" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>fp16</strong>：模型用半精度加载，显存几乎减半，精度损失可忽略。</li>
+<li><strong>attention slicing</strong>：把注意力计算切成小块分步算，用时间换显存。</li>
+<li><strong>CPU offload</strong>：把当前不用的模块（如 VAE）暂时放到内存，进一步省显存，代价是变慢。</li>
+</ul>
+<p>三者可叠加，按&quot;先 fp16，不够再 slicing，还不够再 offload&quot;的顺序逐级加码。</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<h4 id="h-示例-1一次完整的可复现的文生图">示例 1：一次完整的、可复现的文生图<a class="anchor" href="#h-示例-1一次完整的可复现的文生图" aria-label="本节链接">#</a></h4>
+<pre data-lang="python"><code class="language-python">from diffusers import StableDiffusionPipeline
+import torch
+
+pipe = StableDiffusionPipeline.from_pretrained(
+    &quot;runwayml/stable-diffusion-v1-5&quot;, torch_dtype=torch.float16
+)
+pipe = pipe.to(&quot;cuda&quot;)
+
+prompt = &quot;a cute corgi wearing a red scarf, cartoon style, high quality&quot;
+negative_prompt = &quot;low quality, blurry, deformed, watermark&quot;
+
+# 固定种子: 同一个 seed 每次生成完全相同的图
+seed = 42
+generator = torch.Generator(device=&quot;cuda&quot;).manual_seed(seed)
+
+image = pipe(
+    prompt=prompt,
+    negative_prompt=negative_prompt,
+    num_inference_steps=30,      # 去噪步数
+    guidance_scale=7.5,          # CFG 强度
+    height=512,
+    width=512,
+    generator=generator,
+).images[0]
+
+image.save(f&quot;corgi_seed{seed}.png&quot;)
+print(f&quot;已生成 corgi_seed{seed}.png&quot;)</code></pre>
+<p>把 <code>seed</code> 换成 <code>43</code> 再跑一次，你会得到一张<strong>完全不同</strong>的图；换回 <code>42</code>，又能<strong>逐像素复现</strong>刚才那张——这个性质是后续所有对比实验的基础。</p>
+<h4 id="h-示例-2参数扫描--批量生成">示例 2：参数扫描 + 批量生成<a class="anchor" href="#h-示例-2参数扫描--批量生成" aria-label="本节链接">#</a></h4>
+<p>一次把不同 CFG 值都试一遍，直观感受&quot;这个旋钮&quot;的影响。</p>
+<pre data-lang="python"><code class="language-python">from diffusers import StableDiffusionPipeline
+import torch
+
+pipe = StableDiffusionPipeline.from_pretrained(
+    &quot;runwayml/stable-diffusion-v1-5&quot;, torch_dtype=torch.float16
+).to(&quot;cuda&quot;)
+
+prompt = &quot;a glass of orange juice on a wooden table&quot;
+seed = 7
+
+for cfg in [3.0, 7.5, 12.0, 20.0]:
+    generator = torch.Generator(device=&quot;cuda&quot;).manual_seed(seed)  # 同 seed, 只变 CFG
+    img = pipe(
+        prompt=prompt,
+        num_inference_steps=30,
+        guidance_scale=cfg,
+        generator=generator,
+    ).images[0]
+    img.save(f&quot;juice_cfg{cfg}.png&quot;)
+    print(f&quot;guidance_scale={cfg} 完成&quot;)</code></pre>
+<p>把四张图并排看：CFG 从小到大，你会看到图像从&quot;松散、贴合度一般&quot;逐步变到&quot;贴合文字&quot;，再到&quot;过饱和、发灰发艳&quot;。找到你项目里最舒服的那个值，就是调参的意义。</p>
+<h4 id="h-示例-3显存优化fp16--attention-slicing--cpu-offlo">示例 3：显存优化（fp16 + attention slicing + CPU offload）<a class="anchor" href="#h-示例-3显存优化fp16--attention-slicing--cpu-offlo" aria-label="本节链接">#</a></h4>
+<pre data-lang="python"><code class="language-python">from diffusers import StableDiffusionPipeline
+import torch
+
+pipe = StableDiffusionPipeline.from_pretrained(
+    &quot;runwayml/stable-diffusion-v1-5&quot;, torch_dtype=torch.float16
+)
+
+# 三板斧: 依次开启
+pipe.enable_attention_slicing()   # 切片注意力, 省显存
+pipe.enable_model_cpu_offload()   # 不用的模块放到 CPU, 进一步省显存
+# 注意: enable_model_cpu_offload 会自动处理设备放置, 无需再 .to(&quot;cuda&quot;)
+
+image = pipe(
+    &quot;a lighthouse at sunset, oil painting style&quot;,
+    num_inference_steps=25,
+    guidance_scale=7.5,
+).images[0]
+image.save(&quot;lighthouse.png&quot;)
+print(&quot;已生成 lighthouse.png&quot;)</code></pre>
+<p><code>enable_model_cpu_offload</code> 后不要再手动 <code>.to(&quot;cuda&quot;)</code>，否则会破坏它的自动显存调度。这套组合能让 SD v1.5 在 4 GB 左右的显卡上也能跑起来。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>参数-理论对应</strong>：把 <code>num_inference_steps</code>、<code>guidance_scale</code>、<code>generator/seed</code>、<code>negative_prompt</code> 四个参数，分别对应到扩散流程的哪个环节（加噪/去噪、CFG、噪声来源、条件方向），写一张对照表。</li>
+<li><strong>动手实验</strong>：固定 seed，把 <code>guidance_scale</code> 依次设为 1.0、7.5、20.0 各生成一张，描述图像贴合度与画质的变化，并解释 CFG=1.0 时模型在做什么。</li>
+<li><strong>动手实验</strong>：保持所有参数不变，只把 <code>num_inference_steps</code> 从 10 逐步加到 50，找出你观察到的&quot;收益递减点&quot;。</li>
+<li><strong>思考题</strong>：为什么输出分辨率必须是 8 的倍数？结合 VAE 的 8 倍下采样解释；如果硬要输出 500×500 会怎样？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Hugging Face StableDiffusionPipeline 文档：<a href="https://huggingface.co/docs/diffusers/api/pipelines/stable_diffusion/text2img" target="_blank" rel="noopener noreferrer">https://huggingface.co/docs/diffusers/api/pipelines/stable_diffusion/text2img</a></li>
+<li>Hugging Face 显存优化文档：<a href="https://huggingface.co/docs/diffusers/optimization/memory" target="_blank" rel="noopener noreferrer">https://huggingface.co/docs/diffusers/optimization/memory</a></li>
+<li>Stable Diffusion v1.5 模型卡：<a href="https://huggingface.co/runwayml/stable-diffusion-v1-5" target="_blank" rel="noopener noreferrer">https://huggingface.co/runwayml/stable-diffusion-v1-5</a></li>
+<li>Latent Diffusion 论文（High-Resolution Image Synthesis with Latent Diffusion Models）：<a href="https://arxiv.org/abs/2112.10752" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2112.10752</a></li>
+</ul>
+<p><a href="#/l/mm-ch6-l3">下一课：结果与复盘</a></p>

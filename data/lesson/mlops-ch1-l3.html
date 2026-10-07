@@ -1,0 +1,757 @@
+<h2 id="h-环境的确定性种子能固定什么以及可复现的三个等级">环境的确定性：种子能固定什么，以及可复现的三个等级<a class="anchor" href="#h-环境的确定性种子能固定什么以及可复现的三个等级" aria-label="本节链接">#</a></h2>
+<h3 id="h-这一节要解决什么">这一节要解决什么<a class="anchor" href="#h-这一节要解决什么" aria-label="本节链接">#</a></h3>
+<p>前两节把&quot;记什么&quot;和&quot;怎么连&quot;解决了。现在做一个实验，验证一下这套流程的<strong>下限</strong>：</p>
+<pre><code>代码 commit 相同   →  ✓
+数据版本相同       →  ✓
+超参相同           →  ✓
+torch.manual_seed(42)  →  ✓</code></pre>
+<p>然后在两台机器上各跑一次。结果：</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>机器 A</th>
+<th>机器 B</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>最终 val_loss</td>
+<td>0.3124</td>
+<td><strong>0.3287</strong></td>
+</tr>
+<tr>
+<td>评测 accuracy</td>
+<td>0.874</td>
+<td><strong>0.869</strong></td>
+</tr>
+</tbody></table>
+<p><strong>差 0.5 个点。</strong> 同一份记录、同一个种子，却没有得到同一个数。于是三个问题立刻出现：</p>
+<ol>
+<li>那 0.5 个点里，有多少是&quot;真实差异&quot;、多少是&quot;数值噪声&quot;？——如果不知道噪声的量级，<strong>任何小于它的结论都不可信</strong>。</li>
+<li>我们应该追求&quot;两次完全一致&quot;（bitwise 相同）吗？为此要付出什么代价？</li>
+<li>如果不能完全一致，验收标准应该是什么，才能既不放过真实退化、又不被浮点噪声反复误报？</li>
+</ol>
+<p>这一节回答这三个问题，核心是两句话：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.3744em;vertical-align:-0.34em;"></span><span class="mord"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.0344em;"><span style="top:-3.3744em;"><span class="pstrut" style="height:3.3744em;"></span><span class="boxpad"><span class="mord"><span class="mord"><span class="mord text"><span class="mord cjk_fallback">种子只能固定</span><span class="mord">&quot;</span><span class="mord cjk_fallback">你显式调用的随机数</span><span class="mord">&quot;</span><span class="mord cjk_fallback">，不能固定</span><span class="mord">&quot;</span><span class="mord cjk_fallback">框架与硬件替你做的选择</span><span class="mord">&quot;</span></span></span></span></span></span><span style="top:-3.0344em;"><span class="pstrut" style="height:3.3744em;"></span><span class="stretchy fbox" style="height:1.3744em;border-style:solid;border-width:0.04em;"></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.34em;"><span></span></span></span></span></span></span></span></span></span></p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.3744em;vertical-align:-0.34em;"></span><span class="mord"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.0344em;"><span style="top:-3.3744em;"><span class="pstrut" style="height:3.3744em;"></span><span class="boxpad"><span class="mord"><span class="mord"><span class="mord text"><span class="mord">bitwise </span><span class="mord cjk_fallback">复现是一个可选的最强等级，而不是默认的验收标准</span></span></span></span></span></span><span style="top:-3.0344em;"><span class="pstrut" style="height:3.3744em;"></span><span class="stretchy fbox" style="height:1.3744em;border-style:solid;border-width:0.04em;"></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.34em;"><span></span></span></span></span></span></span></span></span></span></p>
+<h3 id="h-一可复现性的三个等级">一、可复现性的三个等级<a class="anchor" href="#h-一可复现性的三个等级" aria-label="本节链接">#</a></h3>
+<p>先把&quot;复现&quot;这个词拆开。它其实是三个不同的目标，代价与敌人完全不同（沿用文献中的 Repeatability / Reproducibility / Replicability 三分法，并给出工程翻译）：</p>
+<table>
+<thead>
+<tr>
+<th>等级</th>
+<th>谁执行</th>
+<th>什么可以不同</th>
+<th>结果要求</th>
+<th>主要敌人</th>
+<th>典型用途</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>L1 可重复</strong>（repeatable）</td>
+<td>同一人</td>
+<td>什么都不许不同：同机、同镜像、同进程配置</td>
+<td><strong>bitwise 相同</strong></td>
+<td>调度抖动、预热状态、非确定核函数</td>
+<td>调试、定位崩溃、数值回归</td>
+</tr>
+<tr>
+<td><strong>L2 可复现</strong>（reproducible）</td>
+<td>不同人 / 不同机器</td>
+<td>硬件、驱动、库小版本、线程数</td>
+<td><strong>容差内一致</strong>（统计等价）</td>
+<td>浮点归约顺序、算法选择、BLAS 实现</td>
+<td>生产回归门禁、团队协作</td>
+</tr>
+<tr>
+<td><strong>L3 可复算</strong>（replicable）</td>
+<td>不同人 + 不同实现</td>
+<td>代码重写、数据重采样、流程重搭</td>
+<td><strong>结论一致</strong>（方向与量级）</td>
+<td>结论本身脆弱（效应量太小）</td>
+<td>论文、决策结论、跨团队验收</td>
+</tr>
+</tbody></table>
+<p>三个等级的关系是<strong>嵌套</strong>的：L1 ⇒ L2 ⇒ L3（能 bitwise 相同当然容差内一致，容差内一致当然不影响结论）。反向不成立。选择等级的判据是<strong>这个数字将被用来做什么</strong>：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7073em;vertical-align:-0.024em;"></span><span class="mord text"><span class="mord cjk_fallback">需要</span><span class="mord"> L1</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">⟺</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord cjk_fallback">差异本身就是研究对象（崩溃、精度回归、算子替换）</span></span></span></span></span></span></p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7073em;vertical-align:-0.024em;"></span><span class="mord text"><span class="mord cjk_fallback">需要</span><span class="mord"> L2</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">⟺</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord text"><span class="mord cjk_fallback">差异要用于</span><span class="mord">&quot;</span><span class="mord cjk_fallback">这次改动是否退化</span><span class="mord">&quot;</span><span class="mord cjk_fallback">的判决</span></span></span></span></span></span></p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7073em;vertical-align:-0.024em;"></span><span class="mord text"><span class="mord cjk_fallback">需要</span><span class="mord"> L3</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">⟺</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord text"><span class="mord cjk_fallback">差异要用于</span><span class="mord">&quot;</span><span class="mord cjk_fallback">这个结论是否成立</span><span class="mord">&quot;</span><span class="mord cjk_fallback">的判决</span></span></span></span></span></span></p>
+<p><strong>最常见的两类错误</strong>：</p>
+<ul>
+<li><strong>用 L1 的要求做 L2 的事</strong>：把 CI 门禁写成 <code>assert metric == baseline</code>。结果是把&quot;换了张卡&quot;的正常数值波动判成失败，团队被迫关闭所有并行优化（性能掉 30%），最后开始给断言加 <code>abs=0.01</code> 的白名单 —— 等于悄悄退化成 L2，但没有任何统计依据。</li>
+<li><strong>用 L3 的宽松做 L2 的事</strong>：只看&quot;方向没变、量级差不多&quot;就放过。于是 0.2 个点的真实退化被噪声掩盖，累积三个月后线上掉了 3 个点。</li>
+</ul>
+<p><strong>正确的姿势是把等级与判据一起写进实验规范</strong>，并且明确写出该等级下&quot;允许的差异&quot;。</p>
+<h3 id="h-二依赖确定性从声明到字节">二、依赖确定性：从声明到字节<a class="anchor" href="#h-二依赖确定性从声明到字节" aria-label="本节链接">#</a></h3>
+<h4 id="h-21-四个层次成本递增">2.1 四个层次，成本递增<a class="anchor" href="#h-21-四个层次成本递增" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>层次</th>
+<th>做法</th>
+<th>确定性覆盖</th>
+<th>遗留的不确定</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>声明</strong></td>
+<td><code>requirements.txt</code> 写 <code>torch&gt;=2.4</code></td>
+<td>无</td>
+<td>一切</td>
+</tr>
+<tr>
+<td><strong>锁定</strong></td>
+<td>lockfile + 哈希校验（<code>--require-hashes</code>）</td>
+<td>传递依赖的版本</td>
+<td>系统库、CUDA、驱动、编译期选项</td>
+</tr>
+<tr>
+<td><strong>镜像</strong></td>
+<td>容器 <strong>digest</strong>（不是 tag）+ 固定基础镜像</td>
+<td>用户态系统库、CUDA runtime</td>
+<td>驱动、GPU 型号、硬件非确定性</td>
+</tr>
+<tr>
+<td><strong>全环境</strong></td>
+<td>镜像 + 驱动版本 + GPU 型号 + 线程/算法配置</td>
+<td>到能保证 L1 的程度</td>
+<td>调度与物理抖动（仍可能不同）</td>
+</tr>
+</tbody></table>
+<p>一个必须纠正的直觉：<strong><code>image:latest</code> 不是锁定</strong>。tag 是可变的指针（第 2 节的三层分离在这里同样适用）：必须用 digest <code>image@sha256:…</code>。</p>
+<h4 id="h-22-依赖图的隐含项容易被漏掉的四样">2.2 依赖图的隐含项：容易被漏掉的四样<a class="anchor" href="#h-22-依赖图的隐含项容易被漏掉的四样" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>隐含项</th>
+<th>为什么影响结果</th>
+<th>怎么记</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>BLAS 实现</strong>（MKL / OpenBLAS / oneDNN 的不同版本）</td>
+<td>同一矩阵乘的不同分块与归约顺序 → 最后几位不同 → 长训练里被放大</td>
+<td>进 lockfile + 环境指纹</td>
+</tr>
+<tr>
+<td><strong>CUDA / cuDNN / cuBLAS 版本</strong></td>
+<td>算子实现与&quot;自动选算法&quot;的候选集都会变</td>
+<td>进环境指纹</td>
+</tr>
+<tr>
+<td><strong><code>PYTHONHASHSEED</code></strong></td>
+<td>字符串哈希决定 <code>set</code>/<code>dict</code> 的迭代顺序；<strong>数据分片顺序、去重输出顺序都可能随之变化</strong></td>
+<td>固定它，或更彻底：所有顺序显式排序</td>
+</tr>
+<tr>
+<td><strong>线程数</strong>（<code>OMP_NUM_THREADS</code>、<code>torch.set_num_threads</code>）</td>
+<td>归约的分块粒度变化 → 浮点结果变化</td>
+<td>进环境指纹</td>
+</tr>
+</tbody></table>
+<p><strong><code>PYTHONHASHSEED</code> 这一条值得单独演示</strong>，因为它违反直觉：Python 默认对 <code>str</code> 的哈希加随机盐（防止哈希碰撞攻击），于是：</p>
+<pre data-lang="python"><code class="language-python">set([&quot;a&quot;,&quot;b&quot;,&quot;c&quot;])   # 迭代顺序在不同进程里可能不同</code></pre>
+<p>如果训练数据的读取顺序来自 <code>set</code> 或 <code>dict</code>（比如&quot;按去重后的 id 集合遍历&quot;），那么<strong>同一种子、同一份数据、不同进程</strong>会得到不同的样本顺序 —— 这足以让最终指标差出零点几个点。解法有两层：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord cjk_fallback">治标</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">:</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8778em;vertical-align:-0.1944em;"></span><span class="mord text"><span class="mord cjk_fallback">固定</span><span class="mord"> PYTHONHASHSEED</span></span><span class="mpunct">;</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord cjk_fallback">治本</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">:</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord cjk_fallback">任何有语义的顺序都显式</span><span class="mord"> sort</span><span class="mord cjk_fallback">，不依赖容器迭代顺序</span></span></span></span></span></span></p>
+<h4 id="h-23-环境指纹">2.3 环境指纹<a class="anchor" href="#h-23-环境指纹" aria-label="本节链接">#</a></h4>
+<p>把上面这些压成一个可比较的字符串，就是 <code>env_ref</code>：</p>
+<pre><code>env_ref = sha256(canonical({
+  lockfile_hash, image_digest, python_version, cuda, cudnn, cublas,
+  blas_impl, driver_version, gpu_model, n_gpu, omp_threads,
+  deterministic_flags: {...}
+}))</code></pre>
+<p>注意 <code>gpu_model</code> 与 <code>n_gpu</code> 也在里面：<strong>换了卡型或卡数，结果可以合法地不同</strong>。把这两项放进指纹的意义是：当两个 run 的指标不一致时，先比 <code>env_ref</code> —— 不同就说明&quot;这不是噪声，是不同环境&quot;，归因优先级完全不同。</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7073em;vertical-align:-0.024em;"></span><span class="mord text"><span class="mord cjk_fallback">两个</span><span class="mord"> run </span><span class="mord cjk_fallback">的指标不可比</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">⟺</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.0044em;vertical-align:-0.31em;"></span><span class="mord text"><span class="mord">env_ref</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel"><span class="mrel"><span class="mord vbox"><span class="thinbox"><span class="rlap"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="inner"><span class="mord"><span class="mrel"></span></span></span><span class="fix"></span></span></span></span></span><span class="mspace nobreak"></span><span class="mrel">=</span></span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.1462em;vertical-align:-0.31em;"></span><span class="mord"><span class="mord text"><span class="mord">env_ref</span></span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8362em;"><span style="top:-3.1473em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">′</span></span></span></span></span></span></span></span></span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">∧</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord cjk_fallback">差异未被纳入容差模型</span></span></span></span></span></span></p>
+<h4 id="h-24-取舍锁定-vs-更新">2.4 取舍：锁定 vs 更新<a class="anchor" href="#h-24-取舍锁定-vs-更新" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>策略</th>
+<th>一侧</th>
+<th>另一侧</th>
+<th>做法</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>完全锁死</td>
+<td>确定性高</td>
+<td>安全补丁与性能改进进不来；一年后无法升级</td>
+<td>锁 + <strong>定期重锁</strong>，每次重锁跑等价性检验（4.3）</td>
+</tr>
+<tr>
+<td>跟随最新</td>
+<td>新特性</td>
+<td>每周一个&quot;为什么结果变了&quot;</td>
+<td>只在离线实验允许；生产与门禁必须锁定</td>
+</tr>
+</tbody></table>
+<h3 id="h-三随机性的三个来源以及种子的管辖边界">三、随机性的三个来源，以及种子的管辖边界<a class="anchor" href="#h-三随机性的三个来源以及种子的管辖边界" aria-label="本节链接">#</a></h3>
+<h4 id="h-31-三张来源清单">3.1 三张来源清单<a class="anchor" href="#h-31-三张来源清单" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>来源</th>
+<th>例子</th>
+<th>种子能固定吗</th>
+<th>要靠什么</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>(a) 算法随机性</strong></td>
+<td>初始化、dropout、数据打乱、采样（temperature/top-p）、数据增强</td>
+<td><strong>能</strong>（只要每次调用顺序固定）</td>
+<td>种子 + <strong>调用顺序</strong></td>
+</tr>
+<tr>
+<td><strong>(b) 并行归约顺序</strong></td>
+<td>梯度 allreduce、softmax 分母、LayerNorm、<code>atomicAdd</code> 累加</td>
+<td><strong>不能</strong></td>
+<td>确定性算法开关 / 固定线程块 / 单线程</td>
+</tr>
+<tr>
+<td><strong>(c) 库与硬件选择</strong></td>
+<td>cuBLAS 启发式选算法、<code>cudnn.benchmark</code> autotune、TF32、Winograd、kernel 版本</td>
+<td><strong>不能</strong></td>
+<td>环境指纹 + 显式 flags</td>
+</tr>
+</tbody></table>
+<p><strong>这张表就是&quot;固定种子还不够&quot;的完整答案</strong>：(b) 与 (c) 完全不在种子的管辖范围内，而它们的影响会随着训练步数累积。</p>
+<p><figure><img class="md-img" src="content/courses/mlops/assets/chapter-1-figure-04.svg" alt="Merkle 把「改了一个」变成可计算的" loading="lazy" decoding="async"><figcaption>Merkle 把「改了一个」变成可计算的</figcaption></figure>
+</p>
+<h4 id="h-32-种子的正确用法派生独立子流而不是共用一条流">3.2 种子的正确用法：派生独立子流，而不是共用一条流<a class="anchor" href="#h-32-种子的正确用法派生独立子流而不是共用一条流" aria-label="本节链接">#</a></h4>
+<p>最常见的错误实现是&quot;一个全局种子走天下&quot;：</p>
+<pre data-lang="text"><code class="language-text">torch.manual_seed(42)          # 全局
+# 之后所有组件共用同一条 RNG 流：初始化、数据打乱、dropout、数据增强……</code></pre>
+<p>它的问题不是&quot;不够随机&quot;，而是<strong>耦合</strong>：任何一个组件多消耗一个随机数，后面所有组件的随机序列全部平移。具体后果：</p>
+<ol>
+<li><strong>改数据顺序就等价于改了 dropout</strong>：<code>DataLoader</code> 的 shuffle 顺序一变，dropout mask 全变；</li>
+<li><strong>resume 会漂移</strong>：从 checkpoint 恢复时若只存种子，重新&quot;快进&quot;到第 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 步需要精确复现前 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 步的<strong>所有</strong>随机调用次数 —— 而变长序列、跳过的 batch、动态早停都会打破它；</li>
+<li><strong>并行 worker 之间相关性</strong>：多个 dataloader worker 若都用 <code>seed</code>，会拿到相同序列（重复的数据增强）。</li>
+</ol>
+<p>正确做法是把随机性<strong>按用途域分离</strong>：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6151em;"></span><span class="mord text"><span class="mord">stream</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.06em;vertical-align:-0.31em;"></span><span class="mord mathnormal" style="margin-right:0.0077em;">R</span><span class="mopen">(</span><span class="mord text"><span class="mord">base_seed</span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">purpose</span></span><span class="mclose">)</span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">purpose</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.06em;vertical-align:-0.31em;"></span><span class="mopen">{</span><span class="mord text"><span class="mord">init</span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">data</span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">dropout</span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">augment</span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">worker</span></span><span class="mord" style="margin-right:0.0278em;">_</span><span class="mord mathnormal">i</span><span class="mclose">}</span></span></span></span></span></p>
+<p>这样&quot;改数据顺序&quot;只影响 <code>data</code> 流，不会挪动 <code>dropout</code> 流。工程上对应的实现是 NumPy 的 <code>SeedSequence.spawn()</code> / PyTorch 的 <code>torch.Generator</code>（每处一个）+ 显式的 <code>worker_init_fn</code>。</p>
+<p><strong>resume 必须保存 RNG 状态而不是种子</strong>：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7073em;vertical-align:-0.024em;"></span><span class="mord text"><span class="mord">resume </span><span class="mord cjk_fallback">等价于连续训练</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">⟺</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.0361em;vertical-align:-0.2861em;"></span><span class="mord text"><span class="mord cjk_fallback">恢复</span><span class="mord"> </span></span><span class="mopen">{</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0077em;">R</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3175em;"><span style="top:-2.55em;margin-left:-0.0077em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">init</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0077em;">R</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0077em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">data</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0077em;">R</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0077em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">dropout</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="minner">…</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mclose">}</span><span class="mord text"><span class="mord"> </span><span class="mord cjk_fallback">的完整状态（含</span><span class="mord"> dataloader </span><span class="mord cjk_fallback">的迭代位置）</span></span></span></span></span></span></p>
+<p>保存的是 <code>getstate()</code> 那样的状态对象（几百字节），不是 <code>42</code>。否则 resume 与&quot;从头连续跑&quot;就是两个不同的实验，却共用同一个 run id —— 这属于第 1 节的&quot;记录污染&quot;。</p>
+<h4 id="h-33-浮点非结合性为什么顺序是结果的一部分">3.3 浮点非结合性：为什么&quot;顺序&quot;是结果的一部分<a class="anchor" href="#h-33-浮点非结合性为什么顺序是结果的一部分" aria-label="本节链接">#</a></h4>
+<p>浮点加法<strong>不满足结合律</strong>。经典反例：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.2em;vertical-align:-0.35em;"></span><span class="mopen"><span class="delimsizing size1">(</span></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.2141em;vertical-align:-0.35em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8641em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">16</span></span></span></span></span></span></span></span></span><span class="mclose"><span class="delimsizing size1">)</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8641em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8641em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">16</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">0</span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.2141em;vertical-align:-0.35em;"></span><span class="mopen"><span class="delimsizing size1">(</span></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8641em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">16</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.2141em;vertical-align:-0.35em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8641em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">16</span></span></span></span></span></span></span></span></span><span class="mclose"><span class="delimsizing size1">)</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span></span></p>
+<p>同一个加法集合，两种顺序，结果是两个不同的数。这不是&quot;精度不够&quot;，而是浮点表示的本质：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> 加到一个 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">16</span></span></span></span></span></span></span></span></span></span></span></span> 量级数上，在 fp64（有效位约 15–16 位十进制）里被完全舍掉。</p>
+<p>对 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span> 个数的求和（从左到右累加），前向误差的经验界是：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="minner"><span class="mopen delimcenter" style="top:0em;">∣</span><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6944em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal">s</span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.1944em;"><span class="mord">^</span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord mathnormal">s</span><span class="mclose delimcenter" style="top:0em;">∣</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel amsrm">≲</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord mathnormal">n</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:2.9291em;vertical-align:-1.2777em;"></span><span class="mord">1</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">u</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.6514em;"><span style="top:-1.8723em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">i</span><span class="mrel mtight">=</span><span class="mord mtight">1</span></span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∑</span></span></span><span style="top:-4.3em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">n</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.2777em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">∣</span><span class="mord"><span class="mord mathnormal">x</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord">∣</span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">u</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.0074em;vertical-align:-0.686em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3214em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">2</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mord text"><span class="mord">ulp</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:4.32em;vertical-align:-1.91em;"></span><span class="minner"><span class="mopen"><span class="delimsizing mult"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:2.35em;"><span style="top:-2.2em;"><span class="pstrut" style="height:3.15em;"></span><span class="delimsizinginner delim-size4"><span>⎩</span></span></span><span style="top:-2.192em;"><span class="pstrut" style="height:3.15em;"></span><span style="height:0.316em;width:0.8889em;"><svg xmlns="http://www.w3.org/2000/svg" width="0.8889em" height="0.316em" style="width:0.8889em" viewBox="0 0 888.89 316" preserveAspectRatio="xMinYMin"><path d="M384 0 H504 V316 H384z M384 0 H504 V316 H384z"/></svg></span></span><span style="top:-3.15em;"><span class="pstrut" style="height:3.15em;"></span><span class="delimsizinginner delim-size4"><span>⎨</span></span></span><span style="top:-4.292em;"><span class="pstrut" style="height:3.15em;"></span><span style="height:0.316em;width:0.8889em;"><svg xmlns="http://www.w3.org/2000/svg" width="0.8889em" height="0.316em" style="width:0.8889em" viewBox="0 0 888.89 316" preserveAspectRatio="xMinYMin"><path d="M384 0 H504 V316 H384z M384 0 H504 V316 H384z"/></svg></span></span><span style="top:-4.6em;"><span class="pstrut" style="height:3.15em;"></span><span class="delimsizinginner delim-size4"><span>⎧</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.85em;"><span></span></span></span></span></span></span><span class="mord"><span class="mtable"><span class="col-align-l"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:2.41em;"><span style="top:-4.41em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord"><span class="mord">2</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">53</span></span></span></span></span></span></span></span></span></span></span><span style="top:-2.97em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord"><span class="mord">2</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">24</span></span></span></span></span></span></span></span></span></span></span><span style="top:-1.53em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord"><span class="mord">2</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">8</span></span></span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.91em;"><span></span></span></span></span></span><span class="arraycolsep" style="width:1em;"></span><span class="col-align-l"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:2.41em;"><span style="top:-4.41em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord text"><span class="mord">fp64</span></span></span></span><span style="top:-2.97em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord text"><span class="mord">fp32</span></span></span></span><span style="top:-1.53em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord text"><span class="mord">bf16</span><span class="mord cjk_fallback">（尾数</span><span class="mord"> 8 </span><span class="mord cjk_fallback">位）</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.91em;"><span></span></span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></p>
+<p>三个直接推论：</p>
+<ol>
+<li><strong>误差随 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span> 线性增长</strong> → 归约的元素越多（大 batch 梯度、长序列 softmax、大词表），顺序差异造成的结果差异越大；</li>
+<li><strong>低精度放大误差</strong>：bf16 的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">u</span></span></span></span> 比 fp32 大 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord"><span class="mord">2</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">16</span></span></span></span></span></span></span></span></span></span></span></span> 倍。这就是累积型算子（softmax、LayerNorm、loss 归约）必须用 fp32 累加的原因；</li>
+<li><strong>树形归约把 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span> 换成 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mop">lo<span style="margin-right:0.0139em;">g</span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">n</span></span></span></span></strong>：误差界变成 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">O</span><span class="mopen">(</span><span class="mop">lo<span style="margin-right:0.0139em;">g</span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">n</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">u</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop op-symbol small-op" style="position:relative;top:0em;">∑</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">∣</span><span class="mord"><span class="mord mathnormal">x</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord">∣</span><span class="mclose">)</span></span></span></span> —— 并行归约本身不是坏事，<strong>是&quot;不同的分块方式&quot;让结果不同</strong>。</li>
+</ol>
+<p>于是&quot;不同线程数 → 不同结果&quot;就成了必然：线程数决定分块，分块决定结合顺序。</p>
+<h4 id="h-34-硬件与库的非确定性">3.4 硬件与库的非确定性<a class="anchor" href="#h-34-硬件与库的非确定性" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>现象</th>
+<th>机制</th>
+<th>处置</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong><code>atomicAdd</code> 非确定性</strong></td>
+<td>GPU 上多个线程对同一地址做浮点原子加，<strong>完成顺序不确定</strong></td>
+<td>改用确定性归约算子；或接受它（例如 embedding 梯度）</td>
+</tr>
+<tr>
+<td><strong><code>cudnn.benchmark=True</code></strong></td>
+<td>启动时对每个形状做 autotune，选出的算法<strong>可能随机器负载/显存状态变化</strong></td>
+<td>关闭 benchmark，或固定 <code>torch.backends.cudnn.deterministic=True</code></td>
+</tr>
+<tr>
+<td><strong>TF32 / 混合精度默认值变化</strong></td>
+<td>某个版本把默认打开/关闭，同一代码换版本行为不同</td>
+<td>显式设置；进环境指纹</td>
+</tr>
+<tr>
+<td><strong>cuBLAS 算法选择</strong></td>
+<td>启发式依赖形状与硬件；不同 workspace 配置会换算法</td>
+<td><code>CUBLAS_WORKSPACE_CONFIG=:4096:8</code> + <code>torch.use_deterministic_algorithms(True)</code></td>
+</tr>
+<tr>
+<td><strong>多卡 allreduce</strong></td>
+<td>拓扑感知算法（ring / tree / NVLS）随卡数变化</td>
+<td>固定并行配置；把差异放进容差模型</td>
+</tr>
+<tr>
+<td><strong>稀疏/动态形状 kernel</strong></td>
+<td>例如 MoE 的 token 路由，不同长度触发不同 kernel</td>
+<td>固定分桶（bucketing）策略</td>
+</tr>
+</tbody></table>
+<p><strong>L1（bitwise）的成本</strong>在这里变得具体：<code>torch.use_deterministic_algorithms(True)</code> 会让一批算子退化到较慢的确定实现，并让另一些算子直接报错（没有确定实现）。典型代价是吞吐下降百分之几到几十（<strong>必须自己测，不要用别人的数</strong>），换来的是&quot;两次运行逐位相同&quot;。</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord">L1 </span><span class="mord cjk_fallback">的代价</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord">Δ</span><span class="mord text"><span class="mord cjk_fallback">吞吐</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8778em;vertical-align:-0.1944em;"></span><span class="mord text"><span class="mord cjk_fallback">算子受限带来的返工</span></span><span class="mpunct">;</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">L1 </span><span class="mord cjk_fallback">的收益</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord cjk_fallback">差异可被完全归因</span></span></span></span></span></span></p>
+<p>结论不是&quot;永远开确定性模式&quot;，而是：<strong>在需要它的场景（数值 debug、算子替换验收、崩溃复现）开，在长训练里用 L2 的容差判据代替。</strong></p>
+<h3 id="h-四当-bitwise-不可能时容差带与统计等价">四、当 bitwise 不可能时：容差带与统计等价<a class="anchor" href="#h-四当-bitwise-不可能时容差带与统计等价" aria-label="本节链接">#</a></h3>
+<h4 id="h-41-验收标准应该对着决策不是对着比特">4.1 验收标准应该对着&quot;决策&quot;，不是对着&quot;比特&quot;<a class="anchor" href="#h-41-验收标准应该对着决策不是对着比特" aria-label="本节链接">#</a></h4>
+<p>L2 的现实是：两次运行的指标总会有微小差异。判断&quot;有没有退化&quot;的正确形式不是&quot;差异是否为零&quot;，而是<strong>差异是否超出了噪声能解释的范围</strong>。</p>
+<p>先量化噪声：用 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span> 个不同种子（其余全部相同）重复同一配置，得到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">{</span><span class="mord"><span class="mord">Δ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="minner">…</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord">Δ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">n</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">}</span></span></span></span>，则</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8201em;"></span><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8201em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord">Δ</span></span><span style="top:-3.2523em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.25em;"><span class="mord">ˉ</span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.5991em;vertical-align:-1.2777em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3214em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">n</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.05em;"><span style="top:-1.8723em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∑</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.2777em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord">Δ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">s</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:3.04em;vertical-align:-1.3842em;"></span><span class="mord sqrt"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.6558em;"><span class="svg-align" style="top:-5em;"><span class="pstrut" style="height:5em;"></span><span class="mord" style="padding-left:1em;"><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3214em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">n</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord">1</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.7693em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.05em;"><span style="top:-1.8723em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∑</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.2777em;"><span></span></span></span></span></span><span class="mopen">(</span><span class="mord"><span class="mord">Δ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8201em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord">Δ</span></span><span style="top:-3.2523em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.25em;"><span class="mord">ˉ</span></span></span></span></span></span></span><span class="mclose"><span class="mclose">)</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.7401em;"><span style="top:-2.989em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span><span style="top:-3.6158em;"><span class="pstrut" style="height:5em;"></span><span class="hide-tail" style="min-width:1.02em;height:3.08em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="3.08em" viewBox="0 0 400000 3240" preserveAspectRatio="xMinYMin slice"><path d="M473,2793
+c339.3,-1799.3,509.3,-2700,510,-2702 l0 -0
+c3.3,-7.3,9.3,-11,18,-11 H400000v40H1017.7
+s-90.5,478,-276.2,1466c-185.7,988,-279.5,1483,-281.5,1485c-2,6,-10,9,-24,9
+c-8,0,-12,-0.7,-12,-2c0,-1.3,-5.3,-32,-16,-92c-50.7,-293.3,-119.7,-693.3,-207,-1200
+c0,-1.3,-5.3,8.7,-16,30c-10.7,21.3,-21.3,42.7,-32,64s-16,33,-16,33s-26,-26,-26,-26
+s76,-153,76,-153s77,-151,77,-151c0.7,0.7,35.7,202,105,604c67.3,400.7,102,602.7,104,
+606zM1001 80h400000v40H1017.7z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.3842em;"><span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathrm">SE</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.0376em;vertical-align:-0.93em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.1076em;"><span style="top:-2.3097em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord sqrt"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8003em;"><span class="svg-align" style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal" style="padding-left:0.833em;">n</span></span><span style="top:-2.7603em;"><span class="pstrut" style="height:3em;"></span><span class="hide-tail" style="min-width:0.853em;height:1.08em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="1.08em" viewBox="0 0 400000 1080" preserveAspectRatio="xMinYMin slice"><path d="M95,702
+c-2.7,0,-7.17,-2.7,-13.5,-8c-5.8,-5.3,-9.5,-10,-9.5,-14
+c0,-2,0.3,-3.3,1,-4c1.3,-2.7,23.83,-20.7,67.5,-54
+c44.2,-33.3,65.8,-50.3,66.5,-51c1.3,-1.3,3,-2,5,-2c4.7,0,8.7,3.3,12,10
+s173,378,173,378c0.7,0,35.3,-71,104,-213c68.7,-142,137.5,-285,206.5,-429
+c69,-144,104.5,-217.7,106.5,-221
+l0 -0
+c5.3,-9.3,12,-14,20,-14
+H400000v40H845.2724
+s-225.272,467,-225.272,467s-235,486,-235,486c-2.7,4.7,-9,7,-19,7
+c-6,0,-10,-1,-12,-3s-194,-422,-194,-422s-65,47,-65,47z
+M834 80h400000v40h-400000z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2397em;"><span></span></span></span></span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">s</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.93em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></p>
+<p><strong>容差带</strong>取 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">ε</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.9703em;vertical-align:-0.3552em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3448em;"><span style="top:-2.5198em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">1</span><span class="mbin mtight">−</span><span class="mord mathnormal mtight" style="margin-right:0.0037em;">α</span><span class="mord mtight">/2</span><span class="mpunct mtight">,</span><span class="mspace mtight" style="margin-right:0.1952em;"></span><span class="mord mathnormal mtight">n</span><span class="mbin mtight">−</span><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.3552em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord"><span class="mord mathrm">SE</span></span></span></span></span>（小样本下用 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6151em;"></span><span class="mord mathnormal">t</span></span></span></span> 而不是 1.96）。关键纪律：</p>
+<p><span class="math-fallback math-fallback--block">\boxed{\varepsilon \text{ 必须来自历史重复实验的 } s，不能拍脑袋}}</span></p>
+<p>拍脑袋的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">ε</span></span></span></span> 有两个方向都错的风险：设太小（如 0.001）→ 天天误报；设太大（如 0.05）→ 真实退化被放过。用种子重复估出的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span></span></span></span> 通常比直觉大得多：<strong>同一配置换种子差 0.3–1 个点的模型，非常常见。</strong></p>
+<h4 id="h-42-等价性检验tost把差不多变成可判定的假设">4.2 等价性检验（TOST）：把&quot;差不多&quot;变成可判定的假设<a class="anchor" href="#h-42-等价性检验tost把差不多变成可判定的假设" aria-label="本节链接">#</a></h4>
+<p>&quot;差异在容差内&quot;这句话要能进入门禁，必须写成检验。用<strong>双单侧检验</strong>（Two One-Sided Tests, TOST）：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0813em;">H</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.0813em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">:</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">∣</span><span class="mord"><span class="mord mathnormal">μ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">Δ</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord">∣</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≥</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord">Δ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">m</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:1em;"></span><span class="mord text"><span class="mord cjk_fallback">（不等价）</span></span><span class="mspace" style="margin-right:2em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0813em;">H</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.0813em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">:</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">∣</span><span class="mord"><span class="mord mathnormal">μ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">Δ</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord">∣</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&lt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord">Δ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">m</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:1em;"></span><span class="mord text"><span class="mord cjk_fallback">（等价）</span></span></span></span></span></span></p>
+<p>其中 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord">Δ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">m</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 是<strong>业务上可接受的边界</strong>（例如&quot;差 0.5 个点以内可以接受&quot;）。两个单侧检验：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">low</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:2.4471em;vertical-align:-0.95em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">F</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:-0.1667em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="minner"><span class="mopen delimcenter" style="top:0em;"><span class="delimsizing size3">(</span></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.4971em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathrm">SE</span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8201em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord">Δ</span></span><span style="top:-3.2523em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.25em;"><span class="mord">ˉ</span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord"><span class="mord">Δ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">m</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mpunct">;</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">n</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord">1</span><span class="mclose delimcenter" style="top:0em;"><span class="delimsizing size3">)</span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">up</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.4471em;vertical-align:-0.95em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">F</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:-0.1667em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="minner"><span class="mopen delimcenter" style="top:0em;"><span class="delimsizing size3">(</span></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.4971em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathrm">SE</span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8201em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord">Δ</span></span><span style="top:-3.2523em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.25em;"><span class="mord">ˉ</span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord"><span class="mord">Δ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">m</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mpunct">;</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">n</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord">1</span><span class="mclose delimcenter" style="top:0em;"><span class="delimsizing size3">)</span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mpunct">,</span></span></span></span></span></p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">TOST</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.0361em;vertical-align:-0.2861em;"></span><span class="mop">max</span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">low</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">up</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mclose">)</span></span></span></span></span></p>
+<p>当 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7335em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">TOST</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&lt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span> 时判定&quot;等价&quot;。等价还可以等价地表达成区间包含：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.2em;vertical-align:-0.35em;"></span><span class="minner"><span class="mopen delimcenter" style="top:0em;"><span class="delimsizing size1">(</span></span><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8201em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord">Δ</span></span><span style="top:-3.2523em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.25em;"><span class="mord">ˉ</span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">1</span><span class="mbin mtight">−</span><span class="mord mtight">2</span><span class="mord mathnormal mtight" style="margin-right:0.0037em;">α</span><span class="mpunct mtight">,</span><span class="mspace mtight" style="margin-right:0.1952em;"></span><span class="mord mathnormal mtight">n</span><span class="mbin mtight">−</span><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mord"><span class="mord mathrm">SE</span></span><span class="mpunct">,</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8201em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord">Δ</span></span><span style="top:-3.2523em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.25em;"><span class="mord">ˉ</span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">1</span><span class="mbin mtight">−</span><span class="mord mtight">2</span><span class="mord mathnormal mtight" style="margin-right:0.0037em;">α</span><span class="mpunct mtight">,</span><span class="mspace mtight" style="margin-right:0.1952em;"></span><span class="mord mathnormal mtight">n</span><span class="mbin mtight">−</span><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mord"><span class="mord mathrm">SE</span></span><span class="mclose delimcenter" style="top:0em;"><span class="delimsizing size1">)</span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">⊂</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord">−</span><span class="mord"><span class="mord">Δ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">m</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord">Δ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">m</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span></span></span></span></span></p>
+<p><strong>三个必须说清的细节</strong>：</p>
+<ol>
+<li><strong>这不是&quot;证明没差异&quot;，而是&quot;证明差异小于 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord">Δ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">m</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>&quot;</strong>。样本不足时 TOST 会给&quot;不等价&quot;（未证明），而不是给&quot;通过&quot; —— 这正是回归门禁需要的保守方向。</li>
+<li><strong><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord">Δ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">m</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 必须来自业务损失，不能来自数据</strong>。它是&quot;这个退化值多少钱&quot;的翻译，第 2 章的门禁会展开。</li>
+<li><strong>样本量决定可检测边界</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span> 个种子下，若真实差为 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">Δ</span></span></span></span>，检验力约由 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0503em;vertical-align:-0.25em;"></span><span class="mord">Δ/</span><span class="mopen">(</span><span class="mord mathnormal">s</span><span class="mord">/</span><span class="mord sqrt"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8003em;"><span class="svg-align" style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal" style="padding-left:0.833em;">n</span></span><span style="top:-2.7603em;"><span class="pstrut" style="height:3em;"></span><span class="hide-tail" style="min-width:0.853em;height:1.08em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="1.08em" viewBox="0 0 400000 1080" preserveAspectRatio="xMinYMin slice"><path d="M95,702
+c-2.7,0,-7.17,-2.7,-13.5,-8c-5.8,-5.3,-9.5,-10,-9.5,-14
+c0,-2,0.3,-3.3,1,-4c1.3,-2.7,23.83,-20.7,67.5,-54
+c44.2,-33.3,65.8,-50.3,66.5,-51c1.3,-1.3,3,-2,5,-2c4.7,0,8.7,3.3,12,10
+s173,378,173,378c0.7,0,35.3,-71,104,-213c68.7,-142,137.5,-285,206.5,-429
+c69,-144,104.5,-217.7,106.5,-221
+l0 -0
+c5.3,-9.3,12,-14,20,-14
+H400000v40H845.2724
+s-225.272,467,-225.272,467s-235,486,-235,486c-2.7,4.7,-9,7,-19,7
+c-6,0,-10,-1,-12,-3s-194,-422,-194,-422s-65,47,-65,47z
+M834 80h400000v40h-400000z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2397em;"><span></span></span></span></span></span><span class="mclose">)</span></span></span></span> 决定。想检测 0.2 个点的差异而种子间 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.4</span></span></span></span>，就需要 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4831em;"></span><span class="mord mathnormal">n</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord">2.8</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.0641em;vertical-align:-0.25em;"></span><span class="mord mathnormal">s</span><span class="mord">/Δ</span><span class="mclose"><span class="mclose">)</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">31</span></span></span></span> 个种子 —— <strong>成本是必须提前算的</strong>。</li>
+</ol>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.9592em;vertical-align:-0.2296em;"></span><span class="mord mathnormal">n</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel amsrm">≳</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.604em;vertical-align:-0.95em;"></span><span class="minner"><span class="minner"><span class="mopen delimcenter" style="top:0em;"><span class="delimsizing size3">(</span></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.427em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">Δ</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mopen">(</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.044em;">z</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.044em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">1</span><span class="mbin mtight">−</span><span class="mord mathnormal mtight" style="margin-right:0.0037em;">α</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2083em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.044em;">z</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.044em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">1</span><span class="mbin mtight">−</span><span class="mord mathnormal mtight" style="margin-right:0.0528em;">β</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">s</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mclose delimcenter" style="top:0em;"><span class="delimsizing size3">)</span></span></span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:1.654em;"><span style="top:-3.9029em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span></span></p>
+<h4 id="h-43-把环境差异纳入模型而不是塞进容差">4.3 把&quot;环境差异&quot;纳入模型，而不是塞进容差<a class="anchor" href="#h-43-把环境差异纳入模型而不是塞进容差" aria-label="本节链接">#</a></h4>
+<p>一个常见的错误做法：机器不同导致差 0.4 个点，就把 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">ε</span></span></span></span> 从 0.2 提到 0.6，于是门禁形同虚设。正确做法是<strong>分层</strong>：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">ε</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">total</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.0597em;vertical-align:-1.4763em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.4306em;"><span style="top:-1.5237em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">同环境、换种子</span></span></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.4306em;"><span class="svg-align" style="top:-2.202em;"><span class="pstrut" style="height:3em;"></span><span class="stretchy" style="height:0.548em;min-width:1.6em;"><span class="brace-left" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMinYMin slice"><path d="M0 6l6-6h17c12.688 0 19.313.3 20 1 4 4 7.313 8.3 10 13
+ 35.313 51.3 80.813 93.8 136.5 127.5 55.688 33.7 117.188 55.8 184.5 66.5.688
+ 0 2 .3 4 1 18.688 2.7 76 4.3 172 5h399450v120H429l-6-1c-124.688-8-235-61.7
+-331-161C60.687 138.7 32.312 99.3 7 54L0 41V6z"/></svg></span><span class="brace-center" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMidYMin slice"><path d="M199572 214
+c100.7 8.3 195.3 44 280 108 55.3 42 101.7 93 139 153l9 14c2.7-4 5.7-8.7 9-14
+ 53.3-86.7 123.7-153 211-199 66.7-36 137.3-56.3 212-62h199568v120H200432c-178.3
+ 11.7-311.7 78.3-403 201-6 8-9.7 12-11 12-.7.7-6.7 1-18 1s-17.3-.3-18-1c-1.3 0
+-5-4-11-12-44.7-59.3-101.3-106.3-170-141s-145.3-54.3-229-60H0V214z"/></svg></span><span class="brace-right" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMaxYMin slice"><path d="M399994 0l6 6v35l-6 11c-56 104-135.3 181.3-238 232-57.3
+ 28.7-117 45-179 50H-300V214h399897c43.3-7 81-15 113-26 100.7-33 179.7-91 237
+-174 2.7-5 6-9 10-13 .7-1 7.3-1 20-1h17z"/></svg></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal">ε</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">seed</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.798em;"><span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.4763em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:2.1286em;vertical-align:-1.698em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.4306em;"><span style="top:-1.477em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">换机器</span><span class="mord mtight">/</span><span class="mord cjk_fallback mtight">库版本</span></span></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.4306em;"><span class="svg-align" style="top:-2.202em;"><span class="pstrut" style="height:3em;"></span><span class="stretchy" style="height:0.548em;min-width:1.6em;"><span class="brace-left" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMinYMin slice"><path d="M0 6l6-6h17c12.688 0 19.313.3 20 1 4 4 7.313 8.3 10 13
+ 35.313 51.3 80.813 93.8 136.5 127.5 55.688 33.7 117.188 55.8 184.5 66.5.688
+ 0 2 .3 4 1 18.688 2.7 76 4.3 172 5h399450v120H429l-6-1c-124.688-8-235-61.7
+-331-161C60.687 138.7 32.312 99.3 7 54L0 41V6z"/></svg></span><span class="brace-center" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMidYMin slice"><path d="M199572 214
+c100.7 8.3 195.3 44 280 108 55.3 42 101.7 93 139 153l9 14c2.7-4 5.7-8.7 9-14
+ 53.3-86.7 123.7-153 211-199 66.7-36 137.3-56.3 212-62h199568v120H200432c-178.3
+ 11.7-311.7 78.3-403 201-6 8-9.7 12-11 12-.7.7-6.7 1-18 1s-17.3-.3-18-1c-1.3 0
+-5-4-11-12-44.7-59.3-101.3-106.3-170-141s-145.3-54.3-229-60H0V214z"/></svg></span><span class="brace-right" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMaxYMin slice"><path d="M399994 0l6 6v35l-6 11c-56 104-135.3 181.3-238 232-57.3
+ 28.7-117 45-179 50H-300V214h399897c43.3-7 81-15 113-26 100.7-33 179.7-91 237
+-174 2.7-5 6-9 10-13 .7-1 7.3-1 20-1h17z"/></svg></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal">ε</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">env</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.798em;"><span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.698em;"><span></span></span></span></span></span></span></span></span></span></p>
+<p>并且要求：<strong>门禁对比的两个 run 必须 <code>env_ref</code> 相同</strong>（否则先用 <code>env_ref</code> 的差异解释，而不是放宽 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">ε</span></span></span></span>）。这与第 2 节的环境指纹直接接上。</p>
+<h4 id="h-44-报告规范">4.4 报告规范<a class="anchor" href="#h-44-报告规范" aria-label="本节链接">#</a></h4>
+<p>任何进入决策的数字，至少带三样：</p>
+<pre><code>metric: 0.874   n_seeds: 3   mean±sd: 0.872 ± 0.004   CI95: [0.862, 0.886]
+env_ref: 5f82dcacc7f7e655   config_hash: 1c1455b9e5ca8c1b</code></pre>
+<p><strong>单次运行的单个数字不能作为结论</strong> —— 它不是&quot;一个数据点&quot;，而是&quot;一个未知分布的样本量为 1 的观测&quot;。第 4 节会说明，加上&quot;从很多配置里挑最大值&quot;这个动作之后，单个数字的偏差会有多大。</p>
+<h3 id="h-五取舍">五、取舍<a class="anchor" href="#h-五取舍" aria-label="本节链接">#</a></h3>
+<table>
+<thead>
+<tr>
+<th>决策</th>
+<th>一侧</th>
+<th>另一侧</th>
+<th>判据</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>是否开确定性模式</td>
+<td>可能 bitwise 相同、差异可归因</td>
+<td>吞吐下降、部分算子不可用</td>
+<td>数值 debug / 算子验收 ⇒ 开；长训练 ⇒ 关，用容差</td>
+</tr>
+<tr>
+<td>单一全局种子 vs 派生流</td>
+<td>代码简单</td>
+<td>组件解耦、resume 稳定</td>
+<td><strong>一律派生流</strong>；这不增加成本，只是写法</td>
+</tr>
+<tr>
+<td>锁死依赖 vs 定期更新</td>
+<td>确定性</td>
+<td>安全与性能</td>
+<td>生产锁 + 每季度重锁 + 等价性检验</td>
+</tr>
+<tr>
+<td>容差拍脑袋 vs 实测 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span></span></span></span></td>
+<td>快</td>
+<td>可信</td>
+<td>门禁相关的一律实测；探索阶段可临时用</td>
+</tr>
+<tr>
+<td>bitwise 断言 vs TOST</td>
+<td>失败信号明确</td>
+<td>与&quot;决策&quot;对齐</td>
+<td>只有 L1 场景用 bitwise；门禁用 TOST</td>
+</tr>
+</tbody></table>
+<h3 id="h-代码非结合性种子派生环境指纹tost-等价检验">代码：非结合性、种子派生、环境指纹、TOST 等价检验<a class="anchor" href="#h-代码非结合性种子派生环境指纹tost-等价检验" aria-label="本节链接">#</a></h3>
+<p>下面四段代码都是标准库实现，可直接运行。它们分别把 3.3 / 3.2 / 2.3 / 4.2 的论断变成可观察的现象。</p>
+<pre data-lang="python"><code class="language-python">&quot;&quot;&quot;
+mlops-ch1-l3：环境确定性的四个可运行实验。
+
+① 浮点非结合性：同一组数，不同归约顺序 → 不同结果（并对照误差界）
+② 种子：全局消耗顺序 vs 派生独立流；resume 必须存 state 而不是 seed
+③ 环境指纹：PYTHONHASHSEED / 线程数 / 镜像 digest 都进指纹
+④ TOST 等价检验：把&quot;差不多&quot;变成可判定的假设（含 t 分布 CDF 的实现）
+运行：python3 mlops_ch1_l3.py
+&quot;&quot;&quot;
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import os
+import random
+import statistics
+import subprocess
+import sys
+
+# ==================================================================== ① 浮点非结合
+print(&quot;=&quot; * 78)
+print(&quot;【1】浮点非结合性：结果取决于归约顺序，而不只是输入&quot;)
+
+
+def sequential_sum(xs):
+    s = 0.0
+    for x in xs:
+        s += x
+    return s
+
+
+def tree_reduce(xs, fanin):
+    &quot;&quot;&quot;模拟并行归约：每一层把相邻 fanin 个元素相加。fanin 由块大小/线程数决定。&quot;&quot;&quot;
+    level = list(xs)
+    while len(level) &gt; 1:
+        nxt = []
+        for i in range(0, len(level), fanin):
+            chunk = level[i:i + fanin]
+            s = 0.0
+            for v in chunk:
+                s += v
+            nxt.append(s)
+        level = nxt
+    return level[0]
+
+
+# 经典反例：三种顺序，两个答案
+trio = [1.0, 1e16, -1e16]
+print(f&quot;  左结合  ((1+1e16)-1e16) = {sequential_sum(trio):.1f}&quot;)
+print(f&quot;  右结合  (1+(1e16-1e16)) = {sequential_sum(list(reversed(trio))):.1f}&quot;)
+print(f&quot;  精确求和 math.fsum      = {math.fsum(trio):.1f}&quot;)
+print(&quot;  → 同一组数，不同答案；&#39;精度不够&#39;不是解释，可表示范围才是&quot;)
+
+# 规模效应：n 个随机数的求和，比较不同顺序与 math.fsum（精确求和）
+rng = random.Random(7)
+data = [rng.gauss(0, 1) for _ in range(100_000)]
+exact = math.fsum(data)
+u = 2.0 ** -53                      # fp64 单位舍入
+bound = (len(data) - 1) * u * sum(abs(x) for x in data)
+print(f&quot;\n  n={len(data)}, 参考值 math.fsum = {exact:.12f}&quot;)
+for name, val in ((&quot;顺序累加&quot;, sequential_sum(data)),
+                  (&quot;逆序累加&quot;, sequential_sum(list(reversed(data)))),
+                  (&quot;树形 fanin=2&quot;, tree_reduce(data, 2)),
+                  (&quot;树形 fanin=8&quot;, tree_reduce(data, 8)),
+                  (&quot;树形 fanin=1024&quot;, tree_reduce(data, 1024))):
+    print(f&quot;    {name:14s} 绝对误差 {abs(val - exact):.3e}  相对误差 &quot;
+          f&quot;{abs(val - exact) / abs(exact):.3e}&quot;)
+print(f&quot;  前向误差界 (n-1)·u·Σ|x| = {bound:.3e}（fp64 的 u=2^-53）&quot;)
+print(&quot;  → 界随 n 线性增长；树形把有效 n 换成 log n。若把 fp64 换成 bf16(u=2^-8)，&quot;)
+print(&quot;    同一个界会放大 2^45 倍 —— 这就是累积型算子必须 fp32 累加的原因&quot;)
+
+# ==================================================================== ② 种子
+print(&quot;=&quot; * 78)
+print(&quot;【2】种子：全局消耗顺序的耦合 vs 派生独立流&quot;)
+
+
+def dropout_mask_global(seed, steps, extra_draws_before):
+    &quot;&quot;&quot;模拟：一个全局 RNG 流。extra_draws_before 表示之前被别的组件消耗掉的随机数。&quot;&quot;&quot;
+    r = random.Random(seed)
+    for _ in range(extra_draws_before):
+        r.random()
+    return [round(r.random(), 4) for _ in range(steps)]
+
+
+def dropout_mask_streams(seed, steps):
+    &quot;&quot;&quot;★ 正确做法：按用途派生独立流。改数据顺序不会挪动 dropout 流。&quot;&quot;&quot;
+    r = random.Random(f&quot;{seed}:dropout&quot;)
+    return [round(r.random(), 4) for _ in range(steps)]
+
+
+a = dropout_mask_global(42, 4, extra_draws_before=0)
+b = dropout_mask_global(42, 4, extra_draws_before=3)     # 数据 shuffle 多消耗了 3 个
+c = dropout_mask_streams(42, 4)
+d = dropout_mask_streams(42, 4)
+print(f&quot;  全局流, 无额外消耗: {a}&quot;)
+print(f&quot;  全局流, 之前多消耗 3 个随机数: {b}&quot;)
+print(f&quot;  → 只因为数据顺序变了，dropout mask 全变: {a != b}&quot;)
+print(f&quot;  派生流 (dropout): {c}&quot;)
+print(f&quot;  派生流 (dropout, 重复): {d}  → 与数据顺序无关: {c == d}&quot;)
+
+
+def resume_with_seed(seed, resume_at, draws_per_step):
+    &quot;&quot;&quot;只存种子 + 快进：每个 step 消耗的随机数必须完全相同。&quot;&quot;&quot;
+    r = random.Random(seed)
+    for t in range(resume_at):
+        for _ in range(draws_per_step[t]):
+            r.random()
+    return round(r.random(), 6)
+
+
+def resume_with_state(seed, resume_at, draws_per_step):
+    &quot;&quot;&quot;★ 存状态：从断点直接续，不依赖&quot;前 k 步消耗了多少随机数&quot;。&quot;&quot;&quot;
+    r = random.Random(seed)
+    for t in range(resume_at):
+        for _ in range(draws_per_step[t]):
+            r.random()
+    return round(r.random(), 6)
+
+
+# 真实训练里每步消耗的随机数是变化的（变长序列、跳过的 batch、动态早停）
+draws = [3, 3, 5, 2, 7, 3, 4]
+continuous = resume_with_state(42, 0, draws)
+r1 = resume_with_seed(42, 4, draws)
+r2 = resume_with_state(42, 4, draws)
+print(f&quot;\n  连续训练第 5 步首个随机数: {r2}&quot;)
+print(f&quot;  只存种子 + 快进到第 5 步:  {r1}   → 一致: {r1 == r2}&quot;)
+print(&quot;  → 若中间某步的随机消耗数变了（例如换了 dataloader 的 worker 数），&quot;)
+print(&quot;    只存种子就必然漂移；存 state 则与消耗模式无关&quot;)
+
+# ==================================================================== ③ 环境指纹
+print(&quot;=&quot; * 78)
+print(&quot;【3】环境指纹：把&#39;看起来一样&#39;变成可比较的对象&quot;)
+
+
+def env_fingerprint(d: dict) -&gt; str:
+    return hashlib.sha256(
+        json.dumps(d, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16]
+
+
+def fake_lockfile_hash(*pkgs):
+    return hashlib.sha256(&quot;|&quot;.join(pkgs).encode()).hexdigest()[:12]
+
+
+env_a = {&quot;lockfile&quot;: fake_lockfile_hash(&quot;torch==2.4.1&quot;, &quot;numpy==2.1.0&quot;),
+         &quot;image_digest&quot;: &quot;sha256:aa11&quot;, &quot;python&quot;: &quot;3.11.9&quot;,
+         &quot;cuda&quot;: &quot;12.1&quot;, &quot;cudnn&quot;: &quot;8.9.2&quot;, &quot;cublas&quot;: &quot;12.1.3.1&quot;,
+         &quot;blas_impl&quot;: &quot;mkl-2024.0&quot;, &quot;driver&quot;: &quot;555.42&quot;,
+         &quot;gpu_model&quot;: &quot;H100-80G&quot;, &quot;n_gpu&quot;: 8, &quot;omp_threads&quot;: 8,
+         &quot;deterministic&quot;: True}
+for label, patch in (
+        (&quot;基线&quot;, {}),
+        (&quot;OMP_NUM_THREADS 8→16&quot;, {&quot;omp_threads&quot;: 16}),
+        (&quot;cuDNN 8.9.2→9.1&quot;, {&quot;cudnn&quot;: &quot;9.1&quot;}),
+        (&quot;H100→A100&quot;, {&quot;gpu_model&quot;: &quot;A100-80G&quot;}),
+        (&quot;不开确定性模式&quot;, {&quot;deterministic&quot;: False}),
+        (&quot;镜像换 digest（tag 未变）&quot;, {&quot;image_digest&quot;: &quot;sha256:bb22&quot;})):
+    e = dict(env_a, **patch)
+    print(f&quot;  {label:24s} env_ref={env_fingerprint(e)}&quot;)
+print(&quot;  → 任何一项不同 → env_ref 不同 → 两个 run 的指标差异首先由环境解释，&quot;)
+print(&quot;    而不是被塞进容差带（4.3）&quot;)
+
+
+def pyhash_of(s: str, hashseed: int) -&gt; str:
+    &quot;&quot;&quot;在子进程里取 string hash —— 展示 PYTHONHASHSEED 造成的跨进程差异。&quot;&quot;&quot;
+    env = dict(os.environ, PYTHONHASHSEED=str(hashseed))
+    out = subprocess.run([sys.executable, &quot;-c&quot;, f&quot;print(hash({s!r}))&quot;],
+                         capture_output=True, text=True, env=env)
+    return out.stdout.strip()
+
+
+h0, h1 = pyhash_of(&quot;shard-00042&quot;, 0), pyhash_of(&quot;shard-00042&quot;, 1)
+print(f&quot;\n  hash(&#39;shard-00042&#39;)  PYTHONHASHSEED=0 → {h0}&quot;)
+print(f&quot;  hash(&#39;shard-00042&#39;)  PYTHONHASHSEED=1 → {h1}&quot;)
+print(f&quot;  同一字符串、同一进程外的两次运行，哈希不同: {h0 != h1}&quot;)
+print(&quot;  → 若数据顺序来自 set/dict 的迭代顺序，样本顺序就会跨进程漂移。&quot;)
+print(&quot;    治标：固定 PYTHONHASHSEED；治本：有语义的顺序显式 sorted()&quot;)
+
+# ==================================================================== ④ TOST
+print(&quot;=&quot; * 78)
+print(&quot;【4】TOST 等价检验：把&#39;差不多&#39;变成可判定的假设&quot;)
+
+
+def _betacf(a, b, x, itmax=300, eps=3e-16):
+    qab, qap, qam = a + b, a + 1.0, a - 1.0
+    c, d = 1.0, 1.0 - qab * x / qap
+    d = 1.0 / (d if abs(d) &gt; 1e-30 else 1e-30)
+    h = d
+    for m in range(1, itmax + 1):
+        m2 = 2 * m
+        aa = m * (b - m) * x / ((qam + m2) * (a + m2))
+        d = 1.0 + aa * d
+        c = 1.0 + aa / c
+        d = 1.0 / (d if abs(d) &gt; 1e-30 else 1e-30)
+        c = c if abs(c) &gt; 1e-30 else 1e-30
+        h *= d * c
+        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
+        d = 1.0 + aa * d
+        c = 1.0 + aa / c
+        d = 1.0 / (d if abs(d) &gt; 1e-30 else 1e-30)
+        c = c if abs(c) &gt; 1e-30 else 1e-30
+        delta = d * c
+        h *= delta
+        if abs(delta - 1.0) &lt; eps:
+            break
+    return h
+
+
+def betainc(a, b, x):
+    &quot;&quot;&quot;正则化不完全 Beta 函数 I_x(a,b)，用连分式（Numerical Recipes 的方法）。&quot;&quot;&quot;
+    if x &lt;= 0.0:
+        return 0.0
+    if x &gt;= 1.0:
+        return 1.0
+    lbeta = math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
+    front = math.exp(lbeta + a * math.log(x) + b * math.log1p(-x))
+    if x &lt; (a + 1.0) / (a + b + 2.0):
+        return front * _betacf(a, b, x) / a
+    return 1.0 - math.exp(lbeta + b * math.log1p(-x) + a * math.log(x)) \
+        * _betacf(b, a, 1.0 - x) / b
+
+
+def t_cdf(t, df):
+    p = 0.5 * betainc(df / 2.0, 0.5, df / (df + t * t))
+    return p if t &lt;= 0 else 1.0 - p
+
+
+def t_ppf(p, df):
+    lo, hi = -200.0, 200.0
+    for _ in range(200):
+        mid = (lo + hi) / 2
+        if t_cdf(mid, df) &lt; p:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2
+
+
+# 自检：t 分布的三个已知分位点（与教科书表对照）
+for df, p, expect in ((2, 0.975, 4.303), (9, 0.975, 2.262), (29, 0.95, 1.699)):
+    got = t_ppf(p, df)
+    print(f&quot;  t_ppf({p}, df={df}) = {got:.3f}   教科书值 ≈ {expect}&quot;)
+print(&quot;  → 自检通过后，检验结果才可信；否则统计量错一点，门禁结论就反了&quot;)
+
+
+def tost(diffs, margin, alpha=0.05):
+    n = len(diffs)
+    d = statistics.fmean(diffs)
+    s = statistics.stdev(diffs)
+    se = s / math.sqrt(n)
+    df = n - 1
+    p_low = 1.0 - t_cdf((d + margin) / se, df)     # H0: μ ≤ -margin
+    p_up = t_cdf((d - margin) / se, df)            # H0: μ ≥ +margin
+    tc = t_ppf(1.0 - alpha, df)
+    return {&quot;n&quot;: n, &quot;mean&quot;: d, &quot;sd&quot;: s, &quot;se&quot;: se,
+            &quot;p_tost&quot;: max(p_low, p_up), &quot;equivalent&quot;: max(p_low, p_up) &lt; alpha,
+            &quot;ci90&quot;: (d - tc * se, d + tc * se)}
+
+
+def tolerance_from_seeds(diffs, alpha=0.05):
+    &quot;&quot;&quot;容差带必须来自种子重复实验的 s，而不是拍脑袋。&quot;&quot;&quot;
+    n = len(diffs)
+    se = statistics.stdev(diffs) / math.sqrt(n)
+    return t_ppf(1 - alpha / 2, n - 1) * se
+
+
+# 场景 A：候选与基线差 0.1 个点，种子间 sd = 0.4 个点（噪声主导）
+diffs_A = [0.003, -0.001, 0.002, 0.000, 0.001]
+margin = 0.005          # 业务上接受&quot;差 0.5 个点以内&quot;
+ra = tost(diffs_A, margin)
+print(f&quot;\n  场景 A（差 {ra[&#39;mean&#39;]*100:+.2f} 点, sd={ra[&#39;sd&#39;]*100:.2f} 点, n={ra[&#39;n&#39;]}）:&quot;)
+print(f&quot;    SE={ra[&#39;se&#39;]*100:.3f} 点  p_TOST={ra[&#39;p_tost&#39;]:.4f}  &quot;
+      f&quot;等价={ra[&#39;equivalent&#39;]}&quot;)
+print(f&quot;    90% CI = [{ra[&#39;ci90&#39;][0]*100:+.3f}, {ra[&#39;ci90&#39;][1]*100:+.3f}] 点，&quot;
+      f&quot;margin=±{margin*100:.1f} 点&quot;)
+print(f&quot;    实测容差带 ε = {tolerance_from_seeds(diffs_A)*100:.3f} 点&quot;
+      f&quot;（来自 s={statistics.stdev(diffs_A)*100:.3f} 点）&quot;)
+
+# 场景 B：真实退化 -1.2 个点，噪声很小 —— 不应该被判&quot;等价&quot;
+diffs_B = [-0.012, -0.011, -0.013, -0.012, -0.012]
+rb = tost(diffs_B, margin)
+print(f&quot;\n  场景 B（差 {rb[&#39;mean&#39;]*100:+.2f} 点, sd={rb[&#39;sd&#39;]*100:.2f} 点, n={rb[&#39;n&#39;]}）:&quot;)
+print(f&quot;    p_TOST={rb[&#39;p_tost&#39;]:.6f}  等价={rb[&#39;equivalent&#39;]}  &quot;
+      f&quot;90% CI = [{rb[&#39;ci90&#39;][0]*100:+.3f}, {rb[&#39;ci90&#39;][1]*100:+.3f}] 点&quot;)
+print(&quot;    → 区间整体落在 -margin 之外：不是&#39;没证明等价&#39;，而是明确更差&quot;)
+
+# 场景 C：样本量不足 —— 噪声大 + 只跑 2 个种子
+diffs_C = [0.004, -0.003]
+rc = tost(diffs_C, margin)
+print(f&quot;\n  场景 C（n={rc[&#39;n&#39;]}，只有两个种子）: p_TOST={rc[&#39;p_tost&#39;]:.4f}  &quot;
+      f&quot;等价={rc[&#39;equivalent&#39;]}&quot;)
+print(&quot;    → 样本不足时 TOST 给&#39;未证明等价&#39;，这对回归门禁是保守方向（宁可不放行）&quot;)
+
+# 需要多少种子才能检测出 Δ=0.2 个点（s≈0.4 个点）
+s_hat, delta = 0.004, 0.002
+n_req = ((1.96 + 0.84) * s_hat / delta) ** 2
+print(f&quot;\n  检测 Δ={delta*100:.1f} 个点所需种子数 ≈ ((z₀.₉₇₅+z₀.₈) s/Δ)² &quot;
+      f&quot;= ((1.96+0.84)×{s_hat*100:.1f}/{delta*100:.1f})² ≈ {n_req:.0f}&quot;)
+print(&quot;  → 这个数必须在实验设计阶段算出来；跑不起 31 个种子，就把 Δm 放宽并写明风险&quot;)</code></pre>
+<p><strong>七处关键设计决策</strong>：</p>
+<ol>
+<li><strong><code>tree_reduce</code> 用 <code>fanin</code> 参数化分块</strong>，而不是写一个&quot;顺序求和&quot;和一个&quot;并行求和&quot;。原因是：真实差异不是&quot;并行 vs 串行&quot;，而是<strong>分块粒度</strong>（线程数、块大小）在变。参数化之后，你可以直接观察&quot;fanin 从 2 改到 1024&quot;的误差变化。</li>
+<li><strong>误差界与实测并列打印</strong>。实测的绝对误差比界小几个数量级是正常的（界是保守的最坏情况）；并列的意义是<strong>给出可推理的尺度</strong>。把 <code>u</code> 从 fp64 换成 bf16 时，界会放大 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord"><span class="mord">2</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">45</span></span></span></span></span></span></span></span></span></span></span></span> 倍 —— 这是&quot;累积算子必须 fp32 累加&quot;的定量依据。</li>
+<li><strong><code>dropout_mask_global</code> 显式暴露&quot;之前消耗了多少随机数&quot;这个参数</strong>。这是全局种子耦合的直接演示：只要上游组件多抽一个随机数，下游序列全部平移。&quot;改数据顺序 = 改 dropout&quot;这件事在真实训练里天天发生，却极少被意识到。</li>
+<li><strong><code>dropout_mask_streams</code> 用 <code>f&quot;{seed}:dropout&quot;</code> 这样的域分离键</strong>。对应 NumPy 的 <code>SeedSequence.spawn</code> / 每处一个 <code>torch.Generator</code>：<strong>随机性按用途解耦，是零成本的确定性提升。</strong></li>
+<li><strong><code>resume_with_seed</code> 与 <code>resume_with_state</code> 成对出现</strong>（当前两者对同一个 <code>draws</code> 列表是一致的，因为消耗模式没变）。演示要说明的是：一旦中间的 <code>draws</code> 因分批实现、早停、变长序列而变化，只存种子的快进就会漂移 —— 所以正确做法是<strong>保存 RNG state</strong>。这一条直接决定&quot;断点续训&quot;是不是同一个实验。</li>
+<li><strong><code>env_fingerprint</code> 把 <code>gpu_model</code>/<code>n_gpu</code>/<code>omp_threads</code>/<code>deterministic</code> 都算进去</strong>。理由是这些量<strong>合法地</strong>改变数值；把它们纳入指纹，才能让&quot;指标不一致&quot;先走&quot;环境不同&quot;这条分支，而不是无脑放宽容差（4.3）。</li>
+<li><strong><code>t_cdf</code> 用不完全 Beta 的连分式实现，并先用三个教科书分位点自检</strong>。统计检验的实现错误是最危险的错误 —— 它不会报错，只会给出错误的门禁结论。自检打印必须留在代码里。</li>
+<li><strong><code>tost</code> 同时给出 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span></span></span></span> 值与 90% 置信区间</strong>：区间更直观（是否包含 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord">±</span><span class="mord"><span class="mord">Δ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">m</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>），<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span></span></span></span> 更适合接门禁。场景 C 特意展示&quot;样本不足 ⇒ 未证明等价&quot;，因为回归门禁宁可保守。</li>
+</ol>
+<h3 id="h-练习">练习<a class="anchor" href="#h-练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>等级选择</strong>：下面五个任务各需要哪个等级（L1/L2/L3）？说明理由与你能接受的差异形式：
+（a）把 attention 的内核从实现 A 换成 B，验证数值正确；
+（b）判断&quot;新数据配比是否让模型退化&quot;；
+（c）复现一篇论文的主结论；
+（d）定位一个只在 8 卡上出现的 NaN；
+（e）为新版本生成回归基线。</li>
+<li><strong>误差界的应用</strong>：注意力 softmax 在序列长 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">8192</span></span></span></span> 时对 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span></span></span></span> 个元素做归约。若用 fp32 累加（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">u</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord"><span class="mord">2</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">24</span></span></span></span></span></span></span></span></span></span></span></span>），给出前向误差界的量级；若改用 bf16 累加（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">u</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord"><span class="mord">2</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">8</span></span></span></span></span></span></span></span></span></span></span></span>）会变成多少？据此说明为什么 online softmax 必须用 fp32 累加状态。</li>
+<li><strong>种子派生设计</strong>：为一个训练脚本设计完整的种子方案，要求覆盖：参数初始化、数据打乱、dropout、数据增强、多个 dataloader worker、评测采样。给出每个流的派生键与&quot;哪些流必须进 checkpoint&quot;。再回答：如果只在 checkpoint 里保存 <code>seed=42</code>，resume 后在什么条件下仍能连续？（列出至少两个条件。）</li>
+<li><strong>环境指纹的边界</strong>：某团队的 <code>env_ref</code> 只包含 lockfile 与镜像 digest。一次&quot;结果不一致&quot;的排查中发现两批机器分别是 H100 与 A100。请说明这次排查会多花多少时间（列出你会依次怀疑什么），并给出改进后的指纹字段。再说明：指纹里加进 <code>gpu_model</code> 会不会让&quot;跨机型比较&quot;变得不可能？应该怎么设计才既能识别又能比较？</li>
+<li><strong>TOST 实操</strong>：5 个种子的配对差为 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">[</span><span class="mord">+</span><span class="mord">0.6</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">−</span><span class="mord">0.2</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">+</span><span class="mord">0.1</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">+</span><span class="mord">0.9</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">−</span><span class="mord">0.4</span><span class="mclose">]</span></span></span></span>（单位：个点）。
+（a）算出 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8201em;"></span><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8201em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord">Δ</span></span><span style="top:-3.2523em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.25em;"><span class="mord">ˉ</span></span></span></span></span></span></span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord"><span class="mord mathrm">SE</span></span></span></span></span> 与 90% CI；
+（b）取 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord">Δ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">m</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.5</span></span></span></span> 个点，判断能否声明&quot;等价&quot;，并给出 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">TOST</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>；
+（c）若结论是&quot;未证明等价&quot;，请给出三种处置（增加种子 / 放宽 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord">Δ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">m</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> / 接受不确定性）及各自的代价。</li>
+<li><strong>determinism 的成本</strong>：设计一个实验测量 <code>torch.use_deterministic_algorithms(True)</code> 的代价。要求写清：对照条件（同机同配置）、要测的指标（吞吐、显存、是否有算子报错）、样本量（几次重复）、以及<strong>如何确认它真的让结果 bitwise 相同</strong>。预测哪类模型（稠密 Transformer / MoE / 含 scatter 的模型）代价最大，并说明机制。</li>
+<li><strong>开放题（接第 4 节）</strong>：你的团队报告&quot;新方法在 5 个种子上平均提升 1.2 个点，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord"><span class="mord mathrm">SE</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.3</span></span></span></span>&quot;。请写出你会追问的五个问题（提示：种子数怎么定的、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord">Δ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">m</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 是多少、比较了几个配置、是否预注册、评测集是否被复用），并说明其中哪一个问题最可能推翻结论。</li>
+</ol>
+<h3 id="h-小结">小结<a class="anchor" href="#h-小结" aria-label="本节链接">#</a></h3>
+<ul>
+<li><strong>&quot;复现&quot;有三个等级，代价与敌人各不相同</strong>：<strong>L1 可重复</strong>（同人同环境，bitwise）、<strong>L2 可复现</strong>（不同机器，容差内一致）、<strong>L3 可复算</strong>（不同实现，结论一致）。它们是嵌套关系；<strong>验收标准必须与等级匹配</strong>。用 L1 的标准做 L2 的事，会逼团队关掉并行优化再偷偷放宽断言。</li>
+<li><strong>依赖确定性有四个层次</strong>：声明（无锁）→ 锁定（hash pin）→ 镜像 digest → 全环境（驱动 + 卡型 + 线程 + 算法开关）。<code>image:latest</code> 不是锁定。容易漏的四项：<strong>BLAS 实现、CUDA/cuDNN、<code>PYTHONHASHSEED</code>、线程数</strong>。</li>
+<li><strong><code>PYTHONHASHSEED</code> 是隐藏的跨进程非确定性来源</strong>：它改变 <code>set</code>/<code>dict</code> 的迭代顺序，从而改变数据顺序。治本是<strong>有语义的顺序显式排序</strong>。</li>
+<li><strong>种子只能固定算法随机性</strong>（初始化 / dropout / 打乱 / 采样），<strong>固定不了并行归约顺序与库/硬件选择</strong>（atomicAdd、cudnn autotune、cuBLAS 算法、TF32 默认值）。而且全局单一 RNG 流会让组件互相耦合：<strong>改数据顺序等于改 dropout</strong>。</li>
+<li><strong>正确做法是按用途派生独立流</strong>（<code>SeedSequence.spawn</code> / 每处一个 <code>torch.Generator</code>），并且 <strong>resume 必须保存 RNG state 而不是 seed</strong> —— 保存种子只在&quot;每步随机消耗量完全不变&quot;时才成立。</li>
+<li><strong>浮点不满足结合律</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0641em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">16</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">16</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0</span></span></span></span> 而 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8974em;vertical-align:-0.0833em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">16</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.0641em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">16</span></span></span></span></span></span></span></span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span>；前向误差界 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.9592em;vertical-align:-0.2296em;"></span><span class="mrel amsrm">≲</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord mathnormal">n</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span><span class="mord mathnormal">u</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop op-symbol small-op" style="position:relative;top:0em;">∑</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">∣</span><span class="mord"><span class="mord mathnormal">x</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord">∣</span></span></span></span> 随 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span> 线性增长、随精度剧烈变化（bf16 的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">u</span></span></span></span> 是 fp32 的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord"><span class="mord">2</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">16</span></span></span></span></span></span></span></span></span></span></span></span> 倍）。<strong>并行归约本身没问题，&quot;分块方式不同&quot;才是差异来源。</strong></li>
+<li><strong>当 bitwise 不可能时，判据应当是统计的</strong>：用种子重复估出 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span></span></span></span> 与 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord"><span class="mord mathrm">SE</span></span></span></span></span>，容差带 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">ε</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6151em;"></span><span class="mord mathnormal">t</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord"><span class="mord mathrm">SE</span></span></span></span></span>（<strong>必须实测，不能拍脑袋</strong>），并用 <strong>TOST</strong> 把&quot;差不多&quot;变成 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0813em;">H</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.0813em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">:</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">∣</span><span class="mord"><span class="mord mathnormal">μ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">Δ</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord">∣</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&lt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord">Δ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">m</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 的假设检验；<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord">Δ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">m</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 来自业务损失，样本量 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.9592em;vertical-align:-0.2296em;"></span><span class="mord mathnormal">n</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel amsrm">≳</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">((</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.044em;">z</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.044em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">1</span><span class="mbin mtight">−</span><span class="mord mathnormal mtight" style="margin-right:0.0037em;">α</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2083em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.1002em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.044em;">z</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.044em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">1</span><span class="mbin mtight">−</span><span class="mord mathnormal mtight" style="margin-right:0.0528em;">β</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mord mathnormal">s</span><span class="mord">/Δ</span><span class="mclose"><span class="mclose">)</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span> 必须提前算。</li>
+<li><strong>环境差异要分层处理</strong>：<code>env_ref</code> 不同就先解释环境，而不是把 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">ε</span></span></span></span> 从 0.2 放宽到 0.6 把门禁做废；<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">ε</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">total</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">ε</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">seed</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">ε</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">env</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>。</li>
+<li><strong>任何进入决策的数字都要带 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span>、均值、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span></span></span></span>、CI 与 <code>env_ref</code>、<code>config_hash</code></strong>。单次运行的单个数字是&quot;样本量为 1 的观测&quot;，不是结论。</li>
+</ul>
+<blockquote>
+<p>下一节：到这里，我们能让同一份记录在不同机器上给出统计等价的数了。但真正的污染不来自机器，来自<strong>人</strong>：跑了 50 组配置挑最好的那组、不断调整评测集、只报告显著的对比。第 4 节要把&quot;实验管理&quot;落到统计上：族错误率、多重比较校正、winner&#39;s curse，以及配额与命名规范为什么是可信度的前提。</p>
+</blockquote>

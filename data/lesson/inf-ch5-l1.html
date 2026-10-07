@@ -1,0 +1,89 @@
+<h2 id="h-张量并行">张量并行<a class="anchor" href="#h-张量并行" aria-label="本节链接">#</a></h2>
+<p>前几章我们把单卡上的优化手段——KV Cache、PagedAttention、量化——讲了一遍。但当模型大到一张卡装不下，或者我们想用多张卡同时加速同一份请求时，单卡思路就走到头了。从这一章起进入<strong>分布式推理</strong>：把模型和计算拆到多张 GPU 上协同工作。这一课先讲最贴近矩阵运算本质的一种拆分方式——<strong>张量并行（Tensor Parallelism，TP）</strong>：不按&quot;层&quot;切，而是把单个权重矩阵本身切成几块，让一次矩阵乘法由多张卡分摊完成。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-为什么需要把一个矩阵切开">1. 为什么需要把&quot;一个矩阵&quot;切开<a class="anchor" href="#h-1-为什么需要把一个矩阵切开" aria-label="本节链接">#</a></h4>
+<p>LLM 的主体是堆叠的 Transformer 层，每层里最重的计算是 <code>Y = X @ W</code> 形式的线性变换。假设某层权重 <code>W</code> 的 shape 是 <code>[4096, 4096]</code>（单精度约 64 MB），输入 <code>X</code> 是 <code>[seq, 4096]</code>。一张 24 GB 的卡要放权重的几十亿参数尚且吃力，再加上 KV Cache、激活值、优化器状态，就彻底超了。</p>
+<p>更关键的是：<strong>张量并行同时解决&quot;装不下&quot;和&quot;算得慢&quot;两个问题</strong>。把 <code>W</code> 按列切成两份 <code>W1</code>、<code>W2</code>（各 <code>[4096, 2048]</code>），分别放到 GPU0、GPU1，两张卡各自算自己的那一半矩阵乘法，最后把结果拼起来——显存占用减半，计算量也减半，理想情况下延迟接近单卡的一半。这就是张量并行的核心直觉：<strong>把一次大矩阵乘法变成多张卡上并行的小矩阵乘法</strong>。</p>
+<h4 id="h-2-列并行与行并行transformer-的两类切法">2. 列并行与行并行：Transformer 的两类切法<a class="anchor" href="#h-2-列并行与行并行transformer-的两类切法" aria-label="本节链接">#</a></h4>
+<p>Megatron-LM 最早把 Transformer 的 FFN 和注意力层规范化成两种标准切法。</p>
+<p><strong>列并行（Column Parallel）</strong>：把权重按<strong>列<strong>切。线性层 <code>Y = X @ W + b</code>，<code>W</code> 切成 <code>[W1 | W2]</code>，偏置 <code>b</code> 也对应切。每张卡持有完整输入 <code>X</code>，算出各自的 <code>Y_i = X @ W_i + b_i</code>，最后把输出在</strong>列维度拼接</strong>。它适合放在层的前半段，因为切分后每张卡的输出只有原来的一半宽，下游接着切就行。</p>
+<p><strong>行并行（Row Parallel）</strong>：把权重按<strong>行</strong>切。<code>W</code> 切成 <code>[W1; W2]</code>（上下叠放），此时要求输入 <code>X</code> 也按列切成 <code>[X1 | X2]</code>，两张卡分别算 <code>Y_i = X_i @ W_i</code>，最后把结果做一次 <strong>AllReduce 求和</strong>得到完整 <code>Y</code>。它天然接在列并行之后，用来把&quot;被切开的中间表示&quot;重新合拢回完整维度。</p>
+<p>一个标准 Transformer FFN 的排布是：<code>[列并行 up/gate 投影] → 激活函数 → [行并行 down 投影]</code>。注意力层的 Q/K/V 投影同理可以用列并行，输出投影 O 用行并行。两次列并行之间只传&quot;半个向量&quot;，中间激活函数和 dropout 都只在本地半张上做，通信只在边界发生。</p>
+<h4 id="h-3-通信是怎么发生的">3. 通信是怎么发生的<a class="anchor" href="#h-3-通信是怎么发生的" aria-label="本节链接">#</a></h4>
+<p>列并行最后一步是拼接，行并行最后一步是求和，两者都归结为<strong>集合通信原语</strong>：</p>
+<ul>
+<li><strong>AllGather</strong>：把各卡的半张输出凑成完整张量（列并行拼接的推广）；</li>
+<li><strong>ReduceScatter / AllReduce</strong>：把各卡的部分结果求和并广播/分发（行并行求和的推广）。</li>
+</ul>
+<p>张量并行的代价主要就是这些通信：每经过一个&quot;行并行 → 列并行&quot;的边界就要来回同步一次。这也解释了为什么 TP 对<strong>卡间带宽极其敏感</strong>——两张卡若只靠慢速 PCIe 互联，通信时间会吃掉并行省下的计算时间。因此 TP 通常只部署在<strong>单机内的多卡</strong>（NVLink/NVSwitch 高速互联）之间，跨机器做 TP 通信代价太高。</p>
+<h4 id="h-4-注意力头的并行与-kv-的配合">4. 注意力头的并行与 KV 的配合<a class="anchor" href="#h-4-注意力头的并行与-kv-的配合" aria-label="本节链接">#</a></h4>
+<p>对多头注意力，一个更直观的切法是把<strong>注意力头</strong>分给不同卡：每张卡持有若干个头的 Q/K/V/O 权重，各自算完 softmax 后，O 投影的结果再做一次 AllReduce。配合 MQA/GQA（若干查询头共享同一组 KV 头），KV Cache 还能按&quot;KV 头&quot;切到不同卡上，进一步降低单卡显存压力。vLLM、TensorRT-LLM 等引擎在底层就是把张量并行 + 头并行 + KV 切分打包成 <code>tensor_parallel_size</code> 一个参数暴露给你。</p>
+<p><figure><img class="md-img" src="content/courses/llm-inference-optimization/assets/chapter-5-figure-01.svg" alt="张量并行的列并行与行并行示意：权重按列/按行切开，输出分别拼接或求和" loading="lazy" decoding="async"><figcaption>张量并行的列并行与行并行示意：权重按列/按行切开，输出分别拼接或求和</figcaption></figure>
+</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<h4 id="h-示例-1用-torch-手写一个简化版张量并行-ffn">示例 1：用 torch 手写一个简化版张量并行 FFN<a class="anchor" href="#h-示例-1用-torch-手写一个简化版张量并行-ffn" aria-label="本节链接">#</a></h4>
+<p>下面这段代码演示列并行 + 行并行的核心逻辑。为了在单机不依赖多卡也能理解，我们用&quot;显式切分权重&quot;来模拟两块 GPU 的分工，注释标出每一步在真实多卡里对应哪张卡、哪次通信。</p>
+<pre data-lang="python"><code class="language-python">import torch
+
+torch.manual_seed(0)
+
+d_model, d_ff = 8, 16        # 隐藏维 8，FFN 中间维 16（故意取小便于打印）
+seq = 3                       # 3 个 token
+
+# 模拟&quot;完整&quot;的 up 投影与 down 投影权重
+W_up = torch.randn(d_model, d_ff)   # [8, 16]
+W_down = torch.randn(d_ff, d_model) # [16, 8]
+x = torch.randn(seq, d_model)       # 输入 [3, 8]
+
+# ---- 单卡基线（结果参考）----
+y_ref = (x @ W_up).relu() @ W_down
+
+# ---- 张量并行：按列切成两块，分到 GPU0 / GPU1 ----
+tp = 2
+W_up0, W_up1 = W_up.chunk(tp, dim=1)       # 各 [8, 8]   （列并行：每卡持半列）
+W_down0, W_down1 = W_down.chunk(tp, dim=0) # 各 [8, 8]   （行并行：每卡持半行）
+
+# GPU0 的本地计算：x 完整可见，算半段中间表示
+h0 = (x @ W_up0).relu()          # [3, 8]
+# GPU1 的本地计算
+h1 = (x @ W_up1).relu()          # [3, 8]
+
+# 行并行要求输入按列切分——列并行后中间表示 h 正是 [h0 | h1]，天然满足
+y0 = h0 @ W_down0                # [3, 8]   GPU0 的部分和
+y1 = h1 @ W_down1                # [3, 8]   GPU1 的部分和
+
+# 行并行的收尾：AllReduce 求和（真实多卡用 torch.distributed.all_reduce）
+y_tp = y0 + y1
+
+print(&quot;与单卡结果的最大误差:&quot;, (y_tp - y_ref).abs().max().item())  # 应为 0</code></pre>
+<p>输出 <code>0</code>，说明切开再拼回的数学结果与单卡完全一致——张量并行是<strong>数值等价</strong>的拆分，只是把计算与存储摊到了多张卡上。</p>
+<h4 id="h-示例-2用-vllm-一行开启张量并行">示例 2：用 vLLM 一行开启张量并行<a class="anchor" href="#h-示例-2用-vllm-一行开启张量并行" aria-label="本节链接">#</a></h4>
+<p>真实部署不需要手写切分，交给引擎即可。以 vLLM 为例，<code>tensor_parallel_size</code> 就是 TP 卡数：</p>
+<pre data-lang="bash"><code class="language-bash"># 用 4 张卡做张量并行，serving 一个 70B 模型
+vllm serve meta-llama/Llama-3.1-70B-Instruct \
+    --tensor-parallel-size 4 \
+    --dtype bfloat16</code></pre>
+<pre data-lang="python"><code class="language-python"># 客户端照常请求，引擎内部已把权重与 KV 切到 4 张卡
+from openai import OpenAI
+client = OpenAI(base_url=&quot;http://localhost:8000/v1&quot;, api_key=&quot;EMPTY&quot;)
+resp = client.chat.completions.create(
+    model=&quot;meta-llama/Llama-3.1-70B-Instruct&quot;,
+    messages=[{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;一句话解释张量并行&quot;}],
+)
+print(resp.choices[0].message.content)</code></pre>
+<p>注意两点：<code>tensor_parallel_size</code> 一般取 2 的幂且<strong>不超过单机 GPU 数</strong>（TP 依赖高速 NVLink）；切得越细，通信占比越高，所以不是越大越快，要根据卡间带宽实测。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>把示例 1 改成 <code>tp=4</code> 的切分，验证结果仍与单卡一致；再思考：切到 4 份后，行并行收尾需要几次 AllReduce？</li>
+<li>用 <code>torch.distributed</code> 的 <code>all_reduce</code> 把示例 1 的 <code>y0 + y1</code> 改写成真实的两进程通信版本，在两张卡或两个进程上跑通。</li>
+<li>手算一个 <code>[d_model, d_ff]</code> 的权重按列并行切 2 份后，每张卡的显存与计算量分别是原来的几分之几；说明为什么&quot;通信开销&quot;会随 TP 卡数增加而恶化。</li>
+<li>若在单机上用 2×A100（NVLink 互联）跑 <code>tensor_parallel_size=2</code>，对比 <code>=1</code> 时 TTFT 的变化，解释增益与通信开销的来源。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Megatron-LM：Training Multi-Billion Parameter Language Models Using Model Parallelism：<a href="https://arxiv.org/abs/1909.08053" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1909.08053</a></li>
+<li>NVIDIA Megatron-LM 源码（tensor_parallel 实现）：<a href="https://github.com/NVIDIA/Megatron-LM" target="_blank" rel="noopener noreferrer">https://github.com/NVIDIA/Megatron-LM</a></li>
+<li>vLLM 文档 · 分布式推理（tensor parallel）：<a href="https://docs.vllm.ai/en/latest/serving/distributed_serving.html" target="_blank" rel="noopener noreferrer">https://docs.vllm.ai/en/latest/serving/distributed_serving.html</a></li>
+<li>NVIDIA TensorRT-LLM 文档 · 张量并行：<a href="https://nvidia.github.io/TensorRT-LLM/" target="_blank" rel="noopener noreferrer">https://nvidia.github.io/TensorRT-LLM/</a></li>
+</ul>
+<p><a href="#/l/inf-ch5-l2">下一课：流水线并行与数据并行</a></p>

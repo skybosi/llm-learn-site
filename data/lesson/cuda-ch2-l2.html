@@ -1,0 +1,226 @@
+<h2 id="h-warp-调度分支发散与占用率的取舍">warp 调度、分支发散与占用率的取舍<a class="anchor" href="#h-warp-调度分支发散与占用率的取舍" aria-label="本节链接">#</a></h2>
+<p>上一课把线程分成了 warp：32 个线程共享一个取指单元。那么 SM 上常驻的几十个 warp，谁先发射？两条常见错答是&quot;大家一起跑&quot;和&quot;平均轮转&quot;。真相是：每个 warp scheduler 每周期只从<strong>就绪</strong>的 warp 里挑一个发一条指令；被挑中的 warp 里，32 个 lane 只有&quot;这一刻该干活&quot;的会产生结果。这两句话解释了发散的全部代价，也解释了 occupancy 为什么只是&quot;延迟隐藏的预算&quot;，不是性能指标本身。</p>
+<p><figure><img class="md-img" src="content/courses/gpu-cuda-kernels/assets/chapter-2-figure-02.svg" alt="warp 调度：就绪队列、发散与用别的 warp 填空" loading="lazy" decoding="async"><figcaption>warp 调度：就绪队列、发散与用别的 warp 填空</figcaption></figure>
+</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-发射模型一个周期一个-warp一条指令">1. 发射模型：一个周期、一个 warp、一条指令<a class="anchor" href="#h-1-发射模型一个周期一个-warp一条指令" aria-label="本节链接">#</a></h4>
+<p>把 SM 看成若干子分区（sub-partition），每个子分区一个 warp scheduler：每周期从名下 warp 中挑出一个<strong>就绪（ready）</strong>的，发射它的下一条指令；一条 warp 指令不论多少 lane 活跃，都只占<strong>一个 issue slot</strong>。非就绪原因有三类：</p>
+<table>
+<thead>
+<tr>
+<th>停顿原因</th>
+<th>触发条件</th>
+<th>典型修法</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>等访存</td>
+<td>load/store 未返回</td>
+<td>提 occupancy、预取、少访存</td>
+</tr>
+<tr>
+<td>等依赖</td>
+<td>上一条指令结果未就绪</td>
+<td>增 ILP（展开、重排）、别的 warp 顶上</td>
+</tr>
+<tr>
+<td>等屏障</td>
+<td><code>__syncthreads()</code> 等同伴（第 3 课）</td>
+<td>减少屏障轮数、改用 warp shuffle</td>
+</tr>
+</tbody></table>
+<p>关键推论：<strong>性能取决于&quot;每周期有多少 warp 能发指令&quot;，而不是有多少 warp 存在</strong>。单个 warp 内部严格串行，SIMT 并行度只体现在 32 个 lane 上，所以一个 warp 再快也占不满发射端口。</p>
+<h4 id="h-2-延迟隐藏需要几个-warp-才够">2. 延迟隐藏：需要几个 warp 才够<a class="anchor" href="#h-2-延迟隐藏需要几个-warp-才够" aria-label="本节链接">#</a></h4>
+<p>设平均停顿为 <code>L</code> 周期，单个 warp 大约每 <code>L+1</code> 周期才贡献一条指令；子分区想每周期都发得出去，就需要约 <code>L+1</code> 个 ready warp 轮着来：</p>
+<table>
+<thead>
+<tr>
+<th>平均停顿 L（量级估算）</th>
+<th>单个子分区需要</th>
+<th>4 个子分区合计</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>4（寄存器运算为主）</td>
+<td>≈5</td>
+<td>≈20</td>
+</tr>
+<tr>
+<td>16（L2 命中）</td>
+<td>≈17</td>
+<td>≈68（已超常见 64 warp/SM 上限）</td>
+</tr>
+<tr>
+<td>32+（HBM 访存）</td>
+<td>≈33</td>
+<td>≈132（远超上限）</td>
+</tr>
+</tbody></table>
+<p>这些数字按&quot;每条指令都取最坏停顿&quot;估，是乐观上界（真实 kernel 是混合停顿），但给出了正确直觉：<strong>访存延迟靠&quot;更多 warp&quot;填，计算延迟靠&quot;更多 ILP&quot;填</strong>。需求超过硬件上限时，出路是减少访存次数、或用共享内存/寄存器复用数据（第 3、4 章）。</p>
+<h4 id="h-3-分支发散一条指令服务不了两拨-lane">3. 分支发散：一条指令服务不了两拨 lane<a class="anchor" href="#h-3-分支发散一条指令服务不了两拨-lane" aria-label="本节链接">#</a></h4>
+<p>同一 warp 内线程走到不同路径时，硬件把当前路径不参与的 lane <strong>掩掉（masked off）</strong>，先让活跃 lane 执行这段指令，路径都走完再汇合。官方称之为 <strong>warp divergence</strong>，并指出 warp 内线程走同一路径时利用率最高。</p>
+<p>代价可按 issue slot 直接算：两条路径各 <code>k</code> 条指令、16 lane 走 A、16 lane 走 B，该 warp 要发 <code>2k</code> 条指令，而有用的只有 <code>32k</code> 个 lane·指令——<strong>lane 效率降到 1/2</strong>。warp 内出现 <code>p</code> 条路径时串行次数接近 <code>p</code> 倍（本课代码扫出 1/2/4/8/16/32 条路径，最坏 1/32）。</p>
+<p>什么时候不花钱？<strong>uniform branch</strong>（条件在整个 warp 内同向，如按 <code>blockIdx</code> 判断）不发散；短分支常被编译器改写成 <strong>branch predication（谓词化）</strong>——官方 Best Practices Guide 说明，谓词化时受条件控制的指令<strong>不会被跳过</strong>，而是每条带一个 per-thread 谓词决定该线程是否写回结果。可见它省的是跳转与重汇聚开销，不是两边指令量：两条路径都有真活时，它和发散一样贵。</p>
+<p>判据是<strong>发散条件与谁相关</strong>：与 lane 索引相关（<code>if (threadIdx.x % 2)</code>、<code>if (lane &lt; 16)</code>）几乎总是写法的锅，可通过重划任务边界让同 warp 线程干同一件事；与数据相关（<code>if (a[i] &gt; 0)</code>）无法消除，只能平衡两条路径的工作量，让重路径上的 lane 尽量多。</p>
+<h4 id="h-4-occupancy它是预算不是-kpi">4. occupancy：它是预算，不是 KPI<a class="anchor" href="#h-4-occupancy它是预算不是-kpi" aria-label="本节链接">#</a></h4>
+<p><strong>occupancy（占用率）</strong> = 每 SM 实际驻留 warp 数 ÷ warp 数上限，由四类限制取<strong>最小值</strong>：① warp 上限 <code>max_warps_per_sm ÷ ceil(blockDim/32)</code>；② 寄存器——每线程寄存器数按分配粒度向上取整（多数现代架构按每 warp 256 个、即每线程 8 个），乘块内线程数得&quot;每块实占寄存器&quot;再除 <code>regs_per_sm</code>；③ 共享内存 <code>smem_per_sm ÷ 每块共享内存</code>（含每块开销与 carveout）；④ <code>max_blocks_per_sm</code>——32 线程的小 block 往往是它先卡住。</p>
+<p>数值以官方 Programming Guide 附录 &quot;Features and Technical Specifications&quot; 表和本机 <code>deviceQuery</code> 为准；Runtime 另有 <code>cudaOccupancyMaxActiveBlocksPerMultiprocessor()</code> 可算。重点是取舍：</p>
+<ul>
+<li>访存密集（延迟长、靠大量 warp 填空）→ 要高 occupancy，先看寄存器与共享内存吃掉了多少常驻 warp；</li>
+<li>计算密集且 ILP 高（每路都有独立指令可重叠）→ 中等甚至偏低 occupancy 也能跑满，压寄存器只换来 spill（变量挤进本地内存，反增访存）；</li>
+<li>官方 Best Practices Guide 的立场：occupancy 高不保证性能高，它只衡量&quot;够不够隐藏延迟&quot;，真正的判据是 profile 出的 stall 原因（第 8 章）。</li>
+</ul>
+<h4 id="h-5-常见坑">5. 常见坑<a class="anchor" href="#h-5-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>把 occupancy 当唯一目标</strong>：用 <code>__launch_bounds__</code>/<code>maxrregcount</code> 硬压寄存器，spill 增加、指令变多，性能反降。</li>
+<li><strong>用小 block 提 occupancy</strong>：<code>blockDim = 32</code> 时 <code>max_blocks_per_sm</code>（常见 16<del>32）先到顶，occupancy 卡在 25%</del>50%。</li>
+<li><strong>以为&quot;分支短就没代价&quot;</strong>：代价按&quot;路径条数 × 路径长度&quot;算，不是分支语句的视觉长度。</li>
+<li><strong>边界判断写在热循环里</strong>：<code>if (threadIdx.x &lt; n)</code> 在 <code>n</code> 非 32 倍数时必然多走一条空路径，通常可接受，但别嵌套。</li>
+<li><strong>以为 warp 内线程自动同步</strong>：Volta 之后 warp 内线程独立调度，warp 级同步须显式写（第 3 课）。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>不碰 GPU 也能算清两件事：发散花掉多少 issue slot，occupancy 卡在哪一项。下面纯 Python 代码的上半部分是 issue slot 模型（含路径数扫描），下半部分用官方 occupancy 文档的&quot;逐项取最小&quot;算法扫描 block 大小、寄存器与共享内存。</p>
+<pre data-lang="python"><code class="language-python"># ---- issue slot 模型量化 warp 发散 + 官方 occupancy 公式算常驻 warp（纯 Python）----
+WARP = 32
+
+
+def report(name, paths, branch_overhead=0, useful=None):
+    &quot;&quot;&quot;paths: {路径名: (活跃 lane 数, 路径指令条数)}。
+    关键假设：一条 warp 指令不论几个 lane 活跃，都占 1 个 issue slot —— 发散的代价由此而来。&quot;&quot;&quot;
+    slots = sum(insts for _, insts in paths.values()) + branch_overhead
+    if useful is None:                       # 默认：每个 lane 的结果都有用
+        useful = sum(lanes * insts for lanes, insts in paths.values())
+    print(f&#39;{name:&lt;30} issue slot={slots:&gt;3}  有用 lane·指令={useful:&gt;4}  &#39;
+          f&#39;lane 效率={useful / (slots * WARP):.3f}&#39;)
+    return slots
+
+
+print(&#39;=== 同一段代码的三种写法（两条路径各 10 条指令）===&#39;)
+a1 = report(&#39;无分支：全 warp 走同一路径&#39;, {&#39;all&#39;: (32, 10)})
+a2 = report(&#39;发散：16 lane 走 A、16 lane 走 B&#39;,
+            {&#39;A&#39;: (16, 10), &#39;B&#39;: (16, 10)}, branch_overhead=2)
+a3 = report(&#39;谓词化：两条路径都发、都不跳过&#39;,
+            {&#39;A+pred&#39;: (32, 10), &#39;B+pred&#39;: (32, 10)}, useful=320)
+print(f&#39;两条路径都发时，发散比无反散多花 {a2 / a1:.1f}x issue slot；&#39;
+      f&#39;谓词化省掉 {a2 - a3} 个 slot（跳转与重汇聚）\n&#39;)
+
+print(&#39;=== warp 内被走到的路径数扫描（每路 10 条指令，lane 均分）===&#39;)
+print(f&#39;{&quot;路径数&quot;:&gt;5} {&quot;每路 lane&quot;:&gt;8} {&quot;issue slot&quot;:&gt;11} {&quot;lane 效率&quot;:&gt;10}&#39;)
+for p in (1, 2, 4, 8, 16, 32):
+    slots = p * 10
+    print(f&#39;{p:&gt;5} {WARP // p:&gt;8} {slots:&gt;11} {(WARP * 10) / (slots * WARP):&gt;10.3f}&#39;)
+
+# ---- occupancy：按官方 occupancy 文档的&quot;逐项取最小&quot;算法 ----
+# 参数取某代架构的常见量级；真值以官方 Programming Guide 的
+# &quot;Features and Technical Specifications&quot; 表与实际 GPU 的 deviceQuery 输出为准
+SM = dict(regs_per_sm=65536,       # 64K 个 32-bit 寄存器 / SM
+          smem_per_sm=100 * 1024,  # 每 SM 可用共享内存，量级 100 KB（随架构与 carveout 变）
+          max_warps_per_sm=64,     # 常驻 warp 上限
+          max_blocks_per_sm=32,    # 常驻 block 上限
+          reg_gran_per_warp=256)   # 寄存器分配按 warp 粒度 256 个向上取整（=8 寄存器/线程）
+
+
+def occupancy(regs_per_thread, block_threads, smem_per_block, sm=SM):
+    warps_per_block = -(-block_threads // WARP)
+    reg_alloc = -(-regs_per_thread // 8) * 8                    # 每线程按 8 个向上取整
+    per_block = max(reg_alloc * block_threads,
+                    warps_per_block * sm[&#39;reg_gran_per_warp&#39;])  # 每块实占寄存器
+    limits = {&#39;warps&#39;: sm[&#39;max_warps_per_sm&#39;] // warps_per_block,
+              &#39;regs&#39;: sm[&#39;regs_per_sm&#39;] // per_block,
+              &#39;smem&#39;: (sm[&#39;smem_per_sm&#39;] // smem_per_block) if smem_per_block else 10 ** 9,
+              &#39;blocks&#39;: sm[&#39;max_blocks_per_sm&#39;]}
+    blocks = min(limits.values())
+    res_warps = blocks * warps_per_block
+    limiters = [k for k, v in limits.items() if v == blocks]
+    return blocks, res_warps, res_warps / sm[&#39;max_warps_per_sm&#39;], limiters
+
+
+def sweep(title, rows, header, label=lambda a: str(a[0])):
+    print(f&#39;\n=== {title} ===&#39;)
+    print(header)
+    for args in rows:
+        b, w, o, lim = occupancy(*args)
+        print(f&#39;{label(args):&gt;12} {b:&gt;9} {w:&gt;8} {o:&gt;8.1%}  {&quot;+&quot;.join(sorted(lim))}&#39;)
+
+
+sweep(&#39;block 大小扫描：40 寄存器/线程、0 共享内存&#39;,
+      [(40, bt, 0) for bt in (32, 64, 128, 256, 384, 512, 1024)],
+      f&#39;{&quot;block 线程数&quot;:&gt;12} {&quot;常驻 block&quot;:&gt;9} {&quot;常驻 warp&quot;:&gt;8} {&quot;occupancy&quot;:&gt;9}  限制项&#39;,
+      label=lambda a: str(a[1]))
+
+sweep(&#39;寄存器压力扫描：block = 256 线程、0 共享内存&#39;,
+      [(rg, 256, 0) for rg in (24, 32, 40, 48, 64, 96, 128)],
+      f&#39;{&quot;寄存器/线程&quot;:&gt;12} {&quot;常驻 block&quot;:&gt;9} {&quot;常驻 warp&quot;:&gt;8} {&quot;occupancy&quot;:&gt;9}  限制项&#39;)
+
+sweep(&#39;共享内存扫描：block = 256 线程、40 寄存器/线程&#39;,
+      [(40, 256, kb * 1024) for kb in (0, 8, 16, 32, 48, 100)],
+      f&#39;{&quot;KB/块&quot;:&gt;12} {&quot;常驻 block&quot;:&gt;9} {&quot;常驻 warp&quot;:&gt;8} {&quot;occupancy&quot;:&gt;9}  限制项&#39;,
+      label=lambda a: str(a[2] // 1024))</code></pre>
+<p>运行结果（CPU 实测）：</p>
+<pre><code>=== 同一段代码的三种写法（两条路径各 10 条指令）===
+无分支：全 warp 走同一路径               issue slot= 10  有用 lane·指令= 320  lane 效率=1.000
+发散：16 lane 走 A、16 lane 走 B     issue slot= 22  有用 lane·指令= 320  lane 效率=0.455
+谓词化：两条路径都发、都不跳过                issue slot= 20  有用 lane·指令= 320  lane 效率=0.500
+两条路径都发时，发散比无反散多花 2.2x issue slot；谓词化省掉 2 个 slot（跳转与重汇聚）
+
+=== warp 内被走到的路径数扫描（每路 10 条指令，lane 均分）===
+  路径数  每路 lane  issue slot    lane 效率
+    1       32          10      1.000
+    2       16          20      0.500
+    4        8          40      0.250
+    8        4          80      0.125
+   16        2         160      0.062
+   32        1         320      0.031
+
+=== block 大小扫描：40 寄存器/线程、0 共享内存 ===
+   block 线程数  常驻 block  常驻 warp occupancy  限制项
+          32        32       32    50.0%  blocks
+          64        25       50    78.1%  regs
+         128        12       48    75.0%  regs
+         256         6       48    75.0%  regs
+         384         4       48    75.0%  regs
+         512         3       48    75.0%  regs
+        1024         1       32    50.0%  regs
+
+=== 寄存器压力扫描：block = 256 线程、0 共享内存 ===
+      寄存器/线程  常驻 block  常驻 warp occupancy  限制项
+          24         8       64   100.0%  warps
+          32         8       64   100.0%  regs+warps
+          40         6       48    75.0%  regs
+          48         5       40    62.5%  regs
+          64         4       32    50.0%  regs
+          96         2       16    25.0%  regs
+         128         2       16    25.0%  regs
+
+=== 共享内存扫描：block = 256 线程、40 寄存器/线程 ===
+        KB/块  常驻 block  常驻 warp occupancy  限制项
+           0         6       48    75.0%  regs
+           8         6       48    75.0%  regs
+          16         6       48    75.0%  regs+smem
+          32         3       24    37.5%  smem
+          48         2       16    25.0%  smem
+         100         1        8    12.5%  smem</code></pre>
+<p>三张表对应三段取舍：block 从 32 增到 64 把 occupancy 从 50% 拉到 78%（<code>max_blocks_per_sm</code> 不再卡住）；寄存器从 24 涨到 128 让它从 100% 掉到 25%（&quot;少 spill&quot;与&quot;多驻留 warp&quot;的张力）；共享内存超约 20 KB/块后取代寄存器成为新限制项。<strong>要优化的是最后一列的限制项，不是 occupancy 本身。</strong></p>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选（需自备 GPU 或云上按需）：在真机上量同样三件事 ----
+# 1) 实际达成的 occupancy 及其限制项：
+#      ncu --metrics launch__occupancy_limit_registers,launch__occupancy_limit_shared_mem,\
+#launch__occupancy_limit_blocks,launch__occupancy_limit_warps ./app
+# 2) 发散：smsp__branch_targets_threads_divergent / smsp__branch_targets_threads_uniform，
+#    以及&quot;平均每条 warp 指令代表多少条线程指令&quot;的比值——理想是 32。
+#    ncu 指标名随版本变化，先 `ncu --query-metrics | grep -i branch` 确认真名。
+# 3) 不用 ncu 的粗测：同一 kernel 分别以 -maxrregcount=32/64/128 编译三份，
+#    对比 kernel 时间，观察&quot;寄存器 ↓ → occupancy ↑ → 时间？&quot;是否真有收益。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：给 <code>report</code> 加一个三路发散的例子：16 lane 走 A（10 条指令）、8 lane 走 B（6 条）、8 lane 走 C（4 条），算出 issue slot 与 lane 效率，解释&quot;路径数相同但长度不同&quot;与&quot;均分&quot;差在哪。</li>
+<li><strong>解释</strong>：为什么谓词化在两条路径都有真活时不比发散便宜？请从官方对谓词化的描述（受控指令不被跳过、只加 per-thread 谓词）出发，说明它省了什么。</li>
+<li><strong>对比/验证</strong>：把 <code>occupancy()</code> 的 <code>max_blocks_per_sm</code> 依次改成 16/8，重跑 block 大小扫描，找出 block = 32 时的 occupancy；解释小 block 为什么被它卡住。</li>
+<li><strong>思考</strong>：纯访存拷贝 kernel（每线程 1 次 16 字节 load、store）与矩阵乘 kernel，哪个更依赖高 occupancy？用第 2 节&quot;延迟隐藏需要几个 warp&quot;表论证，并各举一个压寄存器伤性能的场景。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>NVIDIA, <em>CUDA C++ Best Practices Guide</em> — Branching and Divergence、Branch Predication、Calculating Occupancy：<a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#branching-and-divergence" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#branching-and-divergence</a></li>
+<li>NVIDIA, <em>CUDA C++ Programming Guide</em> §2.3「Writing SIMT Kernels」— Kernel Launch and Occupancy（occupancy 定义、限制项与 <code>cudaOccupancyMaxActiveBlocksPerMultiprocessor</code>）：<a href="https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/writing-cuda-kernels.html#kernel-launch-and-occupancy" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/writing-cuda-kernels.html#kernel-launch-and-occupancy</a></li>
+<li>NVIDIA, <em>Nsight Compute</em> 文档 — Profiling Guide 的 Launch Metrics（<code>launch__occupancy_limit_*</code> 等指标名的权威出处）：<a href="https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html#launch-metrics" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html#launch-metrics</a></li>
+</ul>
+<p><a href="#/l/cuda-ch2-l3">下一课：同步与协作：__syncthreads、warp shuffle、协作组</a></p>

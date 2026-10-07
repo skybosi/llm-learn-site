@@ -1,0 +1,111 @@
+<h2 id="h-投机解码">投机解码<a class="anchor" href="#h-投机解码" aria-label="本节链接">#</a></h2>
+<p>上一课用 IO 感知让&quot;单次注意力&quot;变快。但自回归解码还有一个更根本的瓶颈：<strong>decode 阶段一次只能出一个 token，而每出一个 token 都要把整个模型跑一遍</strong>，大部分算力其实在&quot;空转&quot;。<strong>投机解码（Speculative Decoding）</strong> 换了个思路：用一个小模型&quot;猜&quot;出接下来的一串 token，再用大模型一次性<strong>验证</strong>这串猜测，猜对几个就前进几步——用&quot;一次大模型前向&quot;换&quot;多个 token 的产出&quot;，在不损失精度的前提下显著提升 decode 吞吐。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-为什么-decode-又慢又浪费">1. 为什么 decode 又慢又浪费<a class="anchor" href="#h-1-为什么-decode-又慢又浪费" aria-label="本节链接">#</a></h4>
+<p>回忆 decode 阶段：每生成一个 token，要把这 1 个新 token 送进模型，做一次矩阵乘法。问题在于，模型权重有几十 GB，为产出 1 个 token 却要把几十 GB 权重全部扫一遍——<strong>计算强度极低，访存却极大</strong>，GPU 大量时间在搬运权重而不是计算。这就是典型的 memory-bound 场景。投机解码不试图让这次前向更快，而是让它&quot;产出更多 token&quot;。</p>
+<h4 id="h-2-核心流程草稿--验证">2. 核心流程：草稿 + 验证<a class="anchor" href="#h-2-核心流程草稿--验证" aria-label="本节链接">#</a></h4>
+<p>投机解码需要两个模型：</p>
+<ul>
+<li><strong>草稿模型（draft）</strong>：一个小模型（或同一个模型加个轻量头），负责快速自回归地猜出 <code>γ</code> 个候选 token（<code>γ</code> 叫&quot;投机长度&quot;）；</li>
+<li><strong>目标模型（target）</strong>：真正的大模型，负责<strong>并行</strong>验证这串候选。</li>
+</ul>
+<p>流程如下：</p>
+<ol>
+<li>用草稿模型基于当前前缀，自回归生成 <code>γ</code> 个候选 token：<code>x1, x2, ..., xγ</code>；</li>
+<li>把前缀连同整串候选<strong>一次性</strong>喂给目标模型，前向一次得到每个位置的 logits；</li>
+<li>逐位<strong>比对</strong>：若第 <code>i</code> 位候选与目标模型自己采样出的 token 一致，就接受它；一旦出现第一个不一致，接受其之前的 token，并用目标模型在该位置采出的 token 修正，丢弃其后所有候选；</li>
+<li>把接受后的前缀作为新的起点，重复上述过程。</li>
+</ol>
+<p>关键洞察：目标模型的那次前向，通过一次矩阵乘法同时算出了 <code>γ+1</code> 个位置的预测（就像 prefill 处理多个 token 一样），所以<strong>一次目标模型前向可以推进多个 token</strong>。</p>
+<h4 id="h-3-无损性为什么不会降低质量">3. 无损性：为什么不会降低质量<a class="anchor" href="#h-3-无损性为什么不会降低质量" aria-label="本节链接">#</a></h4>
+<p>投机解码最漂亮的性质是<strong>无损（lossless）</strong>——输出分布与直接用目标模型自回归完全一致。原因在于接受规则：某个候选 token 只有<strong>恰好等于目标模型本应采出的 token</strong> 时才被接受，否则就用目标模型自己的采样结果替换。等价地看，草稿模型只是&quot;提前排队&quot;提交了候选，最终的序列完全由目标模型的分布决定，草稿模型猜得再差也只是&quot;加速变少&quot;，不会&quot;答案变错&quot;。（更严格的说法是接受概率经过 <code>min(1, p_target/p_draft)</code> 修正，保证联合分布不变；本课示例用贪心采样简化演示。）</p>
+<h4 id="h-4-加速取决于什么以及常见变体">4. 加速取决于什么，以及常见变体<a class="anchor" href="#h-4-加速取决于什么以及常见变体" aria-label="本节链接">#</a></h4>
+<p>加速比约等于 <strong>平均接受长度 + 1</strong>（每轮前向平均产出多少 token），上限是 <code>γ+1</code>。它高度依赖草稿模型与目标模型的<strong>输出一致性</strong>：两者分布越接近，接受得越多。于是产生了几类变体：</p>
+<ul>
+<li><strong>独立草稿模型</strong>：如用 T5-small 给 LLaMA 当草稿，训练成本低但匹配度一般；</li>
+<li><strong>MEDUSA</strong>：不在&quot;另一个模型&quot;上猜，而是在目标模型头上加若干&quot;前瞻头&quot;，一次前向并行预测未来多个位置，省掉草稿模型的单独运行；</li>
+<li><strong>EAGLE</strong>：草稿阶段不是逐 token 自回归，而是直接预测&quot;特征层面&quot;的未来 token，接受率更高；</li>
+<li><strong>树形/多候选</strong>：草稿模型一次给出多棵候选序列（树状），验证时并行遍历，进一步提升接受长度。</li>
+</ul>
+<p>在推理引擎里，vLLM、TensorRT-LLM 都提供了投机解码的开关，通常能把 decode 吞吐提升 1.5~3 倍，代价是额外显存放草稿模型（或前瞻头）。</p>
+<p><figure><img class="md-img" src="content/courses/llm-inference-optimization/assets/chapter-6-figure-02.svg" alt="投机解码流程：草稿模型猜 γ 个候选 → 目标模型一次验证 → 接受一致前缀并修正分歧点" loading="lazy" decoding="async"><figcaption>投机解码流程：草稿模型猜 γ 个候选 → 目标模型一次验证 → 接受一致前缀并修正分歧点</figcaption></figure>
+</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<h4 id="h-示例-1用贪心采样手写一个投机解码模拟器">示例 1：用贪心采样手写一个投机解码模拟器<a class="anchor" href="#h-示例-1用贪心采样手写一个投机解码模拟器" aria-label="本节链接">#</a></h4>
+<p>下面用&quot;两个假模型&quot;（字典映射式的小型语言模型）模拟投机解码的验证逻辑。为了聚焦算法，我们用贪心解码（每步取概率最大 token），核心是展示&quot;一次验证推进多步&quot;与&quot;分歧点截断&quot;。</p>
+<pre data-lang="python"><code class="language-python"># 两个&quot;模型&quot;：输入一个 token 序列，返回下一步最可能 token（贪心）
+def next_token_draft(prefix):
+    &quot;&quot;&quot;草稿模型：小、快、可能猜错。&quot;&quot;&quot;
+    table = {(&quot;The&quot;,): &quot;cat&quot;, (&quot;The&quot;, &quot;cat&quot;): &quot;sat&quot;, (&quot;The&quot;, &quot;cat&quot;, &quot;sat&quot;): &quot;on&quot;,
+             (&quot;The&quot;, &quot;cat&quot;, &quot;sat&quot;, &quot;on&quot;): &quot;the&quot;, (&quot;The&quot;, &quot;cat&quot;, &quot;sat&quot;, &quot;on&quot;, &quot;the&quot;): &quot;mat&quot;}
+    return table.get(prefix)
+
+def next_token_target(prefix):
+    &quot;&quot;&quot;目标模型：权威、慢、输出视为标准答案。&quot;&quot;&quot;
+    table = {(&quot;The&quot;,): &quot;cat&quot;, (&quot;The&quot;, &quot;cat&quot;): &quot;sat&quot;, (&quot;The&quot;, &quot;cat&quot;, &quot;sat&quot;): &quot;on&quot;,
+             (&quot;The&quot;, &quot;cat&quot;, &quot;sat&quot;, &quot;on&quot;): &quot;the&quot;, (&quot;The&quot;, &quot;cat&quot;, &quot;sat&quot;, &quot;on&quot;, &quot;the&quot;): &quot;mat&quot;}
+    return table.get(prefix)
+
+def speculative_decode(prompt, gamma=3, max_tokens=6):
+    &quot;&quot;&quot;投机解码：草稿先猜 gamma 个，目标一次验证并截断分歧。&quot;&quot;&quot;
+    seq = list(prompt)
+    target_calls = 0                     # 统计目标模型前向次数（贵）
+    while len(seq) &lt; max_tokens + len(prompt):
+        # 1) 草稿模型自回归猜 gamma 个候选
+        draft = []
+        cur = tuple(seq)
+        for _ in range(gamma):
+            t = next_token_draft(cur)
+            if t is None:
+                break
+            draft.append(t)
+            cur = cur + (t,)
+        if not draft:
+            break
+        # 2) 目标模型一次性验证（模拟：逐位看是否一致）
+        target_calls += 1
+        accept = 0
+        cur = tuple(seq)
+        for i, cand in enumerate(draft):
+            correct = next_token_target(cur)
+            if correct == cand:
+                accept += 1              # 一致：接受
+                cur = cur + (cand,)
+            else:
+                seq.append(correct)      # 分歧：用目标模型的答案修正
+                break
+        else:
+            # 全部猜中：整串接受，末尾再接一个目标模型 token
+            seq.extend(draft)
+            nxt = next_token_target(tuple(seq))
+            if nxt:
+                seq.append(nxt)
+            continue
+        seq.extend(draft[:accept])
+    return seq, target_calls
+
+out, calls = speculative_decode((&quot;The&quot;,))
+print(&quot;生成序列:&quot;, &quot; &quot;.join(out))
+print(&quot;目标模型前向次数:&quot;, calls, &quot;，产出 token 数:&quot;, len(out) - 1)</code></pre>
+<p>跑一遍会发现：目标模型只前向了极少几次，却产出了完整句子——这就是投机解码&quot;一次前向多步产出&quot;的直观效果。把草稿模型改错几个映射（如让 <code>(&quot;The&quot;,)</code> 猜成 <code>&quot;dog&quot;</code>），再运行，会看到目标模型在分歧点截断并修正，序列依然正确、只是加速变少。</p>
+<h4 id="h-示例-2vllm-里启用投机解码">示例 2：vLLM 里启用投机解码<a class="anchor" href="#h-示例-2vllm-里启用投机解码" aria-label="本节链接">#</a></h4>
+<p>生产里用引擎一行配置（下面命令示意：<code>--speculative-config</code> 指定草稿模型与方法）：</p>
+<pre data-lang="bash"><code class="language-bash"># 用一个小模型当草稿，给大模型加速 decode
+vllm serve meta-llama/Llama-3.1-70B-Instruct \
+    --speculative-config &#39;{&quot;model&quot;: &quot;meta-llama/Llama-3.2-1B-Instruct&quot;, &quot;num_speculative_tokens&quot;: 5}&#39;</code></pre>
+<p>引擎内部负责草稿采样、并行验证、接受/拒绝的全部细节，你只需关心草稿模型的选择与投机长度。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>把示例 1 的草稿模型改成&quot;前两词猜对、后面全错&quot;，观察接受长度如何下降、目标模型前向次数如何上升，解释&quot;匹配度决定加速比&quot;。</li>
+<li>推导：若平均接受长度为 <code>a</code>，每轮草稿自回归开销与目标模型一次前向开销之比为 <code>c</code>，写出吞吐加速比公式，并说明什么条件下投机解码反而会变慢。</li>
+<li>比较&quot;独立草稿模型&quot;与&quot;MEDUSA 前瞻头&quot;两种方案的显存与通信开销差异，说明各自适合什么场景。</li>
+<li>用 vLLM 分别以开/关投机解码跑同一批请求，记录 decode 吞吐与 TTFT 的变化，注意观察草稿模型带来的额外显存占用。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Fast Inference from Transformers via Speculative Decoding（Leviathan 等）：<a href="https://arxiv.org/abs/2211.17192" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2211.17192</a></li>
+<li>MEDUSA: Simple LLM Inference Acceleration Framework with Multiple Decoding Heads：<a href="https://arxiv.org/abs/2401.10774" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2401.10774</a></li>
+<li>EAGLE: Speculative Sampling Requires Rethinking Feature Uncertainty：<a href="https://arxiv.org/abs/2401.15077" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2401.15077</a></li>
+<li>vLLM 文档 · 投机解码：<a href="https://docs.vllm.ai/en/latest/features/spec_decode.html" target="_blank" rel="noopener noreferrer">https://docs.vllm.ai/en/latest/features/spec_decode.html</a></li>
+</ul>
+<p><a href="#/l/inf-ch6-l3">下一课：prefix caching</a></p>

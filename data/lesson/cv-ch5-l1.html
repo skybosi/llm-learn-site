@@ -1,0 +1,118 @@
+<h2 id="h-对比学习simclrmoco">对比学习（SimCLR/MoCo）<a class="anchor" href="#h-对比学习simclrmoco" aria-label="本节链接">#</a></h2>
+<p>你已经能用监督学习训练检测分割模型，但监督学习有一个绕不开的瓶颈：它需要海量的人工标注。标注一张图可能要几十秒，标注百万张图就是天文数字的成本。自监督学习（Self-Supervised Learning，SSL）的思路是：<strong>不依赖人工标签，让模型从数据本身构造&quot;任务&quot;来学习表征</strong>。这一章我们先讲其中最成功的一支——<strong>对比学习</strong>，用 SimCLR 和 MoCo 两个代表作把它的原理吃透。关键不是背公式，而是理解&quot;为什么让相似样本靠近、不相似样本远离&quot;这件事能让模型学到可迁移的特征。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-核心思想不靠标签靠像不像">1. 核心思想：不靠标签，靠&quot;像不像&quot;<a class="anchor" href="#h-1-核心思想不靠标签靠像不像" aria-label="本节链接">#</a></h4>
+<p>监督学习用标签告诉模型&quot;这是猫、那是狗&quot;。对比学习换了个角度：对同一张图做两种不同的数据增强（比如两次随机裁剪 + 颜色抖动），得到的两个视图<strong>本质上还是同一张图</strong>，它们构成一对&quot;正样本对&quot;；来自不同图的视图则是&quot;负样本对&quot;。训练目标很朴素——<strong>在表征空间里，让正样本对靠得尽可能近，让负样本对离得尽可能远</strong>。</p>
+<p><figure><img class="md-img" src="content/courses/cv-advanced/assets/chapter-5-figure-01.svg" alt="对比学习框架：同一张图两种增强作为正样本对，拉近它们的表征；不同图的样本作为负样本，推远" loading="lazy" decoding="async"><figcaption>对比学习框架：同一张图两种增强作为正样本对，拉近它们的表征；不同图的样本作为负样本，推远</figcaption></figure>
+</p>
+<p>为什么这个&quot;像不像&quot;的游戏能学到好东西？因为模型要在一堆扰动（裁剪、颜色、翻转）之下，仍然认出&quot;这两个视图是同一个东西&quot;，它就必须学到<strong>对增强不变、又能区分不同物体</strong>的稳定特征——而这恰恰是下游任务（分类、检测、分割）最想要的那类特征。</p>
+<h4 id="h-2-simclr简单有效的四件套">2. SimCLR：简单有效的四件套<a class="anchor" href="#h-2-simclr简单有效的四件套" aria-label="本节链接">#</a></h4>
+<p>SimCLR 的洞察是，对比学习不需要复杂的结构，靠<strong>四个精心设计的组件</strong>就能追上甚至超越当时的监督预训练：</p>
+<ol>
+<li><strong>更强的数据增强组合</strong>：随机裁剪 + 颜色抖动 + 高斯模糊等叠加。作者证明增强的&quot;组合&quot;至关重要——裁剪负责全局形状，颜色抖动负责防止模型靠颜色直方图&quot;作弊&quot;。</li>
+<li><strong>投影头（projection head）</strong>：在编码器（如 ResNet）之后加一个小 MLP <code>g(·)</code>，对比学习在 <code>g</code> 的输出上做，但下游只用编码器的输出 <code>f(·)</code>。一个反直觉的发现是：<strong>投影头学到的表征&quot;用前即弃&quot;反而更好</strong>——它帮编码器在训练时&quot;藏起&quot;那些和增强有关、但不通用的信息。</li>
+<li><strong>NT-Xent 损失（InfoNCE）</strong>：对每个正样本对算相似度，再对一批里所有负样本做 softmax 归一化，本质是&quot;把正样本当成唯一正确答案的分类问题&quot;。</li>
+<li><strong>大批量</strong>：负样本来自同一个 batch 里的其他样本，所以 batch 越大，负样本越多，对比越充分。SimCLR 用到了 4096 甚至 8192 的大 batch。</li>
+</ol>
+<h4 id="h-3-moco负样本不够建一个字典">3. MoCo：负样本不够？建一个&quot;字典&quot;<a class="anchor" href="#h-3-moco负样本不够建一个字典" aria-label="本节链接">#</a></h4>
+<p>SimCLR 依赖大批量提供负样本，硬件门槛高。MoCo 提出另一个思路：把&quot;负样本来源&quot;从 batch 里拆出来，变成一个<strong>常驻的负样本队列（dictionary）</strong>：</p>
+<ul>
+<li>维护一个先进先出的队列，存最近若干 batch 的编码结果，作为负样本库（比如 65536 个）；</li>
+<li>用两个编码器：一个<strong>在线编码器</strong>（正常梯度更新），一个<strong>动量编码器</strong>（参数用在线编码器的指数移动平均更新，<code>θ_m ← m·θ_m + (1−m)·θ_q</code>，<code>m</code> 接近 1）；</li>
+<li>队列里的负样本由动量编码器生成，因为动量更新很慢，队列里的表征在短时间内保持&quot;同一批人&quot;的口径一致，不会因为参数突变而混乱。</li>
+</ul>
+<p><figure><img class="md-img" src="content/courses/cv-advanced/assets/chapter-5-figure-02.svg" alt="MoCo 的动量编码器 + 负样本队列：一个慢慢更新的编码器持续往队列里补充负样本" loading="lazy" decoding="async"><figcaption>MoCo 的动量编码器 + 负样本队列：一个慢慢更新的编码器持续往队列里补充负样本</figcaption></figure>
+</p>
+<p>可以这样理解：SimCLR 是&quot;临时凑一批当负样本&quot;，MoCo 是&quot;养一个长期更新的负样本字典&quot;。两者殊途同归——都是让模型在足够多的负样本压力下，把正样本对对齐。</p>
+<h4 id="h-4-为什么它-work对齐--均匀">4. 为什么它 work：对齐 + 均匀<a class="anchor" href="#h-4-为什么它-work对齐--均匀" aria-label="本节链接">#</a></h4>
+<p>理论分析（Wang &amp; Isola 等）把对比学习的目标拆成两个优雅的性质：</p>
+<ul>
+<li><strong>对齐（Alignment）</strong>：正样本对的表征要接近——这保证了对增强不变性；</li>
+<li><strong>均匀性（Uniformity）</strong>：所有样本的表征要尽量在球面上<strong>铺开、分布均匀</strong>——这防止了模型把所有样本都坍缩到同一点（即&quot;平凡解&quot;）。</li>
+</ul>
+<p>只有&quot;对齐&quot;没有&quot;均匀&quot;，模型会退化；两者同时满足，表征空间才既有判别性又不塌缩。这个&quot;对齐 + 均匀&quot;的框架，是理解&quot;为什么对比学习不崩&quot;的钥匙，也是后面几课评价其他自监督方法的一面镜子。</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>先实现 SimCLR 的核心——NT-Xent（InfoNCE）损失，用一个小 batch 的假表征跑通前向：</p>
+<pre data-lang="python"><code class="language-python">import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+torch.manual_seed(0)
+
+
+def nt_xent_loss(z1, z2, temperature=0.5):
+    &quot;&quot;&quot;NT-Xent 损失。z1、z2 是同一批图两种增强的投影表征，形状 (N, d)。&quot;&quot;&quot;
+    z = torch.cat([z1, z2], dim=0)          # (2N, d)
+    z = F.normalize(z, dim=-1)              # 先 L2 归一化，点积即余弦相似度
+
+    sim = z @ z.T / temperature             # (2N, 2N) 相似度矩阵
+    N = z1.shape[0]
+
+    # 每个样本的正样本，是&quot;它在另一半增强里的对应项&quot;
+    labels = torch.arange(N, device=z.device).repeat(2)
+    labels = (labels + N * torch.arange(2, device=z.device).unsqueeze(1)).flatten()
+    # 即：z1 第 i 个的正样本是 z2 第 i 个，反之亦然
+
+    # 把自己与自己的相似度屏蔽掉，避免退化解
+    mask = torch.eye(2 * N, dtype=torch.bool, device=z.device)
+    sim = sim.masked_fill(mask, float(&quot;-inf&quot;))
+
+    # 以&quot;正样本&quot;为唯一正确答案做交叉熵
+    loss = F.cross_entropy(sim, labels)
+    return loss
+
+
+# 模拟一个 batch=4 的投影表征（维度 8）
+z1 = torch.randn(4, 8)
+z2 = torch.randn(4, 8)
+print(&quot;NT-Xent 损失:&quot;, nt_xent_loss(z1, z2).item())</code></pre>
+<p>再写一个精简的 MoCo 动量更新 + 队列，体会&quot;字典&quot;是怎么维护的：</p>
+<pre data-lang="python"><code class="language-python">class MoCoQueue:
+    &quot;&quot;&quot;简化的 MoCo：维护一个负样本队列，用动量编码器更新。&quot;&quot;&quot;
+    def __init__(self, dim=8, queue_size=16, momentum=0.999):
+        self.queue_size = queue_size
+        self.momentum = momentum
+        # 队列初始用随机向量填充
+        self.register_queue(torch.randn(queue_size, dim))
+
+    def register_queue(self, q):
+        self.queue = F.normalize(q, dim=-1)
+
+    def enqueue_dequeue(self, keys):
+        &quot;&quot;&quot;新 batch 的负样本入队，最旧的出队（先进先出）。&quot;&quot;&quot;
+        keys = F.normalize(keys, dim=-1)
+        self.queue = torch.cat([self.queue, keys], dim=0)[keys.shape[0]:]
+
+    def momentum_update(self, online_params, momentum_params):
+        &quot;&quot;&quot;把动量编码器参数往在线编码器参数上缓慢靠近。&quot;&quot;&quot;
+        with torch.no_grad():
+            for p_o, p_m in zip(online_params, momentum_params):
+                p_m.mul_(self.momentum).add_(p_o, alpha=1 - self.momentum)
+
+
+q = MoCoQueue()
+keys = torch.randn(4, 8)                 # 新 batch 由动量编码器算出的负样本
+q.enqueue_dequeue(keys)
+print(&quot;入队后队列长度（保持不变）:&quot;, q.queue.shape)  # (16, 8)
+
+# 演示动量更新：把两个参数&quot;缓慢对齐&quot;
+online = [torch.tensor([1.0, 2.0])]
+momentum_p = [torch.tensor([0.0, 0.0])]
+q.momentum_update(online, momentum_p)
+print(&quot;动量更新后的参数:&quot;, momentum_p[0])   # 接近 [0.001, 0.002]</code></pre>
+<p>运行后你能直观看到两件事：NT-Xent 通过&quot;屏蔽自身 + 交叉熵&quot;把正样本对齐；MoCo 队列长度恒定、先入先出，动量更新让参数每步只挪动 <code>1 − m</code> 的一小步。把这两个机制合起来，就是对比学习在工业界落地时的标准形态。</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li>修改 <code>nt_xent_loss</code>，把 <code>temperature</code> 分别设为 0.1、0.5、2.0，观察损失值变化，并解释温度如何控制&quot;对难负样本的惩罚强度&quot;（提示：温度越小，softmax 分布越尖锐）。</li>
+<li>用手写的小例子验证&quot;对齐 + 均匀&quot;：构造一批全部坍缩到同一点的表征，计算它们的 InfoNCE 损失和&quot;均匀性&quot;指标（可近似为两两平均相似度），说明为什么只有对齐没有均匀会失败。</li>
+<li>用 <code>torchvision</code> 加载 ResNet18，去掉最后的全连接层作为编码器，接一个两层 MLP 投影头，在 CIFAR-10（或你自己的小数据集）上实现一个最小 SimCLR 训练循环，记录前 100 步损失的下降趋势。</li>
+<li>思考 MoCo 与 SimCLR 的本质差异：如果硬件允许用超大 batch，队列机制还有必要吗？什么场景下 MoCo 的&quot;动量 + 队列&quot;反而更划算？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>论文《A Simple Framework for Contrastive Learning of Visual Representations》（SimCLR）：<a href="https://arxiv.org/abs/2002.05709" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2002.05709</a></li>
+<li>论文《Momentum Contrast for Unsupervised Visual Representation Learning》（MoCo）：<a href="https://arxiv.org/abs/1911.05722" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/1911.05722</a></li>
+<li>论文《Understanding Contrastive Representation Learning through Alignment and Uniformity》（Wang &amp; Isola）：<a href="https://arxiv.org/abs/2005.10242" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2005.10242</a></li>
+<li>论文《Big Self-Supervised Models are Strong Semi-Supervised Learners》（SimCLRv2，投影头与蒸馏）：<a href="https://arxiv.org/abs/2006.10029" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2006.10029</a></li>
+</ul>
+<p><a href="#/l/cv-ch5-l2">下一课：掩码自编码器 MAE</a></p>

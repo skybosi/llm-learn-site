@@ -1,0 +1,145 @@
+<h2 id="h-结果与复盘llm-领域微调">结果与复盘（LLM 领域微调）<a class="anchor" href="#h-结果与复盘llm-领域微调" aria-label="本节链接">#</a></h2>
+<p>微调项目最难的不是&quot;跑通训练&quot;，而是<strong>证明这次微调是值得的</strong>。本课把结果落成三样东西：微调前后对比、rank/alpha 选择实验、以及一套能顶住面试追问的话术。做完本课，你手里是&quot;可复现的效果证据 + 可对答的工程决策&quot;。</p>
+<h3 id="h-一目标与步骤">一、目标与步骤<a class="anchor" href="#h-一目标与步骤" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>微调前后对比</strong>：同一测试集的基座 vs 微调分数与样例对比。</li>
+<li><strong>rank/alpha 选择实验</strong>：用数据说明&quot;为什么用 r=8/alpha=16&quot;。</li>
+<li><strong>成本与效果复盘</strong>：显存、时间、可训练参数占比。</li>
+<li><strong>面试话术</strong>：预演高频追问，特别是&quot;为什么 LoRA 不用全参微调&quot;。</li>
+</ol>
+<h3 id="h-二代码骨架与实现指导">二、代码骨架与实现指导<a class="anchor" href="#h-二代码骨架与实现指导" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-微调前后对比表">1. 微调前后对比表<a class="anchor" href="#h-1-微调前后对比表" aria-label="本节链接">#</a></h4>
+<p>把第 2 课的评估函数跑在基座与微调模型上，汇总成报告表：</p>
+<pre data-lang="python"><code class="language-python">import pandas as pd
+
+models = {&quot;基座 Qwen2.5-7B&quot;: base_model, &quot;LoRA 微调&quot;: lora_model}
+rows = []
+for name, m in models.items():
+    rows.append({
+        &quot;模型&quot;: name,
+        &quot;格式遵循率&quot;: f&quot;{eval_format_following(m, val_rows):.3f}&quot;,
+        &quot;领域准确率&quot;: f&quot;{eval_domain_accuracy(m, val_rows):.3f}&quot;,
+    })
+summary = pd.DataFrame(rows)
+print(summary.to_markdown(index=False))</code></pre>
+<p>预期形态（示例，供对照）：</p>
+<table>
+<thead>
+<tr>
+<th>模型</th>
+<th>格式遵循率</th>
+<th>领域准确率</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>基座 Qwen2.5-7B</td>
+<td>0.62</td>
+<td>0.71</td>
+</tr>
+<tr>
+<td>LoRA 微调</td>
+<td>0.91</td>
+<td>0.86</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p>汇报要点：<strong>不要只报&quot;准确率涨了&quot;</strong>，要分项说明——格式遵循率大涨，证明 LoRA 把&quot;按 JSON 输出&quot;烧进了权重；领域准确率提升，证明领域知识/习惯被注入。若领域准确率提升有限，也如实说明，并给出&quot;数据量不足/知识更适合 RAG&quot;的结论，这比虚报更专业。</p>
+</blockquote>
+<h4 id="h-2-样例对比最有说服力的证据">2. 样例对比（最有说服力的证据）<a class="anchor" href="#h-2-样例对比最有说服力的证据" aria-label="本节链接">#</a></h4>
+<p>挑 2~3 个&quot;基座答得差、微调答得好&quot;的典型例子贴进报告：</p>
+<pre data-lang="python"><code class="language-python">examples = [
+    &quot;请以 JSON 输出：{症状:..., 可能疾病:..., 建议:...} 针对&#39;持续发热伴咳嗽&#39;&quot;,
+    &quot;把下面的合同条款改写成通俗语言：……&quot;,
+]
+for e in examples:
+    print(&quot;【问题】&quot;, e)
+    print(&quot;基座输出：&quot;, generate(base_model, e)[:150])
+    print(&quot;微调输出：&quot;, generate(lora_model, e)[:150])
+    print(&quot;-&quot; * 50)</code></pre>
+<p>样例对比比任何分数都直观——面试官或简历读者一眼就能看出差别。<strong>务必选真实的、有代表性的例子，不要挑极端个案</strong>。</p>
+<p><figure><img class="md-img" src="content/courses/ai-projects/assets/chapter-3-figure-02.svg" alt="微调前后对比与典型样例" loading="lazy" decoding="async"><figcaption>微调前后对比与典型样例</figcaption></figure>
+</p>
+<h4 id="h-3-rankalpha-选择实验">3. rank/alpha 选择实验<a class="anchor" href="#h-3-rankalpha-选择实验" aria-label="本节链接">#</a></h4>
+<p>回答&quot;r 取多少&quot;的最好方式不是背结论，而是小规模实验：</p>
+<pre data-lang="python"><code class="language-python"># 用同一份数据、同一超参，只改 r，训少量步数后在验证集打分
+import itertools
+grid = [(8, 16), (16, 32), (64, 128)]   # (r, alpha)
+for r, alpha in grid:
+    cfg = LoraConfig(r=r, lora_alpha=alpha, lora_dropout=0.05,
+                     target_modules=[&quot;q_proj&quot;, &quot;k_proj&quot;, &quot;v_proj&quot;, &quot;o_proj&quot;],
+                     task_type=TaskType.CAUSAL_LM)
+    # 训练 0.5~1 epoch，记录验证 loss 与格式遵循率，以及可训练参数数
+    print(f&quot;r={r}, alpha={alpha}, 可训练参数占比={pct:.3%}, val_loss={vloss:.4f}&quot;)</code></pre>
+<p>预期方向：r 过小（如 4）表达力不足、指标偏低；r 过大（如 64）参数更多但收益边际递减、且更易过拟合；<code>r=8~16</code> 在领域任务上常是性价比拐点。<strong>结论必须来自你的数据</strong>，这张&quot;拐点表&quot;就是你 rank 选择的证据。</p>
+<h4 id="h-4-成本与效果复盘">4. 成本与效果复盘<a class="anchor" href="#h-4-成本与效果复盘" aria-label="本节链接">#</a></h4>
+<p>把工程成本也量化，展示&quot;用最小代价换最大收益&quot;：</p>
+<table>
+<thead>
+<tr>
+<th>项</th>
+<th>数值</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>基座模型</td>
+<td>Qwen2.5-7B-Instruct</td>
+</tr>
+<tr>
+<td>训练方案</td>
+<td>LoRA（bf16，单张 24GB）</td>
+</tr>
+<tr>
+<td>可训练参数占比</td>
+<td>~0.3%</td>
+</tr>
+<tr>
+<td>峰值显存</td>
+<td>~18GB</td>
+</tr>
+<tr>
+<td>训练数据</td>
+<td>3k 条领域指令</td>
+</tr>
+<tr>
+<td>训练时长</td>
+<td>3 epochs，约 2 小时（单卡）</td>
+</tr>
+<tr>
+<td>格式遵循率提升</td>
+<td>0.62 → 0.91</td>
+</tr>
+</tbody></table>
+<p>这张表直接支撑你简历里&quot;低成本微调&quot;的说法，也让面试官看到你有成本意识。</p>
+<p><figure><img class="md-img" src="content/courses/ai-projects/assets/chapter-3-figure-03.svg" alt="rank/alpha 选择与成本复盘" loading="lazy" decoding="async"><figcaption>rank/alpha 选择与成本复盘</figcaption></figure>
+</p>
+<h3 id="h-三面试话术">三、面试话术<a class="anchor" href="#h-三面试话术" aria-label="本节链接">#</a></h3>
+<p><strong>Q1：为什么用 LoRA 而不是全参数微调？</strong>
+答：全参数微调 7B 需要约 112GB 显存，个人根本负担不起；LoRA 冻结原权重、只训练低秩增量，把显存降到 18GB，可训练参数占比约 0.3%，单卡 2 小时就能出结果。更重要的是，LoRA 的增量权重是<strong>独立可插拔的</strong>——我可以在同一个基座上保存多个领域的 adapter，部署时按需挂载，比每个领域存一份全量模型更经济、更易维护。</p>
+<p><strong>Q2：r 和 alpha 你是怎么选的？</strong>
+答：r 决定低秩增量的表达力，alpha 是与 r 挂钩的缩放系数，一般取 r 的 1~2 倍。我做了 r=8/16/64 的小规模对比，发现 r=8 已经接近性能拐点，r=64 收益边际递减还更容易过拟合，所以选了 r=8、alpha=16。结论来自我的验证集实验，不是抄默认值。</p>
+<p><strong>Q3：微调会不会&quot;灾难性遗忘&quot;基座能力？</strong>
+答：LoRA 冻结原权重、只加低秩增量，天然缓解遗忘；我再加了两道保险——控制 epoch 数（3 个）、用 warmup + 余弦学习率，并在评估时同时看领域指标与通用格式指标。如果发现通用能力下降，我会降学习率或减少 epoch，而不是硬训。</p>
+<p><strong>Q4：你怎么保证微调数据质量？</strong>
+答：三步——去空去重、统一成 messages 格式套 chat template、人工抽检 100 条。微调是&quot;垃圾进垃圾出&quot;，我在数据清洗上花的时间不比训练少；另外我坚持&quot;少量高质量&quot;而不是&quot;海量噪声&quot;，3k 条就够见效果。</p>
+<p><strong>Q5：如果效果不达预期，你怎么排查？</strong>
+答：按顺序看——先看训练 loss 是否下降（不降查学习率与 chat template），再看验证集是否过拟合（涨了减 epoch/加 dropout），最后看评估指标（loss 低不等于答得好，必须上格式遵循率与领域准确率）。我踩过&quot;没套 chat template 导致模型输出错乱&quot;的坑，也踩过&quot;学习率照搬全参微调导致 loss 震荡&quot;的坑，现在都有固定的排查顺序。</p>
+<p><strong>Q6：微调和 RAG 在这个场景怎么权衡？</strong>
+答：如果领域知识频繁更新、且要可追溯，我会选 RAG；如果是&quot;格式稳定 + 领域说话习惯 + 长期复现某种行为&quot;，我选微调。这个项目选微调，是因为我要求模型<strong>稳定输出结构化 JSON 且带领域术语</strong>，这是提示词和 RAG 都难以稳定复现的。</p>
+<h3 id="h-四常见坑复盘清单">四、常见坑（复盘清单）<a class="anchor" href="#h-四常见坑复盘清单" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>只报 loss</strong>：loss 低不代表答案好，必须上任务级指标（格式遵循率、领域准确率）。</li>
+<li><strong>没套 chat template</strong>：手动拼字符串导致训练数据与推理格式不一致，模型输出错乱。</li>
+<li><strong>学习率照搬全参微调</strong>：LoRA 该用更高的 2e-4 量级，用 1e-5 会几乎学不动。</li>
+<li><strong>数据没清洗</strong>：重复、空输出、格式错乱直接喂进去，白烧显存还学坏。</li>
+<li><strong>r 拍脑袋且无实验</strong>：说不出 r 的依据，面试一问就露怯。</li>
+<li><strong>忽略遗忘风险</strong>：只看领域指标涨，不检查通用能力是否退化。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>LoRA 原始论文：<a href="https://arxiv.org/abs/2106.09685" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2106.09685</a></li>
+<li>QLoRA 论文：<a href="https://arxiv.org/abs/2305.14314" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2305.14314</a></li>
+<li>Hugging Face PEFT 文档：<a href="https://huggingface.co/docs/peft/index" target="_blank" rel="noopener noreferrer">https://huggingface.co/docs/peft/index</a></li>
+<li>Hugging Face TRL 文档：<a href="https://huggingface.co/docs/trl/index" target="_blank" rel="noopener noreferrer">https://huggingface.co/docs/trl/index</a></li>
+<li>Qwen2.5 模型：<a href="https://huggingface.co/Qwen" target="_blank" rel="noopener noreferrer">https://huggingface.co/Qwen</a></li>
+</ul>
+<p><a href="#/l/proj-ch4-l1">下一课：项目规划</a></p>

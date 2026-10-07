@@ -1,0 +1,163 @@
+<h2 id="h-调度空间tile--unroll--vectorize--并行化--流水与-cuda">调度空间：tile / unroll / vectorize / 并行化 / 流水（与 CUDA 优化一一对应）<a class="anchor" href="#h-调度空间tile--unroll--vectorize--并行化--流水与-cuda" aria-label="本节链接">#</a></h2>
+<p>第 1 课证明了&quot;同一算法可以有很多正确调度&quot;，但没说这些调度之间怎么组合、组合起来有多大空间。先看一个小空间：6 个 tile 形状 × 2 种次序 × 2 种向量宽度 × 3 种展开次数 = <strong>72 条</strong>，最差与最好相差约 3.4 倍。更关键的是<strong>每个原语的收益量级差得很远</strong>：取消分块让代价涨 8.4 倍，而取消向量化只涨 0.2%——搜索预算该怎么花，答案在这张表里。</p>
+<p><figure><img class="md-img" src="content/courses/ml-compilers/assets/chapter-6-figure-02.svg" alt="调度空间：五个原语的可选组合与各自的收益量级" loading="lazy" decoding="async"><figcaption>调度空间：五个原语的可选组合与各自的收益量级</figcaption></figure>
+</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-能改顺序不等于随便改合法性先立边界">1. &quot;能改顺序&quot;不等于&quot;随便改&quot;：合法性先立边界<a class="anchor" href="#h-1-能改顺序不等于随便改合法性先立边界" aria-label="本节链接">#</a></h4>
+<p>调度原语不是自由改写，每个都带前提。<strong>tile / split</strong> 要求拆出的两层覆盖原范围（<code>tiles</code> 必须整除维度）；<strong>vectorize</strong> 要求被向量化的维在内存里连续，否则硬件拒绝或退化成标量；<strong>bind</strong> 允许把输出维绑到线程块，但归约维绑核会让不同线程写同一个累加器；<strong>unroll</strong> 展开后寄存器用量上升，溢出就变慢。所以调度空间是&quot;合法子集里的地形&quot;，不是整个笛卡尔积。</p>
+<h4 id="h-2-五个原语的收益量级差得很远">2. 五个原语的收益量级差得很远<a class="anchor" href="#h-2-五个原语的收益量级差得很远" aria-label="本节链接">#</a></h4>
+<p>代码第 3 节做<strong>单变量对比</strong>：从最优调度出发，每次只动一个原语。结果分三档。</p>
+<p><strong>第一档是分块</strong>：<code>tile=(128,64,8)</code> 换成未分块，代价从 23.0 MB 涨到 192.8 MB（×8.4）——未分块时每个输出元素都要把一整行 a 与一整列 b 从上级存储取回，复用完全消失。<strong>分块决定&quot;数据在片上能活多久&quot;，是量级问题</strong>。</p>
+<p><strong>第二档是并行绑定</strong>：把 <code>(&#39;i&#39;,&#39;j&#39;)</code> 改成只并 <code>j</code>，代价 ×3.6。并行维的切分定义了复用边界，块与块之间不能共享片上数据——所以并行策略必须与 tile 形状一起选（第 1 课结尾的&quot;只并 j&quot;是同一现象）。</p>
+<p><strong>第三档是向量化与 unroll</strong>：改成 <code>vec=1</code> 或 <code>unroll=8</code> 只带来 0.2% 上下的变化。这不是说它们不重要，而是说明<strong>在这条基线上它们不是瓶颈</strong>：访存已被分块压到最低，指令数占比本来就小。unroll 的价值在隐藏延迟，只有访存顺畅、流水线有空隙时才体现。</p>
+<h4 id="h-3-好调度是稀有的把-720-条分成十档">3. 好调度是稀有的：把 720 条分成十档<a class="anchor" href="#h-3-好调度是稀有的把-720-条分成十档" aria-label="本节链接">#</a></h4>
+<p>把取值集合放大（10 个 tile × 2 次序 × 2 种归约提前 × 3 向量宽 × 2 绑核 × 3 unroll）就有 <strong>720 条</strong>候选。按代价分十档：每档 72 条，而第 1 档（23.0 MB 上下）与第 5 档（42.5 MB 起）几乎断开——<strong>劣档不是渐变，而是断崖</strong>，从某一档开始驻留量超过 L2，DRAM 账突然乘上倍数。</p>
+<p>这解释了自动调优的两个事实：<strong>好区域只占 10%，随机碰运气效率不高；但同一档内的 72 条差别很小，没必要精确到小数第三位</strong>。第 3、4 课分别处理这两件事：用代价模型把搜索导向好区域，用预算账决定&quot;搜多久才划算&quot;。</p>
+<p><figure><img class="md-img" src="content/courses/ml-compilers/assets/chapter-6-figure-03.svg" alt="五个调度原语的收益分三档：分块、并行绑定是量级项，向量化与展开是第三档，好调度只占约一成" loading="lazy" decoding="async"><figcaption>五个调度原语的收益分三档：分块、并行绑定是量级项，向量化与展开是第三档，好调度只占约一成</figcaption></figure>
+</p>
+<h4 id="h-4-与-cuda-优化一一对应但顺序要反过来">4. 与 CUDA 优化一一对应，但顺序要反过来<a class="anchor" href="#h-4-与-cuda-优化一一对应但顺序要反过来" aria-label="本节链接">#</a></h4>
+<p>把五个原语翻译成前一门课的语言：tile → 共享内存分块；reorder/归约提前 → 循环交换与流水；vectorize → 向量化访存；bind → 网格/线程块划分；unroll → <code>#pragma unroll</code>。手工优化的经验顺序是&quot;先分块、再看并行度、最后向量化和展开&quot;；自动调优的搜索顺序反过来——<strong>先解决量级最大的那一项</strong>。</p>
+<h4 id="h-5-常见坑">5. 常见坑<a class="anchor" href="#h-5-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>tile 越大越好？</strong> 不是。tile 面积超过片上缓存后驻留量溢出，DRAM 账反弹（第 1 课&quot;只并 j&quot;的 1124 MB 即是此类）。</li>
+<li><strong>把&quot;合法&quot;当&quot;好&quot;</strong>：<code>tiles=(1,1,1)</code> 与 <code>(8,8,1)</code> 都合法，代价差 1.4 倍；合法性检查不保证性能。</li>
+<li><strong>并行度只看块数</strong>：<code>(&#39;i&#39;,&#39;j&#39;)</code> 与 <code>(&#39;j&#39;,)</code> 都能开很多块，但后者改变了 a 的驻留量，代价 ×3.6。</li>
+<li><strong>忽略 unroll 的寄存器账</strong>：本课用 <code>{1: 1.6, 4: 1.0, 8: 2.4}</code> 的压力因子近似它，真实硬件上是寄存器溢出——该因子要按实测标定。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<pre data-lang="python"><code class="language-python"># ---- 第 2 课：调度空间 = 五个原语的可选组合（纯 Python，无第三方依赖）----
+import itertools
+
+
+def cost(order, tiles, file_loop, vec, parallel, unroll, M=1024, N=1024, K=1024,
+         l2=131072, elem=4, inst_equiv=2.5e-5):
+    &quot;&quot;&quot;解析代价模型（越小越好），四项相加，都在&quot;等效字节&quot;量纲上：
+       ① 跨层搬运：驻留工作集装不进 L2 就按超出倍数补；
+       ② 片上搬运：tile 越大，块内复用越充分；
+       ③ 指令数：向量化按宽度摊薄；unroll 4 以内藏延迟，unroll 8 反受寄存器压力；
+       ④ 并行度不足的启动开销。&quot;&quot;&quot;
+    ti, tj, tk = tiles
+    on_chip = (M / ti) * (N / tj) * (ti * K + K * tj) * elem
+    ws_a = (ti if &#39;i&#39; in parallel else M) * K
+    ws_b = K * (tj if &#39;j&#39; in parallel else N)
+    dram = (M * K + K * N) * elem * (max(1.0, ws_a / l2) + max(1.0, ws_b / l2)) + M * N * elem
+    inst = (2 * M * N * K) / vec
+    reg = {1: 1.6, 4: 1.0, 8: 2.4}[unroll]        # unroll 4 最优：再多寄存器压力上来
+    launch = 0.0 if len(parallel) == 2 else M * N * elem * 0.5
+    return dram + on_chip * 0.02 + inst * inst_equiv * reg + launch
+
+
+TILES = [(1, 1, 1), (8, 8, 1), (16, 16, 1), (32, 32, 1), (64, 64, 1),
+         (16, 16, 4), (32, 32, 8), (64, 64, 16), (128, 64, 8), (64, 128, 8)]
+ORDERS = [(&#39;i&#39;, &#39;j&#39;, &#39;k&#39;), (&#39;j&#39;, &#39;i&#39;, &#39;k&#39;)]
+FILE = [None, &#39;k&#39;]
+VECS = [1, 2, 4]
+PARS = [(&#39;i&#39;, &#39;j&#39;), (&#39;j&#39;,)]
+UNROLLS = [1, 4, 8]
+FIELDS = (&#39;order&#39;, &#39;tiles&#39;, &#39;file_loop&#39;, &#39;vec&#39;, &#39;parallel&#39;, &#39;unroll&#39;)
+
+
+def space():
+    for t, o, fl, v, p, u in itertools.product(TILES, ORDERS, FILE, VECS, PARS, UNROLLS):
+        yield dict(tiles=t, order=o, file_loop=fl, vec=v, parallel=p, unroll=u)
+
+
+def evaluate(s, **kw):
+    return cost(s[&#39;order&#39;], s[&#39;tiles&#39;], s[&#39;file_loop&#39;], s[&#39;vec&#39;], s[&#39;parallel&#39;], s[&#39;unroll&#39;], **kw)
+
+
+if __name__ == &#39;__main__&#39;:
+    all_s = sorted(space(), key=evaluate)
+    print(f&#39;=== 1. 调度空间规模：{len(TILES)} tile × {len(ORDERS)} 次序 × {len(FILE)} 归约提前 &#39;
+          f&#39;× {len(VECS)} 向量宽 × {len(PARS)} 绑核 × {len(UNROLLS)} unroll = {len(all_s)} 条 ===&#39;)
+
+    print(&#39;\n=== 2. 按代价排序：前 4 名（并列说明哪几个原语在这组里真的起作用）与后 3 名 ===&#39;)
+    for tag, rows in ((&#39;最优&#39;, all_s[:4]), (&#39;最差&#39;, all_s[-3:])):
+        for s in rows:
+            print(f&#39;  {tag}  tile={str(s[&quot;tiles&quot;]):&lt;12} order={&quot;&quot;.join(s[&quot;order&quot;])} &#39;
+                  f&#39;file={str(s[&quot;file_loop&quot;]):&lt;5} vec={s[&quot;vec&quot;]} par={&quot;&quot;.join(s[&quot;parallel&quot;])} &#39;
+                  f&#39;unroll={s[&quot;unroll&quot;]:&lt;2} 代价={evaluate(s) / 1e6:7.2f} MB&#39;)
+
+    print(&#39;\n=== 3. 单变量对比：从最优调度出发各动一处 ===&#39;)
+    base = all_s[0]
+    b = evaluate(base)
+    print(f&#39;  基线：tile={base[&quot;tiles&quot;]} order={&quot;&quot;.join(base[&quot;order&quot;])} vec={base[&quot;vec&quot;]} &#39;
+          f&#39;par={&quot;&quot;.join(base[&quot;parallel&quot;])} unroll={base[&quot;unroll&quot;]}  代价={b / 1e6:.2f} MB&#39;)
+    for name, mut in [(&#39;取消分块 tile=1&#39;, dict(tiles=(1, 1, 1))),
+                      (&#39;取消向量化 vec=1&#39;, dict(vec=1)),
+                      (&#39;放弃 i 并行 par=j&#39;, dict(parallel=(&#39;j&#39;,))),
+                      (&#39;unroll 8（寄存器压力）&#39;, dict(unroll=8)),
+                      (&#39;归约不提前 file=None&#39;, dict(file_loop=None)),
+                      (&#39;只改循环次序 jik&#39;, dict(order=(&#39;j&#39;, &#39;i&#39;, &#39;k&#39;)))]:
+        t = dict(base); t.update(mut)
+        c = evaluate(t)
+        print(f&#39;  {name:&lt;24} 代价 {c / 1e6:7.2f} MB   相对基线 ×{c / b:5.2f}&#39;)
+
+    print(&#39;\n=== 4. 好调度有多稀有：把 720 条按代价分十档 ===&#39;)
+    step = len(all_s) // 10
+    print(&#39;  档位  代价区间(MB)   档内 tile 分布&#39;)
+    for k in range(10):
+        chunk = all_s[k * step:(k + 1) * step]
+        lo, hi = evaluate(chunk[0]) / 1e6, evaluate(chunk[-1]) / 1e6
+        tiles = sorted({str(s[&#39;tiles&#39;]) for s in chunk})
+        print(f&#39;  {k + 1:&gt;2}/10  {lo:6.2f} ~ {hi:6.2f}   {&quot; &quot;.join(tiles[:4])}&#39;)
+    print(f&#39;  最优 / 中位 = {evaluate(all_s[0]) / evaluate(all_s[len(all_s) // 2]):.2f}×；&#39;
+          f&#39;最优 / 最差 = {evaluate(all_s[0]) / evaluate(all_s[-1]):.2f}×&#39;)</code></pre>
+<p>运行结果（Python 3.10.14）：</p>
+<pre data-lang="text"><code class="language-text">=== 1. 调度空间规模：10 tile × 2 次序 × 2 归约提前 × 3 向量宽 × 2 绑核 × 3 unroll = 720 条 ===
+
+=== 2. 按代价排序：前 4 名（并列说明哪几个原语在这组里真的起作用）与后 3 名 ===
+  最优  tile=(128, 64, 8) order=ijk file=None  vec=4 par=ij unroll=4  代价=  23.00 MB
+  最优  tile=(128, 64, 8) order=ijk file=k     vec=4 par=ij unroll=4  代价=  23.00 MB
+  最优  tile=(128, 64, 8) order=jik file=None  vec=4 par=ij unroll=4  代价=  23.00 MB
+  最优  tile=(128, 64, 8) order=jik file=k     vec=4 par=ij unroll=4  代价=  23.00 MB
+  最差  tile=(1, 1, 1)    order=ijk file=k     vec=1 par=j unroll=8  代价= 253.72 MB
+  最差  tile=(1, 1, 1)    order=jik file=None  vec=1 par=j unroll=8  代价= 253.72 MB
+  最差  tile=(1, 1, 1)    order=jik file=k     vec=1 par=j unroll=8  代价= 253.72 MB
+
+=== 3. 单变量对比：从最优调度出发各动一处 ===
+  基线：tile=(128, 64, 8) order=ijk vec=4 par=ij unroll=4  代价=23.00 MB
+  取消分块 tile=1              代价  192.78 MB   相对基线 × 8.38
+  取消向量化 vec=1              代价   23.04 MB   相对基线 × 1.00
+  放弃 i 并行 par=j            代价   83.82 MB   相对基线 × 3.64
+  unroll 8（寄存器压力）          代价   23.02 MB   相对基线 × 1.00
+  归约不提前 file=None          代价   23.00 MB   相对基线 × 1.00
+  只改循环次序 jik               代价   23.00 MB   相对基线 × 1.00
+
+=== 4. 好调度有多稀有：把 720 条按代价分十档 ===
+  档位  代价区间(MB)   档内 tile 分布
+   1/10   23.00 ~  23.11   (128, 64, 8) (64, 128, 8)
+   2/10   23.67 ~  23.78   (64, 64, 1) (64, 64, 16)
+   3/10   26.35 ~  26.47   (32, 32, 1) (32, 32, 8)
+   4/10   31.72 ~  31.84   (16, 16, 1) (16, 16, 4)
+   5/10   42.46 ~  83.85   (128, 64, 8) (64, 128, 8) (8, 8, 1)
+   6/10   83.85 ~  84.52   (128, 64, 8) (64, 128, 8) (64, 64, 1) (64, 64, 16)
+   7/10   84.52 ~  87.20   (32, 32, 1) (32, 32, 8) (64, 64, 1) (64, 64, 16)
+   8/10   87.20 ~  92.57   (16, 16, 1) (16, 16, 4) (32, 32, 1) (32, 32, 8)
+   9/10   92.57 ~ 103.39   (16, 16, 1) (16, 16, 4) (8, 8, 1)
+  10/10  192.78 ~ 253.72   (1, 1, 1)
+  最优 / 中位 = 0.27×；最优 / 最差 = 0.09×</code></pre>
+<p>三处可核对的结论：<strong>分块是量级项</strong>（取消分块 ×8.4，其余原语都在 ×1.01 以内）；<strong>并行绑定与 tile 绑在一起</strong>（只并 j 就 ×3.6，因为 a 的驻留量变成 K×N 全体）；<strong>好区域是断崖不是斜坡</strong>（第 1 档 23.0 MB、第 5 档直接跳到 42.5 MB，说明&quot;驻留量是否装得下 L2&quot;比连续调参更关键）。</p>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选，需自备或云上按需：在真实工具链里枚举调度 ----
+# Apache TVM（pip install apache-tvm）：用 Schedule 逐个施加 split/reorder/vectorize/bind，
+#   再用 tvm.lower 看 TIR 循环结构；DLight 提供&quot;规则型 GPU 调度&quot;作为对照。
+# Triton（需 NVIDIA GPU）：@triton.autotune 直接枚举 triton.Config 列表（BLOCK_SIZE_*、
+#   num_warps、num_stages），key=[&#39;M&#39;,&#39;N&#39;,&#39;K&#39;] 决定哪些 shape 复用同一份调优结果。
+# ncu（可选，需 GPU）：对两条候选分别 profile，比较 dram__bytes 与 smsp__inst_executed，
+#   验证本课模型的&quot;三类账&quot;方向是否正确。
+# 没有 GPU 时，本课模型已经给出了全部趋势结论；有 GPU 时只需替换 cost() 为实测。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：给 <code>cost()</code> 增加一项&quot;片上容量检查&quot;：若 <code>ti*K</code> 或 <code>K*tj</code> 超过给定的 shared memory 容量（例如 48 KB / 4 B），返回无穷大。重跑第 2 节，看最优调度是否从 <code>(128,64,8)</code> 变成更小的 tile。</li>
+<li><strong>解释</strong>：为什么&quot;取消向量化&quot;只涨 0.2%，而真实 GPU 上 fp16 输入不向量化可能慢一倍？提示：本课把访存字节与指令数分开算，而真实硬件里低精度访存必须按 128 位打包。</li>
+<li><strong>对比/验证</strong>：把 <code>ORDERS</code> 换成三种次序（含 <code>(&#39;k&#39;,&#39;i&#39;,&#39;j&#39;)</code>，即归约维在最外），观察最优调度的变化；再解释为什么&quot;归约维在最外&quot;在有流水的硬件上反而可能是好选择。</li>
+<li><strong>思考</strong>：第 1 档的 72 条代价几乎相同，但真实硬件上差距可能远超模型预测（寄存器压力、L2 行为、指令发射）。只有 20 次真测预算时，你会怎么在这 72 条里取样？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>Tianqi Chen et al., <em>TVM: An Automated End-to-End Optimizing Compiler for Deep Learning</em>（OSDI&#39;18；调度原语与&quot;自动优化低层程序&quot;的框架）：<a href="https://www.usenix.org/conference/osdi18/presentation/chen" target="_blank" rel="noopener noreferrer">https://www.usenix.org/conference/osdi18/presentation/chen</a></li>
+<li>Apache TVM, <em>Design and Architecture</em> 与 <em>DLight: Rule-Based GPU Scheduling</em>（张量程序里的循环/线程/向量信息，以及规则型调度作为搜索的对照）：<a href="https://tvm.apache.org/docs/arch/index.html#tvm-s-tir" target="_blank" rel="noopener noreferrer">https://tvm.apache.org/docs/arch/index.html#tvm-s-tir</a></li>
+<li>Triton 官方教程, <em>Matrix Multiplication</em>（<code>BLOCK_SIZE_M/N/K</code>、<code>GROUP_SIZE_M</code>、<code>num_warps</code>、<code>num_stages</code> 这些真实调度旋钮与 <code>triton.autotune</code>）：<a href="https://triton-lang.org/main/getting-started/tutorials/03-matrix-multiplication.html" target="_blank" rel="noopener noreferrer">https://triton-lang.org/main/getting-started/tutorials/03-matrix-multiplication.html</a></li>
+<li>Lianmin Zheng et al., <em>The Deep Learning Compiler: A Comprehensive Survey</em>（第 4 节对循环变换与调度搜索的分类）：<a href="https://arxiv.org/abs/2002.03794" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2002.03794</a></li>
+</ul>
+<p><a href="#/l/mlc-ch6-l3">下一课：自动调优：AutoTVM / Ansor 的搜索与代价模型</a></p>

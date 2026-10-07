@@ -1,0 +1,217 @@
+<h2 id="h-tiling-与数据复用从-gemm-讲起">Tiling 与数据复用：从 GEMM 讲起<a class="anchor" href="#h-tiling-与数据复用从-gemm-讲起" aria-label="本节链接">#</a></h2>
+<p>同一段矩阵乘，改成分块写法后浮点指令一条没少，实测却快好几倍。差距不在&quot;算了多少&quot;，而在&quot;搬了多少&quot;：naive 版本把绝大部分时间花在等 HBM（High Bandwidth Memory，显卡上的主存）的数据。这一课把搬运量算成一本可以逐项核对的账，并用 <strong>tiling</strong>（分块）这个通用手法把复用从 HBM 搬到片上。</p>
+<p><figure><img class="md-img" src="content/courses/gpu-cuda-kernels/assets/chapter-4-figure-01.svg" alt="分块 GEMM：一次搬运，T 次复用" loading="lazy" decoding="async"><figcaption>分块 GEMM：一次搬运，T 次复用</figcaption></figure>
+</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-先把账的边界定清楚">1. 先把&quot;账&quot;的边界定清楚<a class="anchor" href="#h-1-先把账的边界定清楚" aria-label="本节链接">#</a></h4>
+<p>第 3 章给过存储层次的量级：寄存器与 shared memory（共享内存，片上可编程缓存）比 HBM 快一到两个数量级，但容量小三到五个数量级（具体倍数以自己显卡的官方规格为准）。所以访存优化的第一步永远是同一个问题：<strong>这一层（HBM）到底被搬了多少字节？</strong></p>
+<p>衡量它的标准量是<strong>算术强度</strong>（arithmetic intensity）：浮点运算次数 ÷ 搬运字节数，单位 FLOP/Byte。它把&quot;算得多&quot;和&quot;搬得多&quot;放进同一个刻度，是判断一个 kernel 是 memory-bound（受带宽限制）还是 compute-bound（受算力限制）的最简工具。</p>
+<p><strong>tiling</strong> 的定义就一句话：把大矩阵切成子块，让每块在被搬上片之后<strong>被反复使用多次</strong>再丢弃。这里的&quot;子块&quot;有三层：grid 层的输出块（block tile）、shared memory 里的输入条带、以及每个线程自己算的那一小块（thread tile，第 6 章细讲）。</p>
+<h4 id="h-2-naive-gemm-的账025-flopbyte">2. naive GEMM 的账：0.25 FLOP/Byte<a class="anchor" href="#h-2-naive-gemm-的账025-flopbyte" aria-label="本节链接">#</a></h4>
+<p>设 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="mopen">[</span><span class="mord mathnormal" style="margin-right:0.109em;">M</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mclose">]</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">A</span><span class="mopen">[</span><span class="mord mathnormal" style="margin-right:0.109em;">M</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">K</span><span class="mclose">]</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0502em;">B</span><span class="mopen">[</span><span class="mord mathnormal" style="margin-right:0.0715em;">K</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mclose">]</span></span></span></span>，浮点运算次数（每个输出元素 K 次乘加，各算 1 次浮点操作）：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord">FLOPs</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">2</span><span class="mord mathnormal" style="margin-right:0.109em;">M</span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mord mathnormal" style="margin-right:0.0715em;">K</span></span></span></span></span></p>
+<p>naive 写法里，每个线程负责一个输出 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="mopen">[</span><span class="mord mathnormal">i</span><span class="mclose">]</span><span class="mopen">[</span><span class="mord mathnormal" style="margin-right:0.0572em;">j</span><span class="mclose">]</span></span></span></span>，内层循环 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 读 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">A</span><span class="mopen">[</span><span class="mord mathnormal">i</span><span class="mclose">]</span><span class="mopen">[</span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mclose">]</span></span></span></span> 与 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0502em;">B</span><span class="mopen">[</span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mclose">]</span><span class="mopen">[</span><span class="mord mathnormal" style="margin-right:0.0572em;">j</span><span class="mclose">]</span></span></span></span>，于是<strong>每个输出元素要读 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">2</span><span class="mord mathnormal" style="margin-right:0.0715em;">K</span></span></span></span> 个元素</strong>：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord cjk_fallback">搬运元素数</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">M</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">2</span><span class="mord mathnormal" style="margin-right:0.0715em;">K</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">2</span><span class="mord mathnormal" style="margin-right:0.109em;">M</span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mord mathnormal" style="margin-right:0.0715em;">K</span></span></span></span></span></p>
+<p>单精度下每个元素 4 字节，算术强度 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.3669em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">2</span><span class="mord mathnormal" style="margin-right:0.109em;">M</span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mord mathnormal" style="margin-right:0.0715em;">K</span><span class="mord">/</span><span class="mopen">(</span><span class="mord">4</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">2</span><span class="mord mathnormal" style="margin-right:0.109em;">M</span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mord mathnormal" style="margin-right:0.0715em;">K</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.25</span></span></span></span> FLOP/Byte。这个数字和矩阵大小无关——<strong>naive GEMM 无论多大，每搬 1 字节只做 0.25 次浮点运算</strong>。</p>
+<p>对照硬件拐点：roofline 模型的拐点 = 峰值算力 ÷ 峰值带宽。以常见数据中心 GPU 的量级（算力 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">13</span></span></span></span></span></span></span></span></span></span></span></span> FLOP/s 上下、HBM 带宽 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">12</span></span></span></span></span></span></span></span></span></span></span></span> Byte/s 上下）估算，拐点在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∼</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span> FLOP/Byte 区间（近似值，请用自己显卡的官方规格算）。0.25 比拐点低两到三个数量级，结论很硬：<strong>这类 kernel 加再多浮点指令也没用，时间全在等数据</strong>。</p>
+<h4 id="h-3-分块之后搬运降-t-倍">3. 分块之后：搬运降 T 倍<a class="anchor" href="#h-3-分块之后搬运降-t-倍" aria-label="本节链接">#</a></h4>
+<p>做法：每个 block 负责输出的一块 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span></span></span></span>，把 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">K</span></span></span></span> 维按 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span></span></span></span> 切成若干段；每段把 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">A</span></span></span></span> 的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span></span></span></span> 子块和 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0502em;">B</span></span></span></span> 的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span></span></span></span> 子块从 HBM 搬进 shared memory，块内所有线程共享使用，做 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">3</span></span></span></span></span></span></span></span></span></span></span> 次乘加。</p>
+<p>把搬运量重新数一遍：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord cjk_fallback">搬运元素数</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:3.3727em;vertical-align:-2.0123em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3603em;"><span style="top:-1.348em;"><span class="pstrut" style="height:3.3603em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">块数</span></span></span></span></span><span style="top:-3.3603em;"><span class="pstrut" style="height:3.3603em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3603em;"><span class="svg-align" style="top:-2.0263em;"><span class="pstrut" style="height:3.3603em;"></span><span class="stretchy" style="height:0.548em;min-width:1.6em;"><span class="brace-left" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMinYMin slice"><path d="M0 6l6-6h17c12.688 0 19.313.3 20 1 4 4 7.313 8.3 10 13
+ 35.313 51.3 80.813 93.8 136.5 127.5 55.688 33.7 117.188 55.8 184.5 66.5.688
+ 0 2 .3 4 1 18.688 2.7 76 4.3 172 5h399450v120H429l-6-1c-124.688-8-235-61.7
+-331-161C60.687 138.7 32.312 99.3 7 54L0 41V6z"/></svg></span><span class="brace-center" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMidYMin slice"><path d="M199572 214
+c100.7 8.3 195.3 44 280 108 55.3 42 101.7 93 139 153l9 14c2.7-4 5.7-8.7 9-14
+ 53.3-86.7 123.7-153 211-199 66.7-36 137.3-56.3 212-62h199568v120H200432c-178.3
+ 11.7-311.7 78.3-403 201-6 8-9.7 12-11 12-.7.7-6.7 1-18 1s-17.3-.3-18-1c-1.3 0
+-5-4-11-12-44.7-59.3-101.3-106.3-170-141s-145.3-54.3-229-60H0V214z"/></svg></span><span class="brace-right" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMaxYMin slice"><path d="M399994 0l6 6v35l-6 11c-56 104-135.3 181.3-238 232-57.3
+ 28.7-117 45-179 50H-300V214h399897c43.3-7 81-15 113-26 100.7-33 179.7-91 237
+-174 2.7-5 6-9 10-13 .7-1 7.3-1 20-1h17z"/></svg></span></span></span><span style="top:-3.3603em;"><span class="pstrut" style="height:3.3603em;"></span><span class="mord"><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3603em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.109em;">M</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3603em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.109em;">N</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.334em;"><span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:2.0123em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:3.3804em;vertical-align:-2.0201em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3603em;"><span style="top:-1.3402em;"><span class="pstrut" style="height:3.3603em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">k </span><span class="mord cjk_fallback mtight">段数</span></span></span></span></span><span style="top:-3.3603em;"><span class="pstrut" style="height:3.3603em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3603em;"><span class="svg-align" style="top:-2.0263em;"><span class="pstrut" style="height:3.3603em;"></span><span class="stretchy" style="height:0.548em;min-width:1.6em;"><span class="brace-left" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMinYMin slice"><path d="M0 6l6-6h17c12.688 0 19.313.3 20 1 4 4 7.313 8.3 10 13
+ 35.313 51.3 80.813 93.8 136.5 127.5 55.688 33.7 117.188 55.8 184.5 66.5.688
+ 0 2 .3 4 1 18.688 2.7 76 4.3 172 5h399450v120H429l-6-1c-124.688-8-235-61.7
+-331-161C60.687 138.7 32.312 99.3 7 54L0 41V6z"/></svg></span><span class="brace-center" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMidYMin slice"><path d="M199572 214
+c100.7 8.3 195.3 44 280 108 55.3 42 101.7 93 139 153l9 14c2.7-4 5.7-8.7 9-14
+ 53.3-86.7 123.7-153 211-199 66.7-36 137.3-56.3 212-62h199568v120H200432c-178.3
+ 11.7-311.7 78.3-403 201-6 8-9.7 12-11 12-.7.7-6.7 1-18 1s-17.3-.3-18-1c-1.3 0
+-5-4-11-12-44.7-59.3-101.3-106.3-170-141s-145.3-54.3-229-60H0V214z"/></svg></span><span class="brace-right" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMaxYMin slice"><path d="M399994 0l6 6v35l-6 11c-56 104-135.3 181.3-238 232-57.3
+ 28.7-117 45-179 50H-300V214h399897c43.3-7 81-15 113-26 100.7-33 179.7-91 237
+-174 2.7-5 6-9 10-13 .7-1 7.3-1 20-1h17z"/></svg></span></span></span><span style="top:-3.3603em;"><span class="pstrut" style="height:3.3603em;"></span><span class="mord"><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3603em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0715em;">K</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.334em;"><span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:2.0201em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:2.4121em;vertical-align:-1.548em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8641em;"><span style="top:-1.627em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord cjk_fallback mtight">每段搬</span><span class="mord mtight"> A/B </span><span class="mord cjk_fallback mtight">各一块</span></span></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="minner munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8641em;"><span class="svg-align" style="top:-2.352em;"><span class="pstrut" style="height:3em;"></span><span class="stretchy" style="height:0.548em;min-width:1.6em;"><span class="brace-left" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMinYMin slice"><path d="M0 6l6-6h17c12.688 0 19.313.3 20 1 4 4 7.313 8.3 10 13
+ 35.313 51.3 80.813 93.8 136.5 127.5 55.688 33.7 117.188 55.8 184.5 66.5.688
+ 0 2 .3 4 1 18.688 2.7 76 4.3 172 5h399450v120H429l-6-1c-124.688-8-235-61.7
+-331-161C60.687 138.7 32.312 99.3 7 54L0 41V6z"/></svg></span><span class="brace-center" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMidYMin slice"><path d="M199572 214
+c100.7 8.3 195.3 44 280 108 55.3 42 101.7 93 139 153l9 14c2.7-4 5.7-8.7 9-14
+ 53.3-86.7 123.7-153 211-199 66.7-36 137.3-56.3 212-62h199568v120H200432c-178.3
+ 11.7-311.7 78.3-403 201-6 8-9.7 12-11 12-.7.7-6.7 1-18 1s-17.3-.3-18-1c-1.3 0
+-5-4-11-12-44.7-59.3-101.3-106.3-170-141s-145.3-54.3-229-60H0V214z"/></svg></span><span class="brace-right" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMaxYMin slice"><path d="M399994 0l6 6v35l-6 11c-56 104-135.3 181.3-238 232-57.3
+ 28.7-117 45-179 50H-300V214h399897c43.3-7 81-15 113-26 100.7-33 179.7-91 237
+-174 2.7-5 6-9 10-13 .7-1 7.3-1 20-1h17z"/></svg></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">2</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8641em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.648em;"><span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.548em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.0463em;vertical-align:-0.686em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3603em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">2</span><span class="mord mathnormal" style="margin-right:0.109em;">M</span><span class="mord mathnormal" style="margin-right:0.109em;">N</span><span class="mord mathnormal" style="margin-right:0.0715em;">K</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></p>
+<p><strong>搬运量降了 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span></span></span></span> 倍，算术强度升到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">0.25</span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span></span></span></span></strong>（各列数字见下一节的运行输出）。换个说法：从 HBM 搬进来的一个 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">A</span></span></span></span> 元素，在片上被 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span></span></span></span> 个不同的输出列各用一次。</p>
+<table>
+<thead>
+<tr>
+<th>T</th>
+<th>HBM 搬运（元素）</th>
+<th>相对 naive</th>
+<th>算术强度</th>
+<th>片上缓冲</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>8</td>
+<td>2.68×10⁸</td>
+<td>8×</td>
+<td>2.00 FLOP/B</td>
+<td>512 B</td>
+</tr>
+<tr>
+<td>16</td>
+<td>1.34×10⁸</td>
+<td>16×</td>
+<td>4.00 FLOP/B</td>
+<td>2 KB</td>
+</tr>
+<tr>
+<td>32</td>
+<td>6.71×10⁷</td>
+<td>32×</td>
+<td>8.00 FLOP/B</td>
+<td>8 KB</td>
+</tr>
+<tr>
+<td>64</td>
+<td>3.36×10⁷</td>
+<td>64×</td>
+<td>16.00 FLOP/B</td>
+<td>32 KB</td>
+</tr>
+</tbody></table>
+<h4 id="h-4-为什么顺序本身就值一个数量级">4. 为什么&quot;顺序&quot;本身就值一个数量级<a class="anchor" href="#h-4-为什么顺序本身就值一个数量级" aria-label="本节链接">#</a></h4>
+<p>tiling 之外还有一层更朴素的收益：<strong>同一批数据，换个遍历顺序，L1/L2 的命中率就完全不同</strong>。下一节的可运行代码用一个玩具 LRU 模型量了这件事：同一块 512×512 的数据，分块内按行遍历的命中率 96.9%、有效字节比 100%；按列优先遍历（naive 内层循环的形状）命中率 0%、有效字节比 3.1%。</p>
+<p>把它和第 3 章连起来看：<strong>合并访存（coalescing）解决&quot;一次访存事务里有多少字节是有效的&quot;，tiling 解决&quot;搬上片的字节被用了几次&quot;</strong>。有效带宽 = 事务效率 × 复用次数，两者是乘法关系。</p>
+<h4 id="h-5-常见坑">5. 常见坑<a class="anchor" href="#h-5-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>只在 block 层分块，线程层不复用</strong>：block 内每个线程只算一个输出，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">A</span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0502em;">B</span></span></span></span> 条带在 shared memory 里被反复读，读放大只是从 HBM 转移到了 shared memory。</li>
+<li><strong>边界不处理</strong>：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">M</span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.109em;">N</span></span></span></span>、<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.0715em;">K</span></span></span></span> 不是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span></span></span></span> 的整数倍时，越界读会读到脏数据甚至崩，必须显式判边界（本课代码用 <code>min(T, M-i)</code> 处理）。</li>
+<li><strong>以为 tile 越大越好</strong>：搬运量虽然按 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1/</span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span></span></span></span> 降，但片上容量是硬约束；tile 变大还直接吃寄存器，这是第 4 课的主题。</li>
+<li><strong>只盯 FLOPs</strong>：算术强度没到拐点之前，优化浮点指令的收益是 0。</li>
+<li><strong>累加器位置写错</strong>：乘加结果必须留在寄存器里跨 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span></span></span></span> 段累积，每段都写一次 HBM 会把降下来的搬运量加回去。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>下面三段纯 numpy/Python（无 GPU、无额外依赖）分别做三件事：算清搬运账、实现分块 GEMM 并验证结果与搬运次数、用玩具 LRU 量遍历顺序对命中率的影响。</p>
+<pre data-lang="python"><code class="language-python"># ===== 本课示例：GEMM 的搬运账本 + 分块实现 + 命中率模型 =====
+import numpy as np
+from collections import OrderedDict
+
+# ---------- 1. 搬运量账本：naive vs tiled ----------
+def gemm_traffic(M, N, K, T, item=4):
+    &quot;&quot;&quot;返回 HBM↔SM 的元素搬运次数。naive：每个输出元素读 K 个 A + K 个 B。&quot;&quot;&quot;
+    naive = 2 * M * N * K
+    tiled = (M // T) * (N // T) * (2 * K * T)   # 每个块搬 A/B 各一个 T×K 条带
+    return naive, tiled
+
+M = N = K = 1024
+naive, _ = gemm_traffic(M, N, K, 1)
+print(f&quot;GEMM {M}x{N}x{K}，FLOPs = {2*M*N*K:,}&quot;)
+print(f&quot;{&#39;T&#39;:&gt;3} {&#39;HBM 搬运(元素)&#39;:&gt;16} {&#39;相对 naive&#39;:&gt;10} {&#39;算术强度&#39;:&gt;10} {&#39;片上缓冲(B)&#39;:&gt;12}&quot;)
+for T in (8, 16, 32, 64):
+    _, t = gemm_traffic(M, N, K, T)
+    print(f&quot;{T:&gt;3} {t:&gt;16,} {naive/t:&gt;9.0f}x {2*M*N*K/(4*t):&gt;9.2f} {2*4*T*T:&gt;12,}&quot;)
+print(f&quot;naive 算术强度 = {2*M*N*K/(4*naive):.2f} FLOP/Byte；A/B/C 驻留 {3*M*M*4/2**20:.0f} MiB\n&quot;)
+
+# ---------- 2. 分块 GEMM：结果正确 + 搬运次数与公式吻合 ----------
+def blocked_gemm(A, B, T):
+    M, K = A.shape; N = B.shape[1]
+    C = np.zeros((M, N), dtype=A.dtype); loads = stores = 0
+    for i in range(0, M, T):
+        for j in range(0, N, T):
+            acc = np.zeros((min(T, M - i), min(T, N - j)), dtype=A.dtype)
+            for k in range(0, K, T):
+                at, bt = A[i:i+T, k:k+T], B[k:k+T, j:j+T]
+                loads += at.size + bt.size      # 一次搬运，T 次复用
+                acc += at @ bt
+            C[i:i+T, j:j+T] = acc; stores += acc.size
+    return C, loads + stores
+
+rng = np.random.default_rng(0)
+A = rng.standard_normal((256, 256), dtype=np.float32)
+B = rng.standard_normal((256, 256), dtype=np.float32)
+ref = A @ B
+for T in (16, 32):
+    C, moved = blocked_gemm(A, B, T)
+    _, t_formula = gemm_traffic(256, 256, 256, T)
+    print(f&quot;T={T:&lt;3} max|C-ref|={np.abs(C-ref).max():.2e}  实测搬运={moved:,}&quot;
+          f&quot;  公式={t_formula + 256*256:,}&quot;)
+
+# ---------- 3. 遍历顺序决定命中率：256 行的玩具 L2 ----------
+class LRU:
+    def __init__(self, n):
+        self.n, self.m, self.hits, self.misses = n, OrderedDict(), 0, 0
+    def touch(self, line):
+        if line in self.m:
+            self.hits += 1; self.m.move_to_end(line); return
+        self.misses += 1; self.m[line] = None
+        if len(self.m) &gt; self.n:
+            self.m.popitem(last=False)
+
+LINE, K2, N2 = 32, 512, 512               # 一条 line 放 32 个 float32 = 128 字节
+line_of = lambda k, j: k * (N2 // LINE) + j // LINE
+def walk(tiled, T=32):
+    c = LRU(256)
+    if tiled:
+        for kk in range(0, K2, T):
+            for jj in range(0, N2, T):
+                for k in range(kk, kk + T):
+                    for j in range(jj, jj + T):
+                        c.touch(line_of(k, j))
+    else:
+        for j in range(N2):
+            for k in range(K2):
+                c.touch(line_of(k, j))
+    return c
+
+print()
+tot = K2 * N2
+for name, c in ((&quot;分块内按行遍历 T=32&quot;, walk(True)), (&quot;列优先遍历（naive）&quot;, walk(False))):
+    useful = tot * 4 / (c.misses * LINE * 4)
+    print(f&quot;{name:&lt;20} 访问 {tot:,} | 缺行 {c.misses:&gt;7,} | 命中率 {c.hits/tot:6.1%}&quot;
+          f&quot; | 有效字节比 {useful:6.1%}&quot;)</code></pre>
+<p>在 <code>python3</code>（需要 numpy，本机用 python3.10 验证）下实际运行结果：</p>
+<pre data-lang="text"><code class="language-text">GEMM 1024x1024x1024，FLOPs = 2,147,483,648
+  T       HBM 搬运(元素)   相对 naive       算术强度      片上缓冲(B)
+  8      268,435,456         8x      2.00          512
+ 16      134,217,728        16x      4.00        2,048
+ 32       67,108,864        32x      8.00        8,192
+ 64       33,554,432        64x     16.00       32,768
+naive 算术强度 = 0.25 FLOP/Byte；A/B/C 驻留 12 MiB
+
+T=16  max|C-ref|=3.81e-05  实测搬运=2,162,688  公式=2,162,688
+T=32  max|C-ref|=4.58e-05  实测搬运=1,114,112  公式=1,114,112
+
+分块内按行遍历 T=32         访问 262,144 | 缺行   8,192 | 命中率  96.9% | 有效字节比 100.0%
+列优先遍历（naive）         访问 262,144 | 缺行 262,144 | 命中率   0.0% | 有效字节比   3.1%</code></pre>
+<p>两处值得盯住的对照：<strong>实测搬运次数与公式逐位吻合</strong>（含写回 C 的 65536 次），说明&quot;搬运降 T 倍&quot;不是修辞；分块计算结果与 <code>numpy</code> 的 BLAS 参考实现最大误差 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">4.6</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">5</span></span></span></span></span></span></span></span></span></span></span></span>，只来自 float32 累加顺序差异（浮点加法不满足结合律），<strong>不是 bug</strong>。</p>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选：需要 GPU。用 ncu 量你写的 tiled kernel 是否真的降了 HBM 搬运 ----
+# nvcc -O3 -arch=sm_90 -o gemm gemm.cu
+# 先看&quot;实际搬了多少&quot;，再和上面的账本对：
+#   ncu --metrics dram__bytes_read.sum,dram__bytes_write.sum,\
+#         l1tex__data_bank_conflicts_pipe_lsu_mem_shared.sum,sm__throughput.avg.pct_of_peak_sustained_elapsed \
+#       ./gemm
+# 判读：dram__bytes_read.sum 显著大于 A+B 的字节数 → 说明复用没做足（T 太小或线程层没复用）；
+#      sm__throughput 接近 100% 而 dram 带宽远未打满 → 已经转到 compute-bound，可以收手。
+# 没有 GPU 不影响本课：上面三段 Python 已经把搬运账与复用效果算完了。
+# 指标名以 ncu --query-metrics 在你本机出的清单为准。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：在 <code>blocked_gemm</code> 之外再加一层线程级 tile——每个线程算 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">4</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4</span></span></span></span> 个输出，统计每个线程的累加器数量与 shared memory 访问次数，说明<strong>总的 HBM 搬运量是否变化</strong>、shared memory 访问量是否变化。</li>
+<li><strong>解释</strong>：为什么算术强度是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">0.25</span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span></span></span></span> 而不是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">0.25</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span>？（提示：分块同时降低了搬运量、但没有改变浮点运算总数。）</li>
+<li><strong>对比/验证</strong>：把玩具 L2 的 <code>LINE</code> 改为 8、<code>LRU(256)</code> 改为 <code>LRU(64)</code>，两个遍历顺序的命中率各是多少？再把 cache 放大到能装下一整列（≥512 行），解释列优先为什么也能命中。</li>
+<li><strong>思考</strong>：如果 tile 只受 shared memory 容量限制（例如每块最多用 100 KB），你会不会把 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span></span></span></span> 取到最大？要回答这个问题，还需要哪两个量？（分别对应第 4 课的 occupancy 与 thread tile 的寄存器占用。）</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>NVIDIA, <em>CUDA C++ Best Practices Guide</em> §10.2.3「Shared Memory in Matrix Multiplication (C=AB)」（分块矩阵乘的逐步推导与 shared memory 用法）：<a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#shared-memory-in-matrix-multiplication-c-ab" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#shared-memory-in-matrix-multiplication-c-ab</a></li>
+<li>NVIDIA, <em>CUDA C++ Best Practices Guide</em> §9.2「Bandwidth」（理论带宽与有效带宽的定义和算法，本课&quot;有效字节比&quot;的口径来源）：<a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#bandwidth" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#bandwidth</a></li>
+<li>NVIDIA, <em>CUDA Programming Guide</em>（shared memory 与异步数据搬运的权威定义）：<a href="https://docs.nvidia.com/cuda/cuda-programming-guide/" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/cuda/cuda-programming-guide/</a></li>
+<li>NVIDIA CUTLASS, <em>Efficient GEMM in CUDA</em>（工业级 GEMM 的分层 tiling：block tile → warp tile → thread tile）：<a href="https://github.com/NVIDIA/cutlass/blob/main/media/docs/cpp/efficient_gemm.md" target="_blank" rel="noopener noreferrer">https://github.com/NVIDIA/cutlass/blob/main/media/docs/cpp/efficient_gemm.md</a></li>
+</ul>
+<p><a href="#/l/cuda-ch4-l2">下一课：异步拷贝与双缓冲：cp.async 与流水线</a></p>

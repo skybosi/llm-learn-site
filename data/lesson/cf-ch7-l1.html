@@ -1,0 +1,434 @@
+<h2 id="h-llvm-实战写一个-pass-并观察-ir-变化">LLVM 实战：写一个 pass 并观察 IR 变化<a class="anchor" href="#h-llvm-实战写一个-pass-并观察-ir-变化" aria-label="本节链接">#</a></h2>
+<p>前六章我们都是自己造轮子：自己建 CFG、自己插 φ、自己做寄存器分配。真实工程里很少这样干——&quot;改 IR&quot;这件事有一个工业标准形态，就是 LLVM 的 pass。本课用一个半小时能跑完的闭环把它走通：从 clang 拿到文本 IR，定位一个可替换的模式，写一个函数级 pass，用 <code>opt</code> 把它挂进管道，最后看到每个 pass 前后的 IR 差异。下面每条命令和每段输出都是本机实测的，你可以逐条复核。</p>
+<p><figure><img class="md-img" src="content/courses/compiler-foundations/assets/chapter-7-figure-01.svg" alt="写一个 LLVM pass 的闭环：写源码、出 IR、定位模式、写 pass、opt 运行、前后对照" loading="lazy" decoding="async"><figcaption>写一个 LLVM pass 的闭环：写源码、出 IR、定位模式、写 pass、opt 运行、前后对照</figcaption></figure>
+</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-闭环的五个动作">1. 闭环的五个动作<a class="anchor" href="#h-1-闭环的五个动作" aria-label="本节链接">#</a></h4>
+<ol>
+<li><strong>拿到 IR</strong>：<code>clang -O0 -S -emit-llvm demo.c -o demo.ll</code>，得到文本 IR（<code>.ll</code>），可直接读、可手改。</li>
+<li><strong>定位模式</strong>：本课挑最简单的真优化——<code>%8 = mul nsw i32 %0, 8</code> 换成 <code>%.shl = shl i32 %0, 3</code>，即<strong>强度削减</strong>（strength reduction）：乘 2 的幂改成左移。</li>
+<li><strong>写 pass</strong>：新 PassManager（New PM）里一个函数 pass 就是&quot;继承 <code>PassInfoMixin&lt;你的类型&gt;</code>，实现 <code>PreservedAnalyses run(Function &amp;F, FunctionAnalysisManager &amp;AM)</code>&quot;。</li>
+<li><strong>注册</strong>：插件导出 <code>extern &quot;C&quot; llvmGetPassPluginInfo()</code>，在 <code>PassBuilder</code> 的回调里把命令行名字映射到你的 pass。</li>
+<li><strong>运行与对照</strong>：<code>opt -passes=&#39;mem2reg,strength-reduce&#39; -load-pass-plugin ./MyPass.so demo.ll -o out.ll</code>；加 <code>-print-after-all</code> 就能看到管道里<strong>每一个</strong> pass 前后的 IR。</li>
+</ol>
+<h4 id="h-2-pass-的粒度决定它能做什么">2. pass 的粒度决定它能做什么<a class="anchor" href="#h-2-pass-的粒度决定它能做什么" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>粒度</th>
+<th>作用对象</th>
+<th>典型用途</th>
+<th>核心约束</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>ModulePass</td>
+<td>整个模块</td>
+<td>过程间分析、增删全局量</td>
+<td>最自由、最慢，PassManager 无法优化调度</td>
+</tr>
+<tr>
+<td>FunctionPass</td>
+<td>单个函数</td>
+<td>局部优化、指令替换</td>
+<td>不能碰别的函数；不能跨调用保存状态</td>
+</tr>
+<tr>
+<td>LoopPass</td>
+<td>函数内每个循环</td>
+<td>不变量外提、展开</td>
+<td>只能改当前循环，循环嵌套由 LPM 维护</td>
+</tr>
+<tr>
+<td>MachineFunctionPass</td>
+<td>机器级 IR（MIR）</td>
+<td>寄存器分配、调度</td>
+<td>由后端 <code>addPassesToEmitFile</code> 调度，<strong>不能</strong>从 <code>opt</code> 跑</td>
+</tr>
+</tbody></table>
+<p>&quot;函数 pass 不能跨调用保存状态&quot;不是洁癖，而是 PassManager 敢重排、并行、按需失效分析结果的<strong>前提</strong>：只要每个 pass 只依赖入参，调度器就能自由决定顺序。第 6 章的寄存器分配、调度都属于最后一行的机器级 pass，这也是为什么它们必须挂在后端管道里而不是 <code>opt</code> 里。</p>
+<h4 id="h-3-返回值是正确性契约不是礼貌">3. 返回值是正确性契约，不是礼貌<a class="anchor" href="#h-3-返回值是正确性契约不是礼貌" aria-label="本节链接">#</a></h4>
+<p><code>run()</code> 返回 <code>PreservedAnalyses</code>：<strong>改了就 <code>none()</code>，没动就 <code>all()</code></strong>，只改了局部信息就精确声明保住了哪些分析。PassManager 按这个声明决定 DominatorTree、LoopInfo 等分析结果是否失效。谎报的后果不是&quot;慢一点&quot;，而是后续 pass 拿着过期的支配关系做变换，生成<strong>语义错误</strong>的代码——这正是第 5 章讲的&quot;优化正确性&quot;在工程里的落点。</p>
+<h4 id="h-4-分析要显式索取也必须能单独观察">4. 分析要显式索取，也必须能单独观察<a class="anchor" href="#h-4-分析要显式索取也必须能单独观察" aria-label="本节链接">#</a></h4>
+<p>pass 里用 <code>AM.getResult&lt;DominatorTreeAnalysis&gt;(F)</code> 要分析结果；命令行上可以只跑分析：<code>opt -passes=&#39;print&lt;domtree&gt;&#39; -disable-output demo.ll</code> 会直接打印支配树。能&quot;单独把分析打出来&quot;是调试优化问题的第一手段。</p>
+<h4 id="h-5-opt-的四件套本课全部实测">5. <code>opt</code> 的四件套（本课全部实测）<a class="anchor" href="#h-5-opt-的四件套本课全部实测" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>参数</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>-passes=&#39;mem2reg,early-cse&#39;</code></td>
+<td>显式指定管道（New PM 语法；<code>default&lt;O2&gt;</code> 是预置管道）</td>
+</tr>
+<tr>
+<td><code>-load-pass-plugin=./MyPass.so</code></td>
+<td>加载动态插件里的 pass</td>
+</tr>
+<tr>
+<td><code>-print-after-all</code> / <code>-print-before-all</code></td>
+<td>每个 pass 前后 dump IR（<code>clang</code> 侧对应 <code>-mllvm -print-after-all</code>）</td>
+</tr>
+<tr>
+<td><code>--version</code></td>
+<td>确认版本：<strong>插件 ABI 必须与 <code>opt</code> 一致</strong>，混用会加载失败</td>
+</tr>
+</tbody></table>
+<h4 id="h-6-两个真实的坑都是实测撞出来的">6. 两个真实的坑（都是实测撞出来的）<a class="anchor" href="#h-6-两个真实的坑都是实测撞出来的" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong><code>-O0</code> 的 <code>optnone</code> 陷阱</strong>：<code>clang -O0</code> 会给函数加 <code>optnone</code> 属性，标准优化 pass 会跳过它。实测 <code>opt -S -passes=&#39;mem2reg&#39;</code> 跑 <code>-O0</code> 的 IR，函数体<strong>逐字节不变</strong>（仍有 6 条 <code>alloca</code>）；加 <code>-Xclang -disable-O0-optnone</code> 重新生成后，<code>alloca</code> 降到 0 条。官方文档明确：<code>optnone</code> 函数会被跳过，但标记为 required 的 pass 仍会执行。</li>
+<li><strong>头文件位置随版本漂移</strong>：本机 <code>opt --version</code> 是 Homebrew LLVM 22.1.5，<code>PassPlugin.h</code> 在 <code>llvm/Plugins/</code> 下，而不在教程里常见的 <code>llvm/Passes/</code> 下。找不到就先 <code>ls $(llvm-config --includedir)/llvm/*/PassPlugin.h</code> 定位——照抄旧教程的 include 会直接编译失败。</li>
+</ul>
+<h4 id="h-7-常见坑清单">7. 常见坑清单<a class="anchor" href="#h-7-常见坑清单" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>该失效的分析没失效</strong>：改了 IR 就返回 <code>none()</code>（或精确声明保住了哪些分析）；谎报 <code>all()</code> 会让后续 pass 拿着过期事实做变换。</li>
+<li><strong>遍历时删除指令</strong>：必须用 <code>make_early_inc_range(BB)</code>，否则迭代器失效。</li>
+<li><strong>以为 <code>-O2</code> 的 pass 顺序是固定的</strong>：同名 pass 会跑很多遍——实测 <code>default&lt;O2&gt;</code> 在这段 6 行 C 函数上跑了 <strong>8 次 <code>InstCombinePass</code>、8 次 <code>SimplifyCFGPass</code></strong>、2 次 <code>EarlyCSEPass</code>，因为简化与展开会互相触发；<code>-print-after-all</code> 数一遍就明白。</li>
+<li><strong>用 <code>errs()</code> 当调试输出</strong>：插件日志走 stderr，和 stdout 的 IR 混在一起读会头疼；本课示例刻意把日志打 stderr，方便 <code>-o -</code> 只看 IR。</li>
+</ul>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-纯-python-版不装-llvm-也能完整观察-pass-链">1. 纯 Python 版：不装 LLVM 也能完整观察 pass 链<a class="anchor" href="#h-1-纯-python-版不装-llvm-也能完整观察-pass-链" aria-label="本节链接">#</a></h4>
+<p>下面这段解析 LLVM 风格的 SSA 文本 IR，顺序跑 <code>early-cse → const-fold → strength-reduce → dce</code> 四个 pass，并逐步打印 IR 与改动日志——相当于自己实现一个迷你 <code>opt</code>。无第三方依赖，任何 Python 3 都能跑。</p>
+<pre data-lang="python"><code class="language-python"># ---- 迷你 opt：解析 LLVM 风格 SSA 文本 IR，跑一串 pass，并打印每个 pass 前后的 IR ----
+# 纯 Python，无第三方依赖；语义刻意与真实 opt 对齐，便于与 clang/opt 的输出并排核对
+import re
+
+PURE = {&#39;add&#39;, &#39;sub&#39;, &#39;mul&#39;, &#39;sdiv&#39;, &#39;udiv&#39;, &#39;srem&#39;, &#39;shl&#39;, &#39;and&#39;, &#39;or&#39;, &#39;xor&#39;}
+
+
+class Inst:
+    &quot;&quot;&quot;一条 SSA 指令：dest/op/flags/ty/ops；无 dest 表示 ret 这类终结指令&quot;&quot;&quot;
+    def __init__(self, dest, op, flags, ty, ops):
+        self.dest, self.op, self.flags, self.ty, self.ops = dest, op, flags, ty, ops
+
+    def __str__(self):
+        head = f&#39;{self.dest} = &#39; if self.dest else &#39;&#39;
+        fl = (&#39; &#39;.join(self.flags) + &#39; &#39;) if self.flags else &#39;&#39;
+        body = f&#39;{self.op} {fl}{self.ty}&#39;.rstrip()
+        if self.ops:
+            if self.op == &#39;ret&#39;:
+                return f&#39;  ret {self.ty} {self.ops[0]}&#39;.rstrip()
+            body += &#39; &#39; + &#39;, &#39;.join(self.ops)
+        return f&#39;  {head}{body}&#39;.rstrip()
+
+
+LINE = re.compile(r&#39;^\s*(?:([%\w.]+)\s*=\s*)?([a-z]+)\s+(.*)$&#39;)
+HDR = re.compile(r&#39;^((?:nsw |nuw |exact )*)(i\d+|float|double|ptr|void)?\s*(.*)$&#39;)
+
+
+def parse(src):
+    &quot;&quot;&quot;只解析函数体中的直线 SSA 指令（本课示例不含 CFG，控制流见第 4 章）&quot;&quot;&quot;
+    insts = []
+    for raw in src.splitlines():
+        ln = raw.split(&#39;;&#39;)[0].strip()
+        if not ln or ln.startswith(&#39;define&#39;) or ln == &#39;}&#39;:
+            continue
+        m = LINE.match(ln)
+        dest, op, rest = m.group(1), m.group(2), m.group(3).strip()
+        m2 = HDR.match(rest)
+        flags = m2.group(1).split()
+        ty = m2.group(2) or &#39;&#39;
+        tail = m2.group(3).strip()
+        ops = [o.strip() for o in tail.split(&#39;,&#39;)] if tail else []
+        insts.append(Inst(dest, op, flags, ty, ops))
+    return insts
+
+
+def is_const(x):
+    return re.fullmatch(r&#39;-?\d+&#39;, x) is not None
+
+
+def early_cse(insts):
+    &quot;&quot;&quot;函数内值编号：右值相同的指令只保留第一条，其余改为复用它的结果（对齐 opt 的 early-cse）&quot;&quot;&quot;
+    vnum, log = {}, []
+    for i, ins in enumerate(insts):
+        if not ins.dest or ins.op not in PURE or len(ins.ops) != 2:
+            continue
+        key = (ins.op, tuple(ins.ops))
+        if key in vnum:
+            old, _ = vnum[key]
+            for later in insts[i + 1:]:
+                later.ops = [old if o == ins.dest else o for o in later.ops]
+            log.append(f&#39;{ins.dest} 与 {old} 右值相同 → 复用 {old}&#39;)
+            insts[i] = None
+        else:
+            vnum[key] = (ins.dest, i)
+    return [x for x in insts if x is not None], log
+
+
+def const_fold(insts):
+    &quot;&quot;&quot;常量折叠：两个操作数都是常量就直接算出，并用字面量替换所有使用（对齐 instcombine）&quot;&quot;&quot;
+    log = []
+    for i, ins in enumerate(insts):
+        if ins.op not in PURE or len(ins.ops) != 2 or not all(is_const(o) for o in ins.ops):
+            continue
+        a, b = int(ins.ops[0]), int(ins.ops[1])
+        if ins.op == &#39;add&#39;: val = a + b
+        elif ins.op == &#39;sub&#39;: val = a - b
+        elif ins.op == &#39;mul&#39;: val = a * b
+        elif ins.op == &#39;shl&#39;: val = a &lt;&lt; b
+        elif ins.op in (&#39;sdiv&#39;, &#39;udiv&#39;):
+            if b == 0:
+                continue
+            val = int(a / b)
+        else:
+            continue
+        for later in insts:
+            later.ops = [str(val) if o == ins.dest else o for o in later.ops]
+        log.append(f&#39;{ins.dest} = {ins.op} {a}, {b} → {val}&#39;)
+        insts[i] = None
+    return [x for x in insts if x is not None], log
+
+
+def strength_reduce(insts):
+    &quot;&quot;&quot;强度削减：乘以 2^k 的常量 → 左移 k 位（本课要写的那个 pass）&quot;&quot;&quot;
+    log = []
+    for ins in insts:
+        if ins.op != &#39;mul&#39; or len(ins.ops) != 2:
+            continue
+        for k, pos in ((0, 1), (1, 0)):            # 常量可能在任一侧
+            if is_const(ins.ops[pos]) and int(ins.ops[pos]) &gt; 0:
+                v = int(ins.ops[pos])
+                if v &amp; (v - 1) == 0:               # v 是 2 的幂
+                    sh = v.bit_length() - 1
+                    other = ins.ops[1 - pos]
+                    log.append(f&#39;{ins.dest} = mul {other}, {v} → shl {other}, {sh}&#39;)
+                    ins.op, ins.ops = &#39;shl&#39;, [other, str(sh)]
+                    ins.flags = [f for f in ins.flags if f != &#39;nsw&#39;]
+                    break
+    return insts, log
+
+
+def dce(insts):
+    &quot;&quot;&quot;死代码消除：结果没人用、且无副作用的纯指令直接删掉&quot;&quot;&quot;
+    used = {o for ins in insts for o in ins.ops}
+    keep, log = [], []
+    for ins in insts:
+        if ins.dest and ins.op in PURE and ins.dest not in used:
+            log.append(f&#39;{ins.dest} = {ins.op} ... 结果无使用者 → 删除&#39;)
+            continue
+        keep.append(ins)
+    return keep, log
+
+
+def stats(insts):
+    c = {}
+    for ins in insts:
+        c[ins.op] = c.get(ins.op, 0) + 1
+    return c
+
+
+SRC = &quot;&quot;&quot;
+define i32 @f(i32 %0, i32 %1, i32 %2) {
+  %4 = add nsw i32 %0, %1
+  %5 = mul nsw i32 %4, %2
+  %6 = add nsw i32 %0, %1
+  %7 = sdiv nsw i32 %6, %2
+  %8 = mul nsw i32 %0, 8
+  %13 = mul i32 6, 7
+  %9 = add nsw i32 %5, %7
+  %10 = add nsw i32 %9, %8
+  %11 = mul nsw i32 %10, %13
+  %12 = sdiv nsw i32 %5, %4
+  ret i32 %11
+}
+&quot;&quot;&quot;
+
+PIPELINE = [(&#39;early-cse&#39;, early_cse), (&#39;const-fold&#39;, const_fold),
+            (&#39;strength-reduce&#39;, strength_reduce), (&#39;dce&#39;, dce)]
+
+code = parse(SRC)
+print(&#39;=== 输入 IR（clang -O0 -emit-llvm 之后、mem2reg 之前的样子）===&#39;)
+print(*code, sep=&#39;\n&#39;)
+print(f&#39;\n初始指令数：{len(code)}（{stats(code)}）\n&#39;)
+
+for name, fn in PIPELINE:
+    code, log = fn(code)
+    print(f&#39;--- pass: {name} ---&#39;)
+    print(*code, sep=&#39;\n&#39;)
+    print(f&#39;  改动 {len(log)} 处：&#39; + (&#39;；&#39;.join(log) if log else &#39;无&#39;) + f&#39;   [指令数 {len(code)}]\n&#39;)
+
+print(f&#39;最终指令数：{len(code)}（{stats(code)}）&#39;)</code></pre>
+<p>运行 <code>python3 mini_opt.py</code> 的真实输出（11 条指令压到 8 条，每一步的改动都列了出来）：</p>
+<pre><code>=== 输入 IR（clang -O0 -emit-llvm 之后、mem2reg 之前的样子）===
+  %4 = add nsw i32 %0, %1
+  %5 = mul nsw i32 %4, %2
+  %6 = add nsw i32 %0, %1
+  %7 = sdiv nsw i32 %6, %2
+  %8 = mul nsw i32 %0, 8
+  %13 = mul i32 6, 7
+  %9 = add nsw i32 %5, %7
+  %10 = add nsw i32 %9, %8
+  %11 = mul nsw i32 %10, %13
+  %12 = sdiv nsw i32 %5, %4
+  ret i32 %11
+
+初始指令数：11（{&#39;add&#39;: 4, &#39;mul&#39;: 4, &#39;sdiv&#39;: 2, &#39;ret&#39;: 1}）
+
+--- pass: early-cse ---
+  %4 = add nsw i32 %0, %1
+  %5 = mul nsw i32 %4, %2
+  %7 = sdiv nsw i32 %4, %2
+  %8 = mul nsw i32 %0, 8
+  %13 = mul i32 6, 7
+  %9 = add nsw i32 %5, %7
+  %10 = add nsw i32 %9, %8
+  %11 = mul nsw i32 %10, %13
+  %12 = sdiv nsw i32 %5, %4
+  ret i32 %11
+  改动 1 处：%6 与 %4 右值相同 → 复用 %4   [指令数 10]
+
+--- pass: const-fold ---
+  %4 = add nsw i32 %0, %1
+  %5 = mul nsw i32 %4, %2
+  %7 = sdiv nsw i32 %4, %2
+  %8 = mul nsw i32 %0, 8
+  %9 = add nsw i32 %5, %7
+  %10 = add nsw i32 %9, %8
+  %11 = mul nsw i32 %10, 42
+  %12 = sdiv nsw i32 %5, %4
+  ret i32 %11
+  改动 1 处：%13 = mul 6, 7 → 42   [指令数 9]
+
+--- pass: strength-reduce ---
+  %4 = add nsw i32 %0, %1
+  %5 = mul nsw i32 %4, %2
+  %7 = sdiv nsw i32 %4, %2
+  %8 = shl i32 %0, 3
+  %9 = add nsw i32 %5, %7
+  %10 = add nsw i32 %9, %8
+  %11 = mul nsw i32 %10, 42
+  %12 = sdiv nsw i32 %5, %4
+  ret i32 %11
+  改动 1 处：%8 = mul %0, 8 → shl %0, 3   [指令数 9]
+
+--- pass: dce ---
+  %4 = add nsw i32 %0, %1
+  %5 = mul nsw i32 %4, %2
+  %7 = sdiv nsw i32 %4, %2
+  %8 = shl i32 %0, 3
+  %9 = add nsw i32 %5, %7
+  %10 = add nsw i32 %9, %8
+  %11 = mul nsw i32 %10, 42
+  ret i32 %11
+  改动 1 处：%12 = sdiv ... 结果无使用者 → 删除   [指令数 8]
+
+最终指令数：8（{&#39;add&#39;: 3, &#39;mul&#39;: 2, &#39;sdiv&#39;: 1, &#39;shl&#39;: 1, &#39;ret&#39;: 1}）</code></pre>
+<p>对照着看三件事：重复的 <code>%6 = add %0, %1</code> 被值编号识别成与 <code>%4</code> 同右值，于是后续使用被改写成 <code>%4</code>；<code>%13 = mul 6, 7</code> 被折成常量 42 并内联进使用者；<code>%8 = mul %0, 8</code> 变成 <code>shl %0, 3</code>；最后没人用的 <code>%12 = sdiv</code> 被 DCE 删掉。真实 <code>opt</code> 的 <code>early-cse</code> + <code>instcombine</code> 效果与此一致——本课把 <code>instcombine</code> 的两种职责（折叠与强度削减）拆成两个 pass，只是为了让你逐步看清。</p>
+<h4 id="h-2-可选需本机-clangllvm-开发库真写一个-pass-插件">2. 可选（需本机 clang/LLVM 开发库）：真写一个 pass 插件<a class="anchor" href="#h-2-可选需本机-clangllvm-开发库真写一个-pass-插件" aria-label="本节链接">#</a></h4>
+<p>把下面 48 行存为 <code>MyPass.cpp</code>：</p>
+<pre data-lang="cpp"><code class="language-cpp">#include &quot;llvm/Passes/PassBuilder.h&quot;
+#include &quot;llvm/Plugins/PassPlugin.h&quot;   // LLVM 22 的路径；更早的版本是 &quot;llvm/Passes/PassPlugin.h&quot;
+#include &quot;llvm/IR/Function.h&quot;
+#include &quot;llvm/IR/Instructions.h&quot;
+#include &quot;llvm/IR/IRBuilder.h&quot;
+#include &quot;llvm/IR/Constants.h&quot;
+#include &quot;llvm/Support/raw_ostream.h&quot;
+
+using namespace llvm;
+
+namespace {
+struct StrengthReduce : PassInfoMixin&lt;StrengthReduce&gt; {
+  PreservedAnalyses run(Function &amp;F, FunctionAnalysisManager &amp;) {
+    bool Changed = false;
+    for (BasicBlock &amp;BB : F)
+      for (Instruction &amp;I : make_early_inc_range(BB)) {
+        auto *BO = dyn_cast&lt;BinaryOperator&gt;(&amp;I);
+        if (!BO || BO-&gt;getOpcode() != Instruction::Mul) continue;
+        auto *C = dyn_cast&lt;ConstantInt&gt;(BO-&gt;getOperand(1));
+        if (!C) continue;
+        APInt V = C-&gt;getValue();
+        if (!V.isPowerOf2()) continue;
+        unsigned K = V.logBase2();
+        errs() &lt;&lt; &quot;  [strength-reduce] &quot; &lt;&lt; *BO &lt;&lt; &quot;  -&gt;  shl by &quot; &lt;&lt; K &lt;&lt; &quot;\n&quot;;
+        IRBuilder&lt;&gt; B(BO);
+        Value *Sh = B.CreateShl(BO-&gt;getOperand(0), K, BO-&gt;getName() + &quot;.shl&quot;);
+        BO-&gt;replaceAllUsesWith(Sh);
+        BO-&gt;eraseFromParent();
+        Changed = true;
+      }
+    return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
+  }
+  static bool isRequired() { return true; }
+};
+}
+
+extern &quot;C&quot; LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo
+llvmGetPassPluginInfo() {
+  return {LLVM_PLUGIN_API_VERSION, &quot;MyPass&quot;, LLVM_VERSION_STRING,
+          [](PassBuilder &amp;PB) {
+            PB.registerPipelineParsingCallback(
+                [](StringRef Name, FunctionPassManager &amp;FPM,
+                   ArrayRef&lt;PassBuilder::PipelineElement&gt;) {
+                  if (Name == &quot;strength-reduce&quot;) { FPM.addPass(StrengthReduce()); return true; }
+                  return false;
+                });
+          }};
+}</code></pre>
+<pre data-lang="bash"><code class="language-bash"># 构建插件并造出 IR（需要与 opt 版本一致的 LLVM；Linux 上前缀常是 /usr/lib/llvm-&lt;ver&gt;）
+LLVM=/opt/homebrew/opt/llvm
+$LLVM/bin/clang++ -std=c++17 -fPIC -shared -I$LLVM/include MyPass.cpp -o MyPass.so \
+  -L$LLVM/lib -lLLVM -Wl,-rpath,$LLVM/lib
+
+cat &gt; demo.c &lt;&lt;&#39;EOF&#39;
+int f(int a, int b, int c) {
+  int d = (a + b) * c;
+  int e = (a + b) / c;
+  int g = a * 8;
+  return d + e + g;
+}
+EOF
+
+# 关掉 -O0 的 optnone，标准 pass 才会处理这个函数（见第 6 节第一个坑）
+$LLVM/bin/clang -O0 -Xclang -disable-O0-optnone -S -emit-llvm demo.c -o demo.ll</code></pre>
+<p>上面两步没有输出。先只跑标准 pass：<code>mem2reg</code> 把 6 条 <code>alloca</code>/<code>load</code>/<code>store</code> 全部提升成 SSA 值（<code>sed</code> 只是为了截出函数体，免得把模块头也贴出来）：</p>
+<pre data-lang="bash"><code class="language-bash">LLVM=/opt/homebrew/opt/llvm        # 与前面同一个 LLVM 前缀
+$LLVM/bin/opt -S -passes=&#39;mem2reg&#39; demo.ll -o - | sed -n &#39;/^define/,/^}/p&#39;</code></pre>
+<pre><code>define i32 @f(i32 noundef %0, i32 noundef %1, i32 noundef %2) #0 {
+  %4 = add nsw i32 %0, %1
+  %5 = mul nsw i32 %4, %2
+  %6 = add nsw i32 %0, %1
+  %7 = sdiv i32 %6, %2
+  %8 = mul nsw i32 %0, 8
+  %9 = add nsw i32 %5, %7
+  %10 = add nsw i32 %9, %8
+  ret i32 %10
+}</code></pre>
+<p>再加载我们的插件：<code>mul nsw i32 %0, 8</code> 变成 <code>shl i32 %0, 3</code>：</p>
+<pre data-lang="bash"><code class="language-bash">LLVM=/opt/homebrew/opt/llvm
+$LLVM/bin/opt -S -passes=&#39;mem2reg,strength-reduce&#39; -load-pass-plugin ./MyPass.so demo.ll -o - \
+  | sed -n &#39;/^define/,/^}/p&#39;</code></pre>
+<pre><code>define i32 @f(i32 noundef %0, i32 noundef %1, i32 noundef %2) #0 {
+  %4 = add nsw i32 %0, %1
+  %5 = mul nsw i32 %4, %2
+  %6 = add nsw i32 %0, %1
+  %7 = sdiv i32 %6, %2
+  %.shl = shl i32 %0, 3
+  %8 = add nsw i32 %5, %7
+  %9 = add nsw i32 %8, %.shl
+  ret i32 %9
+}</code></pre>
+<p>被 <code>sed</code> 截掉的那行是我们 pass 打到 <strong>stderr</strong> 的日志（它不走管道，所以单独看到的是）：</p>
+<pre><code>  [strength-reduce]   %8 = mul nsw i32 %0, 8  -&gt;  shl by 3</code></pre>
+<p>最后验证第 6 节那个坑：同一份源码<strong>不加</strong> <code>-Xclang -disable-O0-optnone</code>，<code>mem2reg</code> 一条 <code>alloca</code> 都提升不掉：</p>
+<pre data-lang="bash"><code class="language-bash">LLVM=/opt/homebrew/opt/llvm
+$LLVM/bin/clang -O0 -S -emit-llvm demo.c -o demo_optnone.ll
+$LLVM/bin/opt -S -passes=&#39;mem2reg&#39; demo_optnone.ll -o promoted.ll &amp;&amp; grep -c alloca promoted.ll</code></pre>
+<pre><code>6</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：给迷你 <code>opt</code> 加第五个 pass <code>instcombine-lite</code>：把 <code>add i32 %x, 0</code> 直接替换成 <code>%x</code>（再删掉该指令），用 <code>%9 = add nsw i32 %5, 0</code> 的输入验证使用者被正确改写成 <code>%5</code>。</li>
+<li><strong>解释</strong>：为什么 <code>PreservedAnalyses::none()</code> 是&quot;最安全但最慢&quot;的选择？如果一个 pass 只改了调试信息（debug info），返回 <code>all()</code> 算不算撒谎？</li>
+<li><strong>对比/验证</strong>：跑 <code>opt -passes=&#39;default&lt;O2&gt;&#39; -print-after-all demo.ll -o /dev/null</code>（<code>demo.ll</code> 是关掉 <code>optnone</code> 的那份；换成 <code>demo_optnone.ll</code> 的话函数级 pass 全被跳过、一个都数不到），数出 <code>PromotePass</code>、<code>EarlyCSEPass</code>、<code>InstCombinePass</code> 各出现几次，并解释同一个 pass 为什么要跑很多遍。</li>
+<li><strong>思考</strong>：本课的插件 pass 没有检查 <code>optnone</code>，所以在 <code>-O0</code> 的 IR 上照样改了代码。这是 bug 还是特性？如果要求它遵守 <code>optnone</code>，应该在哪一层判断？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>LLVM 官方教程 Kaleidoscope 第 4 章「Adding JIT and Optimizer Support」（用 pass 管道跑优化、<code>-print-after-all</code> 的来历）：<a href="https://llvm.org/docs/tutorial/MyFirstLanguageFrontend/LangImpl04.html" target="_blank" rel="noopener noreferrer">https://llvm.org/docs/tutorial/MyFirstLanguageFrontend/LangImpl04.html</a></li>
+<li>LLVM 官方文档「Writing an LLVM Pass（new PM）」与「Using the New Pass Manager」（<code>PassInfoMixin</code>、<code>PassBuilder</code>、插件入口 <code>llvmGetPassPluginInfo</code>）：<a href="https://llvm.org/docs/WritingAnLLVMNewPMPass.html" target="_blank" rel="noopener noreferrer">https://llvm.org/docs/WritingAnLLVMNewPMPass.html</a> ｜ <a href="https://llvm.org/docs/NewPassManager.html" target="_blank" rel="noopener noreferrer">https://llvm.org/docs/NewPassManager.html</a></li>
+<li>LLVM <code>opt</code> 命令行指南（<code>-passes=</code>、<code>-load-pass-plugin</code>、<code>-print-after-all</code>、<code>-disable-output</code> 的确切语义）：<a href="https://llvm.org/docs/CommandGuide/opt.html" target="_blank" rel="noopener noreferrer">https://llvm.org/docs/CommandGuide/opt.html</a></li>
+<li>Aho, Lam, Sethi, Ullman, <em>Compilers: Principles, Techniques, and Tools</em>（龙书）第 9 章「Machine-Independent Optimizations」（冗余计算消除、强度削减等机器无关优化）：<a href="https://suif.stanford.edu/dragonbook/" target="_blank" rel="noopener noreferrer">https://suif.stanford.edu/dragonbook/</a></li>
+</ul>
+<p><a href="#/l/cf-ch7-l2">下一课：从通用编译到 ML 编译：为什么深度学习需要自己的编译器</a></p>

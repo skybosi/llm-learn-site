@@ -1,0 +1,82 @@
+<h2 id="h-vllm">vLLM<a class="anchor" href="#h-vllm" aria-label="本节链接">#</a></h2>
+<p>前两章讲的 PagedAttention 与 continuous batching，最终都要落到一个<strong>能直接拿来部署的引擎</strong>上。vLLM 就是把这两项技术产品化的代表作，也是目前开源社区使用最广的高吞吐 LLM 推理框架之一。学完本课，你应当能用 vLLM 起一个服务、用 OpenAI 兼容接口调用它，并说出它的几个关键参数的含义。</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-vllm-是什么">1. vLLM 是什么<a class="anchor" href="#h-1-vllm-是什么" aria-label="本节链接">#</a></h4>
+<p>vLLM 是一个面向 <strong>GPU 的高吞吐 LLM 推理与 serving 引擎</strong>，由加州大学伯克利分校团队开发。它的立身之本是两件事：</p>
+<ul>
+<li><strong>PagedAttention</strong>（第 2 章）：块状 KV Cache 管理，消除碎片、支持共享，把并发数提高 2–4 倍；</li>
+<li><strong>continuous batching</strong>（第 1 章）：迭代级调度，让 GPU 不空转。</li>
+</ul>
+<p>在此之上，vLLM 还提供了 <strong>OpenAI 兼容 API</strong>（<code>/v1/completions</code>、<code>/v1/chat/completions</code>），意味着你原来调 OpenAI 的代码，把 base_url 改成 vLLM 的地址就能用——迁移成本极低。</p>
+<h4 id="h-2-为什么它吞吐高">2. 为什么它吞吐高<a class="anchor" href="#h-2-为什么它吞吐高" aria-label="本节链接">#</a></h4>
+<p>除了 PagedAttention 和 continuous batching，vLLM 还叠加了多项优化：</p>
+<ul>
+<li><strong>CUDA kernel 优化</strong>：针对注意力、融合算子做高效 kernel，减少 kernel 启动开销；</li>
+<li><strong>张量并行 / 流水线并行</strong>：大模型可拆到多卡（第 5 章会专门讲张量并行）；</li>
+<li><strong>量化支持</strong>：支持 AWQ、GPTQ、FP8、INT8 等（第 4 章）；</li>
+<li><strong>前缀缓存（automatic prefix caching）</strong>：自动复用相同 prompt 前缀的 KV，进一步省算力。</li>
+</ul>
+<h4 id="h-3-关键启动参数">3. 关键启动参数<a class="anchor" href="#h-3-关键启动参数" aria-label="本节链接">#</a></h4>
+<ul>
+<li><code>--model</code>：模型路径或 Hugging Face 模型 id；</li>
+<li><code>--max-model-len</code>：最大序列长度，直接决定 KV Cache 预算；</li>
+<li><code>--gpu-memory-utilization</code>：允许 vLLM 占用的显存比例（默认 0.9）；</li>
+<li><code>--tensor-parallel-size</code>：张量并行卡数；</li>
+<li><code>--max-num-seqs</code>：最多同时服务的序列数（并发上限）；</li>
+<li><code>--quantization</code>：量化方式（如 <code>awq</code>、<code>gptq</code>、<code>fp8</code>）。</li>
+</ul>
+<h3 id="h-二可运行示例">二、可运行示例<a class="anchor" href="#h-二可运行示例" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-安装与启动服务">1. 安装与启动服务<a class="anchor" href="#h-1-安装与启动服务" aria-label="本节链接">#</a></h4>
+<pre data-lang="bash"><code class="language-bash"># 用 pip 安装（需要 CUDA 环境）
+pip install vllm
+
+# 启动一个 OpenAI 兼容服务，监听 8000 端口
+# 显存利用率 0.85，最大序列长度 4096，张量并行 1 卡
+python -m vllm.entrypoints.openai.api_server \
+    --model meta-llama/Llama-2-7b-chat-hf \
+    --max-model-len 4096 \
+    --gpu-memory-utilization 0.85 \
+    --tensor-parallel-size 1 \
+    --port 8000</code></pre>
+<h4 id="h-2-用-openai-sdk-调用">2. 用 OpenAI SDK 调用<a class="anchor" href="#h-2-用-openai-sdk-调用" aria-label="本节链接">#</a></h4>
+<pre data-lang="python"><code class="language-python"># -*- coding: utf-8 -*-
+# 用 OpenAI SDK 调用本地 vLLM 服务（base_url 指向本地）
+from openai import OpenAI
+
+client = OpenAI(base_url=&quot;http://localhost:8000/v1&quot;, api_key=&quot;EMPTY&quot;)
+
+resp = client.chat.completions.create(
+    model=&quot;meta-llama/Llama-2-7b-chat-hf&quot;,
+    messages=[{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;用一句话解释 KV Cache&quot;}],
+    max_tokens=128,
+    temperature=0.7,
+)
+print(resp.choices[0].message.content)</code></pre>
+<h4 id="h-3-离线批处理不经-http">3. 离线批处理（不经 HTTP）<a class="anchor" href="#h-3-离线批处理不经-http" aria-label="本节链接">#</a></h4>
+<pre data-lang="python"><code class="language-python"># -*- coding: utf-8 -*-
+# vLLM 离线推理：适合批量评测，不经 HTTP 服务
+from vllm import LLM, SamplingParams
+
+llm = LLM(model=&quot;meta-llama/Llama-2-7b-chat-hf&quot;, max_model_len=4096)
+prompts = [&quot;什么是 TTFT？&quot;, &quot;什么是 continuous batching？&quot;]
+sampling = SamplingParams(temperature=0.8, max_tokens=128)
+
+outputs = llm.generate(prompts, sampling)
+for p, o in zip(prompts, outputs):
+    print(f&quot;Q: {p}\nA: {o.outputs[0].text}\n&quot;)</code></pre>
+<p><figure><img class="md-img" src="content/courses/llm-inference-optimization/assets/chapter-3-figure-01.svg" alt="vLLM 架构图：左侧&quot;OpenAI 兼容 API 入口&quot;方块，箭头进入中间一个&quot;调度器（continuous batching）&quot;齿轮方块；调度器下方连&quot;PagedAttention KV 管理&quot;方块（内画小块 block 与页表）和&quot;CUDA kernel 优化&quot;方块；调度器右侧箭头连到多个 GPU 方块（标 GPU0、GPU1…，虚线框标注&quot;张量并行可扩展&quot;）；底部一排小标签&quot;量化支持 / 前缀缓存 / 高吞吐&quot;；一句话&quot;PagedAttention + continuous batching 的开源实现&quot;" loading="lazy" decoding="async"><figcaption>vLLM 架构图：左侧&quot;OpenAI 兼容 API 入口&quot;方块，箭头进入中间一个&quot;调度器（continuous batching）&quot;齿轮方块；调度器下方连&quot;PagedAttention KV 管理&quot;方块（内画小块 block 与页表）和&quot;CUDA kernel 优化&quot;方块；调度器右侧箭头连到多个 GPU 方块（标 GPU0、GPU1…，虚线框标注&quot;张量并行可扩展&quot;）；底部一排小标签&quot;量化支持 / 前缀缓存 / 高吞吐&quot;；一句话&quot;PagedAttention + continuous batching 的开源实现&quot;</figcaption></figure>
+</p>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>起服务</strong>：在本地（或一台有 GPU 的机器）按示例 1 启动 vLLM，用 <code>curl http://localhost:8000/v1/models</code> 确认服务就绪。</li>
+<li><strong>改并发</strong>：启动时改 <code>--max-num-seqs</code>（如 16、64、256），用压测工具（如 <code>vllm bench serve</code> 或自己写并发请求）观察吞吐与延迟的变化，验证第 1 章&quot;吞吐 vs 延迟&quot;的结论。</li>
+<li><strong>调显存</strong>：把 <code>--gpu-memory-utilization</code> 从 0.9 改成 0.6，观察是否 OOM 或并发下降，说明该参数如何影响 KV Cache 预算。</li>
+<li><strong>换模型</strong>：把模型换成一个 GQA 模型（如 Llama-3-8B），保持其它参数不变，观察同等显存下能服务的请求数是否更多（对照第 2 章的 KV 公式）。</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>vLLM 官方文档：<a href="https://docs.vllm.ai/" target="_blank" rel="noopener noreferrer">https://docs.vllm.ai/</a></li>
+<li>vLLM 论文（PagedAttention 与吞吐收益）：<a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2309.06180</a></li>
+<li>vLLM OpenAI 兼容 API 说明：<a href="https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html" target="_blank" rel="noopener noreferrer">https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html</a></li>
+</ul>
+<p><a href="#/l/inf-ch3-l2">下一课：TensorRT-LLM 与 llama.cpp</a></p>

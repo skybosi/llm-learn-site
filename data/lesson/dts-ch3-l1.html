@@ -1,0 +1,224 @@
+<h2 id="h-pcie--nvlink--nvswitch域内带宽的层级">PCIe / NVLink / NVSwitch：域内带宽的层级<a class="anchor" href="#h-pcie--nvlink--nvswitch域内带宽的层级" aria-label="本节链接">#</a></h2>
+<p>第 2 章你选好了算法，式子里还剩一个没着落的参数：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0528em;">β</span></span></span></span> 到底是多少。它不是常数——同一台服务器上，卡 0 到卡 1 可能走 NVLink（每秒几百 GB），也可能绕 PCIe 根复合体（每秒几十 GB），而这两种情况在 <code>nvidia-smi topo -m</code> 里只差一个单词。本课把机器内部拆成三级链路，把每一级换算成可以直接代进 α-β 模型的单向 β。</p>
+<p><figure><img class="md-img" src="content/courses/distributed-training-systems/assets/chapter-3-figure-01.svg" alt="从 HBM 到网络：每穿过一道边界，可用带宽就降一级" loading="lazy" decoding="async"><figcaption>从 HBM 到网络：每穿过一道边界，可用带宽就降一级</figcaption></figure>
+</p>
+<h3 id="h-一概念讲解">一、概念讲解<a class="anchor" href="#h-一概念讲解" aria-label="本节链接">#</a></h3>
+<h4 id="h-1-一台机器里其实有三条卡间链路">1. 一台机器里其实有三条&quot;卡间链路&quot;<a class="anchor" href="#h-1-一台机器里其实有三条卡间链路" aria-label="本节链接">#</a></h4>
+<p>两块 GPU 之间传数据，物理上可能走三种路：</p>
+<table>
+<thead>
+<tr>
+<th>域内路径</th>
+<th>站在谁的肩膀上</th>
+<th>单向带宽量级</th>
+<th>100 MiB ring AllReduce（P=8）</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>NVLink + NVSwitch</td>
+<td>专用高速串行链路网络</td>
+<td>数百 GB/s（NVLink 4 双向 900 GB/s）</td>
+<td>0.44 ms</td>
+</tr>
+<tr>
+<td>PCIe 交换机 / 根复合体</td>
+<td>PCIe 树（可能过 switch，不过 CPU）</td>
+<td>x16 数十 GB/s</td>
+<td>2.98 ms（PCIe 5.0 x16）</td>
+</tr>
+<tr>
+<td>经 CPU / NUMA 互连</td>
+<td>PCIe 主机桥 + QPI/UPI 之类的 SMP 链路</td>
+<td>更低的有效带宽、更高延迟</td>
+<td>5.91 ms（PCIe 4.0 x16）</td>
+</tr>
+</tbody></table>
+<p>三行是同一份 100 MiB 梯度、同一个 ring 算法（每步每条环边只传 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span><span class="mord">/</span><span class="mord mathnormal">p</span></span></span></span>，共 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">2</span><span class="mopen">(</span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span></span></span></span> 步，即 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">2</span><span class="mopen">(</span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.4911em;vertical-align:-0.4811em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.01em;"><span style="top:-2.655em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">p</span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.485em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">2</span><span class="mopen mtight">(</span><span class="mord mathnormal mtight">p</span><span class="mbin mtight">−</span><span class="mord mtight">1</span><span class="mclose mtight">)</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.4811em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.3534em;vertical-align:-0.4811em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8723em;"><span style="top:-2.655em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.0528em;">β</span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.394em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.0576em;">S</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.4811em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span>），只有 β 换了一级。<strong>域内选择比算法选择更能决定量级</strong>——这是本章的第一条结论。</p>
+<h4 id="h-2-pcie它是一棵树不是一条线">2. PCIe：它是一棵树，不是一条线<a class="anchor" href="#h-2-pcie它是一棵树不是一条线" aria-label="本节链接">#</a></h4>
+<p>PCIe 是分层的树：GPU（endpoint）挂在 root complex 或 switch 下，switch 再向上汇聚。所以&quot;两张卡之间的 PCIe 路径&quot;可能是&quot;同一个 switch 内的两跳（PIX）&quot;，也可能是&quot;各自过主机桥、再跨 NUMA 节点（SYS）&quot;，带宽与延迟都不同。</p>
+<p>带宽不能靠背，要会算：每通道速率 × 通道数 × 编码效率 ÷ 8。PCIe 3.0/4.0/5.0 用 128b/130b 编码（效率 128/130），6.0 换 PAM4 并引入 FLIT/FEC。于是 x16 单向是：</p>
+<table>
+<thead>
+<tr>
+<th>代际</th>
+<th>每通道速率</th>
+<th>x16 单向</th>
+<th>x16 双向</th>
+<th>x8 单向</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>PCIe 3.0</td>
+<td>8 GT/s</td>
+<td>15.8 GB/s</td>
+<td>31.5 GB/s</td>
+<td>7.9 GB/s</td>
+</tr>
+<tr>
+<td>PCIe 4.0</td>
+<td>16 GT/s</td>
+<td>31.5 GB/s</td>
+<td>63.0 GB/s</td>
+<td>15.8 GB/s</td>
+</tr>
+<tr>
+<td>PCIe 5.0</td>
+<td>32 GT/s</td>
+<td>63.0 GB/s</td>
+<td>126.0 GB/s</td>
+<td>31.5 GB/s</td>
+</tr>
+<tr>
+<td>PCIe 6.0</td>
+<td>64 GT/s</td>
+<td>128.0 GB/s（未计 FLIT/FEC 开销，实际略低）</td>
+<td>256.0 GB/s</td>
+<td>64.0 GB/s</td>
+</tr>
+</tbody></table>
+<p>关键推论：<strong>x8 就是 x16 的一半</strong>，所以&quot;卡插在 x16 槽&quot;这句话不完整，还要看链路协商到的宽度（<code>nvidia-smi -q</code> 的 PCIe 段会给出 Link Width）。</p>
+<h4 id="h-3-nvlink-与-nvswitch把-8-张卡变成一个域">3. NVLink 与 NVSwitch：把 8 张卡变成一个域<a class="anchor" href="#h-3-nvlink-与-nvswitch把-8-张卡变成一个域" aria-label="本节链接">#</a></h4>
+<p>NVLink 是点对点的高速链路，NVSwitch 是把这些链路接成非阻塞全互连的交换芯片。按 NVIDIA 官方口径的代际量级：</p>
+<table>
+<thead>
+<tr>
+<th>代</th>
+<th>出现时间</th>
+<th>每 GPU 链路数</th>
+<th>每 GPU 双向带宽</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>第 1 代</td>
+<td>2014（P100 之前）</td>
+<td>—</td>
+<td>160 GB/s</td>
+</tr>
+<tr>
+<td>第 3 代</td>
+<td>2020（A100）</td>
+<td>12</td>
+<td>600 GB/s</td>
+</tr>
+<tr>
+<td>第 4 代</td>
+<td>2022（H100）</td>
+<td>18</td>
+<td>900 GB/s</td>
+</tr>
+<tr>
+<td>第 5 代</td>
+<td>2024（Blackwell）</td>
+<td>18</td>
+<td>1.8 TB/s</td>
+</tr>
+</tbody></table>
+<p>官方都按<strong>双向</strong>报数，工程上按单向记账时要除以 2：NVLink 4 单向 450 GB/s，正好是 PCIe 5.0 x16 单向（63 GB/s）的约 7.1 倍——这也解释了官方&quot;N×PCIe Gen5&quot;的说法从哪来。上到第 5 代，一颗 NVLink 交换机托盘就能提供 144 个 100 GB/s 端口，把 72 颗 Blackwell 接成单一 NVLink 域（GB200 NVL72 官方给出域内总带宽 130 TB/s）。</p>
+<p>NVSwitch 还有一个容易被忽略的能力：把 AllReduce 卸载到交换机（NVLink SHARP / NVLS）。NCCL 由 <code>NCCL_NVLS_ENABLE</code> 控制（默认 2：不支持则回落，资源分配失败则报错），要求第三代 NVSwitch（NVLink 4）与 Hopper 及之后的架构。</p>
+<h4 id="h-4-三个最容易算错的地方">4. 三个最容易算错的地方<a class="anchor" href="#h-4-三个最容易算错的地方" aria-label="本节链接">#</a></h4>
+<ul>
+<li><strong>双向 vs 单向</strong>：ring 的每一步只往一个方向发 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span></span></span></span> 字节，用单向带宽；把 900 GB/s 直接代进 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.0528em;">β</span></span></span></span> 会把账算少一半。</li>
+<li><strong>Gb/s vs GB/s</strong>：网络侧常说 Gb/s（bit），除以 8 才是 GB/s。NVLink 与 PCIe 的 GB/s 已经是字节口径，两边混用是常见错误。</li>
+<li><strong>峰值 vs 有效</strong>：上面都是规范峰值。实测里还有协议头、PCIe 事务开销与共享上行，有效带宽通常低于峰值，所以第 1 课的态度是&quot;用实测反解 α、β&quot;，规范值只用来定预期量级。</li>
+</ul>
+<h4 id="h-5-读自己的机器nvidia-smi-topo--m">5. 读自己的机器：<code>nvidia-smi topo -m</code><a class="anchor" href="#h-5-读自己的机器nvidia-smi-topo--m" aria-label="本节链接">#</a></h4>
+<p>它输出一张卡间/NIC 矩阵，官方图例：<code>X</code> 自己、<code>SYS</code> 过 PCIe + NUMA 间 SMP 互连、<code>NODE</code> 过同一 NUMA 内的 PCIe 主机桥互连、<code>PHB</code> 过 PCIe 主机桥（通常就是 CPU）、<code>PXB</code> 过多个 PCIe 交换机、<code>PIX</code> 只过一个 PCIe 交换机、<code>NV#</code> 过一组 # 条 NVLink。</p>
+<p>读法只有三条：看到 <code>NV#</code> 就是最快一级；<code>PIX</code> 好过 <code>PXB</code> 与 <code>PHB</code>；出现 <code>SYS</code> 说明这段通信要跨 NUMA。配套命令：<code>nvidia-smi topo -p2p r -i 0</code> 看卡 0 能否被 peer 读，<code>nvidia-smi topo -mp</code> 只看 PCIe 路径（排除 NVLink），<code>nvidia-smi topo -C -i 0</code> 给出最近的 NUMA 节点。</p>
+<h4 id="h-6-常见坑">6. 常见坑<a class="anchor" href="#h-6-常见坑" aria-label="本节链接">#</a></h4>
+<ul>
+<li>只报 GPU 型号、不看 topo：同样是 8×H100，全 NVLink 与 4+4 拼接的机器，ring 的 β 差一倍以上。</li>
+<li>假设&quot;服务器内一定是 NVLink&quot;：<code>nvidia-smi topo -m</code> 里出现 <code>PHB</code>/<code>SYS</code> 的机比想象中多。</li>
+<li>忽略 PCIe 上行共享：多张卡挂同一个 switch、switch 再共用一条上行时，同时通信会互相抢带宽，&quot;每卡 x16&quot;只是名义值。</li>
+<li>拿双向带宽算单向账（见上节）。</li>
+</ul>
+<h4 id="h-7-这一课到哪里为止">7. 这一课到哪里为止<a class="anchor" href="#h-7-这一课到哪里为止" aria-label="本节链接">#</a></h4>
+<p>域内层级只解决&quot;β 取哪个数量级&quot;。一旦通信要出门，路径上必然出现网卡，链路代际换成 InfiniBand / RoCE 的说法，还会多出一次&quot;GPU 与网卡之间怎么传&quot;的选择——这正是下一课。</p>
+<h3 id="h-二可运行代码示例">二、可运行代码示例<a class="anchor" href="#h-二可运行代码示例" aria-label="本节链接">#</a></h3>
+<p>三段纯 Python（只用标准库），先把 PCIe 带宽算出来，再用同一份梯度看三级链路的差距，最后做层级换算。参数取规范速率与量级值，<strong>请用自己机器的 <code>nccl-tests</code> 实测替换</strong>。</p>
+<pre data-lang="python"><code class="language-python"># ===== 示例 1：PCIe 各代带宽由&quot;规范速率 × 编码 × 通道数&quot;推出来，不靠背数字 =====
+PCIe = [(&quot;3.0&quot;, 8.0, 128 / 130), (&quot;4.0&quot;, 16.0, 128 / 130),
+        (&quot;5.0&quot;, 32.0, 128 / 130), (&quot;6.0&quot;, 64.0, 1.0)]     # (代, GT/s/通道, 编码效率)
+
+
+def pcie_uni(rate_gts, enc, lanes=16):
+    &quot;&quot;&quot;单向有效带宽（GB/s）= 每通道速率 × 通道数 × 编码效率 / 8。&quot;&quot;&quot;
+    return rate_gts * 1e9 * lanes * enc / 8 / 1e9
+
+
+print(&quot;x16 插槽的带宽（6.0 未计 FLIT/FEC 开销，实际略低）：&quot;)
+for gen, rate, enc in PCIe:
+    uni = pcie_uni(rate, enc)
+    print(f&quot;  PCIe {gen} x16: 单向 {uni:6.1f} GB/s   双向 {2 * uni:6.1f} GB/s&quot;)
+print(f&quot;  PCIe 5.0 x8 : 单向 {pcie_uni(32.0, 128 / 130, 8):6.1f} GB/s&quot;
+      f&quot;   双向 {2 * pcie_uni(32.0, 128 / 130, 8):6.1f} GB/s&quot;)
+
+
+# ===== 示例 2：同一算法、同一消息量，只换域内链路 =====
+def ring_allreduce_ms(total_bytes, P, alpha_us, beta_gbps):
+    &quot;&quot;&quot;ring AllReduce：总消息量 total_bytes，每步每条环边只传 s = total/P 字节，共 2(P-1) 步。
+    T = 2(P-1)·α + 2(P-1)/P · total/β；β 用单向带宽。返回毫秒。&quot;&quot;&quot;
+    lat = 2 * (P - 1) * alpha_us
+    bw = 2 * (P - 1) / P * total_bytes / (beta_gbps * 1e9) * 1e6
+    return (lat + bw) / 1e3
+
+
+grad = 100 * 2**20                       # 100 MiB 梯度
+print(f&quot;\n{grad / 2**20:.0f} MiB AllReduce，P=8，链路换成各级实测的量级：&quot;)
+for link, alpha, beta in [(&quot;PCIe 4.0 x16（单向）&quot;, 6.0, 31.5),
+                          (&quot;PCIe 5.0 x16（单向）&quot;, 5.0, 63.0),
+                          (&quot;NVLink 4（单向）&quot;, 2.0, 450.0)]:
+    t = ring_allreduce_ms(grad, 8, alpha, beta)
+    print(f&quot;  {link:&lt;20} β={beta:5.1f} GB/s   ring = {t:8.2f} ms&quot;)
+
+
+# ===== 示例 3：层级换算 —— 一条 NVLink 抵几条 PCIe =====
+nv4_uni = 900 / 2                        # NVLink 4：900 GB/s 双向 → 450 GB/s 单向
+print(f&quot;\n链路代差换算（NVLink 4 单向 {nv4_uni:.0f} GB/s 为基准）：&quot;)
+for gen, rate, enc in PCIe:
+    print(f&quot;  1 条 NVLink 4 ≈ {nv4_uni / pcie_uni(rate, enc):4.1f} 条 PCIe {gen} x16 单向&quot;)</code></pre>
+<p>在 Python 3.14.5（仅标准库）下实际运行结果：</p>
+<pre data-lang="text"><code class="language-text">x16 插槽的带宽（6.0 未计 FLIT/FEC 开销，实际略低）：
+  PCIe 3.0 x16: 单向   15.8 GB/s   双向   31.5 GB/s
+  PCIe 4.0 x16: 单向   31.5 GB/s   双向   63.0 GB/s
+  PCIe 5.0 x16: 单向   63.0 GB/s   双向  126.0 GB/s
+  PCIe 6.0 x16: 单向  128.0 GB/s   双向  256.0 GB/s
+  PCIe 5.0 x8 : 单向   31.5 GB/s   双向   63.0 GB/s
+
+100 MiB AllReduce，P=8，链路换成各级实测的量级：
+  PCIe 4.0 x16（单向）     β= 31.5 GB/s   ring =     5.91 ms
+  PCIe 5.0 x16（单向）     β= 63.0 GB/s   ring =     2.98 ms
+  NVLink 4（单向）         β=450.0 GB/s   ring =     0.44 ms
+
+链路代差换算（NVLink 4 单向 450 GB/s 为基准）：
+  1 条 NVLink 4 ≈ 28.6 条 PCIe 3.0 x16 单向
+  1 条 NVLink 4 ≈ 14.3 条 PCIe 4.0 x16 单向
+  1 条 NVLink 4 ≈  7.1 条 PCIe 5.0 x16 单向
+  1 条 NVLink 4 ≈  3.5 条 PCIe 6.0 x16 单向</code></pre>
+<p>下面这段是<strong>可选</strong>实验：只需要 1~2 张卡（自备或云上按需开一台单卡/双卡实例即可）。没有卡也能学完本课——上面的推导与代码不依赖任何 GPU。</p>
+<pre data-lang="bash"><code class="language-bash"># ---- 可选：1~2 张卡即可复现；无卡时看命令的判读方法即可 ----
+nvidia-smi topo -m             # 卡间/NIC 矩阵：NV#（NVLink）、PIX/PXB/PHB（PCIe）、SYS（跨 NUMA）
+nvidia-smi topo -mp            # 只看 PCIe 路径（排除 NVLink），确认域内到底有没有 NVLink
+nvidia-smi topo -p2p r -i 0    # 卡 0 能否被其它设备 peer 读
+nvidia-smi -q | grep -A 3 &quot;GPU Link&quot;   # 协商到的 PCIe 代际与宽度（x16 还是 x8）
+
+# 量域内有效带宽（nccl-tests；-g 2 用两张卡，只有一张卡时用 -g 1）
+# git clone https://github.com/NVIDIA/nccl-tests &amp;&amp; cd nccl-tests &amp;&amp; make MPI=1
+./build/all_reduce_perf -b 8 -e 8G -f 2 -g 2
+# 判读：8B~8K 那几行的 busbw 反映 α 主导区；大消息平台的斜率才接近 β；
+#       把两行 (size, time) 代进第 1 课的 fit_alpha_beta 就得到本机 α、β。</code></pre>
+<h3 id="h-三练习">三、练习<a class="anchor" href="#h-三练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><strong>实现</strong>：把示例 2 改成&quot;按 topo 矩阵自动选 β&quot;：给一个 <code>{(&#39;0&#39;,&#39;1&#39;):&#39;NV4&#39;, (&#39;0&#39;,&#39;2&#39;):&#39;PIX&#39;...}</code> 的字典，输出 P=8、100 MiB ring AllReduce 的预测时间，并与&quot;全部按 NVLink 4&quot;的假设对比差多少。</li>
+<li><strong>解释</strong>：为什么 PCIe 6.0 的每通道速率翻倍（64 GT/s）而单向带宽却不是 PCIe 5.0 的严格两倍？请从编码与 FLIT/FEC 两个角度各说一句。</li>
+<li><strong>对比/验证</strong>：把示例 1 的 <code>lanes</code> 从 16 改成 8、4，重算四代 x8/x4 的单向带宽；再解释为什么&quot;推理卡的 KV cache 传输&quot;更关心 x16 与 x8 的差别。</li>
+<li><strong>思考</strong>：如果一台 8 卡机器里，卡 0<del>3 之间是 NVLink、卡 4</del>7 之间是 PCIe、跨半区只有 PCIe，那么一个 P=8 的 ring AllReduce 的 β 应该取哪个值？换成 tree 算法结论会不会变？</li>
+</ol>
+<h3 id="h-参考来源">参考来源<a class="anchor" href="#h-参考来源" aria-label="本节链接">#</a></h3>
+<ul>
+<li>NVIDIA, <em>NVIDIA System Management Interface (nvidia-smi)</em> — Topology 小节（<code>nvidia-smi topo -m</code> 的 X/SYS/NODE/PHB/PXB/PIX/NV# 图例，<code>-mp</code>/<code>-p2p</code>/<code>-C</code> 用法；本课读机器的依据）：<a href="https://docs.nvidia.com/deploy/nvidia-smi/index.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/deploy/nvidia-smi/index.html</a></li>
+<li>NVIDIA, <em>What Is NVLink?</em>（NVLink 代际与带宽：第 1 代 160 GB/s、第 3 代 A100 600 GB/s 共 12 条、第 4 代 H100 900 GB/s 共 18 条，以及与 PCIe Gen5 的倍数关系）：<a href="https://blogs.nvidia.com/blog/what-is-nvidia-nvlink/" target="_blank" rel="noopener noreferrer">https://blogs.nvidia.com/blog/what-is-nvidia-nvlink/</a></li>
+<li>NVIDIA, <em>NVIDIA GB200 NVL72 Delivers Trillion-Parameter LLM Training and Real-Time Inference</em>（第五代 NVLink：每 GPU 双向 1.8 TB/s、每托盘 144 个 100 GB/s 端口、72 GPU 单域与 130 TB/s 域内总带宽）：<a href="https://developer.nvidia.com/blog/nvidia-gb200-nvl72-delivers-trillion-parameter-llm-training-and-real-time-inference/" target="_blank" rel="noopener noreferrer">https://developer.nvidia.com/blog/nvidia-gb200-nvl72-delivers-trillion-parameter-llm-training-and-real-time-inference/</a></li>
+<li>NVIDIA, <em>NCCL User Guide</em> — Environment Variables（<code>NCCL_NVLS_ENABLE</code> 与 NVLink SHARP：第三代 NVSwitch（NVLink 4）+ Hopper 及之后的卸载条件）：<a href="https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html" target="_blank" rel="noopener noreferrer">https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html</a></li>
+<li>PCI-SIG, <em>PCI Express 规范主页</em>（PCIe 各代的每通道速率与编码；本课表格的规范来源，具体以 PCI-SIG 发布文本为准）：<a href="https://pcisig.com/" target="_blank" rel="noopener noreferrer">https://pcisig.com/</a></li>
+</ul>
+<p><a href="#/l/dts-ch3-l2">下一课：InfiniBand / RoCE / GPUDirect RDMA：跨机通信路径</a></p>

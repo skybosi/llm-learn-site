@@ -1,0 +1,883 @@
+<h2 id="h-三种记忆的职责与写入时机工作记忆长期记忆检索式记忆">三种记忆的职责与写入时机：工作记忆、长期记忆、检索式记忆<a class="anchor" href="#h-三种记忆的职责与写入时机工作记忆长期记忆检索式记忆" aria-label="本节链接">#</a></h2>
+<h3 id="h-这一节要解决什么">这一节要解决什么<a class="anchor" href="#h-这一节要解决什么" aria-label="本节链接">#</a></h3>
+<p>先纠正一个起点错误：<strong>上下文窗口不是记忆。</strong> 它是 Agent 的<strong>工作区</strong>（寄存器 / 栈），不是存储。两者的差别不是容量，而是四条性质：</p>
+<table>
+<thead>
+<tr>
+<th>性质</th>
+<th>上下文窗口</th>
+<th>记忆</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>持久性</td>
+<td>进程结束即消失</td>
+<td>跨会话存活</td>
+</tr>
+<tr>
+<td>容量</td>
+<td>硬上限，满了必须丢弃</td>
+<td>可增长（代价是检索难度）</td>
+</tr>
+<tr>
+<td>可检索</td>
+<td>没有索引，只有位置</td>
+<td>有键/向量/图上的索引</td>
+</tr>
+<tr>
+<td>可遗忘</td>
+<td>只能整体丢弃或压缩</td>
+<td>可以按条删除、衰减、设 TTL</td>
+</tr>
+</tbody></table>
+<p>把这两者混为一谈，会同时产出两种相反的病：<strong>&quot;记不住&quot;</strong>（把该持久的东西留在上下文里，进程一重启就没了）和 <strong>&quot;记错&quot;</strong>（把上下文里的一切不加区分地写进持久存储，包括模型的猜测和过时的中间结论）。</p>
+<p>所以这一节的第一个任务是把&quot;记忆&quot;从一个大词拆成<strong>三种生命周期完全不同的东西</strong>。</p>
+<p>学完这一节你应该能回答：</p>
+<ul>
+<li>一段&quot;用户偏好简洁的报表&quot;应该写进哪种记忆？写在什么结构里？什么时候写？</li>
+<li>为什么<strong>工作记忆必须是结构化的</strong>，而不能就是&quot;消息列表&quot;？</li>
+<li>为什么长期记忆的写入需要<strong>验证门槛</strong>，而工作记忆不需要？</li>
+<li>&quot;检索式记忆&quot;和 RAG 有什么本质差别？（不是&quot;都是向量检索&quot;。）</li>
+<li>三种记忆的更新频率差了几个数量级，这对系统设计意味着什么？</li>
+</ul>
+<h3 id="h-一分解的依据按生命周期而不是按存储">一、分解的依据：按生命周期，而不是按存储<a class="anchor" href="#h-一分解的依据按生命周期而不是按存储" aria-label="本节链接">#</a></h3>
+<h4 id="h-11-一个常见的错误分类">1.1 一个常见的错误分类<a class="anchor" href="#h-11-一个常见的错误分类" aria-label="本节链接">#</a></h4>
+<p>很多资料把记忆分成&quot;短期记忆 / 长期记忆&quot;，或者按存储介质分成&quot;向量库 / 关系库 / 图数据库&quot;。前者太粗（会把工作记忆和会话内的观察混为一谈），后者是<strong>实现</strong>而不是<strong>职责</strong>（同一个向量库可以承载完全不同的两种记忆）。</p>
+<p>正确的分解依据是<strong>生命周期</strong>：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord cjk_fallback">记忆类型</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord text"><span class="mord cjk_fallback">存活范围</span></span><span class="mpunct">,</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord cjk_fallback">写入触发</span></span><span class="mpunct">,</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord cjk_fallback">读取代价</span></span><span class="mpunct">,</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord cjk_fallback">失效方式</span></span><span class="mclose">)</span></span></span></span></span></p>
+<p>按这个四元组拆，得到三种彼此不重叠的类型：</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th><strong>工作记忆</strong>（working）</th>
+<th><strong>长期记忆</strong>（long-term）</th>
+<th><strong>检索式记忆</strong>（episodic / retrieval）</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>存活范围</strong></td>
+<td>单次任务 / 单次 run</td>
+<td>跨任务、跨会话，永久或有 TTL</td>
+<td>跨任务，累积后按需检索</td>
+</tr>
+<tr>
+<td><strong>内容</strong></td>
+<td>当前任务的结构化状态</td>
+<td>稳定的<strong>事实</strong>与<strong>偏好</strong>（去语境化）</td>
+<td>过去的<strong>轨迹与经验</strong>（带语境）</td>
+</tr>
+<tr>
+<td><strong>写入触发</strong></td>
+<td><strong>每步都写</strong>（状态转移即写）</td>
+<td><strong>验证后写</strong>（罕见，低频）</td>
+<td><strong>任务结束时写</strong>（中频，附结果标签）</td>
+</tr>
+<tr>
+<td><strong>读取方式</strong></td>
+<td>直接读字段（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">O</span><span class="mopen">(</span><span class="mord">1</span><span class="mclose">)</span></span></span></span>，无检索）</td>
+<td>按主体键精确读（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">O</span><span class="mopen">(</span><span class="mord">1</span><span class="mclose">)</span></span></span></span>）+ 少量语义检索</td>
+<td><strong>按情境检索</strong>（<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">O</span><span class="mopen">(</span><span class="mop">lo<span style="margin-right:0.0139em;">g</span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">n</span><span class="mclose">)</span></span></span></span> 近似最近邻 + 重排）</td>
+</tr>
+<tr>
+<td><strong>失效方式</strong></td>
+<td>任务结束即丢弃（或归档进③）</td>
+<td>显式撤销 / TTL / 版本</td>
+<td>衰减 + 被更好的经验覆盖</td>
+</tr>
+<tr>
+<td><strong>写错的后果</strong></td>
+<td>本任务跑偏（可见、可回退）</td>
+<td><strong>跨任务持续污染</strong>（不可见）</td>
+<td>检索到错误的先例，模仿错误做法</td>
+</tr>
+<tr>
+<td><strong>容错要求</strong></td>
+<td>中等（可重算）</td>
+<td><strong>最高</strong>（一旦污染，影响面无限）</td>
+<td>高（错误先例会被复制）</td>
+</tr>
+</tbody></table>
+<p><strong>这张表的读法是&quot;写入频率与容错要求成反比&quot;</strong>：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord text"><span class="mord cjk_fallback">写入频率</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">↑</span><span class="mspace" style="margin-right:1em;"></span></span><span class="base"><span class="strut" style="height:0.549em;vertical-align:-0.024em;"></span><span class="mrel">⟺</span><span class="mspace" style="margin-right:1em;"></span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord text"><span class="mord cjk_fallback">单条写入的容错要求</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">↓</span></span></span></span></span></p>
+<p>工作记忆每步都写，所以它必须便宜、可覆盖、可丢弃 —— 它容错的方式是&quot;下一步会修正它&quot;。长期记忆几乎不写，但每一条都可能影响未来所有任务 —— 它容错的方式只能是<strong>写之前验证</strong>。把这两个要求弄反（长期记忆随手写、工作记忆谨慎写）是最常见的架构错误。</p>
+<h4 id="h-12-三种记忆各自的一句话职责">1.2 三种记忆各自的&quot;一句话职责&quot;<a class="anchor" href="#h-12-三种记忆各自的一句话职责" aria-label="本节链接">#</a></h4>
+<p>把上面的表压缩成可以贴在设计文档里的三句话：</p>
+<pre><code>工作记忆：让&quot;当前这个任务&quot;在下一步仍然是同一个任务（连贯性）。
+长期记忆：让&quot;未来的任务&quot;不必重新学习已经确定的事实（省重复劳动）。
+检索式记忆：让&quot;类似的情境&quot;可以复用过去的做法与教训（经验迁移）。</code></pre>
+<p>这三句话对应三种<strong>不同的失败</strong>：</p>
+<ul>
+<li>工作记忆坏 → <strong>任务断裂</strong>（重复做已完成的事、丢失已确认的约束、前后矛盾）</li>
+<li>长期记忆坏 → <strong>持续放错</strong>（把过时/错误的事实当真理，且每用一次就强化一次）</li>
+<li>检索式记忆坏 → <strong>错误模仿</strong>（检索到一个看似相似的失败先例，复制它的做法）</li>
+</ul>
+<p><figure><img class="md-img" src="content/courses/agent-systems/assets/chapter-4-figure-01.svg" alt="三种记忆按生命周期分开" loading="lazy" decoding="async"><figcaption>三种记忆按生命周期分开</figcaption></figure>
+</p>
+<h3 id="h-二工作记忆结构化任务状态">二、工作记忆：结构化任务状态<a class="anchor" href="#h-二工作记忆结构化任务状态" aria-label="本节链接">#</a></h3>
+<h4 id="h-21-为什么不能就是消息列表">2.1 为什么不能就是&quot;消息列表&quot;<a class="anchor" href="#h-21-为什么不能就是消息列表" aria-label="本节链接">#</a></h4>
+<p>最省事的做法是把工作记忆实现为 <code>messages: list[dict]</code>（对话历史）。它的三个致命缺陷：</p>
+<table>
+<thead>
+<tr>
+<th>缺陷</th>
+<th>机制</th>
+<th>后果</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>状态隐含在文本里</strong></td>
+<td>&quot;做到哪了&quot;要靠模型从历史里推断</td>
+<td>推断会错；无法程序化检查</td>
+</tr>
+<tr>
+<td><strong>无法检查不变量</strong></td>
+<td>没有字段可以断言（&quot;已经付过款了吗&quot;）</td>
+<td>重复副作用（第 3 章）、自相矛盾</td>
+</tr>
+<tr>
+<td><strong>无法恢复</strong></td>
+<td>恢复只能靠重放整个消息列表，且模型每次读出的理解可能不同</td>
+<td>崩溃恢复不可靠（第 4 节）</td>
+</tr>
+</tbody></table>
+<p><strong>结论</strong>：工作记忆必须有一份<strong>结构化的状态对象</strong>，消息列表只是它的<strong>渲染形式</strong>。</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord cjk_fallback">上下文里的对话</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord">render</span></span><span class="mopen">(</span><span class="mord text"><span class="mord cjk_fallback">状态对象</span></span><span class="mpunct">,</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord cjk_fallback">最近的观察</span></span><span class="mclose">)</span></span></span></span></span></p>
+<p>这个区分有一个立即可验证的好处：<strong>状态对象可以被断言。</strong> 你可以在每一步开始前检查不变量：</p>
+<pre data-lang="python"><code class="language-python">assert not (state.paid and state.refunded), &quot;已付款又已退款：状态矛盾&quot;
+assert state.step &lt;= state.budget_steps, &quot;步数超预算&quot;
+assert state.pending_approval is None or state.committed, &quot;审批未完成却已提交&quot;</code></pre>
+<p>这类断言在&quot;消息列表&quot;实现里是写不出来的。</p>
+<h4 id="h-22-任务状态的四个正交维度">2.2 任务状态的四个正交维度<a class="anchor" href="#h-22-任务状态的四个正交维度" aria-label="本节链接">#</a></h4>
+<p>一个实用的工作记忆 schema 可以按四个维度组织（<strong>正交</strong>意味着任意组合都合法，这让状态空间可管理）：</p>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>内容</th>
+<th>更新频率</th>
+<th>例子</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>目标（goal）</strong></td>
+<td>要达成什么、验收标准、硬约束</td>
+<td>几乎不变</td>
+<td><code>objective</code>, <code>acceptance</code>, <code>hard_constraints</code></td>
+</tr>
+<tr>
+<td><strong>进展（progress）</strong></td>
+<td>已完成的子目标、当前阶段、待办</td>
+<td>每步</td>
+<td><code>done: [...]</code>, <code>phase</code>, <code>todo: [...]</code></td>
+</tr>
+<tr>
+<td><strong>世界模型（world）</strong></td>
+<td>已知的事实（观察结果的摘要）、已知的实体 ID</td>
+<td>每步</td>
+<td><code>entities: {order_id: ...}</code>, <code>facts: {...}</code></td>
+</tr>
+<tr>
+<td><strong>执行元数据（meta）</strong></td>
+<td>预算、步数、幂等键、审批状态、错误计数</td>
+<td>每步</td>
+<td><code>steps</code>, <code>tokens_used</code>, <code>idem_keys</code>, <code>error_counts</code></td>
+</tr>
+</tbody></table>
+<p><strong>&quot;世界模型&quot;这一维要特别小心</strong>：它存的是<strong>观察的摘要</strong>，而摘要必然有损（下一节展开）。所以规则是：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord text"><span class="mord">world </span><span class="mord cjk_fallback">里存</span><span class="mord">&quot;</span><span class="mord cjk_fallback">可核验的指针</span><span class="mord">&quot;</span><span class="mord cjk_fallback">优先于</span><span class="mord">&quot;</span><span class="mord cjk_fallback">模型的总结</span><span class="mord">&quot;</span></span></span></span></span></span></p>
+<p>即 <code>{&quot;order_id&quot;: &quot;o_123&quot;, &quot;status_observed&quot;: &quot;paid&quot;, &quot;observed_at_step&quot;: 7}</code> 好过 <code>{&quot;order_summary&quot;: &quot;这个订单看起来已经付款了，客户应该是在上周下的单&quot;}</code>。</p>
+<h4 id="h-23-写入时机每步两次位置固定">2.3 写入时机：每步两次，位置固定<a class="anchor" href="#h-23-写入时机每步两次位置固定" aria-label="本节链接">#</a></h4>
+<p>工作记忆的写入时机是确定的，<strong>两次</strong>：</p>
+<pre><code>步 t 开始时：读状态 → 组装上下文（第 3 节）→ 模型决策
+步 t 结束时：决策落地为状态转移 → 写状态（★ 与轨迹同时写，见第 4 节）</code></pre>
+<p>关键规则：<strong>状态转移必须与轨迹写入在同一个原子步骤里完成。</strong> 若先执行了副作用、再写状态，中间崩溃就会出现&quot;世界变了但状态不知道&quot;（第 3 章的未知区间在状态层的版本）。正确顺序：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">:</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord text"><span class="mord cjk_fallback">写</span><span class="mord">&quot;</span><span class="mord cjk_fallback">将要执行</span><span class="mord">&quot;</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">→</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">:</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord cjk_fallback">执行副作用（带幂等键）</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">→</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">3</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">:</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7778em;vertical-align:-0.0833em;"></span><span class="mord text"><span class="mord cjk_fallback">写</span><span class="mord">&quot;</span><span class="mord cjk_fallback">已执行</span><span class="mord"> + </span><span class="mord cjk_fallback">结果</span><span class="mord">&quot;</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">→</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6679em;"></span><span class="mord text"><span class="mord">commit</span></span></span></span></span></span></p>
+<p>这里 <code>T1/T2/T3</code> 不必是数据库事务（副作用在外部系统，做不到）。但<strong>检查点必须记录 <code>T1</code> 已写</strong>，这样恢复时才知道&quot;这一步可能已经执行了&quot;，从而走幂等去重而不是盲目重放。这正是第 3 节幂等键与第 4 节重放的接合点。</p>
+<h4 id="h-24-工作记忆的容量与重算-vs-保留">2.4 工作记忆的容量与&quot;重算 vs 保留&quot;<a class="anchor" href="#h-24-工作记忆的容量与重算-vs-保留" aria-label="本节链接">#</a></h4>
+<p>工作记忆<strong>不需要</strong>全部进上下文。一个实用的分档：</p>
+<table>
+<thead>
+<tr>
+<th>分档</th>
+<th>内容</th>
+<th>进上下文？</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>必须每步可见</strong></td>
+<td>目标、硬约束、当前阶段、待办</td>
+<td>✓ 全量</td>
+</tr>
+<tr>
+<td><strong>按需可见</strong></td>
+<td>已收集的实体 ID 列表、已完成子目标的结论</td>
+<td>✓ 摘要形式（引用/列表）</td>
+</tr>
+<tr>
+<td><strong>仅在轨迹里</strong></td>
+<td>每一步的完整输入输出、原始观察</td>
+<td>✗（可检索，见第 3 节）</td>
+</tr>
+<tr>
+<td><strong>可重算</strong></td>
+<td>从原始观察可推导的中间量</td>
+<td>✗（宁可重算）</td>
+</tr>
+</tbody></table>
+<p>最后一行是一条重要准则：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord cjk_fallback">若某信息可由已保存的原始数据重算，就不要单独存它</span></span></span></span></span></span></p>
+<p>理由与&quot;单一事实来源&quot;同理：<strong>存了两份，就有不一致的可能</strong>；而不一致的中间量是最难归因的 bug（第 7 章的&quot;记忆错&quot;象限）。</p>
+<h3 id="h-三长期记忆去语境化的事实与偏好">三、长期记忆：去语境化的事实与偏好<a class="anchor" href="#h-三长期记忆去语境化的事实与偏好" aria-label="本节链接">#</a></h3>
+<h4 id="h-31-长期记忆的判据去语境化">3.1 长期记忆的判据：去语境化<a class="anchor" href="#h-31-长期记忆的判据去语境化" aria-label="本节链接">#</a></h4>
+<p>一条信息是否该进长期记忆，有一个清晰的判据：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7073em;vertical-align:-0.024em;"></span><span class="mord text"><span class="mord cjk_fallback">该进长期记忆</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">⟺</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord text"><span class="mord cjk_fallback">去掉</span><span class="mord">&quot;</span><span class="mord cjk_fallback">这次任务</span><span class="mord">&quot;</span><span class="mord cjk_fallback">的语境后，它仍然成立且有用</span></span></span></span></span></span></p>
+<table>
+<thead>
+<tr>
+<th>候选</th>
+<th>去语境化后还有用？</th>
+<th>结论</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>&quot;用户希望报表用千分位分隔符&quot;</td>
+<td>✓（对未来的报表任务成立）</td>
+<td>进长期记忆（偏好）</td>
+</tr>
+<tr>
+<td>&quot;本次任务的订单 o_123 已付款&quot;</td>
+<td>✗（只对这次任务有意义）</td>
+<td>工作记忆</td>
+</tr>
+<tr>
+<td>&quot;该客户的发票抬头是 XX 公司&quot;</td>
+<td>✓（未来开票都要用）</td>
+<td>进长期记忆（事实），<strong>但需要时效性</strong></td>
+</tr>
+<tr>
+<td>&quot;上次查库存时 API 报了 500&quot;</td>
+<td>✗（一次性的瞬态故障）</td>
+<td>不进（或只进轨迹）</td>
+</tr>
+<tr>
+<td>&quot;用户拒绝了删除操作，理由是不合规&quot;</td>
+<td>✓（这可能是一条<strong>约束偏好</strong>）</td>
+<td>进长期记忆，附来源与时间</td>
+</tr>
+</tbody></table>
+<p><strong>最后一行值得展开</strong>：拒绝行为会产生一条<strong>否定的偏好</strong>（&quot;不要自动删除&quot;），它比肯定偏好更重要，也更容易被漏掉 —— 因为它不在用户的显式指令里，而在<strong>行为</strong>里。这类记忆的写入需要从行为中提取策略（第 5 章的规划会因为这条约束而改变）。</p>
+<h4 id="h-32-结构类型化条目不是自由文本">3.2 结构：类型化条目，不是自由文本<a class="anchor" href="#h-32-结构类型化条目不是自由文本" aria-label="本节链接">#</a></h4>
+<p>自由文本的长期记忆（&quot;用户说报表要简洁，上次还提到过不要太多颜色&quot;）有三个问题：无法按主体检索、无法撤销单条、无法判断时效。所以长期记忆应当是<strong>类型化条目</strong>：</p>
+<pre data-lang="json"><code class="language-json">{
+  &quot;mem_id&quot;: &quot;m_7f21&quot;,
+  &quot;type&quot;: &quot;preference&quot;,              // fact | preference | constraint | identity
+  &quot;subject&quot;: &quot;user:u_8f3a&quot;,
+  &quot;key&quot;: &quot;report.number_format&quot;,
+  &quot;value&quot;: &quot;thousands_separator&quot;,
+  &quot;confidence&quot;: 0.9,
+  &quot;source&quot;: &quot;user_message:msg_5512&quot;,  // ★ 可追溯：哪条原始输入产生它
+  &quot;verified&quot;: true,                   // ★ 是否被显式确认过（vs 模型推断）
+  &quot;created_at&quot;: &quot;2026-02-14T10:02:00Z&quot;,
+  &quot;ttl_seconds&quot;: null,                 // 偏好可永久；事实类常需要 TTL
+  &quot;supersedes&quot;: null                   // ★ 版本链：新值替代旧值，而不是覆盖
+}</code></pre>
+<p>四个字段承担的职责：</p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>承担的职责</th>
+<th>缺了会怎样</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>source</code></td>
+<td>可追溯 / 可撤销 / 可审计</td>
+<td>无法判断这条记忆是否可信，也无法在源被删除时连带清理</td>
+</tr>
+<tr>
+<td><code>verified</code></td>
+<td>区分&quot;用户说的&quot;与&quot;模型猜的&quot;</td>
+<td>幻觉与事实混在一起（下一节的核心问题）</td>
+</tr>
+<tr>
+<td><code>ttl_seconds</code></td>
+<td>时效性：事实会过期，偏好不会</td>
+<td>三年前的&quot;客户地址&quot;被当现值用</td>
+</tr>
+<tr>
+<td><code>supersedes</code></td>
+<td>版本链：保留历史</td>
+<td>覆盖式更新后，无法回答&quot;它什么时候变的、为什么变&quot;</td>
+</tr>
+</tbody></table>
+<p><code>supersedes</code> 这一项体现的是一条通用架构原则：<strong>记忆应当是追加式日志 + 派生视图，而不是原地覆盖。</strong></p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6747em;vertical-align:-0.2441em;"></span><span class="mord"><span class="mord text"><span class="mord">memory</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1864em;"><span style="top:-2.4559em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">current</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2441em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord">fold</span></span><span class="mopen">(</span><span class="mord text"><span class="mord">append-only log of assertions</span></span><span class="mclose">)</span></span></span></span></span></p>
+<p>好处有三：不丢历史（可审计、可回滚）、并发写不互相覆盖（两条冲突的断言都留下，供矛盾检测）、撤销变成&quot;追加一条撤销断言&quot;而不是删除（删除是不可逆的）。</p>
+<h4 id="h-33-写入时机三个门槛">3.3 写入时机：三个门槛<a class="anchor" href="#h-33-写入时机三个门槛" aria-label="本节链接">#</a></h4>
+<p>长期记忆的写入频率必须<strong>极低</strong>。用一道三级门槛控制：</p>
+<pre><code>门槛 1（候选）：这条信息是否&quot;去语境化后仍有用&quot;？（3.1 的判据）
+门槛 2（验证）：它的来源是什么？
+    · 用户显式陈述 → 可写，verified=true
+    · 工具的确定性返回值 → 可写，verified=true，附 fetched_at
+    · 模型推断/总结 → ★ 默认不写；必须经&quot;确认&quot;才能写（见门槛 3）
+门槛 3（确认的形式）：模型的推断只能作为&quot;候选断言&quot;存在 pending 区，
+    在满足下列任一条件后转正：
+      · 用户在后续交互中确认；
+      · 被至少 k 个独立来源佐证（k=2 起）；
+      · 它是&quot;可核验的指针&quot;（如 ID 映射），而非&quot;结论&quot;。</code></pre>
+<p><strong>门槛 2 的分类是这一节最重要的一条规则</strong>：它把第 3 章&quot;事实 vs 声明&quot;的区分用到了记忆上。</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord cjk_fallback">写入权限</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:3em;vertical-align:-1.25em;"></span><span class="minner"><span class="mopen delimcenter" style="top:0em;"><span class="delimsizing size4">{</span></span><span class="mord"><span class="mtable"><span class="col-align-l"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.69em;"><span style="top:-3.69em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord text"><span class="mord cjk_fallback">直接写</span></span></span></span><span style="top:-2.25em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord text"><span class="mord">pending</span><span class="mord cjk_fallback">（待验证）</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.19em;"><span></span></span></span></span></span><span class="arraycolsep" style="width:1em;"></span><span class="col-align-l"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.69em;"><span style="top:-3.69em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord text"><span class="mord cjk_fallback">来源：用户显式陈述</span><span class="mord"> / </span><span class="mord cjk_fallback">工具确定性返回</span></span></span></span><span style="top:-2.25em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord text"><span class="mord cjk_fallback">来源：模型推断</span><span class="mord"> / </span><span class="mord cjk_fallback">第三方内容</span><span class="mord"> / </span><span class="mord cjk_fallback">摘要</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.19em;"><span></span></span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></p>
+<p>为什么模型的推断默认不写？因为它<strong>可能是幻觉，而且一旦写入就会被反复读取并强化</strong>（下一节的&quot;幻觉固化&quot;）。让它在 <code>pending</code> 区等一等，成本几乎为零；放它直接进长期记忆，代价是无限的污染面。</p>
+<h4 id="h-34-长期记忆的读取按主体--按需">3.4 长期记忆的读取：按主体 + 按需<a class="anchor" href="#h-34-长期记忆的读取按主体--按需" aria-label="本节链接">#</a></h4>
+<p>读取的方式决定了它是否值得存在：</p>
+<table>
+<thead>
+<tr>
+<th>读取方式</th>
+<th>实现</th>
+<th>延迟</th>
+<th>适用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>按主体精确读</strong></td>
+<td><code>get(subject, key)</code></td>
+<td>微秒级</td>
+<td>偏好、身份、稳定事实 —— <strong>主力</strong></td>
+</tr>
+<tr>
+<td>按主体全量读</td>
+<td><code>get_all(subject)</code></td>
+<td>微秒级</td>
+<td>任务开始时装载&quot;关于这个用户我知道什么&quot;（要有条数上限）</td>
+</tr>
+<tr>
+<td>语义检索</td>
+<td>向量召回 + 重排</td>
+<td>毫秒级</td>
+<td>事实条目很多、key 不确定时</td>
+</tr>
+</tbody></table>
+<p><strong>主力应当是精确读</strong>：因为长期记忆的条目本来就不多（一个用户几十条），而精确读没有召回失败的问题。把长期记忆做成&quot;一个向量库&quot;是常见的过度设计 —— 它在条目少时<strong>比精确读更差</strong>（有召回失败，且无法解释为什么没读到）。</p>
+<p><strong>装载策略</strong>（任务开始时读多少）：按预算定上限，而不是&quot;全读&quot;：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8193em;vertical-align:-0.136em;"></span><span class="mord text"><span class="mord cjk_fallback">装载条数</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≤</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.503em;vertical-align:-1.053em;"></span><span class="minner"><span class="mopen delimcenter" style="top:0em;"><span class="delimsizing size3">⌊</span></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3603em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal">L</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">avg_entry</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.367em;"><span></span></span></span></span></span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal" style="margin-right:0.0502em;">B</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0502em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">memory</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.053em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mclose delimcenter" style="top:0em;"><span class="delimsizing size3">⌋</span></span></span></span></span></span></span></p>
+<p>超出时要按&quot;与当前任务的相关性 × 重要性 × 新近度&quot;排序截取，并且<strong>截取这件事必须被记录</strong>（否则你会以为&quot;Agent 不记得&quot;，实际是&quot;没装载&quot;）。</p>
+<h3 id="h-四检索式记忆带语境的过去经验">四、检索式记忆：带语境的过去经验<a class="anchor" href="#h-四检索式记忆带语境的过去经验" aria-label="本节链接">#</a></h3>
+<h4 id="h-41-与-rag-的本质差别">4.1 与 RAG 的本质差别<a class="anchor" href="#h-41-与-rag-的本质差别" aria-label="本节链接">#</a></h4>
+<p>检索式记忆听起来像 RAG（都是&quot;向量检索 + 塞进上下文&quot;），但两者的<strong>对象与用途</strong>完全不同：</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>RAG 的外部知识</th>
+<th>检索式记忆</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>检索对象</td>
+<td>文档 / 知识片段</td>
+<td><strong>过去的轨迹与结论</strong>（含做法、失败、代价）</td>
+</tr>
+<tr>
+<td>检索依据</td>
+<td>与<strong>问题</strong>的语义相似</td>
+<td>与<strong>当前情境</strong>的相似（任务类型 + 状态 + 约束）</td>
+</tr>
+<tr>
+<td>用途</td>
+<td>补充事实</td>
+<td><strong>复用做法 / 避免重蹈覆辙</strong></td>
+</tr>
+<tr>
+<td>关键元数据</td>
+<td>来源、时间</td>
+<td><strong>结果标签</strong>（成功/失败）、代价、当时的约束</td>
+</tr>
+<tr>
+<td>失效方式</td>
+<td>文档更新即失效</td>
+<td><strong>衰减</strong>：旧经验价值下降，且环境变了会误导</td>
+</tr>
+</tbody></table>
+<p><strong>第四行是本质</strong>：检索式记忆的每一条都必须带<strong>结果标签</strong>，否则你会在&quot;看起来相似&quot;的先例里检索到一个<strong>失败</strong>的做法并复制它。这是检索式记忆最常见的失效模式（第三节的&quot;错误模仿&quot;）。</p>
+<h4 id="h-42-条目结构经验单元">4.2 条目结构：经验单元<a class="anchor" href="#h-42-条目结构经验单元" aria-label="本节链接">#</a></h4>
+<pre data-lang="json"><code class="language-json">{
+  &quot;ep_id&quot;: &quot;e_31b0&quot;,
+  &quot;task_type&quot;: &quot;arxiv_digest&quot;,           // ★ 情境归纳键（用于&quot;相似情境&quot;检索）
+  &quot;situation&quot;: {
+    &quot;goal&quot;: &quot;汇总当日 LLM 推理论文&quot;,
+    &quot;constraints&quot;: [&quot;只保留有代码的&quot;, &quot;上限 8 篇&quot;],
+    &quot;tools_available&quot;: [&quot;arxiv_search&quot;, &quot;pdf_extract&quot;]
+  },
+  &quot;approach&quot;: [                            // ★ 做法（可复用）
+    &quot;先按 cs.CL 分类检索再按引用数排序&quot;,
+    &quot;用 pdf_extract 抓摘要而不是全文（省 token）&quot;
+  ],
+  &quot;outcome&quot;: &quot;success&quot;,                    // ★ 结果标签：success | partial | failure
+  &quot;lesson&quot;: &quot;全文抓取会超预算；摘要足够判定相关性&quot;,
+  &quot;cost&quot;: {&quot;tokens&quot;: 41000, &quot;steps&quot;: 9, &quot;seconds&quot;: 74},
+  &quot;created_at&quot;: &quot;2026-02-20T02:00:00Z&quot;,
+  &quot;model_version&quot;: &quot;…&quot;,                    // ★ 环境指纹：换模型后经验可能失效
+  &quot;hit_count&quot;: 3, &quot;last_hit_at&quot;: &quot;…&quot;        // 衰减与价值统计
+}</code></pre>
+<p>三个容易忽略的字段：</p>
+<ul>
+<li><code>model_version</code> / <code>tool_versions</code>：<strong>经验是有环境的</strong>。一个在旧模型上&quot;必须拆两步&quot;的经验，在新模型上可能是过度保守。环境指纹让检索时能降权过期经验。</li>
+<li><code>cost</code>：经验的价值不只是&quot;能不能成&quot;，还有&quot;多贵&quot;。检索时应当偏好<strong>同等成功率下更便宜</strong>的先例。</li>
+<li><code>hit_count</code> / <code>last_hit_at</code>：用于衰减评分（下一节）与&quot;这条经验到底有没有用&quot;的反馈。</li>
+</ul>
+<h4 id="h-43-写入时机任务结束时写一次且必须带结果">4.3 写入时机：任务结束时写一次，且必须带结果<a class="anchor" href="#h-43-写入时机任务结束时写一次且必须带结果" aria-label="本节链接">#</a></h4>
+<pre><code>任务结束（任何终止状态，含 budget_steps / blocked / error）
+  → 生成一条经验单元
+  → 打上结果标签
+  → 写入（★ 成功与失败都要写）</code></pre>
+<p><strong>失败的经验必须写</strong>，而且往往更有价值：&quot;上次走这条路预算耗尽了&quot;。只写成功经验是常见错误 —— 它让检索式记忆只提供&quot;正面先例&quot;，而 Agent 最需要的是<strong>避免重复的坑</strong>。</p>
+<p><strong>写入时的一个纪律</strong>：<code>lesson</code> 字段必须是<strong>可操作的一句话</strong>，而不是泛泛的总结。</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord text"><span class="mord cjk_fallback">好的</span><span class="mord"> lesson</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord text"><span class="mord cjk_fallback">条件</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord text"><span class="mord cjk_fallback">动作</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord cjk_fallback">后果</span></span><span class="mspace" style="margin-right:2em;"></span><span class="mopen">(</span><span class="mord text"><span class="mord">“</span><span class="mord cjk_fallback">当</span><span class="mord"> X </span><span class="mord cjk_fallback">时不要做</span><span class="mord"> Y</span><span class="mord cjk_fallback">，因为</span><span class="mord"> Z”</span></span><span class="mclose">)</span></span></span></span></span></p>
+<p>反例：&quot;需要注意预算控制。&quot;（无法据此行动）
+正例：&quot;当目标论文数 &gt; 10 时不要抓全文，会超 60k token 预算；用摘要筛选后再抓 top-3。&quot;</p>
+<h4 id="h-44-检索式记忆的两个陷阱">4.4 检索式记忆的两个陷阱<a class="anchor" href="#h-44-检索式记忆的两个陷阱" aria-label="本节链接">#</a></h4>
+<table>
+<thead>
+<tr>
+<th>陷阱</th>
+<th>机制</th>
+<th>缓解</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>表面相似 ≠ 情境相同</strong></td>
+<td>向量相似度匹配的是文字，而&quot;情境&quot;包含约束与工具集</td>
+<td>检索时把约束/工具集作为<strong>过滤条件</strong>（不只靠向量），并在条目里显式存 <code>constraints</code></td>
+</tr>
+<tr>
+<td><strong>先例的幸存者偏差</strong></td>
+<td>库里成功案例多、失败案例少（因为失败常被忽略不写）</td>
+<td>强制&quot;失败也写&quot;，并在检索时<strong>分别按结果标签取回</strong>（成功先例 + 失败先例各取 k 条）</td>
+</tr>
+</tbody></table>
+<p>第二个陷阱的缓解手段值得写成规则：</p>
+<p><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord cjk_fallback">检索</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord text"><span class="mord">top-</span></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0315em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">success</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">∪</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord">top-</span></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0315em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">failure</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:1em;"></span><span class="mopen">(</span><span class="mord text"><span class="mord cjk_fallback">分别检索，再合并</span></span><span class="mclose">)</span></span></span></span></span></p>
+<p>这保证上下文里同时有&quot;该怎么做&quot;和&quot;别怎么做&quot;两类信息。</p>
+<h4 id="h-45-三种记忆的读写频率一个数量级对比">4.5 三种记忆的读写频率：一个数量级对比<a class="anchor" href="#h-45-三种记忆的读写频率一个数量级对比" aria-label="本节链接">#</a></h4>
+<p>把整节的内容压成一张&quot;频率表&quot;，它决定了实现的复杂度分配：</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>工作记忆</th>
+<th>长期记忆</th>
+<th>检索式记忆</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>写频率</td>
+<td>每步（10 数量级/任务）</td>
+<td>每几十个任务一条</td>
+<td>每任务一条</td>
+</tr>
+<tr>
+<td>读频率</td>
+<td>每步</td>
+<td>任务开始装载一次</td>
+<td>任务开始或需要建议时</td>
+</tr>
+<tr>
+<td>存储量增长</td>
+<td>任务内线性（任务结束归档）</td>
+<td>极慢</td>
+<td>线性（需衰减）</td>
+</tr>
+<tr>
+<td>该投入的工程</td>
+<td><strong>快、原子、可序列化</strong></td>
+<td><strong>准、可追溯、可撤销</strong></td>
+<td><strong>检索质量、结果标签、衰减</strong></td>
+</tr>
+</tbody></table>
+<p><strong>一个推论</strong>：如果你发现自己在给工作记忆做复杂的冲突消解，那你多半把该进长期记忆的东西放错了地方；反过来，如果你在给长期记忆做&quot;每步更新&quot;，那你在制造污染。</p>
+<h3 id="h-代码三层记忆骨架--写入门槛--归档">代码：三层记忆骨架 + 写入门槛 + 归档<a class="anchor" href="#h-代码三层记忆骨架--写入门槛--归档" aria-label="本节链接">#</a></h3>
+<p>下面的代码实现：<strong>(1)</strong> 结构化工作记忆（含不变量断言与两阶段写入）；<strong>(2)</strong> 长期记忆（追加式日志 + 验证状态 + 时效 + 精确读）；<strong>(3)</strong> 检索式记忆（经验单元 + 按结果标签分别检索）；<strong>(4)</strong> 任务结束时的归档流程（把工作记忆的纯逻辑部分转成经验，把该持久的事实送进长期记忆门槛）。</p>
+<pre data-lang="python"><code class="language-python">import time
+from dataclasses import dataclass, field, asdict
+from typing import Any, Optional
+
+
+# ==================== (1) 工作记忆：结构化任务状态 ====================
+@dataclass
+class WorkingMemory:
+    &quot;&quot;&quot;
+    ★ 设计决策：工作记忆是一个**可断言的对象**，不是消息列表。
+      消息列表只是它的渲染形式；&quot;做到哪了&quot;必须是可程序化检查的字段，
+      否则无法恢复、无法校验、无法防止重复副作用（第 3 章）。
+    &quot;&quot;&quot;
+    run_id: str
+    objective: str
+    acceptance: list[str] = field(default_factory=list)          # 验收标准
+    hard_constraints: list[str] = field(default_factory=list)    # 硬约束（AND 守，第 2 章）
+    phase: str = &quot;plan&quot;                                          # 当前阶段
+    done: list[str] = field(default_factory=list)                # 已完成的子目标
+    todo: list[str] = field(default_factory=list)
+    entities: dict[str, Any] = field(default_factory=dict)        # 世界模型：ID 与可核验指针
+    facts: dict[str, Any] = field(default_factory=dict)           # 世界模型：观察摘要（★ 尽量存指针）
+    # 执行元数据
+    step: int = 0
+    budget_steps: int = 15
+    tokens_used: int = 0
+    idem_keys: dict[str, str] = field(default_factory=dict)       # (tool, attempt) -&gt; key
+    error_counts: dict[str, int] = field(default_factory=dict)    # 第 3 章的重复检测
+    pending_effect: Optional[dict] = None   # ★ 两阶段写入的&quot;将要执行&quot;槽位
+    paid: bool = False
+    refunded: bool = False
+
+    # ---- 不变量：这是结构化工作记忆相对&quot;消息列表&quot;的核心优势 ----
+    def check_invariants(self) -&gt; list[str]:
+        bad = []
+        if self.paid and self.refunded:
+            bad.append(&quot;已付款又已退款：状态矛盾&quot;)
+        if self.step &gt; self.budget_steps:
+            bad.append(&quot;步数超预算却仍在推进&quot;)
+        if self.pending_effect is not None:
+            bad.append(&quot;存在未结算的副作用：必须先经幂等去重确认其状态，不可盲目重放&quot;)
+        if set(self.done) &amp; set(self.todo):
+            bad.append(&quot;同一子目标同时出现在 done 与 todo&quot;)
+        return bad
+
+    # ---- 两阶段写入：先记&quot;将要执行&quot;，再执行，再结算 ----
+    def mark_pending(self, tool: str, args: dict, idem_key: str) -&gt; None:
+        &quot;&quot;&quot;
+        ★ 设计决策：副作用之前先落检查点。这样崩溃恢复时能知道&quot;这一步可能已执行&quot;，
+          从而走幂等去重（第 3 章）而不是盲目重放。
+        &quot;&quot;&quot;
+        self.pending_effect = {&quot;tool&quot;: tool, &quot;args&quot;: args, &quot;idem_key&quot;: idem_key,
+                               &quot;step&quot;: self.step, &quot;at&quot;: time.time()}
+        self.idem_keys[f&quot;{tool}@{self.step}&quot;] = idem_key
+
+    def settle_pending(self, result_summary: str) -&gt; None:
+        self.facts[f&quot;step_{self.step}_result&quot;] = result_summary
+        self.pending_effect = None
+
+    def render(self, max_facts: int = 8) -&gt; str:
+        &quot;&quot;&quot;★ 设计决策：进上下文的是**渲染后的摘要**，而不是整个状态对象。
+        完整状态留在检查点里（第 4 节），上下文只带当前决策需要的那部分。&quot;&quot;&quot;
+        lines = [f&quot;目标: {self.objective}&quot;,
+                 f&quot;阶段: {self.phase} | 步 {self.step}/{self.budget_steps}&quot;,
+                 f&quot;已完成: {self.done or &#39;（无）&#39;}&quot;,
+                 f&quot;待办: {self.todo or &#39;（无）&#39;}&quot;,
+                 f&quot;硬约束: {self.hard_constraints or &#39;（无）&#39;}&quot;]
+        if self.entities:
+            lines.append(f&quot;已知实体: {list(self.entities)[:10]}&quot;)
+        for k, v in list(self.facts.items())[-max_facts:]:
+            lines.append(f&quot;  · {k}: {v}&quot;)
+        if self.pending_effect:
+            lines.append(f&quot;⚠ 未结算副作用: {self.pending_effect[&#39;tool&#39;]} &quot;
+                         f&quot;(idem_key={self.pending_effect[&#39;idem_key&#39;]})&quot;)
+        return &quot;\n&quot;.join(lines)
+
+
+# ==================== (2) 长期记忆：追加式日志 + 三级门槛 ====================
+SOURCES_TRUSTED = (&quot;user_explicit&quot;, &quot;tool_deterministic&quot;)
+
+
+@dataclass
+class MemoryAssertion:
+    &quot;&quot;&quot;★ 设计决策：记忆是&quot;断言日志&quot;，不是&quot;当前值表&quot;。撤销 = 追加一条撤销断言。&quot;&quot;&quot;
+    mem_id: str
+    type: str                     # fact | preference | constraint | identity
+    subject: str
+    key: str
+    value: Any
+    source: str
+    verified: bool
+    created_at: float
+    ttl_seconds: Optional[float] = None
+    supersedes: Optional[str] = None
+    revoked: bool = False
+
+    def expired(self, now: float) -&gt; bool:
+        return self.ttl_seconds is not None and (now - self.created_at) &gt; self.ttl_seconds
+
+
+class LongTermMemory:
+    def __init__(self, now_fn=time.time):
+        self.now = now_fn
+        self.log: list[MemoryAssertion] = []
+        self._pending: list[MemoryAssertion] = []      # ★ 模型推断的暂存区
+        self._seq = 0
+
+    def propose(self, type_: str, subject: str, key: str, value: Any,
+                source: str) -&gt; dict:
+        &quot;&quot;&quot;
+        ★ 设计决策：写入权限由来源决定（3.3 门槛 2）：
+          用户显式陈述 / 工具确定性返回 → 直接写；
+          模型推断 / 第三方内容         → 进 pending，等待确认。
+          这是防止&quot;幻觉固化&quot;的第一道也是最重要的一道闸。
+        &quot;&quot;&quot;
+        self._seq += 1
+        entry = MemoryAssertion(
+            mem_id=f&quot;m_{self._seq:04d}&quot;, type=type_, subject=subject, key=key,
+            value=value, source=source,
+            verified=source in SOURCES_TRUSTED, created_at=self.now())
+        if source in SOURCES_TRUSTED:
+            self.log.append(entry)
+            return {&quot;written&quot;: True, &quot;mem_id&quot;: entry.mem_id, &quot;verified&quot;: True}
+        self._pending.append(entry)
+        return {&quot;written&quot;: False, &quot;pending&quot;: True,
+                &quot;hint&quot;: &quot;来源为模型推断：进入待验证区。需用户确认或两个独立来源佐证后才能转正。&quot;}
+
+    def confirm(self, mem_id: str, by: str, evidence: int = 1) -&gt; bool:
+        &quot;&quot;&quot;转正：pending → log。★ 保留 source 与确认者，便于审计。&quot;&quot;&quot;
+        for e in list(self._pending):
+            if e.mem_id == mem_id and evidence &gt;= 1:
+                e.verified = True
+                e.source = f&quot;{e.source}+confirmed_by:{by}&quot;
+                self.log.append(e)
+                self._pending.remove(e)
+                return True
+        return False
+
+    def revoke(self, mem_id: str, reason: str) -&gt; None:
+        &quot;&quot;&quot;★ 撤销是追加，不是删除：历史必须可审计（3.2）。&quot;&quot;&quot;
+        for e in self.log:
+            if e.mem_id == mem_id:
+                e.revoked = True
+                self.propose(&quot;fact&quot;, e.subject, f&quot;__revoked__{e.key}&quot;, reason, &quot;user_explicit&quot;)
+
+    def get(self, subject: str, key: str) -&gt; Optional[Any]:
+        &quot;&quot;&quot;精确读：主力读取方式（3.4）。取最后一条未撤销且未过期的断言。&quot;&quot;&quot;
+        now = self.now()
+        hits = [e for e in self.log
+                if e.subject == subject and e.key == key
+                and not e.revoked and not e.expired(now)]
+        return hits[-1].value if hits else None
+
+    def snapshot(self, subject: str, limit: int = 20) -&gt; list[dict]:
+        now = self.now()
+        entries = [e for e in self.log
+                   if e.subject == subject and not e.revoked and not e.expired(now)]
+        # ★ 装载必须限量并记录截断（3.4）—— 否则会被误读成&quot;Agent 不记得&quot;
+        return [asdict(e) for e in entries[-limit:]] + (
+            [{&quot;truncated&quot;: True, &quot;total&quot;: len(entries)}] if len(entries) &gt; limit else [])
+
+
+# ==================== (3) 检索式记忆：经验单元 + 分标签检索 ====================
+@dataclass
+class Episode:
+    ep_id: str
+    task_type: str
+    situation: dict
+    approach: list[str]
+    outcome: str                  # success | partial | failure
+    lesson: str                   # ★ 条件 + 动作 + 后果
+    cost: dict
+    created_at: float
+    env: dict = field(default_factory=dict)      # model_version / tool_versions
+    hit_count: int = 0
+    last_hit_at: float = 0.0
+
+
+class EpisodicMemory:
+    &quot;&quot;&quot;
+    ★ 设计决策：不做真正的向量检索（那是实现细节），
+      但把&quot;检索契约&quot;固定下来：按 task_type 过滤 + 成功/失败**分别**取回。
+      检索是接口，向量库只是其中一种实现。
+    &quot;&quot;&quot;
+    def __init__(self, now_fn=time.time, half_life_days: float = 60.0):
+        self.now, self.half_life = now_fn, half_life_days * 86400.0
+        self.items: list[Episode] = []
+        self._seq = 0
+
+    def write(self, ep: Episode) -&gt; None:
+        &quot;&quot;&quot;★ 成功与失败都写。只写成功会造成幸存者偏差（4.4）。&quot;&quot;&quot;
+        assert ep.outcome in (&quot;success&quot;, &quot;partial&quot;, &quot;failure&quot;)
+        assert ep.lesson and len(ep.lesson) &gt; 8, &quot;lesson 必须是可操作的一句话&quot;
+        self.items.append(ep)
+
+    def record_from_working(self, wm: WorkingMemory, outcome: str,
+                            lesson: str, cost: dict, task_type: str,
+                            env: dict) -&gt; Episode:
+        self._seq += 1
+        ep = Episode(ep_id=f&quot;e_{self._seq:04d}&quot;, task_type=task_type,
+                     situation={&quot;goal&quot;: wm.objective,
+                                &quot;constraints&quot;: wm.hard_constraints,
+                                &quot;entities&quot;: list(wm.entities)[:5]},
+                     approach=[f&quot;phase={wm.phase}&quot;] + wm.done[-4:],
+                     outcome=outcome, lesson=lesson, cost=cost,
+                     created_at=self.now(), env=env)
+        self.write(ep)
+        return ep
+
+    def retrieve(self, task_type: str, k_success: int = 3,
+                 k_failure: int = 2) -&gt; dict:
+        &quot;&quot;&quot;
+        ★ 设计决策：成功与失败**分别**检索再合并（4.4 的缓解手段）。
+          同池检索会让失败先例（通常更少）被成功先例挤出上下文。
+        &quot;&quot;&quot;
+        def score(e: Episode) -&gt; float:
+            age = self.now() - e.created_at
+            decay = 0.5 ** (age / self.half_life)          # 半衰期衰减
+            value = 1.0 + 0.1 * min(e.hit_count, 10)        # 被证明有用的加权
+            return decay * value
+
+        pool = [e for e in self.items if e.task_type == task_type]
+        succ = sorted([e for e in pool if e.outcome == &quot;success&quot;],
+                      key=score, reverse=True)[:k_success]
+        fail = sorted([e for e in pool if e.outcome in (&quot;failure&quot;, &quot;partial&quot;)],
+                      key=score, reverse=True)[:k_failure]
+        for e in succ + fail:
+            e.hit_count += 1
+            e.last_hit_at = self.now()
+        return {&quot;do_this&quot;: [asdict(e) for e in succ],
+                &quot;avoid_this&quot;: [asdict(e) for e in fail]}
+
+
+# ==================== (4) 归档：任务结束时把信息送到正确的层 ====================
+def archive(wm: WorkingMemory, ltm: LongTermMemory, epm: EpisodicMemory,
+            terminal_status: str, cost: dict, task_type: str,
+            env: dict, candidate_facts: list[dict]) -&gt; dict:
+    &quot;&quot;&quot;
+    ★ 设计决策：归档是一个**显式的分流步骤**，不是自动行为。
+      它强制回答两个问题：哪些是&quot;去语境化后仍成立的事实&quot;（→ 长期记忆门槛），
+      这次任务教了什么（→ 经验单元，成功与失败都写）。
+    &quot;&quot;&quot;
+    routed = {&quot;to_long_term&quot;: [], &quot;to_episodic&quot;: [], &quot;discarded&quot;: []}
+
+    for cand in candidate_facts:
+        # 门槛 1：去语境化后仍有用吗？
+        if not cand.get(&quot;context_free&quot;):
+            routed[&quot;discarded&quot;].append({&quot;key&quot;: cand[&quot;key&quot;], &quot;why&quot;: &quot;依赖本次任务语境&quot;})
+            continue
+        res = ltm.propose(cand[&quot;type&quot;], cand[&quot;subject&quot;], cand[&quot;key&quot;],
+                          cand[&quot;value&quot;], cand[&quot;source&quot;])
+        routed[&quot;to_long_term&quot;].append({&quot;key&quot;: cand[&quot;key&quot;], **res})
+
+    lesson = (f&quot;以 phase={wm.phase} 结束并返回 {terminal_status}；&quot;
+              f&quot;已完成 {len(wm.done)} 个子目标、剩余 {len(wm.todo)} 个&quot;
+              f&quot;（{&#39;, &#39;.join(wm.todo[:3]) or &#39;无&#39;}）&quot;)
+    ep = epm.record_from_working(
+        wm, outcome=(&quot;success&quot; if terminal_status == &quot;done&quot; else
+                     &quot;failure&quot; if terminal_status in (&quot;error&quot;, &quot;violation&quot;) else &quot;partial&quot;),
+        lesson=lesson, cost=cost, task_type=task_type, env=env)
+    routed[&quot;to_episodic&quot;].append(ep.ep_id)
+
+    # ★ 工作记忆里&quot;可重算&quot;的部分不单独存（2.4）；只把轨迹留给第 2 章的存储
+    routed[&quot;discarded&quot;].append({&quot;key&quot;: &quot;raw_observations&quot;,
+                                &quot;why&quot;: &quot;已在轨迹中，可由轨迹重算，不重复存储&quot;})
+    return routed
+
+
+if __name__ == &quot;__main__&quot;:
+    clock = {&quot;t&quot;: 1_700_000_000.0}
+    ltm = LongTermMemory(now_fn=lambda: clock[&quot;t&quot;])
+    epm = EpisodicMemory(now_fn=lambda: clock[&quot;t&quot;], half_life_days=30)
+
+    wm = WorkingMemory(run_id=&quot;run_1&quot;, objective=&quot;生成当日 LLM 推理论文日报&quot;,
+                       acceptance=[&quot;≤8 篇&quot;, &quot;只含有代码的&quot;], hard_constraints=[&quot;不修改源文件&quot;],
+                       phase=&quot;collect&quot;, todo=[&quot;收集候选&quot;, &quot;筛选&quot;, &quot;写摘要&quot;])
+    wm.mark_pending(&quot;arxiv_search&quot;, {&quot;query&quot;: &quot;cs.CL&quot;}, &quot;search:run_1:0&quot;)
+    print(&quot;【工作记忆渲染】&quot;)
+    print(wm.render())
+    print(&quot;不变量检查:&quot;, wm.check_invariants(), &quot;← 存在未结算副作用：恢复时必须先经幂等去重&quot;)
+    wm.settle_pending(&quot;返回 42 条候选&quot;)
+    # ★ 子目标完成时必须从 todo 移到 done —— 不变量会抓出&quot;两处都在&quot;的状态矛盾
+    wm.step, wm.phase = 1, &quot;filter&quot;
+    wm.done.append(&quot;收集候选&quot;)
+    wm.todo.remove(&quot;收集候选&quot;)
+    print(&quot;结算后不变量:&quot;, wm.check_invariants(), &quot;← 空列表 = 状态自洽&quot;)
+
+    # ★ 反面演示：忘记从 todo 移除会被不变量拦下
+    wm.todo.append(&quot;收集候选&quot;)
+    print(&quot;制造矛盾后:&quot;, wm.check_invariants())
+    wm.todo.remove(&quot;收集候选&quot;)
+    print(&quot;移除后:&quot;, wm.check_invariants())
+
+    # ---- 长期记忆：来源决定写入权限 ----
+    print(&quot;\n【长期记忆写入门槛】&quot;)
+    print(&quot;用户显式偏好 →&quot;, ltm.propose(&quot;preference&quot;, &quot;user:u_1&quot;, &quot;report.number_format&quot;,
+                                        &quot;thousands_separator&quot;, &quot;user_explicit&quot;))
+    print(&quot;模型推断     →&quot;, ltm.propose(&quot;fact&quot;, &quot;user:u_1&quot;, &quot;role&quot;,
+                                        &quot;可能是财务人员&quot;, &quot;model_inference&quot;))
+    print(&quot;读回偏好     →&quot;, ltm.get(&quot;user:u_1&quot;, &quot;report.number_format&quot;))
+    print(&quot;读回未确认推断→&quot;, ltm.get(&quot;user:u_1&quot;, &quot;role&quot;), &quot;← 未转正，读不到（防幻觉固化）&quot;)
+
+    # ---- 时效：事实会过期，偏好不会 ----
+    ltm.propose(&quot;fact&quot;, &quot;customer:c_9&quot;, &quot;billing_address&quot;, &quot;上海市…&quot;, &quot;tool_deterministic&quot;)
+    ltm.log[-1].ttl_seconds = 90 * 86400
+    print(&quot;装载快照（含截断标记）:&quot;, len(ltm.snapshot(&quot;user:u_1&quot;)), &quot;条&quot;)
+
+    # ---- 检索式记忆：成功与失败分别检索 ----
+    epm.write(Episode(ep_id=&quot;e_x1&quot;, task_type=&quot;arxiv_digest&quot;, situation={},
+                      approach=[&quot;先按分类检索再按引用排序&quot;], outcome=&quot;success&quot;,
+                      lesson=&quot;目标条数 &gt; 10 时不要抓全文：会超 60k token 预算&quot;,
+                      cost={&quot;tokens&quot;: 41000}, created_at=clock[&quot;t&quot;] - 5 * 86400,
+                      env={&quot;model&quot;: &quot;m1&quot;}))
+    epm.write(Episode(ep_id=&quot;e_x2&quot;, task_type=&quot;arxiv_digest&quot;, situation={},
+                      approach=[&quot;并行抓取全部 PDF 全文&quot;], outcome=&quot;failure&quot;,
+                      lesson=&quot;并行抓全文会撞上游限流并对整轮任务超时；先摘要筛选&quot;,
+                      cost={&quot;tokens&quot;: 88000}, created_at=clock[&quot;t&quot;] - 40 * 86400,
+                      env={&quot;model&quot;: &quot;m1&quot;}))
+
+    print(&quot;\n【检索式记忆：分别取回】&quot;)
+    got = epm.retrieve(&quot;arxiv_digest&quot;)
+    print(&quot;该这样做:&quot;, [(e[&quot;ep_id&quot;], e[&quot;lesson&quot;][:28]) for e in got[&quot;do_this&quot;]])
+    print(&quot;别这样做:&quot;, [(e[&quot;ep_id&quot;], e[&quot;lesson&quot;][:28]) for e in got[&quot;avoid_this&quot;]])
+
+    # ---- 归档：显式分流 ----
+    print(&quot;\n【归档分流】&quot;)
+    routed = archive(wm, ltm, epm, terminal_status=&quot;budget_steps&quot;,
+                     cost={&quot;tokens&quot;: 58000, &quot;steps&quot;: 12}, task_type=&quot;arxiv_digest&quot;,
+                     env={&quot;model&quot;: &quot;m1&quot;},
+                     candidate_facts=[
+                         {&quot;type&quot;: &quot;preference&quot;, &quot;subject&quot;: &quot;user:u_1&quot;,
+                          &quot;key&quot;: &quot;digest.max_items&quot;, &quot;value&quot;: 8,
+                          &quot;source&quot;: &quot;user_explicit&quot;, &quot;context_free&quot;: True},
+                         {&quot;type&quot;: &quot;fact&quot;, &quot;subject&quot;: &quot;run:run_1&quot;,
+                          &quot;key&quot;: &quot;last_query&quot;, &quot;value&quot;: &quot;cs.CL&quot;,
+                          &quot;source&quot;: &quot;tool_deterministic&quot;, &quot;context_free&quot;: False},
+                     ])
+    for k, v in routed.items():
+        print(f&quot;  {k}: {v}&quot;)</code></pre>
+<p><strong>七处关键设计决策</strong>：</p>
+<ol>
+<li><code>WorkingMemory</code> 是一个<strong>可断言的对象</strong>：<code>check_invariants</code> 能检查出&quot;已付款又已退款&quot;&quot;存在未结算副作用&quot;这类在消息列表里无法发现的状态矛盾。这是&quot;结构化工作记忆&quot;相对&quot;消息列表&quot;的唯一核心优势，也是崩溃恢复的前提。</li>
+<li><code>mark_pending</code> / <code>settle_pending</code> 把<strong>副作用之前的检查点</strong>显式化。这就是第 3 章未知区间在状态层的落地：恢复时看到 <code>pending_effect</code> 未清空，就知道&quot;这一步可能已经执行&quot;，必须先走幂等去重。</li>
+<li><code>render</code> 只输出<strong>摘要</strong>，完整状态留在检查点里。工作记忆不等于&quot;要全部进上下文&quot;（2.4 的分档）。</li>
+<li><code>LongTermMemory.propose</code> 用<strong>来源</strong>决定写入权限：<code>user_explicit</code> / <code>tool_deterministic</code> 直接写，<code>model_inference</code> 进 <code>_pending</code> 等确认。这一行是防&quot;幻觉固化&quot;最重要的一道闸（下一节展开）。</li>
+<li>记忆是<strong>追加式日志</strong>（<code>log</code> + <code>revoked</code> 标记 + <code>supersedes</code>），撤销是追加而非删除。这让历史可审计、并发写不互相覆盖、并为下一节的矛盾检测留出数据基础。</li>
+<li><code>EpisodicMemory.retrieve</code> <strong>分别</strong>取回成功与失败先例。同池检索会让失败先例（通常更少）被挤出上下文，导致 Agent 只看到&quot;别人怎么成功&quot;，看不到&quot;别人怎么踩坑&quot;。</li>
+<li><code>archive</code> 是一个<strong>显式分流步骤</strong>：它强制回答&quot;哪些去语境化后仍成立&quot;&quot;这次教了什么&quot;，并且把&quot;可由轨迹重算&quot;的信息明确丢弃（2.4 的单一事实来源）。</li>
+</ol>
+<h3 id="h-练习">练习<a class="anchor" href="#h-练习" aria-label="本节链接">#</a></h3>
+<ol>
+<li><p><strong>分层判定</strong>：把下面八条信息分到工作记忆 / 长期记忆 / 检索式记忆 / 不进记忆，并说明理由（要引用去语境化判据与写入门槛）：
+（a）用户说&quot;以后报表都用中文&quot;；（b）本次任务的 <code>order_id</code> 列表；（c）某工具在高并发下会限流；（d）用户没有明说但连续三次把英文报表退回；（e）这次调用返回的原始 JSON；（f）客户的营业执照号；（g）本次任务在第 12 步耗尽预算；（h）某个内部 API 的字段名拼写。</p>
+</li>
+<li><p><strong>工作记忆的 schema</strong>：为&quot;自动把论文草稿格式化成期刊模板并提交&quot;的 Agent 设计完整的工作记忆 schema。要求：四个维度（目标/进展/世界模型/执行元数据）都要有字段；写出至少五条 <code>check_invariants</code> 断言；并指出哪些字段<strong>不应该</strong>进上下文渲染（要说明理由）。</p>
+</li>
+<li><p><strong>幻觉固化的预防</strong>：某 Agent 把模型的一次推断&quot;客户是制造业企业&quot;写进了长期记忆（<code>source=model_inference</code>）。请设计三条独立的防线来阻止它，并说明每条防线在哪一层（写入门槛 / 存储结构 / 读取过滤）。然后论证：为什么&quot;让模型自己判断这条推断是否可信&quot;<strong>不是</strong>一条有效防线？</p>
+</li>
+<li><p><strong>频繁更新的长期记忆</strong>：如果业务要求&quot;每次用户交互后都更新用户画像&quot;，请给出一个既能满足业务、又不违反 3.3 三级门槛的设计。要求说明：哪些字段是&quot;断言&quot;（可追加）、哪些是&quot;派生视图&quot;（可重算）、以及为什么&quot;派生视图&quot;不能被当成记忆条目来写。</p>
+</li>
+<li><p><strong>检索式记忆的陷阱</strong>：某团队的检索式记忆库里 92% 是成功案例。请解释这会产生什么行为偏差（要给出具体任务场景），并设计修正方案：如何强制写入失败经验？如何在检索端保证失败先例进入上下文？如何度量&quot;这个修正真的起作用了&quot;？</p>
+</li>
+<li><p><strong>时效性设计</strong>：为下面四类长期记忆分别定 TTL 策略，并给出理由：用户的界面偏好、客户的收货地址、某 API 的字段含义、公司的合规约束。特别回答：TTL 到期时应该是&quot;删除&quot;还是&quot;降权为待核验&quot;？两种做法的失败模式分别是什么？</p>
+</li>
+<li><p><strong>三种记忆的边界事故</strong>：构造一个具体的事故：因为把&quot;该进长期记忆的偏好&quot;放在了工作记忆里，导致跨会话重复问用户同一个问题。再构造相反的事故：因为把&quot;该留在工作记忆的一次性事实&quot;写进了长期记忆，导致两周后 Agent 用了错误的信息。两个事故都要写出：现象的观察方式、根因、以及最小修复。</p>
+</li>
+</ol>
+<h3 id="h-小结">小结<a class="anchor" href="#h-小结" aria-label="本节链接">#</a></h3>
+<ul>
+<li><strong>上下文窗口不是记忆</strong>：它是工作区（易失、有硬上限、无索引、不可按条遗忘）。把它当记忆会同时产出&quot;记不住&quot;和&quot;记错&quot;。</li>
+<li><strong>分解依据是生命周期</strong>，不是存储介质：工作记忆（单任务、每步写）/ 长期记忆（跨会话、验证后写）/ 检索式记忆（跨任务、任务结束时写）。核心规律是 <strong>写入频率与单条容错要求成反比</strong>。</li>
+<li><strong>工作记忆必须是结构化的状态对象</strong>，消息列表只是它的渲染形式。结构化带来三个能力：可断言不变量、可程序化检查&quot;做到哪了&quot;、可恢复。副作用之前必须落检查点（<code>pending_effect</code>），这样恢复时才不会盲目重放。</li>
+<li><strong>长期记忆的判据是去语境化</strong>：去掉&quot;这次任务&quot;的语境后仍成立且有用。结构上必须是<strong>类型化条目 + 追加式日志</strong>（含 <code>source</code> / <code>verified</code> / <code>ttl</code> / <code>supersedes</code>），撤销是追加而不是删除。</li>
+<li><strong>写入门槛由来源决定</strong>：用户显式陈述与工具确定性返回可直接写；<strong>模型推断默认不写</strong>（进 pending 等确认）。这是防止幻觉固化的第一道闸。读取的主力是<strong>按主体精确读</strong>，不是向量检索。</li>
+<li><strong>检索式记忆与 RAG 的本质差别是&quot;带结果标签的经验&quot;</strong>：条目必须记录 <code>outcome</code> / <code>cost</code> / <code>env</code> / <code>lesson</code>（条件+动作+后果）。<strong>失败经验必须写</strong>，并且检索时要<strong>成功与失败分别取回</strong>（否则失败先例会被挤出上下文）。</li>
+<li><strong>单一事实来源</strong>：可由轨迹或原始数据重算的信息不要单独存 —— 存两份就有不一致的可能，而不一致的中间量是最难归因的 bug。</li>
+<li><strong>归档是显式分流</strong>，不是自动行为：它逼你回答&quot;哪些是去语境化后仍成立的事实&quot;&quot;这次教了什么&quot;。</li>
+</ul>
+<blockquote>
+<p>下一节：三种记忆的职责分清了。但真正的难点在<strong>写什么、写多少、什么时候必须忘</strong>。记忆的容量不是瓶颈，<strong>写入纪律</strong>才是 —— 一条错误的记忆会被反复读取并自我强化。这一节要处理记忆污染的三个机制与它们的检测手段。</p>
+</blockquote>
