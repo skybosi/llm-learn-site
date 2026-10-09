@@ -49,14 +49,30 @@
 
   var lessonIndexCache = null;
 
+  /* 启动数据合并（data/boot.json）：一次请求拿到 site/courses/figures/figureMeta。
+     跨境 RTT 高时，4 次请求 → 1 次是最大的一笔收益；缺文件/老产物自动回退分片。 */
+  var bootCache = null, bundleCache = null;
+  function boot() {
+    if (!bootCache) bootCache = fetchJSON('data/boot.json').catch(function () { return null; });
+    return bootCache;
+  }
+
   var api = {
     get: fetchJSON,
-    site: function () { return fetchJSON('data/site.json'); },
-    courses: function () { return fetchJSON('data/courses.json').then(function (d) { return d.courses; }); },
+    site: function () { return boot().then(function (b) { return (b && b.site) || fetchJSON('data/site.json'); }); },
+    courses: function () { return boot().then(function (b) { return (b && b.courses) ? b.courses.courses : fetchJSON('data/courses.json').then(function (d) { return d.courses; }); }); },
     course: function (slug) { return fetchJSON('data/course/' + slug + '.json'); },
     search: function () { return fetchJSON('data/search.json').then(function (d) { return d.items; }); },
     text: function (slug) { return fetchJSON('data/text/' + slug + '.json').then(function (d) { return d.lessons; }); },
-    figures: function () { return fetchJSON('data/figures.json'); },
+    figures: function () { return api.figuresBundle().then(function (b) { return (b && b.figures) || fetchJSON('data/figures.json'); }); },
+    /** 图表库包（figures + figureMeta）：只在图表库页拉一次，避免首页/课程页多背 348KB */
+    figuresBundle: function () {
+      if (!bundleCache) bundleCache = fetchJSON('data/figures-bundle.json').catch(function () { return null; });
+      return bundleCache;
+    },
+    figureMeta: function () {
+      return api.figuresBundle().then(function (b) { return (b && b.figureMeta) || fetchJSON('data/figure-meta.json'); });
+    },
     /** 课时 → 本课涉及的关键词（构建期从百科指针反转而来） */
     lessonTerms: function () { return fetchJSON('data/lesson-terms.json').then(function (d) { return d.lessons || {}; }); },
     glossaryIndex: function () { return fetchJSON('data/glossary/index.json'); },
@@ -65,9 +81,9 @@
     /** 全站课时索引：id → {c,ch,l,t,ct,seq,p}（构建期从 dist/lessons.json 拷来） */
     lessons: function () {
       if (lessonIndexCache) return Promise.resolve(lessonIndexCache);
-      return fetchJSON('data/lessons.json').then(function (d) {
-        lessonIndexCache = d.lessons || {};
-        return lessonIndexCache;
+      return boot().then(function (b) {
+        if (b && b.lessons) { lessonIndexCache = b.lessons.lessons || {}; return lessonIndexCache; }
+        return fetchJSON('data/lessons.json').then(function (d) { lessonIndexCache = d.lessons || {}; return lessonIndexCache; });
       });
     },
 

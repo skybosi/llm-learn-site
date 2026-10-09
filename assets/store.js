@@ -324,12 +324,24 @@
       if (LLM.site && adoptSite(LLM.site)) return;
       hookEvent('site', function (site) { adoptSite(site); });
       var p = null;
-      try { p = fetchJSON('data/site.json'); } catch (e) { p = null; }
+      try { p = LLM.data.site(); } catch (e) { p = null; }
       if (p && typeof p.then === 'function') p.then(adoptSite).catch(finishSite);
       else setTimeout(finishSite, 0);           // 连 fetch 都没有（极端环境）也别让 ready() 挂住
     });
     return siteP;
   }
+  var _lessonDeferred = false;
+  function deferLessonIndex() {
+    if (_lessonDeferred) return;
+    _lessonDeferred = true;
+    var hasLocal = false;
+    try { hasLocal = !!root.localStorage.getItem(KEY); } catch (e) { hasLocal = false; }
+    if (!hasLocal) return;                                   // 首次访问：没有进度 → 不需要课时索引
+    var run = function () { loadLessonIndex(); };
+    if (root.requestIdleCallback) root.requestIdleCallback(run, { timeout: 2500 });
+    else setTimeout(run, 1200);
+  }
+
   function loadLessonIndex() {
     return waitForData().then(function (d) {
       if (d && typeof d.lessons === 'function') return d.lessons();
@@ -353,7 +365,10 @@
     }).catch(function () { return cards; });
   }
   function ready() {
-    if (!readyP) readyP = Promise.all([loadSite(), loadLessonIndex(), loadCards()]).then(function () { return true; });
+    // 课时索引（34KB gzip）**不进 ready 链**：它只用于显示进度，
+    // 延后到首绘/空闲时再拉（首次访问无本地进度时干脆不拉），避免拖住首屏。
+    if (!readyP) readyP = Promise.all([loadSite(), loadCards()]).then(function () { return true; });
+    deferLessonIndex();
     return readyP;
   }
 

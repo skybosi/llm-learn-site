@@ -564,7 +564,7 @@
       // 单课视图：data/courses.json 的课程卡**不含 chapters**（构建期只留在单课 JSON 里），
       // 所以想看章标题与「按 N 章分组」，得再取一次 data/course/<slug>.json；取不到就退化为无标题分组
       (slug && data.course) ? data.course(slug).catch(function () { return null; }) : Promise.resolve(null),
-      data.get('data/figure-meta.json').catch(function () { return { meta: {} }; }),   // 图题 + 图→课时
+      data.figureMeta().catch(function () { return { meta: {} }; }),   // 图题 + 图→课时
     ]).then(function (res) {
       var full = res[3] || {};
       var meta = (res[4] && res[4].meta) || {};

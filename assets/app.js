@@ -106,7 +106,8 @@
       }
     };
     try {
-      var r = view ? view.render(viewRoot, route) : null;   // 按需加载已回退（会引发课时页报错），保留 loadLibs 备用
+      // ②/③（CDN + 按需加载）已回退：CDN 在本机不可达、异步渲染路径也不稳 → 恢复本地 eager（defer，不阻塞首绘）
+      var r = view ? view.render(viewRoot, route) : null;
       // 视觉升级要在 DOM 就绪后跑：等 render 的 Promise 落地（或同步渲染后下一帧）
       var afterRender = function () { try { enhanceVisuals(viewRoot); } catch (e) {} };
       if (r && typeof r.then === 'function') r.then(afterRender, afterRender);
@@ -372,13 +373,42 @@
   /* ---------------- 按需加载（KaTeX / highlight 只在课时与百科路由加载）----------------
      首页/课程/图表库等页面不需要这 ~392KB，之前是全局 <script> 无条件加载 → 首屏变慢。 */
   var _libsPromise = null;
-  function loadScript(src) {
-    return new Promise(function (res, rej) {
-      var s = document.createElement('script');
-      s.src = src; s.async = false;
-      s.onload = res; s.onerror = function () { rej(new Error('加载失败 ' + src)); };
-      document.head.appendChild(s);
+  // 国内 CDN 优先（GitHub Pages 跨境 RTT 4–9 秒），失败自动回落仓库内文件 → 离线仍可用
+  var CDN = 'https://cdn.staticfile.net/';
+  // ⚠️ 必须带超时：CDN 不可达时 onerror 常常**不触发**（连接挂着）→ 只靠 onerror 会让课时页永远渲染不出来
+  var CDN_TIMEOUT = 2500;
+  function loadFirst(urls) {
+    return new Promise(function (resolve, reject) {
+      (function tryAt(i) {
+        if (i >= urls.length) { reject(new Error('全部来源失败')); return; }
+        var s = document.createElement('script');
+        var done = false;
+        var timer = setTimeout(function () { if (!done) { done = true; s.remove(); tryAt(i + 1); } }, CDN_TIMEOUT);
+        s.src = urls[i]; s.async = false;
+        s.onload = function () { if (done) return; done = true; clearTimeout(timer); resolve(); };
+        s.onerror = function () { if (done) return; done = true; clearTimeout(timer); s.remove(); tryAt(i + 1); };
+        document.head.appendChild(s);
+      })(0);
     });
+  }
+  // 记录 CDN 是否可用：不可用则本次会话直接用本地，避免每个课时页都白等 2.5 秒
+  function cdnUsable() {
+    try { return sessionStorage.getItem('cdn-ok') !== '0'; } catch (e) { return true; }
+  }
+  function markCdn(ok) { try { sessionStorage.setItem('cdn-ok', ok ? '1' : '0'); } catch (e) {} }
+  function loadLibs() {
+    if (_libsPromise) return _libsPromise;
+    var css = CDN + 'katex/0.16.47/katex.min.css', cssLocal = 'assets/vendor/katex/katex.min.css';
+    var l = document.createElement('link');
+    l.rel = 'stylesheet'; l.href = css;
+    l.onerror = function () { l.href = cssLocal; };
+    document.head.appendChild(l);
+    var katexSrc = cdnUsable() ? [CDN + 'katex/0.16.47/katex.min.js', 'assets/vendor/katex/katex.min.js'] : ['assets/vendor/katex/katex.min.js'];
+    var hljsSrc = cdnUsable() ? [CDN + 'highlight.js/11.9.0/highlight.min.js', 'assets/vendor/highlight/highlight.min.js'] : ['assets/vendor/highlight/highlight.min.js'];
+    _libsPromise = loadFirst(katexSrc)
+      .then(function () { markCdn(!!root.katex && katexSrc.length > 1); return loadFirst(hljsSrc); })
+      .catch(function () { markCdn(false); return null; });   // 失败也不阻塞（公式退化为纯文本）
+    return _libsPromise;
   }
   function loadStyle(href) {
     var l = document.createElement('link');
