@@ -93,10 +93,24 @@
     ui.clear(viewRoot);
     var done = function () {
       LLM.emit('route', route);
-      if (!(route.query && route.query.keepScroll)) window.scrollTo({ top: 0, behavior: 'auto' });
+      if (!(route.query && route.query.keepScroll)) {
+        // 切页**瞬时**回顶部（用户反馈平滑滚动"晃眼"）。
+        // ⚠️ 只传 behavior:'instant' 不够：CSS 里的 html{scroll-behavior:smooth} 会盖过它（Chromium 实测仍平滑）。
+        //    可靠做法：临时把内联 scroll-behavior 设为 auto（内联 > 样式表），滚完再还原（页面内锚点仍保留平滑）。
+        var _de = document.documentElement, _prev = _de.style.scrollBehavior;
+        _de.style.scrollBehavior = 'auto';
+        window.scrollTo(0, 0);
+        _de.scrollTop = 0;
+        if (document.body) document.body.scrollTop = 0;
+        _de.style.scrollBehavior = _prev;
+      }
     };
     try {
-      var r = view ? view.render(viewRoot, route) : null;
+      var r = view ? view.render(viewRoot, route) : null;   // 按需加载已回退（会引发课时页报错），保留 loadLibs 备用
+      // 视觉升级要在 DOM 就绪后跑：等 render 的 Promise 落地（或同步渲染后下一帧）
+      var afterRender = function () { try { enhanceVisuals(viewRoot); } catch (e) {} };
+      if (r && typeof r.then === 'function') r.then(afterRender, afterRender);
+      else setTimeout(afterRender, 0);
       if (r && typeof r.then === 'function') {
         r.then(function (c) { cleanup = c || null; done(); })
          .catch(function (e) { showError(viewRoot, e); done(); });
@@ -339,6 +353,76 @@
           if (a) a.addEventListener('click', function (e) { e.preventDefault(); location.reload(); });
         })
         .catch(function () { /* 离线/失败就算了 */ });
+    });
+  }
+
+  /* 页内锚点（目录）保留平滑滚动：全局 smooth 已关，这里按需平滑 */
+  document.addEventListener('click', function (e) {
+    var a = e.target && e.target.closest ? e.target.closest('a[href^="#"]:not([href^="#/"])') : null;
+    if (!a) return;
+    var id = a.getAttribute('href').slice(1);
+    if (!id) return;
+    var el = document.getElementById(id);
+    if (!el) return;
+    e.preventDefault();
+    el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    if (history.replaceState) history.replaceState(null, '', '#' + id);
+  });
+
+  /* ---------------- 按需加载（KaTeX / highlight 只在课时与百科路由加载）----------------
+     首页/课程/图表库等页面不需要这 ~392KB，之前是全局 <script> 无条件加载 → 首屏变慢。 */
+  var _libsPromise = null;
+  function loadScript(src) {
+    return new Promise(function (res, rej) {
+      var s = document.createElement('script');
+      s.src = src; s.async = false;
+      s.onload = res; s.onerror = function () { rej(new Error('加载失败 ' + src)); };
+      document.head.appendChild(s);
+    });
+  }
+  function loadStyle(href) {
+    var l = document.createElement('link');
+    l.rel = 'stylesheet'; l.href = href;
+    document.head.appendChild(l);
+  }
+  function loadLibs() {
+    if (_libsPromise) return _libsPromise;
+    loadStyle('assets/vendor/katex/katex.min.css');
+    _libsPromise = loadScript('assets/vendor/katex/katex.min.js')
+      .then(function () { return loadScript('assets/vendor/highlight/highlight.min.js'); })
+      .catch(function () { return null; });      // 失败也不阻塞页面（公式退化为纯文本）
+    return _libsPromise;
+  }
+  function routeNeedsLibs(route) {
+    var n = (route && route.name) || '';
+    return n === 'lesson' || n === 'lessonById' || n === 'glossary';
+  }
+
+  /* ---------------- 视觉升级：扫描线 / 滚动进入 / 指针光晕 ---------------- */
+  var REDUCED = false;
+  try { REDUCED = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches; } catch (e) {}
+
+  function enhanceVisuals(view) {
+    var hero = view.querySelector ? view.querySelector('.hero') : null;
+    if (hero && !REDUCED) {
+      // 扫描线已按用户要求移除（2026-10-09「从上到下的光线不要」）
+      hero.addEventListener('mousemove', function (e) {
+        var r = hero.getBoundingClientRect();
+        hero.style.setProperty('--mx', ((e.clientX - r.left) / r.width * 100).toFixed(1) + '%');
+        hero.style.setProperty('--my', ((e.clientY - r.top) / r.height * 100).toFixed(1) + '%');
+      });
+    }
+    if (REDUCED || !root.IntersectionObserver) return;
+    var io = new IntersectionObserver(function (ents) {
+      ents.forEach(function (en) { if (en.isIntersecting) { en.target.classList.add('in'); io.unobserve(en.target); } });
+    }, { rootMargin: '0px 0px -8% 0px', threshold: 0.05 });
+    // ⚠️ 首屏元素**不能**加入场动画：opacity:0 会把首屏藏住，导致首绘被推迟（实测首次绘制 3.4s、hero 空白）
+    var vh = window.innerHeight || 800;
+    view.querySelectorAll('.section, .card-grid').forEach(function (el) {
+      if (el.classList.contains('in') || el.classList.contains('hero')) return;
+      if (el.getBoundingClientRect().top < vh * 0.9) { el.classList.add('in'); return; }   // 已在首屏 → 直接显示
+      el.classList.add('reveal');
+      io.observe(el);
     });
   }
 

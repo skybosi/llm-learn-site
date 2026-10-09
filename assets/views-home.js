@@ -11,6 +11,56 @@
   /** 课程卡（首页/课程页共用）：封面 + 标题 + 元信息 + 进度环 */
   function courseCard(card, opts) {
     var o = opts || {};
+    // 紧凑行（课程地图用）：无封面、单行 —— 首页原来把 41 门课全用带封面大卡铺开，整页 10600px
+    if (o.compact) {
+      var row = ui.el('a', 'course-row');
+      row.href = '#/course/' + card.slug;
+      row.title = card.title + (card.line ? '（' + card.line + '）' : '') + '：' + card.counts.lessons + ' 课时';
+      // 克制路线：只留「序号 + 标题 + 参数」，不铺色块/缩略图
+      row.appendChild(ui.el('span', 'course-row-idx', o.index ? o.index : ''));
+      var main = ui.el('div', 'course-row-main');
+      main.appendChild(ui.el('span', 'course-row-title', card.title));
+      // 不再重复方向线名（分组标题已写）→ 参数能完整显示
+      main.appendChild(ui.el('span', 'course-row-meta',
+        [card.counts.lessons + ' 课时', card.counts.figures + ' 图', card.difficulty].filter(Boolean).join(' · ')));
+      row.appendChild(main);
+      if (o.progress) {
+        var pct = o.progress.total ? Math.round(o.progress.done / o.progress.total * 100) : 0;
+        var bar = ui.el('span', 'course-row-bar');
+        bar.innerHTML = '<i style="width:' + pct + '%"></i>';
+        row.appendChild(bar);
+        row.appendChild(ui.el('span', 'course-row-pct', pct ? pct + '%' : '—'));
+      }
+      return row;
+    }
+    if (o.medium) {
+      // 课程站做法：封面 + 标题 + 参数 + 难度 + 进度，一屏能扫完
+      var m = ui.el('a', 'card course-card course-card--medium');
+      m.href = '#/course/' + card.slug;
+      if (card.cover) {
+        var mc = ui.el('img', 'card-cover');
+        mc.src = card.cover; mc.alt = card.title + ' 封面'; mc.loading = 'lazy'; mc.decoding = 'async';
+        m.appendChild(mc);
+      }
+      m.setAttribute('aria-label', card.title);
+      var mb = ui.el('div', 'card-body');   // 封面里已有课程名 → 卡体不再重复标题
+      if (card.description) {
+        var md = ui.el('p', 'card-desc'); md.textContent = card.description; mb.appendChild(md);
+      }
+      var mm = ui.el('div', 'card-meta');
+      mm.appendChild(ui.el('span', null, card.counts.lessons + ' 课时'));
+      mm.appendChild(ui.el('span', null, '·'));
+      mm.appendChild(ui.el('span', null, card.counts.figures + ' 图'));
+      if (card.difficulty) mm.appendChild(ui.el('span', 'badge badge--level', card.difficulty));
+      mb.appendChild(mm);
+      if (o.progress && o.progress.total) {
+        var pw = ui.el('div', 'card-progressbar');
+        pw.innerHTML = '<i style="width:' + Math.round(o.progress.done / o.progress.total * 100) + '%"></i>';
+        mb.appendChild(pw);
+      }
+      m.appendChild(mb);
+      return m;
+    }
     var a = ui.el('a', 'card course-card');
     a.href = '#/course/' + card.slug;
     var top = ui.el('div', 'card-top');
@@ -143,6 +193,7 @@
       var progressP = (LLM.store && LLM.store.statsByCourse)
         ? LLM.store.statsByCourse().catch(function () { return { courses: [] }; })
         : Promise.resolve({ courses: [] });
+      var stops = [];
       return Promise.all([data.site(), data.courses(), progressP]).then(function (res) {
         var site = res[0], courses = res[1];
         var pm = {};
@@ -153,12 +204,29 @@
 
           /* ---------- hero ---------- */
           var hero = ui.el('section', 'hero');
+          // 2026-10-09 用户指定：特效用在**标题本身**，不再做背景粒子文字
+          var stopParticles = null;
           var inner = ui.el('div', 'hero-inner');
           var left = ui.el('div');
           left.appendChild(ui.el('span', 'hero-eyebrow', '9 条方向线 · 从零基础到能部署大模型'));
           var h1 = ui.el('h1');
           h1.innerHTML = '把大模型从<em>数学地基</em>学到<em>推理部署</em>';
-          left.appendChild(h1);
+          // 标题区做粒子背景：包一层容器，粒子场铺在里面、标题文字照常可读
+          var titleWrap = ui.el('div', 'hero-title-wrap');
+          titleWrap.appendChild(h1);
+          left.appendChild(titleWrap);
+          // 标题 = 粒子拼出的文字（成功后模块自己隐藏普通文字；关键字用琥珀色，与 <em> 对应）
+          if (LLM.particles && LLM.particles.attachTitle) {
+            stopParticles = LLM.particles.attachTitle(h1, {
+              text: '把大模型从数学地基',
+              sub: '学到推理部署',
+              accent: ['数学地基', '推理部署'],
+              mainPx: 54, subPx: 54, lineGap: 1.25,
+              anchorX: 0.5, anchorY: 0.36,
+              step: 1, maxParticles: 9000,
+              radius: 34, push: 0.3, pull: 0.22
+            });
+          }
           left.appendChild(ui.el('p', 'hero-lead',
             site.counts.courses + ' 门课 · ' + site.counts.chapters + ' 章 · ' + site.counts.lessons +
             ' 个课时：每个概念都从「为什么需要」讲到「怎么算、怎么调、代价是什么」，' +
@@ -251,7 +319,7 @@
           }
 
           /* ---------- 课程地图（按大类 → 方向线） ---------- */
-          var mapSec = ui.el('section', 'section');
+          var mapSec = ui.el('section', 'section course-map');   // ⚠️ 必须带 course-map 类，否则网格/卡片样式选择器不生效
           var mh = ui.el('div', 'section-head');
           var mhl = ui.el('div');
           mhl.appendChild(ui.el('h2', 'section-title', '课程地图'));
@@ -268,19 +336,26 @@
             var famBox = ui.el('div');
             var ft = ui.el('div', 'family-title');
             ft.appendChild(ui.el('h2', null, fam.name));
+            var famLessons = (fam.lines || []).reduce(function (n, ln) {
+              return n + (byLine[ln] || []).reduce(function (m, c) { return m + c.counts.lessons; }, 0); }, 0);
+            var famCourses = (fam.lines || []).reduce(function (n, ln) { return n + (byLine[ln] || []).length; }, 0);
+            ft.appendChild(ui.el('span', 'line-kind', famCourses + ' 门课 · ' + famLessons + ' 课时'));
             famBox.appendChild(ft);
             (fam.lines || []).forEach(function (lineName) {
               var list = byLine[lineName] || [];
               if (!list.length) return;
               var lb = ui.el('div', 'line-block');
-              var lh = ui.el('div', 'line-head');
-              var lh3 = ui.el('h3', null, lineName);
-              lh.appendChild(lh3);
               var totalLessons = list.reduce(function (n, c) { return n + c.counts.lessons; }, 0);
-              lh.appendChild(ui.el('span', 'line-kind', list.length + ' 门课 · ' + totalLessons + ' 课时'));
-              lb.appendChild(lh);
+              // 方向线名与大类名相同（多数如此）→ 不再重复一行标题，只把统计并进大类标题
+              var oneLine = (fam.lines || []).length <= 1;
+              if (!oneLine && lineName !== fam.name) {
+                var lh = ui.el('div', 'line-head');
+                lh.appendChild(ui.el('h3', null, lineName));
+                lh.appendChild(ui.el('span', 'line-kind', list.length + ' 门课 · ' + totalLessons + ' 课时'));
+                lb.appendChild(lh);
+              }
               var g = ui.el('div', 'grid grid--wide');
-              list.forEach(function (c) { g.appendChild(courseCard(c, { progress: pm[c.slug] })); });
+              list.forEach(function (c) { g.appendChild(courseCard(c, { progress: pm[c.slug], medium: true })); });
               lb.appendChild(g);
               famBox.appendChild(lb);
             });

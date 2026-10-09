@@ -34,11 +34,14 @@
   /* ---------------- 依赖：浏览器取全局，node 侧取同目录 vendor（便于回归脚本直接 require） ---------------- */
   var _deps = null;
   function deps() {
-    if (_deps) return _deps;
-    var katex = root.katex;
-    var marked = root.marked;
-    if (!katex && typeof require === 'function') katex = require('./vendor/katex/katex.min.js');
-    if (!marked && typeof require === 'function') marked = require('./vendor/marked.min.js');
+    // 浏览器：root.katex；构建期(node)：require 同目录 vendor。
+    // ⚠️ 只有 katex 已就位才缓存 —— 否则（按需加载/构建期时序）会把"当时没有"永久缓存，
+    //    导致公式全部退化成纯文本（曾因此让 358 个预渲染课时丢失 KaTeX）。
+    if (_deps && _deps.katex) return _deps;
+    var katex = root.katex, marked = root.marked;
+    if (!katex && typeof require === 'function') {
+      try { katex = require('./vendor/katex/katex.min.js'); } catch (e) { katex = null; }
+    }
     _deps = { katex: katex, marked: marked };
     return _deps;
   }
