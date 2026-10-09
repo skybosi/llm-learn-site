@@ -212,9 +212,13 @@
     it.tabIndex = 0;
     it.setAttribute('role', 'button');
     it.setAttribute('aria-label', f.cap);
-    var img = ui.el('img');
+    var img = ui.el('img')
+
     img.src = thumb(f.url);
     img.dataset.slug = f.slug;                         // 灯箱里「跳到该课」要用
+    // ⚠️ 目标是**这一课**（#/l/<课时 id>），不是课程页：图上挂的第一个课时指针
+    img.dataset.lesson = (f.lessons && f.lessons[0] && (f.lessons[0].id || f.lessons[0].l)) || '';
+    SRC_MAP[img.getAttribute('src')] = { slug: f.slug || '', lesson: img.dataset.lesson };
     img.alt = f.cap;
     // 用 setAttribute 而不是 img.loading = 'lazy'：属性写法在任何浏览器里都真的写进 HTML 属性，
     // 「view source / 静态工具检查」时能看到，符合本文件「避免一次插 1000 个立即下载的 img」的意图
@@ -435,18 +439,37 @@
     try { history.replaceState(history.state, '', hash); } catch (e) { /* file:// 下可能不允许，忽略 */ }
   }
 
+  var SRC_MAP = {};      // 图片 src → 所属课程/课时（灯箱的 <img> 不带 dataset，只能靠 src 反查）
+
   /** 灯箱注入「跳到该课」：ui.lightbox 只支持 prev/next/原图，所以在自己的根节点上补一个按钮 */
-  function onDocClick(e) {
-    var box = e.target && e.target.closest ? e.target.closest('.lightbox') : null;
+  function injectJump() {
+    var box = ui.$('.lightbox');
     if (!box || ui.$('.lb-jump', box)) return;
     var img = ui.$('img', box);
     if (!img) return;
     var cap = ui.$('.lightbox-cap', box);
     var a = ui.el('a', 'btn btn--sm lb-jump', '跳到该课');
-    a.href = '#/course/' + (img.dataset.slug || '');
+    var meta = SRC_MAP[img.getAttribute('src')] || { slug: img.dataset.slug || '', lesson: img.dataset.lesson || '' };
+    a.href = meta.lesson ? ('#/l/' + meta.lesson) : ('#/course/' + meta.slug);
+    a.title = meta.lesson ? '跳到这张图所在的课时' : '跳到这门课';
+    // ⚠️ 灯箱是遮罩：不先关掉，跳转就发生在遮罩后面 → 用户看着「点了没反应」
+    a.addEventListener('click', function () {
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+      setTimeout(function () {
+        var lb = ui.$('.lightbox');
+        if (lb && lb.parentNode) lb.parentNode.removeChild(lb);      // 兜底：Esc 没被监听时直接移除
+        document.body.classList.remove('no-scroll');
+      }, 60);
+    });
     a.rel = 'noreferrer';
     if (cap && cap.parentNode) cap.parentNode.insertBefore(a, cap);
     else box.appendChild(a);
+  }
+
+  /** 文档任意点击：既处理「灯箱内点击」，也覆盖「这次点击刚创建灯箱」的情况 */
+  function onDocClick() {
+    injectJump();
+    setTimeout(injectJump, 0);
   }
 
   /** 把当前已渲染的 .fig-item 收集成灯箱要的列表（下标与 DOM 严格一致） */
