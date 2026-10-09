@@ -818,18 +818,6 @@
     });
     return siteP;
   }
-  var _lessonDeferred = false;
-  function deferLessonIndex() {
-    if (_lessonDeferred) return;
-    _lessonDeferred = true;
-    var hasLocal = false;
-    try { hasLocal = !!root.localStorage.getItem(KEY); } catch (e) { hasLocal = false; }
-    if (!hasLocal) return;                                   // 首次访问：没有进度 → 不需要课时索引
-    var run = function () { loadLessonIndex(); };
-    if (root.requestIdleCallback) root.requestIdleCallback(run, { timeout: 2500 });
-    else setTimeout(run, 1200);
-  }
-
   function loadLessonIndex() {
     return waitForData().then(function (d) {
       if (d && typeof d.lessons === 'function') return d.lessons();
@@ -855,8 +843,16 @@
   function ready() {
     // 课时索引（34KB gzip）**不进 ready 链**：它只用于显示进度，
     // 延后到首绘/空闲时再拉（首次访问无本地进度时干脆不拉），避免拖住首屏。
-    if (!readyP) readyP = Promise.all([loadSite(), loadCards()]).then(function () { return true; });
-    deferLessonIndex();
+    // 课时索引（lessons.json，34KB gzip）：**有本地进度时必须在启动链里** ——
+    // 首页「继续学习」要靠它把 id 映射成课时标题（否则会显示裸 id，如 dinf-ch5-l4 ✗）。
+    // 首次访问（无进度）则完全不拉，省掉一次跨境请求 ✓
+    var hasLocal = false;
+    try { hasLocal = !!root.localStorage.getItem(KEY); } catch (e) { hasLocal = false; }
+    if (!readyP) {
+      var chain = [loadSite(), loadCards()];
+      if (hasLocal) chain.push(loadLessonIndex());
+      readyP = Promise.all(chain).then(function () { return true; });
+    }
     return readyP;
   }
 
